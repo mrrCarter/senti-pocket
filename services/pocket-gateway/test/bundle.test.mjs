@@ -168,8 +168,12 @@ test('validateBundleIngress: accepts a clean bundle; rejects empty/oversized/dup
   assert.deepEqual(validateBundleIngress(good).errors, [], 'clean bundle passes ingress');
   assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], snippet: '' }] }).errors.join(), /snippet: empty/);
   assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], sequence: 0 }] }).errors.join(), /not a positive integer/);
-  assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], snippet: 'x'.repeat(3000) }] }).errors.join(), /exceeds/);
+  assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], snippet: 'x'.repeat(9000) }] }).errors.join(), /snippet: exceeds/);
   assert.match(validateBundleIngress({ ...good, signingKeyId: '' }).errors.join(), /signingKeyId: empty/);
+  // frozen ingress additions: non-array collection, evidence out-of-range, empty top-level evidence
+  assert.match(validateBundleIngress({ ...good, evidence: 'not-an-array' }).errors.join(), /evidence: must be an array/);
+  assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], sequence: 999999 }] }).errors.join(), /outside checkpoint range/);
+  assert.match(validateBundleIngress({ ...good, evidence: [] }).errors.join(), /must contain >= 1 entry/);
   const dupNest = { ...good, summary: { ...good.summary,
     perAgent: [{ agentId: 'a', summary: 's', claims: [], evidence: [good.evidence[0], good.evidence[0]] }] } };
   assert.match(validateBundleIngress(dupNest).errors.join(), /duplicate nested evidence id/);

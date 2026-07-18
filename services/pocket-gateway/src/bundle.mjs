@@ -51,9 +51,16 @@ const b8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
 const boundStr = (v, maxBytes) => { const s = String(v ?? ''); return b8(s) > maxBytes ? Buffer.from(s, 'utf8').subarray(0, maxBytes).toString('utf8') + '…' : s; };
 const scrubStr = (v, maxBytes) => boundStr(scrubText(String(v ?? '')).text, maxBytes);
 
-/** Per-field caps for the projected, phone-visible CheckpointSummary (frozen PocketContracts v0.1 schema). */
+/**
+ * Per-field caps for the projected, phone-visible CheckpointSummary. `id`/`evId`/snippet are pinned to the FROZEN
+ * ingress minimums (PocketInference/InferenceTypes.swift GroundedInferenceRequest: checkpoint/session 1...256,
+ * evidence id/agent 1...128, snippet 1...8000) so egress is ALWAYS ⊆ the frozen ingress contract (the phone can never
+ * reject a bundle this gateway signs). snippet stays at the STRICTER egress cap 2048 (< frozen 8000 = safe). The
+ * remaining caps (perAgent/evidence/risks/blockers/headline/summary) are deliberate BUNDLE/egress bounds, distinct
+ * from the inference-request 1...32 (a different type).
+ */
 export const SUMMARY_CAPS = Object.freeze({
-  str: 512, headline: 4096, summary: 8192, snippet: MAX_EVIDENCE_SNIPPET_BYTES,
+  id: 256, evId: 128, str: 512, headline: 4096, summary: 8192, snippet: MAX_EVIDENCE_SNIPPET_BYTES,
   perAgent: 200, evidence: 256, risks: 100, blockers: 100,
 });
 
@@ -61,10 +68,10 @@ export const SUMMARY_CAPS = Object.freeze({
 export function projectEvidenceRef(r) {
   if (!r || typeof r !== 'object') return null;
   return {
-    id: scrubStr(r.id, SUMMARY_CAPS.str),
-    sessionId: scrubStr(r.sessionId, SUMMARY_CAPS.str),
+    id: scrubStr(r.id, SUMMARY_CAPS.evId),
+    sessionId: scrubStr(r.sessionId, SUMMARY_CAPS.id),
     sequence: Number.isSafeInteger(r.sequence) && r.sequence > 0 ? r.sequence : 0,
-    agentId: scrubStr(r.agentId, SUMMARY_CAPS.str),
+    agentId: scrubStr(r.agentId, SUMMARY_CAPS.evId),
     snippet: scrubStr(r.snippet, SUMMARY_CAPS.snippet),
     ts: typeof r.ts === 'string' ? boundStr(r.ts, SUMMARY_CAPS.str) : (r.ts instanceof Date ? r.ts.toISOString() : ''),
   };
@@ -78,7 +85,7 @@ function projectClaim(c) {
     id: scrubStr(c.id, SUMMARY_CAPS.str),
     text: scrubStr(c.text, SUMMARY_CAPS.summary),
     kind: CLAIM_KINDS.has(c.kind) ? c.kind : 'inference',
-    evidenceIds: Array.isArray(c.evidenceIds) ? c.evidenceIds.slice(0, SUMMARY_CAPS.evidence).map((x) => scrubStr(x, SUMMARY_CAPS.str)) : [],
+    evidenceIds: Array.isArray(c.evidenceIds) ? c.evidenceIds.slice(0, SUMMARY_CAPS.evidence).map((x) => scrubStr(x, SUMMARY_CAPS.evId)) : [],
   };
 }
 
@@ -87,7 +94,7 @@ function projectAgentSummary(a) {
   if (!a || typeof a !== 'object') return null;
   const evidence = Array.isArray(a.evidence) ? a.evidence.slice(0, SUMMARY_CAPS.evidence).map(projectEvidenceRef).filter(Boolean) : [];
   const claims = Array.isArray(a.claims) ? a.claims.slice(0, SUMMARY_CAPS.evidence).map(projectClaim).filter(Boolean) : [];
-  return { agentId: scrubStr(a.agentId, SUMMARY_CAPS.str), summary: scrubStr(a.summary, SUMMARY_CAPS.summary), claims, evidence };
+  return { agentId: scrubStr(a.agentId, SUMMARY_CAPS.evId), summary: scrubStr(a.summary, SUMMARY_CAPS.summary), claims, evidence };
 }
 
 /**
@@ -98,7 +105,7 @@ function projectAgentSummary(a) {
 export function projectSummary(summary) {
   const s = summary && typeof summary === 'object' ? summary : {};
   return {
-    checkpointId: scrubStr(s.checkpointId, SUMMARY_CAPS.str),
+    checkpointId: scrubStr(s.checkpointId, SUMMARY_CAPS.id),
     headline: scrubStr(s.headline, SUMMARY_CAPS.headline),
     summaryBaselineSchema: scrubStr(s.summaryBaselineSchema, SUMMARY_CAPS.str),
     grade: s.grade == null ? null : scrubStr(s.grade, SUMMARY_CAPS.str),
@@ -194,8 +201,9 @@ export function validateBundleSemantics(b) {
   if (!b.checkpointId) push('checkpointId: empty');
   if (!b.sessionId) push('sessionId: empty');
   const s0 = b.sequenceStart, s1 = b.sequenceEnd;
-  if (!Number.isSafeInteger(s0) || !Number.isSafeInteger(s1) || s0 < 0 || s1 < 0) push('sequence: not finite non-negative integers');
-  else if (s0 > s1) push(`sequence: inverted range (${s0} > ${s1})`);
+  // frozen GroundedInferenceRequest: sequenceStart > 0 && sequenceEnd >= sequenceStart (POSITIVE, non-inverted).
+  if (!Number.isSafeInteger(s0) || !Number.isSafeInteger(s1) || s0 <= 0 || s1 <= 0) push('sequence: must be positive integers');
+  else if (s1 < s0) push(`sequence: inverted range (${s0} > ${s1})`);
   if (canonicalEpochMs(b.createdAt) == null) push(`createdAt: not an exact epoch-ms (${JSON.stringify(b.createdAt)})`);
   const sum = b.summary && typeof b.summary === 'object' ? b.summary : {};
   if (sum.checkpointId && b.checkpointId && sum.checkpointId !== b.checkpointId) push('summary.checkpointId != bundle.checkpointId');
@@ -238,48 +246,59 @@ export function assertBundleSemantics(b) {
 
 /**
  * Full CONSUME-side ingress validation of an UNTRUSTED PocketBundle (warden bundle-KAV bounded-ingress, seq 234672).
- * Reject BEFORE trusting/verifying: empty required scalars (id/agentId/snippet), non-positive sequences, duplicate
- * NESTED ids (per-agent evidence / claims), and oversized strings/arrays — THEN the semantic-graph checks. This is the
- * Node ground-truth reference for the Swift decode-ingress gate; the phone must reject a malformed/oversized bundle
- * before it can be treated as semantically-valid or trusted. NOT wired into buildBundle (produce bounds by projection);
- * this is the consume-side validator. Returns {ok, errors}.
+ * The numeric bounds MIRROR the FROZEN GroundedInferenceRequest minimums (PocketInference/InferenceTypes.swift): ids
+ * checkpoint/session 1...256, evidence id/agent 1...128, snippet 1...8000, positive+non-inverted range, evidence 1..N
+ * with each sequence in-range + same session + unique. Reject BEFORE trust: empty required scalars, non-positive/
+ * out-of-range sequences, duplicate NESTED ids, non-array collections, oversized strings/arrays — THEN the semantic
+ * checks. This is the Node ground-truth reference for the Swift decode-ingress gate. NOT wired into buildBundle
+ * (produce bounds by projection, which is ⊆ these). Returns {ok, errors}. (The bundle max-count caps here are the
+ * deliberate BUNDLE bounds, distinct from the inference-request 1...32.)
  */
 export function validateBundleIngress(bundle) {
   const errors = [];
   const push = (m) => errors.push(m);
   const b = bundle;
   if (!b || typeof b !== 'object') return { ok: false, errors: ['bundle: not an object'] };
+  const SNIPPET_MAX = 8000; // frozen ingress max (egress is stricter at 2048)
   const reqStr = (v, label, cap) => {
     if (typeof v !== 'string' || v.length === 0) push(`${label}: empty/non-string required field`);
     else if (b8(v) > cap) push(`${label}: exceeds ${cap} bytes`);
   };
-  reqStr(b.checkpointId, 'checkpointId', SUMMARY_CAPS.str);
-  reqStr(b.sessionId, 'sessionId', SUMMARY_CAPS.str);
-  reqStr(b.signingKeyId, 'signingKeyId', SUMMARY_CAPS.str);
+  const arrOf = (v, label) => { if (v == null) return []; if (!Array.isArray(v)) { push(`${label}: must be an array`); return []; } return v; };
+  reqStr(b.checkpointId, 'checkpointId', SUMMARY_CAPS.id);
+  reqStr(b.sessionId, 'sessionId', SUMMARY_CAPS.id);
+  reqStr(b.signingKeyId, 'signingKeyId', SUMMARY_CAPS.id); // not in the inference type; bounded defensively
+  const s0 = b.sequenceStart, s1 = b.sequenceEnd;
+  const rangeOk = Number.isSafeInteger(s0) && Number.isSafeInteger(s1) && s0 > 0 && s1 >= s0;
+  if (!rangeOk) push('sequence: range must be positive and non-inverted (start>0, end>=start)');
   const sum = b.summary && typeof b.summary === 'object' ? b.summary : {};
-  if (Array.isArray(sum.perAgent) && sum.perAgent.length > SUMMARY_CAPS.perAgent) push(`perAgent: exceeds ${SUMMARY_CAPS.perAgent}`);
-  if (Array.isArray(b.evidence) && b.evidence.length > SUMMARY_CAPS.evidence) push(`evidence: exceeds ${SUMMARY_CAPS.evidence}`);
-  if (Array.isArray(sum.risks) && sum.risks.length > SUMMARY_CAPS.risks) push(`risks: exceeds ${SUMMARY_CAPS.risks}`);
-  if (Array.isArray(sum.blockers) && sum.blockers.length > SUMMARY_CAPS.blockers) push(`blockers: exceeds ${SUMMARY_CAPS.blockers}`);
+  const topEv = arrOf(b.evidence, 'evidence');
+  if (topEv.length < 1) push('evidence: must contain >= 1 entry');
+  if (topEv.length > SUMMARY_CAPS.evidence) push(`evidence: exceeds ${SUMMARY_CAPS.evidence}`);
+  if (arrOf(sum.perAgent, 'summary.perAgent').length > SUMMARY_CAPS.perAgent) push(`perAgent: exceeds ${SUMMARY_CAPS.perAgent}`);
+  if (arrOf(sum.risks, 'summary.risks').length > SUMMARY_CAPS.risks) push(`risks: exceeds ${SUMMARY_CAPS.risks}`);
+  if (arrOf(sum.blockers, 'summary.blockers').length > SUMMARY_CAPS.blockers) push(`blockers: exceeds ${SUMMARY_CAPS.blockers}`);
   const chkEv = (e, where) => {
-    reqStr(e && e.id, `${where}.id`, SUMMARY_CAPS.str);
-    reqStr(e && e.agentId, `${where}.agentId`, SUMMARY_CAPS.str);
-    reqStr(e && e.snippet, `${where}.snippet`, SUMMARY_CAPS.snippet);
+    reqStr(e && e.id, `${where}.id`, SUMMARY_CAPS.evId);
+    reqStr(e && e.agentId, `${where}.agentId`, SUMMARY_CAPS.evId);
+    reqStr(e && e.snippet, `${where}.snippet`, SNIPPET_MAX);
     if (!e || !Number.isSafeInteger(e.sequence) || e.sequence <= 0) push(`${where}.sequence: not a positive integer`);
+    else if (rangeOk && (e.sequence < s0 || e.sequence > s1)) push(`${where}.sequence ${e.sequence} outside checkpoint range [${s0},${s1}]`);
+    if (e && b.sessionId && e.sessionId !== b.sessionId) push(`${where}: sessionId != bundle sessionId`);
   };
-  for (const e of Array.isArray(b.evidence) ? b.evidence : []) chkEv(e, `evidence ${e && e.id}`);
-  for (const a of Array.isArray(sum.perAgent) ? sum.perAgent : []) {
-    reqStr(a && a.agentId, 'agent.agentId', SUMMARY_CAPS.str);
+  for (const e of topEv) chkEv(e, `evidence ${e && e.id}`);
+  for (const a of arrOf(sum.perAgent, 'summary.perAgent')) {
+    reqStr(a && a.agentId, 'agent.agentId', SUMMARY_CAPS.evId);
     const nestedIds = new Set();
-    for (const e of Array.isArray(a && a.evidence) ? a.evidence : []) {
+    for (const e of arrOf(a && a.evidence, 'agent.evidence')) {
       chkEv(e, `agent ${a && a.agentId} evidence ${e && e.id}`);
       if (e && e.id) { if (nestedIds.has(e.id)) push(`agent ${a.agentId}: duplicate nested evidence id ${e.id}`); nestedIds.add(e.id); }
     }
     const claimIds = new Set();
-    for (const c of Array.isArray(a && a.claims) ? a.claims : []) {
+    for (const c of arrOf(a && a.claims, 'agent.claims')) {
       reqStr(c && c.id, 'claim.id', SUMMARY_CAPS.str);
       reqStr(c && c.text, 'claim.text', SUMMARY_CAPS.summary);
-      if (Array.isArray(c && c.evidenceIds) && c.evidenceIds.length > SUMMARY_CAPS.evidence) push(`claim ${c.id}: evidenceIds exceeds ${SUMMARY_CAPS.evidence}`);
+      if (arrOf(c && c.evidenceIds, 'claim.evidenceIds').length > SUMMARY_CAPS.evidence) push(`claim ${c.id}: evidenceIds exceeds ${SUMMARY_CAPS.evidence}`);
       if (c && c.id) { if (claimIds.has(c.id)) push(`agent ${a.agentId}: duplicate claim id ${c.id}`); claimIds.add(c.id); }
     }
   }
