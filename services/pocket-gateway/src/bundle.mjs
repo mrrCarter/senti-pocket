@@ -2,11 +2,13 @@
 // The phone caches a PocketBundle and MUST verify its signature before briefing from it.
 // Signature covers the whole bundle EXCEPT the `signature` field itself (so signingKeyId is bound too).
 import { sign as edSign, verify as edVerify, generateKeyPairSync, createPrivateKey, createPublicKey } from 'node:crypto';
-import { scrubDeep, scrubText } from './scrub.mjs';
+import { scrubText } from './scrub.mjs';
 
 export const CONTRACTS_VERSION = '0.1.0';
 /** Max UTF-8 bytes for any single phone-visible evidence snippet (bounded egress). */
 export const MAX_EVIDENCE_SNIPPET_BYTES = 2048;
+/** Max UTF-8 bytes for the entire signed bundle body (defense against a pathological summary). */
+export const MAX_BUNDLE_BYTES = 512 * 1024;
 
 /** Deterministic JSON: recursively sorted object keys, no incidental whitespace. Signer + verifier must agree byte-for-byte. */
 export function stableStringify(v) {
@@ -29,38 +31,80 @@ export function dedupEvidence(refs) {
   return [...seen.values()].sort((a, b) => Number(a.sequence) - Number(b.sequence));
 }
 
-/** Recursively scrub + byte-bound every string field of an EvidenceRef (snippet/quote/text and any nested string). */
-function scrubEvidenceRef(ref) {
-  const scrubbed = scrubDeep(ref).value;
-  for (const k of Object.keys(scrubbed)) {
-    if (typeof scrubbed[k] === 'string' && Buffer.byteLength(scrubbed[k], 'utf8') > MAX_EVIDENCE_SNIPPET_BYTES) {
-      scrubbed[k] = Buffer.from(scrubbed[k], 'utf8').subarray(0, MAX_EVIDENCE_SNIPPET_BYTES).toString('utf8') + '…';
-    }
-  }
-  return scrubbed;
+/** UTF-8 byte length + bounded/scrubbed string helpers (final egress projection is best-effort + minimizing). */
+const b8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
+const boundStr = (v, maxBytes) => { const s = String(v ?? ''); return b8(s) > maxBytes ? Buffer.from(s, 'utf8').subarray(0, maxBytes).toString('utf8') + '…' : s; };
+const scrubStr = (v, maxBytes) => boundStr(scrubText(String(v ?? '')).text, maxBytes);
+
+/** Per-field caps for the projected, phone-visible CheckpointSummary (frozen PocketContracts v0.1 schema). */
+export const SUMMARY_CAPS = Object.freeze({
+  str: 512, headline: 4096, summary: 8192, snippet: MAX_EVIDENCE_SNIPPET_BYTES,
+  perAgent: 200, evidence: 256, risks: 100, blockers: 100,
+});
+
+/** Project one EvidenceRef to ONLY the frozen scalar fields: unknown keys dropped, types enforced, strings scrubbed+bounded. */
+export function projectEvidenceRef(r) {
+  if (!r || typeof r !== 'object') return null;
+  return {
+    id: scrubStr(r.id, SUMMARY_CAPS.str),
+    sessionId: scrubStr(r.sessionId, SUMMARY_CAPS.str),
+    sequence: Number.isSafeInteger(r.sequence) && r.sequence > 0 ? r.sequence : 0,
+    agentId: scrubStr(r.agentId, SUMMARY_CAPS.str),
+    snippet: scrubStr(r.snippet, SUMMARY_CAPS.snippet),
+    ts: typeof r.ts === 'string' ? boundStr(r.ts, SUMMARY_CAPS.str) : (r.ts instanceof Date ? r.ts.toISOString() : ''),
+  };
+}
+
+/** Project one AgentSummary to the frozen schema (agentId, summary, evidence[]); unknown keys dropped. */
+function projectAgentSummary(a) {
+  if (!a || typeof a !== 'object') return null;
+  const evidence = Array.isArray(a.evidence) ? a.evidence.slice(0, SUMMARY_CAPS.evidence).map(projectEvidenceRef).filter(Boolean) : [];
+  return { agentId: scrubStr(a.agentId, SUMMARY_CAPS.str), summary: scrubStr(a.summary, SUMMARY_CAPS.summary), evidence };
+}
+
+/**
+ * STRICT projection of a caller-supplied CheckpointSummary onto the FROZEN PocketContracts v0.1 schema (Echo P0
+ * minimal egress): ONLY known keys survive, types are enforced, strings/arrays are recursively bounded + scrubbed.
+ * An unexpected key (e.g. summary.rawEvents) can NEVER cross to the phone or be signed.
+ */
+export function projectSummary(summary) {
+  const s = summary && typeof summary === 'object' ? summary : {};
+  return {
+    checkpointId: scrubStr(s.checkpointId, SUMMARY_CAPS.str),
+    headline: scrubStr(s.headline, SUMMARY_CAPS.headline),
+    summaryBaselineSchema: scrubStr(s.summaryBaselineSchema, SUMMARY_CAPS.str),
+    grade: s.grade == null ? null : scrubStr(s.grade, SUMMARY_CAPS.str),
+    perAgent: Array.isArray(s.perAgent) ? s.perAgent.slice(0, SUMMARY_CAPS.perAgent).map(projectAgentSummary).filter(Boolean) : [],
+    risks: Array.isArray(s.risks) ? s.risks.slice(0, SUMMARY_CAPS.risks).map((x) => scrubStr(x, SUMMARY_CAPS.str)) : [],
+    blockers: Array.isArray(s.blockers) ? s.blockers.slice(0, SUMMARY_CAPS.blockers).map((x) => scrubStr(x, SUMMARY_CAPS.str)) : [],
+  };
 }
 
 /**
  * Build an UNSIGNED PocketBundle draft from a RawCheckpoint + CheckpointSummary. `signature` is empty until signed.
- * FINAL EGRESS redaction (Echo P0): best-effort scrub EVERY phone-visible string (summary + evidence) and bound
- * evidence snippet size, right before signing. This is defense-in-depth, NOT a guarantee — residual content is
- * untrusted (see scrub.mjs). The bundle carries the SUMMARY + bounded evidence only; raw room events never cross.
+ * MINIMAL EGRESS (Echo P0): the summary is STRICTLY projected onto the frozen schema (unknown keys dropped, sizes
+ * bounded, values scrubbed) and the evidence set is derived ONLY from projected scalar fields — nothing else crosses.
+ * Raw room events never cross (summary + bounded evidence only). Best-effort scrub, not a secret-free guarantee.
+ * Throws if the projected+signed body would exceed MAX_BUNDLE_BYTES.
  */
 export function buildBundle(rawCheckpoint, summary, opts = {}) {
-  const evidence = dedupEvidence((summary.perAgent || []).flatMap((a) => a.evidence || [])).map(scrubEvidenceRef);
-  const scrubbedSummary = scrubDeep(summary).value;
-  return {
+  const projected = projectSummary(summary);
+  const evidence = dedupEvidence(projected.perAgent.flatMap((a) => a.evidence || []));
+  const bundle = {
     contractsVersion: opts.contractsVersion || CONTRACTS_VERSION,
     checkpointId: rawCheckpoint.checkpointId,
     sessionId: rawCheckpoint.sessionId,
     sequenceStart: rawCheckpoint.startSequence,
     sequenceEnd: rawCheckpoint.endSequence,
-    summary: scrubbedSummary,
+    summary: projected,
     evidence,
     createdAt: opts.createdAt || new Date().toISOString(),
     signature: '',
     signingKeyId: opts.signingKeyId || 'pocket-gateway-dev-key',
   };
+  const bodyBytes = canonicalBundleBytes(bundle).length; // signature stripped; the exact bytes that get signed
+  if (bodyBytes > MAX_BUNDLE_BYTES) throw new Error(`bundle exceeds MAX_BUNDLE_BYTES (${bodyBytes} > ${MAX_BUNDLE_BYTES})`);
+  return bundle;
 }
 
 /** Sign a bundle draft with an Ed25519 private key (KeyObject or PEM). Returns a new signed bundle. */

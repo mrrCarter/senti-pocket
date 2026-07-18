@@ -22,6 +22,7 @@ export const CONTRACTS_VERSION = '0.1.0';
 
 /** Hard bounds enforced BEFORE any allocation/signing. Over-redaction/rejection is always the safe direction. */
 export const LIMITS = Object.freeze({
+  MAX_RAW_EVENTS: 200000,     // raw export event-array length (preflight, before any allocation)
   MAX_EVENTS: 10000,          // events in a single checkpoint slice
   MAX_SPAN: 1_000_000,        // endSequence - startSequence
   MAX_AGENTS: 500,            // distinct participants
@@ -29,6 +30,31 @@ export const LIMITS = Object.freeze({
   MAX_TITLE_BYTES: 4096,      // sessionTitle
   MAX_PAYLOAD_BYTES: 16384,   // per-event scrubbed payload (truncated beyond, with a marker)
 });
+
+/** The authoritative event count a durable checkpoint descriptor declares (or null if absent). */
+export function declaredEventCount(cp) {
+  const c = cp?.summarySections?.window?.eventCount ?? cp?.window?.eventCount ?? cp?.eventCount;
+  return Number.isSafeInteger(c) && c >= 0 ? c : null;
+}
+
+/**
+ * Single-pass scan of a raw export events array: preflight the ARRAY LENGTH before any allocation (DoS/OOM guard,
+ * Echo P1), then compute sequence extrema + valid count ITERATIVELY (never Math.min(...spread) — that allocates a
+ * full argument list and can overflow on a huge export). Returns {min,max,count} (min/max = null if no valid ids).
+ */
+export function scanExport(events) {
+  if (!Array.isArray(events)) throw new Error('export events is not an array');
+  if (events.length > LIMITS.MAX_RAW_EVENTS) throw new Error(`export event array length ${events.length} exceeds MAX_RAW_EVENTS ${LIMITS.MAX_RAW_EVENTS}`);
+  let min = null, max = null, count = 0;
+  for (const e of events) {
+    const s = toSeq(e && e.sequenceId);
+    if (s == null) continue;
+    if (min === null || s < min) min = s;
+    if (max === null || s > max) max = s;
+    count++;
+  }
+  return { min, max, count };
+}
 
 const utf8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
 const clampUtf8 = (s, max, marker = '…[truncated]') =>
@@ -60,8 +86,9 @@ export function normalizeTs(ts) {
 
 /**
  * Inclusive slice of export events to [start, end] by canonical sequenceId. Keeps ONLY events with a positive
- * safe-integer sequenceId in range; sorts ascending and DEDUPES to strictly-increasing ids (a duplicate/unsafe id
- * is dropped, never silently collapsed to a neighbour — Echo P1).
+ * safe-integer sequenceId in range; out-of-range/invalid ids are filtered (expected). A DUPLICATE in-range
+ * sequenceId is a DATA-INTEGRITY error (sequence ids are globally unique) and THROWS — never silently collapsed
+ * to a neighbour (Echo P1). Returns events sorted strictly ascending.
  */
 export function sliceEvents(events, start, end) {
   const kept = [];
@@ -69,7 +96,7 @@ export function sliceEvents(events, start, end) {
   for (const e of (events || [])) {
     const s = toSeq(e && e.sequenceId);
     if (s == null || s < start || s > end) continue;
-    if (seen.has(s)) continue; // reject duplicate sequence ids outright
+    if (seen.has(s)) throw new Error(`duplicate in-range sequenceId ${s} (data-integrity violation) — retryable`);
     seen.add(s);
     kept.push([s, e]);
   }
@@ -118,18 +145,30 @@ export function buildRawCheckpoint(checkpoint, exportData, opts = {}) {
   }
   if (end - start > LIMITS.MAX_SPAN) throw new Error(`checkpoint span ${end - start} exceeds MAX_SPAN ${LIMITS.MAX_SPAN}`);
 
-  const allSeqs = (exportData?.events || []).map((e) => toSeq(e && e.sequenceId)).filter((s) => s != null);
-  if (allSeqs.length === 0) throw new Error('export contains no events with valid sequence ids — retryable');
-  const exMin = Math.min(...allSeqs);
-  const exMax = Math.max(...allSeqs);
+  // Preflight array length + iterative extrema BEFORE allocating/mapping (Echo P1 — no spread, bounds first).
+  const { min: exMin, max: exMax, count: exCount } = scanExport(exportData?.events);
+  if (exCount === 0 || exMin === null) throw new Error('export contains no events with valid sequence ids — retryable');
   // CONTAINMENT (Echo P0): the export window must FULLY bracket the durable range, else the slice is PARTIAL and
   // would validate as clean while silently dropping events. Refuse — do not sign a partial checkpoint.
   if (start < exMin || end > exMax) {
     throw new Error(`checkpoint range [${start},${end}] not fully contained in export window [${exMin},${exMax}] (partial/missing) — retryable`);
   }
 
-  const sliced = sliceEvents(exportData?.events, start, end);
+  const session = exportData?.session || {};
+  const exSession = session.id || session.sessionId || '';
+  // descriptor/session provenance: the durable checkpoint must belong to the exported session.
+  if (checkpoint.sessionId && exSession && String(checkpoint.sessionId) !== String(exSession)) {
+    throw new Error(`checkpoint sessionId ${checkpoint.sessionId} does not match export session ${exSession} — retryable`);
+  }
+
+  const sliced = sliceEvents(exportData?.events, start, end); // throws on duplicate in-range id
   if (sliced.length > LIMITS.MAX_EVENTS) throw new Error(`sliced event count ${sliced.length} exceeds MAX_EVENTS ${LIMITS.MAX_EVENTS}`);
+  // COMPLETENESS (Echo P0): the descriptor's authoritative eventCount must EXACTLY match the accepted events. A
+  // contained range that is missing interior events (globally sparse ids => can't check contiguity) is caught here.
+  const declared = declaredEventCount(checkpoint);
+  if (declared != null && sliced.length !== declared) {
+    throw new Error(`incomplete checkpoint: accepted ${sliced.length} events but descriptor declares ${declared} (partial/missing) — retryable`);
+  }
 
   let redactionTotal = 0;
   const events = sliced.map((e) => { const { rawEvent, redactions } = toRawEvent(e); redactionTotal += redactions; return rawEvent; });
@@ -137,10 +176,9 @@ export function buildRawCheckpoint(checkpoint, exportData, opts = {}) {
   const agents = collectAgents(events);
   if (agents.length > LIMITS.MAX_AGENTS) throw new Error(`agent count ${agents.length} exceeds MAX_AGENTS ${LIMITS.MAX_AGENTS}`);
 
-  const session = exportData?.session || {};
   const checkpointId = String(checkpoint.checkpointId ?? '');
   if (!checkpointId) throw new Error('checkpoint has no checkpointId (no provenance) — retryable');
-  const sessionId = String(checkpoint.sessionId || session.id || session.sessionId || '');
+  const sessionId = String(checkpoint.sessionId || exSession || '');
   if (utf8(checkpointId) > LIMITS.MAX_ID_BYTES || utf8(sessionId) > LIMITS.MAX_ID_BYTES) {
     throw new Error('checkpointId/sessionId exceeds MAX_ID_BYTES');
   }
@@ -155,8 +193,10 @@ export function buildRawCheckpoint(checkpoint, exportData, opts = {}) {
     capturedAt: opts.capturedAt || new Date().toISOString(),
     agents,
     events,
-    // boundary/provenance evidence (Echo P0): a DURABLE checkpoint whose full range sat inside the export window.
-    provenance: { kind: 'durable', exportWindow: { min: exMin, max: exMax }, contained: true },
+    // boundary/provenance evidence (Echo P0): a DURABLE checkpoint whose full range sat inside the export window, with
+    // the accepted event count matching the descriptor's authoritative count. Proposed to Atlas to bind into the
+    // signed PocketBundle canonical (contract addition) so a downstream cannot swap this summary onto another checkpoint.
+    provenance: { kind: 'durable', exportWindow: { min: exMin, max: exMax }, contained: true, declaredEventCount: declared, acceptedEventCount: sliced.length },
   };
   return { rawCheckpoint, redactionTotal };
 }
@@ -201,10 +241,9 @@ export function extractCheckpoint(sessionId, opts = {}) {
   // Export FIRST: `sl export` returns a recent event window; a checkpoint is extractable only if its full range
   // falls inside that window (enforced as containment in buildRawCheckpoint).
   const exportData = slJson(['session', 'export', sessionId, '--remote'], run);
-  const seqs = (exportData.events || []).map((e) => toSeq(e && e.sequenceId)).filter((s) => s != null);
-  if (seqs.length === 0) throw new Error(`export returned no events with valid sequence ids for session ${sessionId} — retryable`);
-  const exMin = Math.min(...seqs);
-  const exMax = Math.max(...seqs);
+  // preflight length + iterative extrema (Echo P1: bounds before allocation, no Math.min(...spread)).
+  const { min: exMin, max: exMax, count: exCount } = scanExport(exportData.events);
+  if (exCount === 0 || exMin === null) throw new Error(`export returned no events with valid sequence ids for session ${sessionId} — retryable`);
 
   const list = slJson(['session', 'checkpoint', 'list', sessionId, '--json', '--limit', '200'], run);
   const checkpoints = Array.isArray(list) ? list : list.checkpoints || list.items || [];

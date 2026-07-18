@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { scrubText, scrubPayload, scrubDeep } from '../src/scrub.mjs';
 import {
-  sliceEvents, toRawEvent, buildRawCheckpoint, validateRawCheckpoint, extractCheckpoint, normalizeTs, toSeq, LIMITS,
+  sliceEvents, toRawEvent, buildRawCheckpoint, validateRawCheckpoint, extractCheckpoint, normalizeTs, toSeq, LIMITS, scanExport,
 } from '../src/extract.mjs';
 import { buildBundle } from '../src/bundle.mjs';
 
@@ -138,14 +138,21 @@ test('(P0 provenance) buildRawCheckpoint refuses a synthesized checkpoint', () =
   assert.throws(() => buildRawCheckpoint({ ...CANNED_CKPT, synthesized: true }, CANNED_EXPORT), /synthesized/i);
 });
 
-test('(P1 numeric) sliceEvents drops fractional + duplicate ids (no silent collapse), strictly increasing', () => {
-  const events = [
+test('(P1 numeric) sliceEvents drops fractional/out-of-range but REJECTS duplicate in-range ids (integrity error)', () => {
+  // fractional + out-of-range are filtered (expected); strictly increasing result
+  const clean = [
     { sequenceId: 230141, event: 'm', agent: { id: 'a' }, payload: { text: 'ok' }, ts: '2026-07-18T10:35:00Z' },
-    { sequenceId: 230141, event: 'm', agent: { id: 'a' }, payload: { text: 'dup' }, ts: '2026-07-18T10:35:01Z' },
     { sequenceId: 230150.5, event: 'm', agent: { id: 'a' }, payload: { text: 'frac' }, ts: '2026-07-18T10:35:02Z' },
+    { sequenceId: 999999, event: 'm', agent: { id: 'a' }, payload: { text: 'oob' }, ts: '2026-07-18T10:35:03Z' },
     { sequenceId: 230160, event: 'm', agent: { id: 'b' }, payload: { text: 'ok2' }, ts: '2026-07-18T10:36:00Z' },
   ];
-  assert.deepEqual(sliceEvents(events, 230100, 230180).map((e) => e.sequenceId), [230141, 230160]);
+  assert.deepEqual(sliceEvents(clean, 230100, 230180).map((e) => e.sequenceId), [230141, 230160]);
+  // a DUPLICATE in-range sequenceId is a data-integrity violation => throw (never silently collapse [1,2,2,3]->[1,2,3])
+  const dup = [
+    { sequenceId: 230141, event: 'm', agent: { id: 'a' }, payload: { text: 'ok' }, ts: '2026-07-18T10:35:00Z' },
+    { sequenceId: 230141, event: 'm', agent: { id: 'a' }, payload: { text: 'dup' }, ts: '2026-07-18T10:35:01Z' },
+  ];
+  assert.throws(() => sliceEvents(dup, 230100, 230180), /duplicate in-range sequenceId|integrity/i);
 });
 
 test('(P1 numeric) toSeq rejects fractional/unsafe/zero/negative/leading-zero', () => {
@@ -196,4 +203,64 @@ test('(P0 secret-egress) buildBundle final-egress-scrubs summary + evidence; raw
   assert.ok(!s.includes(fakeApiKey), 'summary secret scrubbed at egress');
   assert.ok(!s.includes('q'.repeat(32)), 'evidence snippet secret scrubbed at egress');
   assert.equal(bundle.events, undefined, 'no raw room events in the phone bundle');
+});
+
+// ---------- Echo 94baad1 re-review refinements (locked) ----------
+test('(P0 completeness) descriptor eventCount must EXACTLY match accepted events', () => {
+  const ok = { ...CANNED_CKPT, summarySections: { window: { eventCount: 2 } } };
+  assert.equal(buildRawCheckpoint(ok, CANNED_EXPORT).rawCheckpoint.events.length, 2);
+  const bad = { ...CANNED_CKPT, summarySections: { window: { eventCount: 3 } } };
+  assert.throws(() => buildRawCheckpoint(bad, CANNED_EXPORT), /incomplete|declares 3|partial/i);
+});
+
+test('(P0 completeness) contained range MISSING an interior event is rejected via eventCount (Echo proof 1..3 w/ [1,3])', () => {
+  const exp = { session: { id: 's' }, events: [
+    { sequenceId: 1, event: 'm', agent: { id: 'a' }, payload: { text: 'one' }, ts: '2026-07-18T10:00:00Z' },
+    { sequenceId: 3, event: 'm', agent: { id: 'b' }, payload: { text: 'three' }, ts: '2026-07-18T10:02:00Z' },
+  ] };
+  const cp = { checkpointId: 'cp_x', sessionId: 's', startSequence: 1, endSequence: 3, summarySections: { window: { eventCount: 3 } } };
+  assert.throws(() => buildRawCheckpoint(cp, exp), /incomplete|declares 3/i);
+});
+
+test('(P0 provenance) checkpoint sessionId must match the export session', () => {
+  assert.throws(() => buildRawCheckpoint({ ...CANNED_CKPT, sessionId: 'different-session' }, CANNED_EXPORT), /does not match export session/i);
+});
+
+test('(P1 bounds) scanExport computes extrema iteratively + counts valid ids; rejects non-array', () => {
+  assert.deepEqual(scanExport([{ sequenceId: 5 }, { sequenceId: 2 }, { sequenceId: 'x' }, { sequenceId: 9 }]), { min: 2, max: 9, count: 3 });
+  assert.deepEqual(scanExport([]), { min: null, max: null, count: 0 });
+  assert.throws(() => scanExport('nope'), /not an array/);
+});
+
+test('(P0 minimal egress) buildBundle projects the frozen summary schema: unknown keys dropped, nested bounded', () => {
+  const rc = { checkpointId: 'cp', sessionId: 's', startSequence: 1, endSequence: 3 };
+  const summary = {
+    checkpointId: 'cp', headline: 'ok', summaryBaselineSchema: 'v1', risks: [], blockers: [],
+    perAgent: [{ agentId: 'a', summary: 'did x', evidence: [{ id: 'e1', sessionId: 's', sequence: 2, agentId: 'a', snippet: 'word '.repeat(1000), ts: '2026-07-18T10:00:00Z', nested: { raw: 'z'.repeat(5000) } }] }],
+    rawEvents: [{ payload: 'w'.repeat(14500) }], // UNKNOWN key -> must be dropped, never signed
+    secretExtra: 'leak-me',
+  };
+  const b = buildBundle(rc, summary);
+  const s = JSON.stringify(b);
+  assert.equal(b.summary.rawEvents, undefined, 'unknown summary key dropped');
+  assert.equal(b.summary.secretExtra, undefined, 'unknown summary key dropped');
+  assert.ok(!s.includes('w'.repeat(100)), 'unknown-key content never crosses');
+  assert.equal(b.evidence[0].nested, undefined, 'unknown EvidenceRef key dropped');
+  assert.ok(Buffer.byteLength(b.evidence[0].snippet, 'utf8') <= 2048 + 4, 'snippet byte-bounded');
+});
+
+test('(P0 bounds) buildBundle throws when the projected body exceeds MAX_BUNDLE_BYTES', () => {
+  const rc = { checkpointId: 'cp', sessionId: 's', startSequence: 1, endSequence: 3 };
+  const perAgent = Array.from({ length: 200 }, (_, i) => ({ agentId: 'a' + i, summary: 'word '.repeat(1700), evidence: [] }));
+  assert.throws(() => buildBundle(rc, { checkpointId: 'cp', headline: 'h', summaryBaselineSchema: 'v1', perAgent, risks: [], blockers: [] }), /MAX_BUNDLE_BYTES/);
+});
+
+test('(P0 bounds) cyclic/deep summary is safely projected (no recursion into unknown keys)', () => {
+  const rc = { checkpointId: 'cp', sessionId: 's', startSequence: 1, endSequence: 3 };
+  const summary = { checkpointId: 'cp', headline: 'h', summaryBaselineSchema: 'v1', perAgent: [], risks: [], blockers: [] };
+  summary.self = summary;
+  summary.perAgent.push({ agentId: 'a', summary: 'ok', evidence: [], extra: summary });
+  const b = buildBundle(rc, summary);
+  assert.equal(b.summary.self, undefined);
+  assert.equal(b.summary.perAgent[0].extra, undefined);
 });
