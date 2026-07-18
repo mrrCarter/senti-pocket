@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  canonicalBundlePayload, dedupEvidence, canonicalEpochMs, validateBundleSemantics,
+  canonicalBundlePayload, dedupEvidence, canonicalEpochMs, validateBundleSemantics, validateBundleIngress,
   buildBundle, verifyBundle, buildSignedBundle, generateSigningKeypair, CONTRACTS_VERSION,
 } from '../src/bundle.mjs';
 
@@ -160,4 +160,19 @@ test('buildBundle FAILS CLOSED on an uncited fact claim', () => {
   const summary = { checkpointId: 'cp', headline: 'h', summaryBaselineSchema: 'v1', risks: [], blockers: [],
     perAgent: [{ agentId: 'a', summary: 's', claims: [{ id: 'c1', text: 't', kind: 'fact', evidenceIds: [] }], evidence: [] }] };
   assert.throws(() => buildBundle({ checkpointId: 'cp', sessionId: 's', startSequence: 1, endSequence: 2 }, summary), /uncited/);
+});
+
+// ---- bounded-ingress consume-side reference (warden bundle-KAV #3, seq 234672) ----
+test('validateBundleIngress: accepts a clean bundle; rejects empty/oversized/duplicate-nested/non-positive', () => {
+  const good = buildBundle(RAW, SUMMARY, { signingKeyId: 'k1', createdAt: '2026-07-18T10:40:00Z' });
+  assert.deepEqual(validateBundleIngress(good).errors, [], 'clean bundle passes ingress');
+  assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], snippet: '' }] }).errors.join(), /snippet: empty/);
+  assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], sequence: 0 }] }).errors.join(), /not a positive integer/);
+  assert.match(validateBundleIngress({ ...good, evidence: [{ ...good.evidence[0], snippet: 'x'.repeat(3000) }] }).errors.join(), /exceeds/);
+  assert.match(validateBundleIngress({ ...good, signingKeyId: '' }).errors.join(), /signingKeyId: empty/);
+  const dupNest = { ...good, summary: { ...good.summary,
+    perAgent: [{ agentId: 'a', summary: 's', claims: [], evidence: [good.evidence[0], good.evidence[0]] }] } };
+  assert.match(validateBundleIngress(dupNest).errors.join(), /duplicate nested evidence id/);
+  const emptyAgent = { ...good, summary: { ...good.summary, perAgent: [{ agentId: '', summary: 's', claims: [], evidence: [] }] } };
+  assert.match(validateBundleIngress(emptyAgent).errors.join(), /agent\.agentId: empty/);
 });

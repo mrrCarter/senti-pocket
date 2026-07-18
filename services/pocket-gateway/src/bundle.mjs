@@ -237,6 +237,57 @@ export function assertBundleSemantics(b) {
 }
 
 /**
+ * Full CONSUME-side ingress validation of an UNTRUSTED PocketBundle (warden bundle-KAV bounded-ingress, seq 234672).
+ * Reject BEFORE trusting/verifying: empty required scalars (id/agentId/snippet), non-positive sequences, duplicate
+ * NESTED ids (per-agent evidence / claims), and oversized strings/arrays — THEN the semantic-graph checks. This is the
+ * Node ground-truth reference for the Swift decode-ingress gate; the phone must reject a malformed/oversized bundle
+ * before it can be treated as semantically-valid or trusted. NOT wired into buildBundle (produce bounds by projection);
+ * this is the consume-side validator. Returns {ok, errors}.
+ */
+export function validateBundleIngress(bundle) {
+  const errors = [];
+  const push = (m) => errors.push(m);
+  const b = bundle;
+  if (!b || typeof b !== 'object') return { ok: false, errors: ['bundle: not an object'] };
+  const reqStr = (v, label, cap) => {
+    if (typeof v !== 'string' || v.length === 0) push(`${label}: empty/non-string required field`);
+    else if (b8(v) > cap) push(`${label}: exceeds ${cap} bytes`);
+  };
+  reqStr(b.checkpointId, 'checkpointId', SUMMARY_CAPS.str);
+  reqStr(b.sessionId, 'sessionId', SUMMARY_CAPS.str);
+  reqStr(b.signingKeyId, 'signingKeyId', SUMMARY_CAPS.str);
+  const sum = b.summary && typeof b.summary === 'object' ? b.summary : {};
+  if (Array.isArray(sum.perAgent) && sum.perAgent.length > SUMMARY_CAPS.perAgent) push(`perAgent: exceeds ${SUMMARY_CAPS.perAgent}`);
+  if (Array.isArray(b.evidence) && b.evidence.length > SUMMARY_CAPS.evidence) push(`evidence: exceeds ${SUMMARY_CAPS.evidence}`);
+  if (Array.isArray(sum.risks) && sum.risks.length > SUMMARY_CAPS.risks) push(`risks: exceeds ${SUMMARY_CAPS.risks}`);
+  if (Array.isArray(sum.blockers) && sum.blockers.length > SUMMARY_CAPS.blockers) push(`blockers: exceeds ${SUMMARY_CAPS.blockers}`);
+  const chkEv = (e, where) => {
+    reqStr(e && e.id, `${where}.id`, SUMMARY_CAPS.str);
+    reqStr(e && e.agentId, `${where}.agentId`, SUMMARY_CAPS.str);
+    reqStr(e && e.snippet, `${where}.snippet`, SUMMARY_CAPS.snippet);
+    if (!e || !Number.isSafeInteger(e.sequence) || e.sequence <= 0) push(`${where}.sequence: not a positive integer`);
+  };
+  for (const e of Array.isArray(b.evidence) ? b.evidence : []) chkEv(e, `evidence ${e && e.id}`);
+  for (const a of Array.isArray(sum.perAgent) ? sum.perAgent : []) {
+    reqStr(a && a.agentId, 'agent.agentId', SUMMARY_CAPS.str);
+    const nestedIds = new Set();
+    for (const e of Array.isArray(a && a.evidence) ? a.evidence : []) {
+      chkEv(e, `agent ${a && a.agentId} evidence ${e && e.id}`);
+      if (e && e.id) { if (nestedIds.has(e.id)) push(`agent ${a.agentId}: duplicate nested evidence id ${e.id}`); nestedIds.add(e.id); }
+    }
+    const claimIds = new Set();
+    for (const c of Array.isArray(a && a.claims) ? a.claims : []) {
+      reqStr(c && c.id, 'claim.id', SUMMARY_CAPS.str);
+      reqStr(c && c.text, 'claim.text', SUMMARY_CAPS.summary);
+      if (Array.isArray(c && c.evidenceIds) && c.evidenceIds.length > SUMMARY_CAPS.evidence) push(`claim ${c.id}: evidenceIds exceeds ${SUMMARY_CAPS.evidence}`);
+      if (c && c.id) { if (claimIds.has(c.id)) push(`agent ${a.agentId}: duplicate claim id ${c.id}`); claimIds.add(c.id); }
+    }
+  }
+  for (const e of validateBundleSemantics(b).errors) push(e); // then the semantic-graph checks (ranges/ids/citations/dates)
+  return { ok: errors.length === 0, errors };
+}
+
+/**
  * Reference TRUST-ANCHOR verify (mirrors the Swift verifiesSignature P1 fix): verify a bundle ONLY against the PINNED
  * key its signingKeyId selects from `trustStore` (signingKeyId -> RAW base64url Ed25519 pubkey — exactly what the phone
  * pins). A caller-supplied key is NEVER trusted; an empty or unknown signingKeyId is REJECTED (no pinned key => no
@@ -254,8 +305,11 @@ export function verifyBundleWithTrustStore(bundle, trustStore) {
   } catch { return false; }
 }
 
-// The Phase-A demo trust anchor, PINNED as an internal FROZEN constant (RAW base64url Ed25519 pubkey derived from the
-// PUBLIC seed phrase "senti-pocket phase-a demo gateway key -- NEVER PRODUCTION"). Non-caller-injectable by design.
+// The Phase-A demo trust anchor, PINNED as an internal FROZEN constant (RAW base64url Ed25519 pubkey), non-caller-
+// injectable by design. HONESTY NOTE: this pubkey is CURRENTLY the public-seed demo key — its private half is publicly
+// derivable, so it is FORGEABLE and DEMO-ONLY (never a real trust claim). Warden's fix generates a real keypair (private
+// key kept secret, only the pubkey committed); the moment that head lands this constant is swapped to that pubkey and
+// the SAME non-injectable selection logic becomes a genuine anchor. The selection pattern is correct today; the KEY is not.
 const PHASE_A_DEMO_TRUST = Object.freeze({ 'pocket-demo-phase-a': 'KiJLmbgZ-ybBDsPp_K27z2JQGzdMrfmlpQMQmyHg2j8' });
 
 /**
