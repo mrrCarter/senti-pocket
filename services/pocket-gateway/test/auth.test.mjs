@@ -118,7 +118,7 @@ test('AIdenID-shaped token interop: EdDSA access token (pairwise sub + resource 
   const v = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, now: () => NOW, replayGuard: createInMemoryReplayGuard() });
   const token = signJwt({
     header: { alg: 'EdDSA', kid: KID, typ: 'JWT' },
-    payload: { iss: ISSUER, aud: AUD, resource: RES, site: 'senti-pocket', sub: 'pairwise-xyz', exp: nowSec + 300, scope: 'actions:execute', cnf: { jkt: jwkThumbprint(ecJwk) } },
+    payload: { iss: ISSUER, aud: AUD, resource: RES, site_id: 'senti-pocket', sub: 'pairwise-xyz', exp: nowSec + 300, scope: 'actions:execute', cnf: { jkt: jwkThumbprint(ecJwk) } },
     privateKey: idp.privateKey,
   });
   const htu = 'https://gateway.senti.app/actions/execute';
@@ -133,7 +133,7 @@ test('AIdenID-shaped token interop: EdDSA access token (pairwise sub + resource 
 
 test('siteId enforced; principal namespaces the full context so a pairwise sub cannot collide across sites', async () => {
   const RES = 'https://gateway.senti.app/actions';
-  const tokenFor = (site) => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, resource: RES, site, sub: 'pairwise-same', exp: nowSec + 300, scope: 'x' }, privateKey: idp.privateKey });
+  const tokenFor = (site) => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, resource: RES, site_id: site, sub: 'pairwise-same', exp: nowSec + 300, scope: 'x' }, privateKey: idp.privateKey });
   const vA = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, siteId: 'siteA', now: () => NOW });
   assert.equal(await vA({ authorization: 'Bearer ' + tokenFor('siteB') }), null, 'a token minted for another site is rejected');
   const ctxA = await vA({ authorization: 'Bearer ' + tokenFor('siteA') });

@@ -45,8 +45,8 @@ const joinClaim = (v) => (Array.isArray(v) ? v.join(',') : (v ?? ''));
  * (issuer, audience/resource, site) context, so state MUST be keyed by the full context — a credential for site A can
  * then never authorize or collide with site B. Length-prefixed so no field boundary is ambiguous.
  */
-export function principalNamespace(p, humanId) {
-  return lp(p.iss) + lp(joinClaim(p.aud)) + lp(joinClaim(p.resource)) + lp(p.site) + lp(humanId);
+export function principalNamespace(p, humanId, site) {
+  return lp(p.iss) + lp(joinClaim(p.aud)) + lp(joinClaim(p.resource)) + lp(site) + lp(humanId);
 }
 
 /**
@@ -98,7 +98,7 @@ async function verifyDpop(dpopHeader, { jkt, htm, htu, accessToken, nowSec, cloc
  *           humanIdClaim?:string, scopeClaim?:string, requireDpop?:boolean }} cfg
  */
 export function createAidenIdVerifier(cfg = {}) {
-  const { jwks = [], issuer, audience, resource, siteId, now = () => Date.now(), clockSkewSec = 60, humanIdClaim = 'consumerAccountId', scopeClaim = 'scope', requireDpop = false, replayGuard } = cfg;
+  const { jwks = [], issuer, audience, resource, siteId, now = () => Date.now(), clockSkewSec = 60, humanIdClaim = 'consumerAccountId', scopeClaim = 'scope', siteClaim = 'site_id', requireDpop = false, replayGuard } = cfg;
   const keyByKid = new Map();
   for (const jwk of jwks) { try { keyByKid.set(jwk.kid, { obj: createPublicKey({ key: jwk, format: 'jwk' }), alg: jwk.alg }); } catch { /* skip bad key */ } }
 
@@ -120,7 +120,8 @@ export function createAidenIdVerifier(cfg = {}) {
       if (issuer && p.iss !== issuer) return null;
       if (audience && !audienceOk(p.aud, audience)) return null;
       if (resource && !audienceOk(p.resource, resource)) return null;             // RFC 8707 resource indicator
-      if (siteId && p.site !== siteId) return null;                               // tenant isolation: wrong site => reject
+      const site = p[siteClaim];
+      if (siteId && site !== siteId) return null;                                 // tenant isolation: wrong site => reject
       if (typeof p.exp === 'number' && nowSec > p.exp + clockSkewSec) return null;
       if (typeof p.nbf === 'number' && nowSec < p.nbf - clockSkewSec) return null;
 
@@ -139,7 +140,7 @@ export function createAidenIdVerifier(cfg = {}) {
       const sc = p[scopeClaim];
       const scopes = typeof sc === 'string' ? sc.split(/\s+/).filter(Boolean) : (Array.isArray(sc) ? sc : []);
       // `principal` is the full-context namespace the gateway keys durable/action state on (never `humanId` alone).
-      return { humanId, principal: principalNamespace(p, humanId), scopes, site: p.site, tokenClaims: { iss: p.iss, aud: p.aud, resource: p.resource, site: p.site, exp: p.exp, dpopBound: !!jkt } };
+      return { humanId, principal: principalNamespace(p, humanId, site), scopes, site, tokenClaims: { iss: p.iss, aud: p.aud, resource: p.resource, site, exp: p.exp, dpopBound: !!jkt } };
     } catch { return null; }
   };
 }
