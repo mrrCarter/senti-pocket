@@ -1,0 +1,190 @@
+import Foundation
+import PocketContracts
+
+public protocol LocalInferenceEngine: Sendable {
+    func prepareModel(_ artifact: VerifiedModelArtifact) async throws -> ModelPreparationMetrics
+    func answer(_ request: GroundedInferenceRequest) async throws -> GroundedInferenceResult
+    func cancel() async
+    func benchmark(prefillTokens: Int, decodeTokens: Int) async throws -> DeviceBenchmarkReport
+}
+
+public struct GroundedInferenceRequest: Sendable {
+    public let checkpointId: String
+    public let question: String
+    public let evidence: [EvidenceRef]
+
+    public init(checkpointId: String, question: String, evidence: [EvidenceRef]) throws {
+        let trimmedCheckpointId = checkpointId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCheckpointId.isEmpty, trimmedCheckpointId.utf8.count <= 256 else {
+            throw InferenceError.invalidRequest("checkpointId must contain 1...256 UTF-8 bytes")
+        }
+        guard !trimmedQuestion.isEmpty, trimmedQuestion.utf8.count <= 2_000 else {
+            throw InferenceError.invalidRequest("question must contain 1...2000 UTF-8 bytes")
+        }
+        guard !evidence.isEmpty, evidence.count <= 32 else {
+            throw InferenceError.invalidRequest("evidence must contain 1...32 entries")
+        }
+
+        var evidenceIds = Set<String>()
+        for item in evidence {
+            guard !item.id.isEmpty,
+                  item.id.utf8.count <= 128,
+                  !item.agentId.isEmpty,
+                  item.agentId.utf8.count <= 128,
+                  item.sequence > 0,
+                  !item.snippet.isEmpty,
+                  item.snippet.utf8.count <= 8_000 else {
+                throw InferenceError.invalidRequest("evidence entries must be bounded and addressable")
+            }
+            guard evidenceIds.insert(item.id).inserted else {
+                throw InferenceError.invalidRequest("evidence IDs must be unique")
+            }
+        }
+
+        self.checkpointId = trimmedCheckpointId
+        self.question = trimmedQuestion
+        self.evidence = evidence
+    }
+}
+
+public struct GroundedInferenceResult: Sendable {
+    public let questionAnswer: QuestionAnswer
+    public let metrics: InferenceRunMetrics
+
+    public init(questionAnswer: QuestionAnswer, metrics: InferenceRunMetrics) {
+        self.questionAnswer = questionAnswer
+        self.metrics = metrics
+    }
+}
+
+public struct ModelPreparationMetrics: Codable, Equatable, Sendable {
+    public let modelIdentifier: String
+    public let backend: InferenceBackend
+    public let loadMilliseconds: Double
+    public let residentMemoryBytes: UInt64?
+    public let thermalState: ThermalLevel
+
+    public init(
+        modelIdentifier: String,
+        backend: InferenceBackend,
+        loadMilliseconds: Double,
+        residentMemoryBytes: UInt64?,
+        thermalState: ThermalLevel
+    ) {
+        self.modelIdentifier = modelIdentifier
+        self.backend = backend
+        self.loadMilliseconds = loadMilliseconds
+        self.residentMemoryBytes = residentMemoryBytes
+        self.thermalState = thermalState
+    }
+}
+
+public struct InferenceRunMetrics: Codable, Equatable, Sendable {
+    public let timeToFirstTokenMilliseconds: Double
+    public let totalMilliseconds: Double
+    public let outputCharacterCount: Int
+    public let residentMemoryBytes: UInt64?
+    public let thermalState: ThermalLevel
+
+    public init(
+        timeToFirstTokenMilliseconds: Double,
+        totalMilliseconds: Double,
+        outputCharacterCount: Int,
+        residentMemoryBytes: UInt64?,
+        thermalState: ThermalLevel
+    ) {
+        self.timeToFirstTokenMilliseconds = timeToFirstTokenMilliseconds
+        self.totalMilliseconds = totalMilliseconds
+        self.outputCharacterCount = outputCharacterCount
+        self.residentMemoryBytes = residentMemoryBytes
+        self.thermalState = thermalState
+    }
+}
+
+public struct DeviceBenchmarkReport: Codable, Equatable, Sendable {
+    public let measuredAt: Date
+    public let deviceModel: String
+    public let operatingSystem: String
+    public let modelIdentifier: String
+    public let backend: InferenceBackend
+    public let initializationSeconds: Double
+    public let timeToFirstTokenSeconds: Double
+    public let prefillTokenCount: Int
+    public let decodeTokenCount: Int
+    public let prefillTokensPerSecond: Double
+    public let decodeTokensPerSecond: Double
+    public let residentMemoryBytes: UInt64?
+    public let thermalState: ThermalLevel
+
+    public init(
+        measuredAt: Date,
+        deviceModel: String,
+        operatingSystem: String,
+        modelIdentifier: String,
+        backend: InferenceBackend,
+        initializationSeconds: Double,
+        timeToFirstTokenSeconds: Double,
+        prefillTokenCount: Int,
+        decodeTokenCount: Int,
+        prefillTokensPerSecond: Double,
+        decodeTokensPerSecond: Double,
+        residentMemoryBytes: UInt64?,
+        thermalState: ThermalLevel
+    ) {
+        self.measuredAt = measuredAt
+        self.deviceModel = deviceModel
+        self.operatingSystem = operatingSystem
+        self.modelIdentifier = modelIdentifier
+        self.backend = backend
+        self.initializationSeconds = initializationSeconds
+        self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
+        self.prefillTokenCount = prefillTokenCount
+        self.decodeTokenCount = decodeTokenCount
+        self.prefillTokensPerSecond = prefillTokensPerSecond
+        self.decodeTokensPerSecond = decodeTokensPerSecond
+        self.residentMemoryBytes = residentMemoryBytes
+        self.thermalState = thermalState
+    }
+}
+
+public enum InferenceBackend: String, Codable, Equatable, Sendable {
+    case cpu
+    case gpu
+}
+
+public enum ThermalLevel: String, Codable, Equatable, Sendable {
+    case nominal
+    case fair
+    case serious
+    case critical
+    case unavailable
+}
+
+public enum InferenceError: Error, Equatable, Sendable {
+    case invalidRequest(String)
+    case modelNotPrepared
+    case superseded
+    case cancelled
+    case malformedModelOutput
+    case unsupportedModelOutputField(String)
+    case ungroundedAnswer
+    case unknownCitation(String)
+    case duplicateCitation(String)
+}
+
+extension InferenceError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidRequest(let reason): return "Invalid inference request: \(reason)"
+        case .modelNotPrepared: return "The local model is not prepared"
+        case .superseded: return "The inference run was superseded"
+        case .cancelled: return "The inference run was cancelled"
+        case .malformedModelOutput: return "The local model returned malformed JSON"
+        case .unsupportedModelOutputField(let field): return "Unsupported model output field: \(field)"
+        case .ungroundedAnswer: return "The answer is not grounded in checkpoint evidence"
+        case .unknownCitation(let id): return "The answer cited unknown evidence: \(id)"
+        case .duplicateCitation(let id): return "The answer cited evidence more than once: \(id)"
+        }
+    }
+}
