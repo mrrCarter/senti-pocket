@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canonicalPayload, computeProposalHash, hashMatchesContent, validateProposal, executeAction, ALLOWED_KINDS,
-  signReceipt, verifyReceipt, canonicalReceiptPayload,
+  signReceipt, verifyReceipt, canonicalReceiptPayload, parseResultingSequence, toSafeSequence,
 } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
 import { generateKeyPairSync } from 'node:crypto';
@@ -289,6 +289,29 @@ test('(TOCTOU) a Date mutated during run() does not affect the signed receipt (s
   assert.equal(typeof r.executedAt, 'string', 'executedAt is an immutable snapshot, not the mutated Date');
   assert.equal(verifyReceipt(r, TESTPUB), true, 'snapshot taken before run is unaffected by post-time mutation');
   assert.equal(calls.length, 1);
+});
+
+test('parseResultingSequence rejects non-canonical / unsafe sequences', () => {
+  for (const bad of [true, false, -1, 0, 1.5, 9007199254740992, NaN, Infinity, '0', '01', '1e3', ' 123 ', '-1', '1.5', 'abc', '']) {
+    assert.equal(toSafeSequence(bad), null, 'toSafeSequence must reject ' + JSON.stringify(bad));
+  }
+  assert.equal(toSafeSequence(123), 123);
+  assert.equal(toSafeSequence('123'), 123);
+  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: true })), null);
+  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: -1 })), null);
+  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 0 })), null);
+  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 1.5 })), null);
+  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 9007199254740992 })), null);
+  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 231111 })), 231111);
+});
+
+test('malformed runner sequence => .failed, NEVER a signed posted', () => {
+  for (const badSeq of [true, -1, 0, 1.5, 9007199254740992]) {
+    const p = makeProposal({ id: 'pseq' });
+    const r = executeAction(p, makeConfirm(p), opts({ run: () => JSON.stringify({ sequenceId: badSeq }) }));
+    assert.equal(r.status, 'failed', 'seq ' + badSeq + ' must not be claimed posted');
+    assert.equal(r.signature, null, 'never signed');
+  }
 });
 
 test('delimiter-injection guard: a targetSessionId carrying the \\n delimiter is rejected, never posted', () => {

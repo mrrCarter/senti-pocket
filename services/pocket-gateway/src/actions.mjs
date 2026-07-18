@@ -170,16 +170,32 @@ export function verifyReceipt(r, publicKey) {
   }
 }
 
-/** Best-effort parse of the resulting sequence from `sl session reply` output (JSON preferred). */
+/**
+ * A real Senti sequence is a POSITIVE safe integer. Accept only that, or a canonical decimal string
+ * (^[1-9][0-9]*$) whose value is a positive safe integer. Rejects booleans (true->1), negatives, zero,
+ * non-integers (1.5), exponentials/whitespace strings, and unsafe integers (> MAX_SAFE_INTEGER) — none of
+ * which are a returned Senti sequence and several of which Swift Int? cannot honestly consume (Echo).
+ */
+export function toSafeSequence(v) {
+  if (typeof v === 'number') return Number.isSafeInteger(v) && v > 0 ? v : null;
+  if (typeof v === 'string' && /^[1-9][0-9]*$/.test(v)) {
+    const n = Number(v);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+  }
+  return null;
+}
+
+/** Parse the resulting sequence from `sl session reply` output; null unless it is a verifiable canonical sequence. */
 export function parseResultingSequence(out) {
   if (out == null) return null;
   try {
     const j = JSON.parse(out);
-    const s = j.sequenceId ?? j.sequence ?? j.seq ?? j?.event?.sequenceId;
-    if (Number.isFinite(Number(s))) return Number(s);
-  } catch { /* not json */ }
-  const m = String(out).match(/sequenceId["\s:=]+(\d{3,})/i);
-  return m ? Number(m[1]) : null;
+    // JSON parsed: trust ONLY the typed value. Do NOT regex-scavenge a rejected value (e.g. "1" out of 1.5).
+    return toSafeSequence(j.sequenceId ?? j.sequence ?? j.seq ?? j?.event?.sequenceId);
+  } catch { /* not json -> regex fallback below */ }
+  // canonical positive integer NOT followed by a decimal/exponent char (so "1.5"/"1e3" don't yield "1")
+  const m = String(out).match(/sequenceId["'\s:=]+([1-9][0-9]*)(?![\d.eE])/i);
+  return m ? toSafeSequence(m[1]) : null;
 }
 
 /**
@@ -241,7 +257,7 @@ export function executeAction(proposal, confirmation, opts = {}) {
   let signingKeyObj = null;
   try { signingKeyObj = loadEd25519Private(opts.signingKey); } catch { signingKeyObj = null; }
   if (!keyIdOk || !signingKeyObj) {
-    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials missing/invalid: a private Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials missing/invalid: a private Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
   // date sanity BEFORE posting: normalize `now` to an IMMUTABLE snapshot (confirmedAt already snapped). If the
   // server timestamp isn't sane we do NOT post — Node must never post+sign a receipt Swift hasSaneDates rejects.
