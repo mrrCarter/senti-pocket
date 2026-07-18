@@ -39,10 +39,28 @@ function decodeJwt(token) {
 const audienceOk = (aud, want) => (Array.isArray(aud) ? aud.includes(want) : aud === want);
 
 /**
- * Verify a DPoP proof (RFC 9449): a JWT in the `dpop` header signed by the client's key, whose JWK thumbprint MUST
- * equal the access token's cnf.jkt, bound to this request's method+url, hashing the access token in `ath`.
+ * In-memory DPoP jti replay guard (dev/tests). `seen(jti, expiresAtSec)` records the jti and returns true iff it was
+ * already present (i.e. a replay). Prod: use createStoreReplayGuard (store.mjs) so it holds across Lambda instances.
  */
-function verifyDpop(dpopHeader, { jkt, htm, htu, accessToken, nowSec, clockSkewSec }) {
+export function createInMemoryReplayGuard() {
+  const store = new Map(); // jti -> expiresAtSec
+  return {
+    async seen(jti, expiresAtSec) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (store.size > 5000) for (const [k, exp] of store) if (exp < nowSec) store.delete(k);
+      if (store.has(jti)) return true;
+      store.set(jti, expiresAtSec);
+      return false;
+    },
+  };
+}
+
+/**
+ * Verify a DPoP proof (RFC 9449): a JWT in the `dpop` header signed by the client's key, whose JWK thumbprint MUST
+ * equal the access token's cnf.jkt, bound to this request's method+url, hashing the access token in `ath`. When a
+ * `replayGuard` is supplied, the proof's `jti` is single-use within its freshness window (replay defense).
+ */
+async function verifyDpop(dpopHeader, { jkt, htm, htu, accessToken, nowSec, clockSkewSec, replayGuard }) {
   if (typeof dpopHeader !== 'string') return false;
   const d = decodeJwt(dpopHeader);
   if (!d || d.header.typ !== 'dpop+jwt' || !d.header.jwk) return false;
@@ -52,9 +70,14 @@ function verifyDpop(dpopHeader, { jkt, htm, htu, accessToken, nowSec, clockSkewS
   if (jwkThumbprint(d.header.jwk) !== jkt) return false;                          // bound to THIS token (cnf.jkt)
   if (htm && String(d.payload.htm).toUpperCase() !== String(htm).toUpperCase()) return false;
   if (htu && d.payload.htu !== htu) return false;                                 // exact request URL
-  if (typeof d.payload.iat !== 'number' || Math.abs(nowSec - d.payload.iat) > Math.max(clockSkewSec, 300)) return false;
+  const maxAge = Math.max(clockSkewSec, 300);
+  if (typeof d.payload.iat !== 'number' || Math.abs(nowSec - d.payload.iat) > maxAge) return false;
   const ath = b64url(createHash('sha256').update(accessToken, 'utf8').digest());
   if (d.payload.ath !== ath) return false;                                        // binds the exact access token
+  if (replayGuard) {                                                              // REPLAY defense (RFC 9449 §11.1)
+    if (typeof d.payload.jti !== 'string' || !d.payload.jti) return false;        // a proof MUST carry a unique jti
+    if (await replayGuard.seen(d.payload.jti, nowSec + maxAge)) return false;     // reused jti within window => reject
+  }
   return true;
 }
 
@@ -64,7 +87,7 @@ function verifyDpop(dpopHeader, { jkt, htm, htu, accessToken, nowSec, clockSkewS
  *           humanIdClaim?:string, scopeClaim?:string, requireDpop?:boolean }} cfg
  */
 export function createAidenIdVerifier(cfg = {}) {
-  const { jwks = [], issuer, audience, now = () => Date.now(), clockSkewSec = 60, humanIdClaim = 'consumerAccountId', scopeClaim = 'scope', requireDpop = false } = cfg;
+  const { jwks = [], issuer, audience, resource, now = () => Date.now(), clockSkewSec = 60, humanIdClaim = 'consumerAccountId', scopeClaim = 'scope', requireDpop = false, replayGuard } = cfg;
   const keyByKid = new Map();
   for (const jwk of jwks) { try { keyByKid.set(jwk.kid, { obj: createPublicKey({ key: jwk, format: 'jwk' }), alg: jwk.alg }); } catch { /* skip bad key */ } }
 
@@ -85,6 +108,7 @@ export function createAidenIdVerifier(cfg = {}) {
       const nowSec = Math.floor(now() / 1000);
       if (issuer && p.iss !== issuer) return null;
       if (audience && !audienceOk(p.aud, audience)) return null;
+      if (resource && !audienceOk(p.resource, resource)) return null;             // RFC 8707 resource indicator
       if (typeof p.exp === 'number' && nowSec > p.exp + clockSkewSec) return null;
       if (typeof p.nbf === 'number' && nowSec < p.nbf - clockSkewSec) return null;
 
@@ -94,10 +118,10 @@ export function createAidenIdVerifier(cfg = {}) {
       const jkt = p.cnf && p.cnf.jkt;                                             // sender-constrained token?
       if (requireDpop && !jkt) return null;
       if (jkt) {
-        const ok = verifyDpop(headers && (headers.dpop || headers.DPoP), {
-          jkt, htm: headers['x-http-method'], htu: headers['x-http-url'], accessToken: token, nowSec, clockSkewSec,
+        const ok = await verifyDpop(headers && (headers.dpop || headers.DPoP), {
+          jkt, htm: headers['x-http-method'], htu: headers['x-http-url'], accessToken: token, nowSec, clockSkewSec, replayGuard,
         });
-        if (!ok) return null;                                                     // missing/invalid proof -> reject
+        if (!ok) return null;                                                     // missing/invalid/replayed proof -> reject
       }
 
       const sc = p[scopeClaim];

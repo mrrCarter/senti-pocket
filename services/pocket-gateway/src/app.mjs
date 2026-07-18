@@ -4,7 +4,7 @@
 // Scalar config comes from `env`. Nothing here reaches out on its own — all boundaries are explicit + testable.
 import { createGateway } from './handlers.mjs';
 import { createAidenIdVerifier } from './auth.mjs';
-import { createDynamoStore } from './store.mjs';
+import { createDynamoStore, createStoreReplayGuard } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { lambdaHandler } from './lambda.mjs';
 
@@ -20,13 +20,15 @@ import { lambdaHandler } from './lambda.mjs';
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
  */
 export function createProdGateway(env = {}, deps = {}) {
+  const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
   const verifyToken = createAidenIdVerifier({
     jwks: deps.jwks || [],
     issuer: env.AIDENID_ISSUER,
     audience: env.GATEWAY_AUDIENCE,
+    resource: env.GATEWAY_RESOURCE,                       // RFC 8707 resource indicator (optional)
     requireDpop: env.REQUIRE_DPOP === 'true',
+    replayGuard: createStoreReplayGuard(store),           // DPoP jti single-use across Lambda instances
   });
-  const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
   const ttsBackend = env.ELEVENLABS_API_KEY
     ? createElevenLabsBackend({ apiKey: env.ELEVENLABS_API_KEY, fetch: deps.fetch, defaultVoiceId: env.TTS_VOICE_ID })
     : undefined;

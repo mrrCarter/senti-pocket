@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign as edSign, createHash } from 'node:crypto';
-import { createAidenIdVerifier, jwkThumbprint } from '../src/auth.mjs';
+import { createAidenIdVerifier, jwkThumbprint, createInMemoryReplayGuard } from '../src/auth.mjs';
 
 const sha256 = (s) => createHash('sha256').update(s, 'utf8').digest();
 
@@ -80,4 +80,26 @@ test('DPoP-bound token: valid proof passes; missing/mismatched proof rejected', 
   assert.equal(await verifier({ ...base, dpop: dpopProof({ accessToken: token, key: attacker }) }), null, 'wrong key thumbprint');
   // stale iat
   assert.equal(await verifier({ ...base, dpop: dpopProof({ accessToken: token, iat: nowSec - 100000 }) }), null, 'stale proof');
+});
+
+test('DPoP replay: a reused jti is rejected when a replayGuard is configured', async () => {
+  const guard = createInMemoryReplayGuard();
+  const v = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, now: () => NOW, replayGuard: guard });
+  const token = mintDpopBound();
+  const htu = 'https://gateway.senti.app/actions/execute';
+  const base = { authorization: 'Bearer ' + token, 'x-http-method': 'POST', 'x-http-url': htu };
+  const proof = dpopProof({ accessToken: token }); // fixed jti 'proof-1'
+  assert.ok(await v({ ...base, dpop: proof }), 'first use accepted');
+  assert.equal(await v({ ...base, dpop: proof }), null, 'replayed jti rejected');
+  // a token with cnf.jkt but a proof lacking jti is rejected under a replay guard
+  const noJti = signJwt({ header: { typ: 'dpop+jwt', alg: 'EdDSA', jwk: client.jwk }, payload: { htm: 'POST', htu, iat: nowSec, ath: b64url(sha256(token)) }, privateKey: client.privateKey });
+  assert.equal(await v({ ...base, dpop: noJti }), null, 'proof without jti rejected when replay guard is on');
+});
+
+test('resource indicator (RFC 8707) enforced when configured', async () => {
+  const RES = 'https://gateway.senti.app/actions';
+  const v = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, now: () => NOW });
+  const withRes = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'c', scope: 'x', resource: RES }, privateKey: idp.privateKey });
+  assert.ok(await v({ authorization: 'Bearer ' + withRes }));
+  assert.equal(await v({ authorization: 'Bearer ' + mint() }), null, 'missing/mismatched resource rejected');
 });

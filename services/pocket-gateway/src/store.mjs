@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 // store.mjs — pluggable ASYNC store for the gateway (Echo P0: production exactly-once across Lambda instances).
 //
 // The governed-writeback core (executeAction) is synchronous and per-request. Cross-INSTANCE exactly-once needs a
@@ -14,17 +15,22 @@
 //   putIfAbsent  -> PutItem ConditionExpression attribute_not_exists(pk) (ConditionalCheckFailed => false)
 // The TTL on the lock self-heals a crash-before-release; the record has no TTL (idempotency is durable).
 
-/** In-memory store — single process, so the primitives are trivially atomic. Used for dev + hermetic tests. */
+/**
+ * In-memory store — single process, so the primitives are trivially atomic. Used for dev + hermetic tests.
+ * acquireLock returns an OWNER TOKEN (or null if held); releaseLock only releases if the caller still owns it
+ * (fencing) — so a lock that expired and was re-acquired by another instance is never released out from under it.
+ */
 export function createInMemoryStore() {
   const records = new Map();
-  const locks = new Set();
+  const locks = new Map(); // key -> owner token
   return {
     async get(key) { return records.get(key); },
     async put(key, value) { records.set(key, value); return value; },
     async delete(key) { records.delete(key); },
-    /** true if acquired; false if already held (mirrors DynamoDB conditional-put lock). */
-    async acquireLock(key) { if (locks.has(key)) return false; locks.add(key); return true; },
-    async releaseLock(key) { locks.delete(key); },
+    /** returns a fresh owner token if acquired; null if already held. */
+    async acquireLock(key) { if (locks.has(key)) return null; const token = randomUUID(); locks.set(key, token); return token; },
+    /** fenced release: no-op unless the caller's token still owns the lock. */
+    async releaseLock(key, token) { if (locks.get(key) === token) locks.delete(key); },
     /** atomic reserve: true if stored, false if the key already existed. */
     async putIfAbsent(key, value) { if (records.has(key)) return false; records.set(key, value); return true; },
     // test/debug introspection only
@@ -51,12 +57,18 @@ export function createDynamoStore(cfg = {}) {
     async put(key, value) { await client.put({ TableName: table, Item: { ...rk(key), value } }); return value; },
     async delete(key) { await client.delete({ TableName: table, Key: rk(key) }); },
     async acquireLock(key) {
+      const token = randomUUID();
       try {
-        await client.put({ TableName: table, Item: { ...lk(key), ttl: Math.floor(now() / 1000) + ttlSeconds }, ConditionExpression: 'attribute_not_exists(pk)' });
-        return true;
-      } catch (e) { if (isCond(e)) return false; throw e; }
+        await client.put({ TableName: table, Item: { ...lk(key), owner: token, ttl: Math.floor(now() / 1000) + ttlSeconds }, ConditionExpression: 'attribute_not_exists(pk)' });
+        return token;
+      } catch (e) { if (isCond(e)) return null; throw e; }
     },
-    async releaseLock(key) { await client.delete({ TableName: table, Key: lk(key) }); },
+    async releaseLock(key, token) {
+      // FENCED: delete ONLY if we still own it. If our TTL expired and another instance re-acquired, this no-ops
+      // (ConditionalCheckFailed) instead of releasing THEIR lock.
+      try { await client.delete({ TableName: table, Key: lk(key), ConditionExpression: 'owner = :t', ExpressionAttributeValues: { ':t': token } }); }
+      catch (e) { if (isCond(e)) return; throw e; }
+    },
     async putIfAbsent(key, value) {
       try {
         await client.put({ TableName: table, Item: { ...rk(key), value }, ConditionExpression: 'attribute_not_exists(pk)' });
@@ -67,15 +79,28 @@ export function createDynamoStore(cfg = {}) {
 }
 
 /**
+ * Store-backed DPoP jti replay guard (prod): single-use jti across instances via an atomic putIfAbsent. `seen`
+ * returns true iff the jti was already recorded (a replay). Shape mirrors createInMemoryReplayGuard (auth.mjs).
+ */
+export function createStoreReplayGuard(store, { prefix = 'dpop-jti:' } = {}) {
+  return {
+    async seen(jti, expiresAtSec) {
+      const stored = await store.putIfAbsent(prefix + jti, { exp: expiresAtSec });
+      return !stored; // putIfAbsent false => key already existed => replay
+    },
+  };
+}
+
+/**
  * Run `fn` while holding the store's cross-instance lock for `key`. Releases in a finally (even on throw).
  * Returns { locked:false } without running fn if the lock is already held (caller decides 409 vs retry).
  */
 export async function withLock(store, key, fn) {
-  const got = await store.acquireLock(key);
-  if (!got) return { locked: false };
+  const token = await store.acquireLock(key); // owner token, or null if held
+  if (!token) return { locked: false };
   try {
     return { locked: true, value: await fn() };
   } finally {
-    await store.releaseLock(key);
+    await store.releaseLock(key, token); // fenced release (only if we still own it)
   }
 }
