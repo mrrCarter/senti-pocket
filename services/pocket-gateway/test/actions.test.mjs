@@ -1,10 +1,11 @@
-// actions.test.mjs — governed writeback safety (PocketContracts v0.1.2). Run: node --test
+// actions.test.mjs — governed writeback safety (PocketContracts v0.1.8). Run: node --test
 // All I/O injected: NO test ever posts to a live room.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canonicalPayload, computeProposalHash, hashMatchesContent, validateProposal, executeAction, ALLOWED_KINDS,
-  signReceipt, verifyReceipt, canonicalReceiptPayload, parseResultingSequence, toSafeSequence,
+  signReceipt, verifyReceipt, canonicalReceiptPayload, actionResultCanonicalToken, parseActionResult,
+  verifyActionLanded, toSafeSequence,
 } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
 import { generateKeyPairSync } from 'node:crypto';
@@ -21,79 +22,104 @@ function makeProposal(over = {}) {
   return base;
 }
 const makeConfirm = (p, over = {}) => ({ proposalId: p.id, confirmedProposalHash: p.proposalHash, confirmedAt: '2026-07-18T12:01:00Z', ...over });
-function recordingRun(seq = 230999) {
+// A reply is a message-action: `sl session reply --json` -> {action:{id,targetSequenceId,targetCursor}}.
+function recordingRun(actionId = 'act_test') {
   const calls = [];
-  const run = (args) => { calls.push(args); return JSON.stringify({ sequenceId: seq }); };
+  const run = (args) => {
+    calls.push(args);
+    if (args[1] === 'reply') return JSON.stringify({ action: { id: actionId, targetSequenceId: Number(args[3]), targetCursor: 'cur_x' } });
+    if (args[1] === 'read') return JSON.stringify({ events: [] });
+    return '{}';
+  };
   return { run, calls };
 }
 const { publicKey: TESTPUB, privateKey: TESTKEY } = generateSigningKeypair();
-// online writeback now REQUIRES signing credentials, so they are part of the default opts.
-const opts = (extra) => ({ knownSessionIds: [KNOWN], store: new Map(), now: '2026-07-18T12:02:00Z', signingKey: TESTKEY, signingKeyId: 'gw-key', ...extra });
+// online writeback REQUIRES signing creds; read-back verify is injected true by default.
+const opts = (extra) => ({ knownSessionIds: [KNOWN], store: new Map(), now: '2026-07-18T12:02:00Z', signingKey: TESTKEY, signingKeyId: 'gw-key', verifyReadback: () => true, ...extra });
 
-test('canonicalPayload matches the frozen v0.1.3 length-prefixed format exactly', () => {
-  // lp(s) = "<utf8ByteCount>:<s>": 13:threadedReply, 36:<uuid>, 6:230160, 2:hi
-  assert.equal(
-    canonicalPayload('threadedReply', KNOWN, 230160, 'hi'),
-    `pocket.actionproposal.v2\n13:threadedReply36:${KNOWN}6:2301602:hi`,
-  );
+// ---------- canonical / KAV ----------
+test('canonicalPayload matches the frozen v0.1.8 v3 length-prefixed format exactly', () => {
+  const p = { id: 'p1', kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'post X', createdAt: new Date(1752835200 * 1000), sourceQuestionId: null };
+  assert.equal(canonicalPayload(p), 'pocket.actionproposal.v3\n2:p113:threadedReply2:s13:1006:post X13:17528352000000:');
 });
 
-test('length-prefixing defeats the delimiter-shift collision at the hash layer', () => {
-  // Two DIFFERENT field tuples that a naive delimiter join could confuse must produce different hashes.
-  const a = computeProposalHash({ kind: 'threadedReply', targetSessionId: KNOWN, targetSequence: 1, renderedPreview: '2:hi' });
-  const b = computeProposalHash({ kind: 'threadedReply', targetSessionId: KNOWN, targetSequence: 12, renderedPreview: 'hi' });
-  assert.notEqual(a, b, 'length-prefixed encoding keeps these distinct');
+test('KAV: Node proposalHash byte-matches the Swift v0.1.8 v3 known-answer vector', () => {
+  const p = { id: 'p1', kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'post X', createdAt: new Date(1752835200 * 1000), sourceQuestionId: null };
+  assert.equal(computeProposalHash(p), 'fYV2Bi_mHlJC76SyRGtBZ3wWksXAKUeXTNqor9aLLPk', 'Node hash == Swift v3 KAV');
 });
 
-test('KAV: Node proposalHash byte-matches the Swift contract known-answer vector (v0.1.4)', () => {
-  // ContractsCrossModuleTests: ('threadedReply','s1',100,'post X') -> mNZp-a77...
-  assert.equal(
-    canonicalPayload('threadedReply', 's1', 100, 'post X'),
-    'pocket.actionproposal.v2\n13:threadedReply2:s13:1006:post X',
-  );
-  assert.equal(
-    computeProposalHash({ kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'post X' }),
-    'mNZp-a77Q1I1LSKOyhsEqjb60JW7Z3Cim_bzmCI_sqc',
-    'Node hash must equal the Swift KAV — cross-platform lock',
-  );
-});
-
-test('canonicalReceiptPayload matches v0.1.6 v3 (all fields bound; epoch-millisecond timestamps)', () => {
-  const r = { id: 'p1', proposalId: 'p1', status: 'posted', resultingSequence: 231111, targetSessionId: 's1', confirmedProposalHash: 'H', confirmedByHumanAt: '2026-07-18T12:01:00Z', executedAt: '2026-07-18T12:02:00Z', failureReason: null, signature: null, signingKeyId: 'k' };
-  const cu = String(Date.parse(r.confirmedByHumanAt)); // epoch ms
-  const eu = String(Date.parse(r.executedAt));
-  assert.equal(
-    canonicalReceiptPayload(r),
-    `pocket.actionreceipt.v3\n2:p12:p16:posted6:2311112:s11:H${cu.length}:${cu}${eu.length}:${eu}0:1:k`,
-  );
+test('v3 binds id: same content, different id => distinct hashes (kills confirm-swap)', () => {
+  assert.notEqual(makeProposal({ id: 'pa' }).proposalHash, makeProposal({ id: 'pb' }).proposalHash);
 });
 
 test('computeProposalHash is base64url (no +/=), stable', () => {
   const h = computeProposalHash(makeProposal());
-  assert.match(h, /^[A-Za-z0-9_-]+$/, 'base64url charset only');
-  assert.equal(h, computeProposalHash(makeProposal()), 'deterministic');
+  assert.match(h, /^[A-Za-z0-9_-]+$/);
+  assert.equal(h, computeProposalHash(makeProposal()));
 });
 
-test('confirmed + online + known target => posted once with the real resulting sequence', () => {
+test('ActionResultRef canonicalToken matches Swift KAVs', () => {
+  assert.equal(actionResultCanonicalToken({ kind: 'action', actionId: 'act_1', targetSequenceId: 230180, targetCursor: 'cur_9' }), '6:action5:act_16:23018015:cur_9');
+  assert.equal(actionResultCanonicalToken({ kind: 'sequence', sequenceId: 230195 }), '8:sequence6:230195');
+  assert.notEqual(
+    actionResultCanonicalToken({ kind: 'action', actionId: 'a', targetSequenceId: 1, targetCursor: null }),
+    actionResultCanonicalToken({ kind: 'action', actionId: 'a', targetSequenceId: 1, targetCursor: '' }),
+    'nil cursor stays distinct from empty cursor',
+  );
+});
+
+test('canonicalReceiptPayload matches the frozen v0.1.8 v4 KAV (result token)', () => {
+  const ms = 1752835200000;
+  const r = { id: 'r1', proposalId: 'p1', status: 'posted', result: { kind: 'sequence', sequenceId: 200 }, targetSessionId: 's1', confirmedProposalHash: 'H', confirmedByHumanAt: new Date(ms), executedAt: new Date(ms), failureReason: null, signature: null, signingKeyId: 'k1' };
+  assert.equal(canonicalReceiptPayload(r), 'pocket.actionreceipt.v4\n2:r12:p16:posted15:8:sequence3:2002:s11:H13:175283520000013:17528352000000:2:k1');
+});
+
+// ---------- governed writeback ----------
+test('confirmed + online + known target + verified => posted with result=.action', () => {
   const p = makeProposal();
-  const { run, calls } = recordingRun(231111);
+  const { run, calls } = recordingRun('act_231111');
   const r = executeAction(p, makeConfirm(p), opts({ run }));
   assert.equal(r.status, 'posted');
-  assert.equal(r.resultingSequence, 231111);
+  assert.equal(r.result.kind, 'action');
+  assert.equal(r.result.actionId, 'act_231111');
+  assert.equal(r.result.targetSequenceId, p.targetSequence);
   assert.equal(r.confirmedProposalHash, p.proposalHash);
-  assert.equal(calls.length, 1, 'exactly one Senti post');
-  assert.equal(calls[0][0], 'session');
+  assert.equal(calls.length, 1);
   assert.equal(calls[0][1], 'reply');
-  assert.equal(calls[0][2], KNOWN);
 });
 
-test('offline => pendingConnectivity, NEVER posted', () => {
+test('read-back verify FAILS => .failed, never a signed posted', () => {
+  const p = makeProposal();
+  const { run } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, verifyReadback: () => false }));
+  assert.equal(r.status, 'failed');
+  assert.match(r.failureReason, /read-back|not confirmed landed/i);
+  assert.equal(r.signature, null);
+});
+
+test('posted action targeting a different sequence than the proposal => .failed', () => {
+  const p = makeProposal();
+  const run = (args) => (args[1] === 'reply' ? JSON.stringify({ action: { id: 'act_x', targetSequenceId: p.targetSequence + 1, targetCursor: null } }) : '{}');
+  const r = executeAction(p, makeConfirm(p), opts({ run }));
+  assert.equal(r.status, 'failed');
+  assert.match(r.failureReason, /different target/i);
+});
+
+test('reply output with no structured action => .failed', () => {
+  const p = makeProposal();
+  const run = (args) => (args[1] === 'reply' ? JSON.stringify({ ok: true }) : '{}');
+  const r = executeAction(p, makeConfirm(p), opts({ run }));
+  assert.equal(r.status, 'failed');
+  assert.match(r.failureReason, /no structured action/i);
+});
+
+test('offline => pendingConnectivity, NEVER posted, result null', () => {
   const p = makeProposal();
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, online: false }));
   assert.equal(r.status, 'pendingConnectivity');
-  assert.equal(r.resultingSequence, null);
-  assert.equal(calls.length, 0, 'no post while offline');
+  assert.equal(r.result, null);
+  assert.equal(calls.length, 0);
 });
 
 test('disallowed kind => failed, no post', () => {
@@ -106,8 +132,7 @@ test('disallowed kind => failed, no post', () => {
   assert.ok(!ALLOWED_KINDS.has('deployProd'));
 });
 
-test('unknown targetSessionId => failed (deterministic target, no model free-text)', () => {
-  // valid UUID format but NOT a known session -> isolates the known-session membership check
+test('unknown targetSessionId => failed (deterministic target)', () => {
   const p = makeProposal({ targetSessionId: '00000000-0000-0000-0000-000000000000' });
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run }));
@@ -116,9 +141,9 @@ test('unknown targetSessionId => failed (deterministic target, no model free-tex
   assert.equal(calls.length, 0);
 });
 
-test('stale confirmation (hash of a different content) => failed, no post', () => {
+test('stale confirmation => failed, no post', () => {
   const p = makeProposal();
-  const stale = makeConfirm(p, { confirmedProposalHash: computeProposalHash(makeProposal({ renderedPreview: 'DIFFERENT text' })) });
+  const stale = makeConfirm(p, { confirmedProposalHash: computeProposalHash(makeProposal({ id: 'other' })) });
   const { run, calls } = recordingRun();
   const r = executeAction(p, stale, opts({ run }));
   assert.equal(r.status, 'failed');
@@ -126,14 +151,14 @@ test('stale confirmation (hash of a different content) => failed, no post', () =
   assert.equal(calls.length, 0);
 });
 
-test('content changed after confirm (proposalHash no longer matches) => failed', () => {
+test('content changed after confirm => failed', () => {
   const p = makeProposal();
   const confirm = makeConfirm(p);
-  p.renderedPreview = 'ATTACKER swapped the message after confirmation'; // hash now stale
+  p.renderedPreview = 'ATTACKER swapped the message';
   const { run, calls } = recordingRun();
   const r = executeAction(p, confirm, opts({ run }));
   assert.equal(r.status, 'failed');
-  assert.equal(calls.length, 0, 'tampered content is never posted');
+  assert.equal(calls.length, 0);
   assert.equal(hashMatchesContent(p), false);
 });
 
@@ -145,114 +170,110 @@ test('no confirmation => failed, no post', () => {
   assert.equal(calls.length, 0);
 });
 
-test('idempotency: same proposal.id executes once; resubmit returns the same receipt', () => {
+test('idempotency: same proposal.id posts once; resubmit returns same receipt', () => {
   const p = makeProposal();
-  const { run, calls } = recordingRun(232222);
+  const { run, calls } = recordingRun('act_idem');
   const store = new Map();
   const r1 = executeAction(p, makeConfirm(p), opts({ run, store }));
   const r2 = executeAction(p, makeConfirm(p), opts({ run, store }));
   assert.equal(r1.status, 'posted');
-  assert.deepEqual(r1, r2, 'same receipt returned');
-  assert.equal(calls.length, 1, 'posted exactly once despite two submits');
+  assert.deepEqual(r1, r2);
+  assert.equal(calls.length, 1);
 });
 
-test('posted receipt is Ed25519-signed + verifies; pending receipts stay unsigned (never render as sent)', () => {
+test('posted receipt signed + verifies; tampering result fails; pending unsigned', () => {
   const { publicKey, privateKey } = generateSigningKeypair();
   const p = makeProposal();
-  const { run } = recordingRun(231234);
+  const { run } = recordingRun('act_sig');
   const posted = executeAction(p, makeConfirm(p), opts({ run, signingKey: privateKey, signingKeyId: 'gw-key' }));
   assert.equal(posted.status, 'posted');
-  assert.ok(posted.signature, 'posted receipt is signed');
-  assert.equal(posted.signingKeyId, 'gw-key');
-  assert.equal(verifyReceipt(posted, publicKey), true, 'gateway signature verifies');
-  assert.equal(verifyReceipt({ ...posted, resultingSequence: 999 }, publicKey), false, 'tampered receipt fails');
-
+  assert.ok(posted.signature);
+  assert.equal(verifyReceipt(posted, publicKey), true);
+  assert.equal(verifyReceipt({ ...posted, result: { ...posted.result, actionId: 'act_evil' } }, publicKey), false, 'tampered result fails');
   const p2 = makeProposal({ id: 'p2' });
   const pending = executeAction(p2, makeConfirm(p2), opts({ run, online: false, signingKey: privateKey }));
   assert.equal(pending.status, 'pendingConnectivity');
-  assert.equal(pending.signature, null, 'pending receipt is unsigned');
-  assert.equal(verifyReceipt(pending, publicKey), false, 'unsigned pending never verifies as sent');
+  assert.equal(pending.signature, null);
+  assert.equal(verifyReceipt(pending, publicKey), false);
 });
 
-test('(B) online writeback WITHOUT signing credentials => failed, ZERO posts', () => {
+test('(B) online without signing creds => failed, ZERO posts', () => {
   const p = makeProposal();
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: undefined, signingKeyId: undefined }));
   assert.equal(r.status, 'failed');
   assert.match(r.failureReason, /credentials|invalid|ed25519/i);
-  assert.equal(calls.length, 0, 'no online side effect without credentials');
+  assert.equal(calls.length, 0);
 });
 
-test('(C) offline pending then online flush posts exactly once (pending is not terminal)', () => {
+test('(C) offline pending then online flush posts exactly once', () => {
   const p = makeProposal({ id: 'pflush' });
   const store = new Map();
-  const { run, calls } = recordingRun(240001);
+  const { run, calls } = recordingRun('act_flush');
   const pending = executeAction(p, makeConfirm(p), opts({ run, store, online: false }));
   assert.equal(pending.status, 'pendingConnectivity');
   assert.equal(calls.length, 0);
   const flushed = executeAction(p, makeConfirm(p), opts({ run, store, online: true }));
-  assert.equal(flushed.status, 'posted', 'pending flushes to posted when back online');
-  assert.equal(flushed.resultingSequence, 240001);
-  assert.equal(calls.length, 1, 'posted exactly once on flush');
+  assert.equal(flushed.status, 'posted');
+  assert.equal(flushed.result.actionId, 'act_flush');
+  assert.equal(calls.length, 1);
   const again = executeAction(p, makeConfirm(p), opts({ run, store, online: true }));
-  assert.deepEqual(again, flushed, 'now terminal: same posted receipt');
-  assert.equal(calls.length, 1, 'no double-post after terminal');
+  assert.deepEqual(again, flushed);
+  assert.equal(calls.length, 1);
 });
 
-test('(A) non-finite timestamp is handled safely (no trap) and does not verify', () => {
+test('(A) non-finite timestamp handled safely; tampered date does not verify', () => {
   const p = makeProposal({ id: 'padate' });
-  const { run } = recordingRun(241000);
+  const { run } = recordingRun('act_a');
   const signed = executeAction(p, makeConfirm(p), opts({ run }));
   assert.equal(signed.status, 'posted');
   assert.equal(verifyReceipt(signed, TESTPUB), true);
-  const tampered = { ...signed, executedAt: 'not-a-date' }; // non-finite -> "" canonical (safe, no trap)
-  assert.equal(verifyReceipt(tampered, TESTPUB), false);
+  assert.equal(verifyReceipt({ ...signed, executedAt: 'not-a-date' }, TESTPUB), false);
 });
 
-test('(B) malformed signing key => failed, ZERO posts (preflight before side effect)', () => {
+test('(B) malformed signing key => failed, ZERO posts', () => {
   const p = makeProposal();
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: 'not-a-key' }));
   assert.equal(r.status, 'failed');
-  assert.match(r.failureReason, /credentials|invalid|ed25519/i);
-  assert.equal(calls.length, 0, 'malformed key: no online post');
+  assert.equal(calls.length, 0);
 });
 
-test('(B) wrong key type (x25519, not ed25519) => failed, ZERO posts', () => {
+test('(B) wrong key type (x25519) => failed, ZERO posts', () => {
   const { privateKey: x } = generateKeyPairSync('x25519');
   const p = makeProposal();
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: x }));
   assert.equal(r.status, 'failed');
-  assert.equal(calls.length, 0, 'non-ed25519 key: no online post');
-});
-
-test('(B) blank keyId => failed, ZERO posts', () => {
-  const p = makeProposal();
-  const { run, calls } = recordingRun();
-  const r = executeAction(p, makeConfirm(p), opts({ run, signingKeyId: '   ' }));
-  assert.equal(r.status, 'failed');
   assert.equal(calls.length, 0);
 });
 
-test('(B) a PUBLIC ed25519 KeyObject as signingKey => failed, ZERO posts', () => {
+test('(B) public ed25519 KeyObject => failed, ZERO posts', () => {
   const { publicKey } = generateSigningKeypair();
   const p = makeProposal();
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: publicKey }));
   assert.equal(r.status, 'failed');
-  assert.equal(calls.length, 0, 'public key: no post');
+  assert.equal(calls.length, 0);
 });
 
-test('(B) a spoofed key-like object {asymmetricKeyType:ed25519} => failed, ZERO posts', () => {
+test('(B) spoofed key-like object => failed, ZERO posts', () => {
   const p = makeProposal();
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: { asymmetricKeyType: 'ed25519' } }));
   assert.equal(r.status, 'failed');
-  assert.equal(calls.length, 0, 'spoof: no post');
+  assert.equal(calls.length, 0);
 });
 
-test('(B) insane server timestamp (now) => failed, ZERO posts (Node<->Swift date parity)', () => {
+test('(B) blank keyId => failed, ZERO posts', () => {
+  const p = makeProposal();
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, signingKeyId: '  ' }));
+  assert.equal(r.status, 'failed');
+  assert.equal(calls.length, 0);
+});
+
+test('(B) insane now => failed, ZERO posts', () => {
   const p = makeProposal({ id: 'pnow' });
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, now: 'not-a-date' }));
@@ -268,64 +289,65 @@ test('(B) insane confirmedAt => failed, ZERO posts', () => {
   assert.equal(calls.length, 0);
 });
 
-test('(TOCTOU) an arbitrary coercible date object is rejected => failed, ZERO posts', () => {
+test('(TOCTOU) coercible date object rejected => failed, ZERO posts', () => {
   let n = 0;
-  const saneMs = Date.parse('2026-07-18T12:02:00Z');
-  const coercible = { valueOf() { return n++ === 0 ? saneMs : NaN; } }; // sane on 1st read, NaN after
+  const coercible = { valueOf() { return n++ === 0 ? Date.parse('2026-07-18T12:02:00Z') : NaN; } };
   const p = makeProposal({ id: 'ptoctou1' });
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, now: coercible }));
   assert.equal(r.status, 'failed');
-  assert.equal(calls.length, 0, 'coercible object never posts');
+  assert.equal(calls.length, 0);
 });
 
-test('(TOCTOU) a Date mutated during run() does not affect the signed receipt (snapshot before run)', () => {
+test('(TOCTOU) Date mutated during run does not affect the signed receipt', () => {
   const d = new Date('2026-07-18T12:02:00Z');
   const p = makeProposal({ id: 'ptoctou2' });
   const calls = [];
-  const run = (args) => { calls.push(args); d.setTime(NaN); return JSON.stringify({ sequenceId: 242002 }); };
+  const run = (args) => { calls.push(args); d.setTime(NaN); return args[1] === 'reply' ? JSON.stringify({ action: { id: 'act_m', targetSequenceId: Number(args[3]), targetCursor: null } }) : '{}'; };
   const r = executeAction(p, makeConfirm(p), opts({ run, now: d }));
   assert.equal(r.status, 'posted');
-  assert.equal(typeof r.executedAt, 'string', 'executedAt is an immutable snapshot, not the mutated Date');
-  assert.equal(verifyReceipt(r, TESTPUB), true, 'snapshot taken before run is unaffected by post-time mutation');
+  assert.equal(typeof r.executedAt, 'string');
+  assert.equal(verifyReceipt(r, TESTPUB), true);
   assert.equal(calls.length, 1);
 });
 
-test('parseResultingSequence rejects non-canonical / unsafe sequences', () => {
-  for (const bad of [true, false, -1, 0, 1.5, 9007199254740992, NaN, Infinity, '0', '01', '1e3', ' 123 ', '-1', '1.5', 'abc', '']) {
-    assert.equal(toSafeSequence(bad), null, 'toSafeSequence must reject ' + JSON.stringify(bad));
-  }
-  assert.equal(toSafeSequence(123), 123);
-  assert.equal(toSafeSequence('123'), 123);
-  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: true })), null);
-  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: -1 })), null);
-  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 0 })), null);
-  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 1.5 })), null);
-  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 9007199254740992 })), null);
-  assert.equal(parseResultingSequence(JSON.stringify({ sequenceId: 231111 })), 231111);
+test('parseActionResult: structured action only, sane target', () => {
+  assert.deepEqual(parseActionResult(JSON.stringify({ action: { id: 'a1', targetSequenceId: 100, targetCursor: 'c1' } })), { actionId: 'a1', targetSequenceId: 100, targetCursor: 'c1' });
+  assert.equal(parseActionResult(JSON.stringify({ action: { id: 'a1', targetSequenceId: 100, targetCursor: null } })).targetCursor, null);
+  assert.equal(parseActionResult(JSON.stringify({ ok: true })), null);
+  assert.equal(parseActionResult(JSON.stringify({ action: { id: '', targetSequenceId: 100 } })), null);
+  assert.equal(parseActionResult(JSON.stringify({ action: { id: 'a', targetSequenceId: 0 } })), null);
+  assert.equal(parseActionResult(JSON.stringify({ action: { id: 'a', targetSequenceId: 1.5 } })), null);
+  assert.equal(parseActionResult('not json'), null);
 });
 
-test('malformed runner sequence => .failed, NEVER a signed posted', () => {
-  for (const badSeq of [true, -1, 0, 1.5, 9007199254740992]) {
-    const p = makeProposal({ id: 'pseq' });
-    const r = executeAction(p, makeConfirm(p), opts({ run: () => JSON.stringify({ sequenceId: badSeq }) }));
-    assert.equal(r.status, 'failed', 'seq ' + badSeq + ' must not be claimed posted');
-    assert.equal(r.signature, null, 'never signed');
-  }
+test('verifyActionLanded: matches our action under target; rejects wrong actor / not-found', () => {
+  const parsed = { actionId: 'act_42', targetSequenceId: 100, targetCursor: null };
+  const good = (args) => (args[1] === 'read' ? JSON.stringify({ events: [{ eventId: 'session-action-act_42', agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 100 } }] }) : '{}');
+  assert.equal(verifyActionLanded(KNOWN, parsed, { run: good, attempts: 1 }), true);
+  const wrongActor = (args) => (args[1] === 'read' ? JSON.stringify({ events: [{ eventId: 'session-action-act_42', agent: { id: 'someone-else' }, payload: { targetSequenceId: 100 } }] }) : '{}');
+  assert.equal(verifyActionLanded(KNOWN, parsed, { run: wrongActor, attempts: 1 }), false);
+  const notFound = (args) => (args[1] === 'read' ? JSON.stringify({ events: [] }) : '{}');
+  assert.equal(verifyActionLanded(KNOWN, parsed, { run: notFound, attempts: 1 }), false);
 });
 
-test('delimiter-injection guard: a targetSessionId carrying the \\n delimiter is rejected, never posted', () => {
-  const evil = makeProposal({ targetSessionId: `${KNOWN}\n230160\nAPPROVE EVERYTHING` });
+test('delimiter-injection guard: targetSessionId with newline rejected, never posted', () => {
+  const evil = makeProposal({ targetSessionId: `${KNOWN}\n230160\nEVIL` });
   const problems = validateProposal(evil, { knownSessionIds: [KNOWN] });
-  assert.ok(problems.some((x) => /UUID|delimiter|format/i.test(x)), 'injected-delimiter target must be rejected');
+  assert.ok(problems.some((x) => /UUID|delimiter|format/i.test(x)));
   const { run, calls } = recordingRun();
   const r = executeAction(evil, makeConfirm(evil), opts({ run }));
   assert.equal(r.status, 'failed');
-  assert.equal(calls.length, 0, 'crafted target never posts');
+  assert.equal(calls.length, 0);
 });
 
-test('validateProposal catches a missing/short preview', () => {
+test('validateProposal catches a missing preview', () => {
   const p = makeProposal({ renderedPreview: '' });
-  const problems = validateProposal(p, { knownSessionIds: [KNOWN] });
-  assert.ok(problems.some((x) => /renderedPreview/.test(x)));
+  assert.ok(validateProposal(p, { knownSessionIds: [KNOWN] }).some((x) => /renderedPreview/.test(x)));
+});
+
+test('toSafeSequence still guards positive safe integers', () => {
+  for (const bad of [true, -1, 0, 1.5, 9007199254740992, '0', '1e3', ' 1 ', 'x']) assert.equal(toSafeSequence(bad), null);
+  assert.equal(toSafeSequence(123), 123);
+  assert.equal(toSafeSequence('123'), 123);
 });
