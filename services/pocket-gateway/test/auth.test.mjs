@@ -1,10 +1,15 @@
 // auth.test.mjs — real AIdenID verifier: signs actual JWTs + DPoP proofs with node:crypto (no live IdP).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, sign as edSign, createHash } from 'node:crypto';
+import { generateKeyPairSync, sign as edSign, createHash, createSign } from 'node:crypto';
 import { createAidenIdVerifier, jwkThumbprint, createInMemoryReplayGuard } from '../src/auth.mjs';
 
 const sha256 = (s) => createHash('sha256').update(s, 'utf8').digest();
+function signEs256({ header, payload, privateKey }) {
+  const si = b64url(JSON.stringify(header)) + '.' + b64url(JSON.stringify(payload));
+  const s = createSign('SHA256'); s.update(si); s.end();
+  return si + '.' + b64url(s.sign({ key: privateKey, dsaEncoding: 'ieee-p1363' }));
+}
 
 const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const NOW = 1_760_000_000_000; // fixed clock
@@ -102,4 +107,24 @@ test('resource indicator (RFC 8707) enforced when configured', async () => {
   const withRes = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'c', scope: 'x', resource: RES }, privateKey: idp.privateKey });
   assert.ok(await v({ authorization: 'Bearer ' + withRes }));
   assert.equal(await v({ authorization: 'Bearer ' + mint() }), null, 'missing/mismatched resource rejected');
+});
+
+// Interop with Echo's AIdenID contract (checkpoint #231811): EdDSA access token carrying aud/resource/site +
+// PAIRWISE sub + cnf.jkt, sender-constrained with an ES256 DPoP proof. Proves the verifier consumes that shape as-is.
+test('AIdenID-shaped token interop: EdDSA access token (pairwise sub + resource + site) with an ES256 DPoP proof', async () => {
+  const ec = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const ecJwk = ec.publicKey.export({ format: 'jwk' });
+  const RES = 'https://gateway.senti.app/actions';
+  const v = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, now: () => NOW, replayGuard: createInMemoryReplayGuard() });
+  const token = signJwt({
+    header: { alg: 'EdDSA', kid: KID, typ: 'JWT' },
+    payload: { iss: ISSUER, aud: AUD, resource: RES, site: 'senti-pocket', sub: 'pairwise-xyz', exp: nowSec + 300, scope: 'actions:execute', cnf: { jkt: jwkThumbprint(ecJwk) } },
+    privateKey: idp.privateKey,
+  });
+  const htu = 'https://gateway.senti.app/actions/execute';
+  const proof = signEs256({ header: { typ: 'dpop+jwt', alg: 'ES256', jwk: ecJwk }, payload: { htm: 'POST', htu, iat: nowSec, ath: b64url(sha256(token)), jti: 'ecp-1' }, privateKey: ec.privateKey });
+  const ctx = await v({ authorization: 'Bearer ' + token, dpop: proof, 'x-http-method': 'POST', 'x-http-url': htu });
+  assert.ok(ctx, 'AIdenID-shaped token + ES256 DPoP verifies');
+  assert.equal(ctx.humanId, 'pairwise-xyz', 'humanId derives from the pairwise sub');
+  assert.equal(ctx.tokenClaims.dpopBound, true);
 });
