@@ -2,8 +2,38 @@
 // A dictated intent becomes a typed ActionProposal; deterministic code here owns target resolution,
 // authorization, single-use confirmation binding, execution, idempotency, and the receipt.
 // NOTHING a model emits drives a write directly. Offline => pendingConnectivity (never shown as "sent").
-import { createHash, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto';
+import { createHash, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey, KeyObject } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+
+/** ~year 9999 in epoch ms — mirrors Swift safeEpochMillis bound so Node never signs a receipt Swift would reject. */
+const SANE_MS_BOUND = 253402300800000;
+
+/** A required timestamp is sane iff it is a finite epoch within +/- the year-9999 bound (mirror hasSaneDates). */
+export function isSaneDate(t) {
+  if (t == null) return false;
+  const ms = new Date(t).getTime();
+  return Number.isFinite(ms) && ms >= -SANE_MS_BOUND && ms <= SANE_MS_BOUND;
+}
+
+/**
+ * Normalize ANY signing-key input to a usable Ed25519 PRIVATE KeyObject, or throw.
+ * Rejects (Echo bypasses): public KeyObjects (.type==='public'), spoofed plain objects (not a KeyObject),
+ * and non-ed25519 keys. createPrivateKey does NOT accept a KeyObject, so branch on the input shape.
+ */
+export function loadEd25519Private(raw) {
+  if (!raw) throw new Error('missing signing key');
+  let ko;
+  if (raw instanceof KeyObject) {
+    ko = raw;
+  } else if (typeof raw === 'string' || Buffer.isBuffer(raw) || raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
+    ko = createPrivateKey(raw); // key material -> private KeyObject (throws on garbage)
+  } else {
+    throw new Error('unrecognized signing key input (not key material or a KeyObject)');
+  }
+  if (ko.type !== 'private') throw new Error('signing key is not a private key');
+  if (ko.asymmetricKeyType !== 'ed25519') throw new Error('signing key is not ed25519');
+  return ko;
+}
 
 /** Sunday scope: the only writes allowed. No destructive/deploy/free-form tool kinds. */
 export const ALLOWED_KINDS = new Set(['threadedReply', 'opinionRequest']);
@@ -85,8 +115,13 @@ const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/
  */
 export function canonicalReceiptPayload(r) {
   const lp = (s) => { const v = s == null ? '' : String(s); return `${Buffer.byteLength(v, 'utf8')}:${v}`; };
-  // safeEpochMillis mirror (v0.1.6 v3): epoch MILLISECONDS; absent/non-finite -> "" (non-trapping, matches Swift).
-  const ms = (t) => { if (!t) return ''; const m = new Date(t).getTime(); return Number.isFinite(m) ? String(m) : ''; };
+  // safeEpochMillis mirror (v0.1.6 v3): epoch MILLISECONDS; absent/non-finite/out-of-range -> "" (non-trapping).
+  const ms = (t) => {
+    if (!t) return '';
+    const m = new Date(t).getTime();
+    if (!Number.isFinite(m) || m < -SANE_MS_BOUND || m > SANE_MS_BOUND) return '';
+    return String(m);
+  };
   return 'pocket.actionreceipt.v3\n'
     + lp(r.id)
     + lp(r.proposalId)
@@ -182,16 +217,14 @@ export function executeAction(proposal, confirmation, opts = {}) {
   // never perform the post and then discover the credentials can't sign a valid .posted.
   const keyIdOk = typeof opts.signingKeyId === 'string' && opts.signingKeyId.trim().length > 0 && opts.signingKeyId.length <= 256;
   let signingKeyObj = null;
-  try {
-    if (!opts.signingKey) throw new Error('missing signing key');
-    signingKeyObj = (typeof opts.signingKey === 'string' || Buffer.isBuffer(opts.signingKey))
-      ? createPrivateKey(opts.signingKey) : opts.signingKey;
-    if (!signingKeyObj || signingKeyObj.asymmetricKeyType !== 'ed25519') throw new Error('not an ed25519 key');
-  } catch {
-    signingKeyObj = null;
-  }
+  try { signingKeyObj = loadEd25519Private(opts.signingKey); } catch { signingKeyObj = null; }
   if (!keyIdOk || !signingKeyObj) {
-    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials missing/invalid: an Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials missing/invalid: a private Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+  }
+  // date sanity BEFORE posting: the .posted receipt's timestamps must pass Swift hasSaneDates, else the phone
+  // would reject a receipt we already posted+signed (Node<->Swift parity, Echo).
+  if (!isSaneDate(now) || !isSaneDate(confirmation.confirmedAt)) {
+    return receipt(proposal, 'failed', { failureReason: 'non-finite/out-of-range timestamp would fail receipt date-sanity (no post attempted)', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
   }
   // execute the real Senti post via the existing CLI/MCP (credentials already validated -> a .posted is always signable)
   try {
