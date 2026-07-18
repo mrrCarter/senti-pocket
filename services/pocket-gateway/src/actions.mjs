@@ -4,7 +4,6 @@
 // NOTHING a model emits drives a write directly. Offline => pendingConnectivity (never shown as "sent").
 import { createHash, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { stableStringify } from './bundle.mjs';
 
 /** Sunday scope: the only writes allowed. No destructive/deploy/free-form tool kinds. */
 export const ALLOWED_KINDS = new Set(['threadedReply', 'opinionRequest']);
@@ -74,26 +73,42 @@ function receipt(proposal, status, extra = {}) {
   };
 }
 
-/** Canonical receipt bytes for signing = the receipt minus its own `signature` field (signingKeyId IS bound). */
-export function canonicalReceiptBytes(r) {
-  const { signature, ...signed } = r;
-  return Buffer.from(stableStringify(signed), 'utf8');
-}
+const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 
-/** Ed25519-sign a receipt with the gateway key. Only ever called on a real .posted receipt. */
+/**
+ * EXACT bytes the gateway signs + the phone verifies — mirrors PocketContracts.swift v0.1.4
+ * ActionReceipt.canonicalReceiptPayload() byte-for-byte. Length-prefixed lp(s)="<utf8count>:<s>".
+ * NOTE: executedAt is encoded as Int(unix seconds) (matching Swift timeIntervalSince1970), NOT ISO8601.
+ * Fields (order fixed): proposalId, status, resultingSequence|"", targetSessionId, confirmedProposalHash, executedAtUnix|"".
+ */
+export function canonicalReceiptPayload(r) {
+  const lp = (s) => { const v = s == null ? '' : String(s); return `${Buffer.byteLength(v, 'utf8')}:${v}`; };
+  const execUnix = r.executedAt ? String(Math.floor(new Date(r.executedAt).getTime() / 1000)) : '';
+  return 'pocket.actionreceipt.v1\n'
+    + lp(r.proposalId)
+    + lp(r.status)
+    + lp(r.resultingSequence == null ? '' : String(r.resultingSequence))
+    + lp(r.targetSessionId)
+    + lp(r.confirmedProposalHash)
+    + lp(execUnix);
+}
+export function canonicalReceiptBytes(r) { return Buffer.from(canonicalReceiptPayload(r), 'utf8'); }
+
+/** Ed25519-sign a receipt with the gateway key. Only ever called on a real .posted receipt. Sig is base64url. */
 export function signReceipt(r, privateKey, signingKeyId) {
   const key = typeof privateKey === 'string' ? createPrivateKey(privateKey) : privateKey;
   const withId = { ...r, signingKeyId: signingKeyId ?? r.signingKeyId ?? null };
   const sig = edSign(null, canonicalReceiptBytes(withId), key);
-  return { ...withId, signature: sig.toString('base64') };
+  return { ...withId, signature: b64url(sig) };
 }
 
-/** Verify a .posted receipt's gateway signature. Returns false for unsigned (pending/failed) receipts. */
+/** Verify a receipt's gateway signature. Only a .posted receipt with a real ed25519 sig verifies (SignatureState.verified). */
 export function verifyReceipt(r, publicKey) {
   try {
-    if (!r || typeof r.signature !== 'string' || r.signature.length === 0) return false;
+    if (!r || r.status !== 'posted' || typeof r.signature !== 'string' || r.signature.length === 0) return false;
     const key = typeof publicKey === 'string' ? createPublicKey(publicKey) : publicKey;
-    return edVerify(null, canonicalReceiptBytes(r), key, Buffer.from(r.signature, 'base64'));
+    return edVerify(null, canonicalReceiptBytes(r), key, b64urlDecode(r.signature));
   } catch {
     return false;
   }

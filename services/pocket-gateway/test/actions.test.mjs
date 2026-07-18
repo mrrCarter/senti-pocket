@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canonicalPayload, computeProposalHash, hashMatchesContent, validateProposal, executeAction, ALLOWED_KINDS,
-  signReceipt, verifyReceipt,
+  signReceipt, verifyReceipt, canonicalReceiptPayload,
 } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
 
@@ -40,6 +40,28 @@ test('length-prefixing defeats the delimiter-shift collision at the hash layer',
   const a = computeProposalHash({ kind: 'threadedReply', targetSessionId: KNOWN, targetSequence: 1, renderedPreview: '2:hi' });
   const b = computeProposalHash({ kind: 'threadedReply', targetSessionId: KNOWN, targetSequence: 12, renderedPreview: 'hi' });
   assert.notEqual(a, b, 'length-prefixed encoding keeps these distinct');
+});
+
+test('KAV: Node proposalHash byte-matches the Swift contract known-answer vector (v0.1.4)', () => {
+  // ContractsCrossModuleTests: ('threadedReply','s1',100,'post X') -> mNZp-a77...
+  assert.equal(
+    canonicalPayload('threadedReply', 's1', 100, 'post X'),
+    'pocket.actionproposal.v2\n13:threadedReply2:s13:1006:post X',
+  );
+  assert.equal(
+    computeProposalHash({ kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'post X' }),
+    'mNZp-a77Q1I1LSKOyhsEqjb60JW7Z3Cim_bzmCI_sqc',
+    'Node hash must equal the Swift KAV — cross-platform lock',
+  );
+});
+
+test('canonicalReceiptPayload matches v0.1.4 (length-prefixed; executedAt as unix seconds)', () => {
+  const r = { id: 'p1', proposalId: 'p1', status: 'posted', resultingSequence: 231111, targetSessionId: 's1', confirmedProposalHash: 'H', confirmedByHumanAt: '2026-07-18T12:01:00Z', executedAt: '2026-07-18T12:02:00Z', failureReason: null, signature: null, signingKeyId: 'k' };
+  const execUnix = String(Math.floor(Date.parse(r.executedAt) / 1000));
+  assert.equal(
+    canonicalReceiptPayload(r),
+    `pocket.actionreceipt.v1\n2:p16:posted6:2311112:s11:H${execUnix.length}:${execUnix}`,
+  );
 });
 
 test('computeProposalHash is base64url (no +/=), stable', () => {
