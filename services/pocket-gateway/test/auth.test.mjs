@@ -33,7 +33,7 @@ const verifier = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, no
 
 const mint = (over = {}) => signJwt({
   header: { alg: 'EdDSA', kid: KID, typ: 'JWT' },
-  payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'consumer-abc', scope: 'actions:execute bundles:read', ...over },
+  payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, consumerAccountId: 'consumer-abc', scope: 'actions:execute bundles:read', ...over },
   privateKey: idp.privateKey,
 });
 
@@ -50,21 +50,21 @@ test('rejects: tampered signature, wrong iss, wrong aud, expired, unknown kid, n
   assert.equal(await verifier({ authorization: 'Bearer ' + mint({ aud: 'https://other' }) }), null, 'wrong aud');
   assert.equal(await verifier({ authorization: 'Bearer ' + mint({ exp: nowSec - 3600 }) }), null, 'expired');
   const otherIdp = ed25519();
-  const foreign = signJwt({ header: { alg: 'EdDSA', kid: 'idp-1', typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'x' }, privateKey: otherIdp.privateKey });
+  const foreign = signJwt({ header: { alg: 'EdDSA', kid: 'idp-1', typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, consumerAccountId: 'x' }, privateKey: otherIdp.privateKey });
   assert.equal(await verifier({ authorization: 'Bearer ' + foreign }), null, 'signed by a key not in JWKS');
   assert.equal(await verifier({ authorization: 'Basic abc' }), null, 'non-bearer');
   assert.equal(await verifier({}), null, 'no header');
 });
 
 test('no humanId claim => reject', async () => {
-  const noSub = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, scope: 'x' }, privateKey: idp.privateKey });
+  const noSub = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, scope: 'x' }, privateKey: idp.privateKey });
   assert.equal(await verifier({ authorization: 'Bearer ' + noSub }), null);
 });
 
 // ---- DPoP (RFC 9449) sender-constrained token ----
 const client = ed25519();
 const jkt = jwkThumbprint(client.jwk);
-const mintDpopBound = () => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'consumer-dpop', scope: 'actions:execute', cnf: { jkt } }, privateKey: idp.privateKey });
+const mintDpopBound = () => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, consumerAccountId: 'consumer-dpop', scope: 'actions:execute', cnf: { jkt } }, privateKey: idp.privateKey });
 function dpopProof({ htm = 'POST', htu = 'https://gateway.senti.app/actions/execute', accessToken, iat = nowSec, key = client }) {
   const ath = b64url(sha256(accessToken));
   return signJwt({ header: { typ: 'dpop+jwt', alg: 'EdDSA', jwk: key.jwk }, payload: { htm, htu, iat, ath, jti: 'proof-1' }, privateKey: key.privateKey });
@@ -104,7 +104,7 @@ test('DPoP replay: a reused jti is rejected when a replayGuard is configured', a
 test('resource indicator (RFC 8707) enforced when configured', async () => {
   const RES = 'https://gateway.senti.app/actions';
   const v = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, now: () => NOW });
-  const withRes = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'c', scope: 'x', resource: RES }, privateKey: idp.privateKey });
+  const withRes = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, consumerAccountId: 'c', scope: 'x', resource: RES }, privateKey: idp.privateKey });
   assert.ok(await v({ authorization: 'Bearer ' + withRes }));
   assert.equal(await v({ authorization: 'Bearer ' + mint() }), null, 'missing/mismatched resource rejected');
 });
@@ -118,7 +118,7 @@ test('AIdenID-shaped token interop: EdDSA access token (pairwise sub + resource 
   const v = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, now: () => NOW, replayGuard: createInMemoryReplayGuard() });
   const token = signJwt({
     header: { alg: 'EdDSA', kid: KID, typ: 'JWT' },
-    payload: { iss: ISSUER, aud: AUD, resource: RES, site_id: 'senti-pocket', sub: 'pairwise-xyz', exp: nowSec + 300, scope: 'actions:execute', cnf: { jkt: jwkThumbprint(ecJwk) } },
+    payload: { iss: ISSUER, aud: AUD, resource: RES, site_id: 'senti-pocket', sub: 'pairwise-xyz', exp: nowSec + 300, iat: nowSec, scope: 'actions:execute', cnf: { jkt: jwkThumbprint(ecJwk) } },
     privateKey: idp.privateKey,
   });
   const htu = 'https://gateway.senti.app/actions/execute';
@@ -133,7 +133,7 @@ test('AIdenID-shaped token interop: EdDSA access token (pairwise sub + resource 
 
 test('siteId enforced; principal namespaces the full context so a pairwise sub cannot collide across sites', async () => {
   const RES = 'https://gateway.senti.app/actions';
-  const tokenFor = (site) => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, resource: RES, site_id: site, sub: 'pairwise-same', exp: nowSec + 300, scope: 'x' }, privateKey: idp.privateKey });
+  const tokenFor = (site) => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, resource: RES, site_id: site, sub: 'pairwise-same', exp: nowSec + 300, iat: nowSec, scope: 'x' }, privateKey: idp.privateKey });
   const vA = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, siteId: 'siteA', now: () => NOW });
   assert.equal(await vA({ authorization: 'Bearer ' + tokenFor('siteB') }), null, 'a token minted for another site is rejected');
   const ctxA = await vA({ authorization: 'Bearer ' + tokenFor('siteA') });

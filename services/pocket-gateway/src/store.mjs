@@ -52,26 +52,39 @@ export function createDynamoStore(cfg = {}) {
   const rk = (key) => ({ pk: key, sk: 'record' });
   const lk = (key) => ({ pk: key, sk: 'lock' });
   const isCond = (e) => e && (e.name === 'ConditionalCheckFailedException' || e.code === 'ConditionalCheckFailedException');
+  const nowSec = () => Math.floor(now() / 1000);
   return {
     async get(key) { const r = await client.get({ TableName: table, Key: rk(key) }); return r && r.Item ? r.Item.value : undefined; },
     async put(key, value) { await client.put({ TableName: table, Item: { ...rk(key), value } }); return value; },
     async delete(key) { await client.delete({ TableName: table, Key: rk(key) }); },
     async acquireLock(key) {
       const token = randomUUID();
+      // Acquire if no lock exists OR the existing lock is LOGICALLY EXPIRED (ttl < now). DynamoDB TTL DELETION lags
+      // (can be hours), so we must not wait for it (Echo P1). `#ttl` aliases the attribute name defensively.
       try {
-        await client.put({ TableName: table, Item: { ...lk(key), owner: token, ttl: Math.floor(now() / 1000) + ttlSeconds }, ConditionExpression: 'attribute_not_exists(pk)' });
+        await client.put({
+          TableName: table,
+          Item: { ...lk(key), owner: token, ttl: nowSec() + ttlSeconds },
+          ConditionExpression: 'attribute_not_exists(pk) OR #ttl < :now',
+          ExpressionAttributeNames: { '#ttl': 'ttl' },
+          ExpressionAttributeValues: { ':now': nowSec() },
+        });
         return token;
       } catch (e) { if (isCond(e)) return null; throw e; }
     },
     async releaseLock(key, token) {
-      // FENCED: delete ONLY if we still own it. If our TTL expired and another instance re-acquired, this no-ops
-      // (ConditionalCheckFailed) instead of releasing THEIR lock.
-      try { await client.delete({ TableName: table, Key: lk(key), ConditionExpression: 'owner = :t', ExpressionAttributeValues: { ':t': token } }); }
+      // FENCED: delete ONLY if we still own it (a TTL-expired + re-acquired lock is never released out from under
+      // its new owner). `owner` is a DynamoDB RESERVED WORD => alias via #o (Echo P1), else the delete errors.
+      try { await client.delete({ TableName: table, Key: lk(key), ConditionExpression: '#o = :t', ExpressionAttributeNames: { '#o': 'owner' }, ExpressionAttributeValues: { ':t': token } }); }
       catch (e) { if (isCond(e)) return; throw e; }
     },
-    async putIfAbsent(key, value) {
+    async putIfAbsent(key, value, opts = {}) {
+      // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can expire the item — e.g. DPoP jti replay
+      // records, which must NOT be nested under `value` where TTL can't see them (Echo P1).
+      const item = { ...rk(key), value };
+      if (Number.isFinite(opts.ttlEpochSec)) item.ttl = opts.ttlEpochSec;
       try {
-        await client.put({ TableName: table, Item: { ...rk(key), value }, ConditionExpression: 'attribute_not_exists(pk)' });
+        await client.put({ TableName: table, Item: item, ConditionExpression: 'attribute_not_exists(pk)' });
         return true;
       } catch (e) { if (isCond(e)) return false; throw e; }
     },
@@ -85,7 +98,8 @@ export function createDynamoStore(cfg = {}) {
 export function createStoreReplayGuard(store, { prefix = 'dpop-jti:' } = {}) {
   return {
     async seen(jti, expiresAtSec) {
-      const stored = await store.putIfAbsent(prefix + jti, { exp: expiresAtSec });
+      // ttlEpochSec sets a TOP-LEVEL DynamoDB ttl so the jti record self-expires at the proof's window end (Echo P1).
+      const stored = await store.putIfAbsent(prefix + jti, { exp: expiresAtSec }, { ttlEpochSec: expiresAtSec });
       return !stored; // putIfAbsent false => key already existed => replay
     },
   };

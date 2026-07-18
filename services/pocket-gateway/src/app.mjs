@@ -20,14 +20,22 @@ import { lambdaHandler } from './lambda.mjs';
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
  */
 export function createProdGateway(env = {}, deps = {}) {
+  // FAIL BOOT if any production binding is absent (Echo P0): all of these gate real security decisions — a missing
+  // issuer/audience/resource/siteId would silently SKIP that check in the verifier. Never boot half-configured.
+  const missingEnv = ['AIDENID_ISSUER', 'GATEWAY_AUDIENCE', 'GATEWAY_RESOURCE', 'GATEWAY_SITE_ID', 'DDB_TABLE', 'SIGNING_KEY_ID', 'GATEWAY_PUBLIC_URL']
+    .filter((k) => !env[k]);
+  if (missingEnv.length) throw new Error('pocket-gateway prod config missing: ' + missingEnv.join(', '));
+  if (!deps.dynamoClient || !Array.isArray(deps.jwks) || deps.jwks.length === 0 || !deps.signingKey || typeof deps.knownSessionIdsFor !== 'function') {
+    throw new Error('pocket-gateway prod deps missing: dynamoClient + non-empty jwks + signingKey + knownSessionIdsFor are required');
+  }
   const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
   const verifyToken = createAidenIdVerifier({
-    jwks: deps.jwks || [],
+    jwks: deps.jwks,
     issuer: env.AIDENID_ISSUER,
     audience: env.GATEWAY_AUDIENCE,
-    resource: env.GATEWAY_RESOURCE,                       // RFC 8707 resource indicator (optional)
-    siteId: env.GATEWAY_SITE_ID,                          // tenant isolation: reject tokens for another site
-    requireDpop: env.REQUIRE_DPOP === 'true',
+    resource: env.GATEWAY_RESOURCE,
+    siteId: env.GATEWAY_SITE_ID,
+    requireDpop: true,                                    // prod tokens MUST be sender-constrained (DPoP)
     replayGuard: createStoreReplayGuard(store),           // DPoP jti single-use across Lambda instances
   });
   const ttsBackend = env.ELEVENLABS_API_KEY
@@ -49,5 +57,6 @@ export function createProdGateway(env = {}, deps = {}) {
 
 /** The deployed Lambda handler: `export const handler = createLambda(process.env, injectedDeps)`. */
 export function createLambda(env, deps) {
-  return lambdaHandler(createProdGateway(env, deps));
+  // canonicalBaseUrl pins the DPoP htu to the deploy origin, not an attacker-spoofable Host header (Echo P0).
+  return lambdaHandler(createProdGateway(env, deps), { canonicalBaseUrl: env.GATEWAY_PUBLIC_URL });
 }

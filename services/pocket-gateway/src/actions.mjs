@@ -464,11 +464,12 @@ export function executeAction(proposal, confirmation, opts = {}) {
     if (!doVerify(parsed)) return store.get(snap.id); // marker persists; a retry re-verifies, never re-posts
     return finalizePosted(parsed, nowSnap);
   } catch (e) {
-    // The external post THREW before returning => it almost certainly did NOT land (spawn/connection error). RELEASE
-    // the reservation (only while it is still the pre-post placeholder, parsed===null) so a legitimate retry can re-post.
-    // Residual: an exception AFTER the server committed could still allow a re-post; the prod close is a server-side
-    // idempotency key on `sl session reply` — documented as a follow-up (sl has no such key today).
-    if ((store.get(snap.id)?.__emitted?.parsed ?? null) === null) store.delete(snap.id);
-    return receipt(snap, 'failed', { failureReason: String(e?.message ?? e).slice(0, 300), confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    // The external post THREW: the outcome is AMBIGUOUS — the reply may have committed remotely before the error.
+    // Do NOT decide it here. Clear only our per-request reserve and return `ambiguous:true`; the caller PRESERVES the
+    // durable in-flight/unknown state so a retry RECONCILES (read-back) instead of blindly re-posting (Echo P0).
+    store.delete(snap.id);
+    const r = receipt(snap, 'failed', { failureReason: 'ambiguous send outcome (post may have committed): ' + String(e?.message ?? e).slice(0, 200), confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    r.ambiguous = true;
+    return r;
   }
 }

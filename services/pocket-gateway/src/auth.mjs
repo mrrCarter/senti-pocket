@@ -38,15 +38,22 @@ function decodeJwt(token) {
 
 const audienceOk = (aud, want) => (Array.isArray(aud) ? aud.includes(want) : aud === want);
 const lp = (s) => `${Buffer.byteLength(String(s ?? ''), 'utf8')}:${s ?? ''}`;
-const joinClaim = (v) => (Array.isArray(v) ? v.join(',') : (v ?? ''));
+// Canonically length-prefix a claim that may be a string OR an array: count-prefixed + each element lp'd (sorted for
+// determinism). A comma-join would let ["a","b"] collide with the string "a,b" (Echo P1) — this cannot.
+const lpClaim = (v) => {
+  const arr = Array.isArray(v) ? v : (v == null ? [] : [v]);
+  const sorted = arr.map((x) => String(x)).sort();
+  return lp(String(sorted.length)) + sorted.map(lp).join('');
+};
 
 /**
  * A collision-proof principal NAMESPACE for durable/action state (Echo): a pairwise `sub` is unique only within an
  * (issuer, audience/resource, site) context, so state MUST be keyed by the full context — a credential for site A can
- * then never authorize or collide with site B. Length-prefixed so no field boundary is ambiguous.
+ * then never authorize or collide with site B. Every typed claim is length-prefixed (arrays element-wise, never
+ * comma-joined) and the PAIRWISE sub is ALWAYS included (never omitted in favour of consumerAccountId).
  */
 export function principalNamespace(p, humanId, site) {
-  return lp(p.iss) + lp(joinClaim(p.aud)) + lp(joinClaim(p.resource)) + lp(site) + lp(humanId);
+  return 'pocket.principal.v1\n' + lp(p.iss ?? '') + lpClaim(p.aud) + lpClaim(p.resource) + lp(site ?? '') + lp(p.sub ?? '') + lp(humanId ?? '');
 }
 
 /**
@@ -56,9 +63,10 @@ export function principalNamespace(p, humanId, site) {
 export function createInMemoryReplayGuard() {
   const store = new Map(); // jti -> expiresAtSec
   return {
-    async seen(jti, expiresAtSec) {
-      const nowSec = Math.floor(Date.now() / 1000);
-      if (store.size > 5000) for (const [k, exp] of store) if (exp < nowSec) store.delete(k);
+    // nowSec comes from the verifier's clock so the sweep is consistent with token evaluation (not wall-clock).
+    async seen(jti, expiresAtSec, nowSec) {
+      const t = Number.isFinite(nowSec) ? nowSec : Math.floor(Date.now() / 1000);
+      for (const [k, exp] of store) if (exp <= t) store.delete(k); // sweep EXPIRED every call (bounded memory)
       if (store.has(jti)) return true;
       store.set(jti, expiresAtSec);
       return false;
@@ -87,7 +95,7 @@ async function verifyDpop(dpopHeader, { jkt, htm, htu, accessToken, nowSec, cloc
   if (d.payload.ath !== ath) return false;                                        // binds the exact access token
   if (replayGuard) {                                                              // REPLAY defense (RFC 9449 §11.1)
     if (typeof d.payload.jti !== 'string' || !d.payload.jti) return false;        // a proof MUST carry a unique jti
-    if (await replayGuard.seen(d.payload.jti, nowSec + maxAge)) return false;     // reused jti within window => reject
+    if (await replayGuard.seen(d.payload.jti, nowSec + maxAge, nowSec)) return false; // reused jti within window => reject
   }
   return true;
 }
@@ -122,8 +130,15 @@ export function createAidenIdVerifier(cfg = {}) {
       if (resource && !audienceOk(p.resource, resource)) return null;             // RFC 8707 resource indicator
       const site = p[siteClaim];
       if (siteId && site !== siteId) return null;                                 // tenant isolation: wrong site => reject
-      if (typeof p.exp === 'number' && nowSec > p.exp + clockSkewSec) return null;
-      if (typeof p.nbf === 'number' && nowSec < p.nbf - clockSkewSec) return null;
+      // Temporal claims MUST be finite numbers with sane ordering (Echo P0): a missing/string exp previously meant
+      // "never expires". exp + iat are required; nbf optional but finite if present.
+      const finite = (x) => typeof x === 'number' && Number.isFinite(x);
+      if (!finite(p.exp) || !finite(p.iat)) return null;
+      if (p.nbf != null && !finite(p.nbf)) return null;
+      if (nowSec > p.exp + clockSkewSec) return null;                 // expired
+      if (nowSec + clockSkewSec < p.iat) return null;                 // issued in the future
+      if (p.nbf != null && nowSec < p.nbf - clockSkewSec) return null; // not yet valid
+      if (p.iat > p.exp || (p.nbf != null && p.nbf > p.exp)) return null; // ordering
 
       const humanId = p[humanIdClaim] || p.sub;
       if (typeof humanId !== 'string' || !humanId) return null;

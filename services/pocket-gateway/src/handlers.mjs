@@ -77,21 +77,23 @@ export function createGateway(deps) {
 
     const lockRes = await withLock(deps.store, key, async () => {
       const rec = await deps.store.get(key);
-      if (rec && rec.status === 'posted') return rec; // idempotent replay of a terminal receipt
+      if (rec && rec.status === 'posted') return json(200, rec); // idempotent replay of a terminal receipt
       const map = new Map();
 
       if (rec && rec.__emitted) {
-        // A post already executed for this (human,id) last time; executeAction re-verifies, never re-posts.
+        // A post already executed for this (principal,id) last time; executeAction re-verifies, never re-posts.
         map.set(id, rec);
       } else if (rec && rec.state === 'in-flight') {
-        // CRASH RECOVERY (Echo P0): a prior attempt may have posted then crashed BEFORE persisting the emitted marker.
-        // Disambiguate by content read-back BEFORE any re-post: if our post is already in the room, seed an emitted
-        // marker so executeAction FINALIZES it (never re-posts); if not found, the crash was pre-post (safe to post).
+        // AMBIGUOUS / crash recovery (Echo P0): a prior attempt reserved and MAY have committed remotely. Disambiguate
+        // by content read-back BEFORE any re-post. If our post is in the room -> finalize it. If NOT found, we must NOT
+        // convert an ambiguous outcome into a re-post from one bounded read miss — preserve the unknown state and
+        // require reconciliation rather than risk a duplicate governed write.
         const landed = findLandedByContent(proposal.targetSessionId, { proposal, run: deps.run, agent: deps.agent });
         if (landed) map.set(id, { status: 'failed', proposalId: id, __emitted: { parsed: landed, executedAt: rec.reservedAt || now() } });
+        else return json(409, { error: 'prior send outcome unknown; not re-posting — reconciliation required', proposalId: id });
       } else {
-        // First attempt: write a DURABLE in-flight reservation BEFORE the external post, so a crash-then-retry takes
-        // the recovery branch above instead of blindly re-posting. (Prod store: conditional put-if-absent.)
+        // First attempt: write a DURABLE in-flight reservation BEFORE the external post, so a crash/ambiguous-then-retry
+        // takes the recovery branch above instead of blindly re-posting. (Prod store: conditional put-if-absent.)
         await deps.store.put(key, { state: 'in-flight', proposalId: id, reservedAt: now() });
       }
 
@@ -100,10 +102,12 @@ export function createGateway(deps) {
         signingKey: deps.signingKey, signingKeyId: deps.signingKeyId,
         agent: deps.agent, now: now(), freshnessSeconds: deps.freshnessSeconds,
       });
-      const persisted = map.get(id); // posted / emitted marker (validation-fails store nothing)
+      const persisted = map.get(id); // posted / emitted marker
       if (persisted) await deps.store.put(key, persisted);
-      else if (receipt.status === 'failed') await deps.store.delete(key); // validation failure: no post -> clear reservation
-      return receipt;
+      else if (receipt.ambiguous) { /* AMBIGUOUS send: PRESERVE the durable in-flight reservation (do NOT clear) so a
+                                       retry reconciles via read-back instead of re-posting a possibly-committed write. */ }
+      else if (receipt.status === 'failed') await deps.store.delete(key); // definitive pre-post failure -> clear reservation
+      return json(200, receipt);
     });
 
     if (!lockRes.locked) {
@@ -112,7 +116,7 @@ export function createGateway(deps) {
       if (rec && rec.status === 'posted') return json(200, rec);
       return json(409, { error: 'proposal execution in progress; retry' });
     }
-    return json(200, lockRes.value);
+    return lockRes.value; // fn already returned a json() descriptor
   }
 
   async function handleTts(req, ctx) {

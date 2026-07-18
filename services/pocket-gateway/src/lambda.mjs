@@ -29,15 +29,25 @@ function toApiGw(res) {
   };
 }
 
-/** Build an async Lambda handler(event) from a gateway. Supports API Gateway HTTP API v2 (and v1-ish fallbacks). */
-export function lambdaHandler(gateway) {
+/**
+ * Build an async Lambda handler(event) from a gateway. Supports API Gateway HTTP API v2 (and v1-ish fallbacks).
+ * @param {{ canonicalBaseUrl?: string }} opts  canonicalBaseUrl = the deploy-canonical origin (e.g.
+ *   https://pocket-api.sentinelayer.com) the DPoP `htu` must match. STRONGLY recommended in prod so the URL the
+ *   proof is bound to is not derived from an attacker-spoofable Host header.
+ */
+export function lambdaHandler(gateway, opts = {}) {
+  const canonicalBaseUrl = opts.canonicalBaseUrl ? opts.canonicalBaseUrl.replace(/\/+$/, '') : null;
   return async function handler(event) {
     const method = event?.requestContext?.http?.method || event?.httpMethod || 'GET';
     const path = stripStage(event?.requestContext?.http?.path || event?.rawPath || event?.path || '/');
     const headers = lowerHeaders(event?.headers || {});
-    // Supply the request method+URL the DPoP proof must be bound to (exact-URL match is a deployment invariant).
-    headers['x-http-method'] = headers['x-http-method'] || method;
-    headers['x-http-url'] = headers['x-http-url'] || fullUrl(event, headers, path);
+    // SECURITY (Echo P0): x-http-method / x-http-url drive DPoP binding, so they MUST come from the trusted request
+    // context, never the caller. Drop any forwarded variants and OVERWRITE with the actual method + the canonical
+    // deployed URL (a spoofed value would let a stolen proof for one method/route authorize another).
+    delete headers['x-http-method'];
+    delete headers['x-http-url'];
+    headers['x-http-method'] = method;
+    headers['x-http-url'] = canonicalBaseUrl ? canonicalBaseUrl + path : fullUrl(event, headers, path);
     const query = event?.queryStringParameters || {};
     let body = event?.body;
     if (typeof body === 'string' && event?.isBase64Encoded) body = Buffer.from(body, 'base64').toString('utf8');

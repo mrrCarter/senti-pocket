@@ -191,15 +191,34 @@ test('crash recovery: in-flight reservation + landed post => retry FINALIZES via
   assert.equal(state.replies, 0, 'crash recovery must NOT re-post');
 });
 
-test('crash recovery: in-flight reservation but post NOT found => safe to post (pre-post crash)', async () => {
+test('unknown prior send: in-flight reservation with NO read-back match does NOT re-post (Echo P0)', async () => {
   const store = createInMemoryStore();
-  const state = { replies: 0, landed: true };
-  const gw = createGateway(baseDeps({ store, run: makeRun(state) })); // read events carry no matching content
+  const state = { replies: 0, landed: true }; // read events carry no matching content
+  const gw = createGateway(baseDeps({ store, run: makeRun(state) }));
   const p = makeProposal({ id: 'pcrash2' });
   await store.put(storeKey('consumer-123', 'pcrash2'), { state: 'in-flight', proposalId: 'pcrash2', reservedAt: '2026-07-18T12:02:00Z' });
   const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
-  assert.equal(r.body.status, 'posted');
-  assert.equal(state.replies, 1, 'pre-post crash: re-posting once is correct (nothing landed to recover)');
+  assert.equal(r.status, 409, 'ambiguous prior outcome => reconciliation required, never a blind re-post from one read miss');
+  assert.equal(state.replies, 0, 'must NOT re-post');
+});
+
+test('ambiguous send (run throws AFTER commit): retry reconciles via read-back and finalizes, never double-posts', async () => {
+  const store = createInMemoryStore();
+  const POSTED = 'Approved.';
+  let phase = 'throw'; // first attempt: reply throws AFTER the server committed
+  const run = (args) => {
+    if (args[1] === 'reply') { if (phase === 'throw') { phase = 'landed'; throw new Error('network reset after send'); } throw new Error('MUST NOT re-post'); }
+    if (args[1] === 'read') return JSON.stringify({ events: phase === 'landed' ? [{ eventId: 'session-action-act_amb', agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160, text: POSTED } }] : [] });
+    return '{}';
+  };
+  const gw = createGateway(baseDeps({ store, run }));
+  const p = makeProposal({ id: 'pamb', renderedPreview: POSTED });
+  const body = { proposal: p, confirmation: makeConfirm(p) };
+  const r1 = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body });
+  assert.equal(r1.body.status, 'failed'); // ambiguous => failed, but the durable reservation is PRESERVED
+  const r2 = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body });
+  assert.equal(r2.body.status, 'posted', 'reconciled the committed reply');
+  assert.equal(r2.body.result.actionId, 'act_amb');
 });
 
 test('POST /tts requires the distinct pocket:voice scope (a read+write token is denied)', async () => {
