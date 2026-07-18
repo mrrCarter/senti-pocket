@@ -55,12 +55,13 @@ test('KAV: Node proposalHash byte-matches the Swift contract known-answer vector
   );
 });
 
-test('canonicalReceiptPayload matches v0.1.4 (length-prefixed; executedAt as unix seconds)', () => {
+test('canonicalReceiptPayload matches v0.1.5 v2 (all fields bound; unix timestamps)', () => {
   const r = { id: 'p1', proposalId: 'p1', status: 'posted', resultingSequence: 231111, targetSessionId: 's1', confirmedProposalHash: 'H', confirmedByHumanAt: '2026-07-18T12:01:00Z', executedAt: '2026-07-18T12:02:00Z', failureReason: null, signature: null, signingKeyId: 'k' };
-  const execUnix = String(Math.floor(Date.parse(r.executedAt) / 1000));
+  const cu = String(Math.floor(Date.parse(r.confirmedByHumanAt) / 1000));
+  const eu = String(Math.floor(Date.parse(r.executedAt) / 1000));
   assert.equal(
     canonicalReceiptPayload(r),
-    `pocket.actionreceipt.v1\n2:p16:posted6:2311112:s11:H${execUnix.length}:${execUnix}`,
+    `pocket.actionreceipt.v2\n2:p12:p16:posted6:2311112:s11:H${cu.length}:${cu}${eu.length}:${eu}0:1:k`,
   );
 });
 

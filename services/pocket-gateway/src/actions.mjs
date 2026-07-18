@@ -77,21 +77,26 @@ const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g
 const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 
 /**
- * EXACT bytes the gateway signs + the phone verifies — mirrors PocketContracts.swift v0.1.4
- * ActionReceipt.canonicalReceiptPayload() byte-for-byte. Length-prefixed lp(s)="<utf8count>:<s>".
- * NOTE: executedAt is encoded as Int(unix seconds) (matching Swift timeIntervalSince1970), NOT ISO8601.
- * Fields (order fixed): proposalId, status, resultingSequence|"", targetSessionId, confirmedProposalHash, executedAtUnix|"".
+ * EXACT bytes the gateway signs + the phone verifies — mirrors PocketContracts.swift v0.1.5
+ * ActionReceipt.canonicalReceiptPayload() (domain v2) byte-for-byte. Length-prefixed lp(s)="<utf8count>:<s>".
+ * v2 binds ALL fields (closes a field-substitution gap): id, proposalId, status, resultingSequence|"",
+ * targetSessionId, confirmedProposalHash, confirmedByHumanAtUnix, executedAtUnix|"", failureReason|"", signingKeyId|"".
+ * Timestamps are Int(unix seconds) (Swift timeIntervalSince1970), NOT ISO8601.
  */
 export function canonicalReceiptPayload(r) {
   const lp = (s) => { const v = s == null ? '' : String(s); return `${Buffer.byteLength(v, 'utf8')}:${v}`; };
-  const execUnix = r.executedAt ? String(Math.floor(new Date(r.executedAt).getTime() / 1000)) : '';
-  return 'pocket.actionreceipt.v1\n'
+  const toUnix = (t) => (t ? String(Math.floor(new Date(t).getTime() / 1000)) : '');
+  return 'pocket.actionreceipt.v2\n'
+    + lp(r.id)
     + lp(r.proposalId)
     + lp(r.status)
     + lp(r.resultingSequence == null ? '' : String(r.resultingSequence))
     + lp(r.targetSessionId)
     + lp(r.confirmedProposalHash)
-    + lp(execUnix);
+    + lp(toUnix(r.confirmedByHumanAt))
+    + lp(toUnix(r.executedAt))
+    + lp(r.failureReason ?? '')
+    + lp(r.signingKeyId ?? '');
 }
 export function canonicalReceiptBytes(r) { return Buffer.from(canonicalReceiptPayload(r), 'utf8'); }
 
