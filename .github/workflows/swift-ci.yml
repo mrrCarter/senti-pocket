@@ -1,0 +1,61 @@
+name: Deterministic and Swift CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic_gate:
+    name: Deterministic security gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Install pinned SentinelLayer CLI
+        run: npm install --global --ignore-scripts sentinelayer-cli@0.39.2
+
+      - name: Run deterministic Omar Gate
+        run: sl omargate deep --path . --scope-mode full --no-ai --json
+
+  swift_tests:
+    name: Swift test (${{ matrix.package }})
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - PocketContracts
+          - PocketBriefing
+          - PocketCall
+          - PocketInference
+          - PocketVoice
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Report Swift toolchain
+        run: swift --version
+
+      - name: Resolve package
+        run: swift package --package-path "packages/${{ matrix.package }}" resolve
+
+      - name: Build and test package
+        run: swift test --package-path "packages/${{ matrix.package }}" --parallel

@@ -1,0 +1,118 @@
+name: Omar Gate
+
+# Senti Pocket Omar Gate - set up the same way as the SentinelLayer org repos:
+# the reusable mrrCarter/sentinelayer-v1-action (pinned SHA) runs a real-LLM deep
+# scan with codex 5.3 (gpt-5.3-codex) as the managed adjudication model, fail-closed
+# (llm_failure_policy: block), P2 severity gate. See docs/OMAR_GATE.md for the
+# pending activation steps (secret + billing + branch protection).
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: Sentinelayer scan profile
+        required: false
+        default: deep
+        type: choice
+        options:
+          - deep
+          - nightly
+          - baseline
+      severity_gate:
+        description: Severity threshold that blocks merge
+        required: false
+        default: P2
+        type: choice
+        options:
+          - P0
+          - P1
+          - P2
+
+permissions:
+  contents: read
+  checks: write
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: omar-gate-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  omar_precheck:
+    name: Omar Gate Precheck
+    runs-on: ubuntu-22.04
+    outputs:
+      allow_scan: ${{ steps.gate.outputs.allow_scan }}
+    permissions:
+      contents: read
+    steps:
+      - id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork || false }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${IS_FORK_PR}" = "true" ]; then
+            echo "allow_scan=false" >> "${GITHUB_OUTPUT}"
+            echo "Skipping privileged Omar scan for forked pull_request events."
+            exit 0
+          fi
+          echo "allow_scan=true" >> "${GITHUB_OUTPUT}"
+
+  omar_gate:
+    name: Omar Gate
+    needs: [omar_precheck]
+    if: needs.omar_precheck.outputs.allow_scan == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: write
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Require Omar service token
+        shell: bash
+        env:
+          SENTINELAYER_TOKEN: ${{ secrets.SENTINELAYER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SENTINELAYER_TOKEN:-}" ]; then
+            echo "::error::Missing SENTINELAYER_TOKEN repo secret — Omar Gate cannot authorize the scan. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "::add-mask::${SENTINELAYER_TOKEN}"
+
+      - name: Run managed Omar Gate (codex 5.3, deep, real-LLM, fail-closed)
+        id: managed_omar
+        uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec # full Omar action + managed capacity fallback + public provider-error redaction
+        with:
+          github_token: ${{ github.token }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          google_api_key: ${{ secrets.GOOGLE_GEMINI_API_KEY || secrets.GOOGLE_API_KEY }}
+          llm_provider: openai
+          comment_tag: managed
+          sentinelayer_token: ${{ secrets.SENTINELAYER_TOKEN }}
+          sentinelayer_spec_id: ${{ vars.SENTINELAYER_SPEC_ID || '' }}
+          sentinelayer_managed_llm: "true"
+          scan_mode: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_mode || 'deep' }}
+          severity_gate: ${{ github.event_name == 'workflow_dispatch' && inputs.severity_gate || 'P2' }}
+          model: gpt-5.3-codex
+          codex_model: gpt-5.3-codex
+          model_fallback: gemini-2.5-flash
+          use_codex: "true"
+          llm_failure_policy: block
