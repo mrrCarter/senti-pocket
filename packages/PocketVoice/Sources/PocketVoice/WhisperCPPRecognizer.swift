@@ -18,6 +18,7 @@ public actor WhisperCPPRecognizer: SpeechRecognizer {
 
     public func prepareModel(at modelURL: URL) async throws -> SpeechModelMetrics {
         guard activeRun == nil else { throw VoiceError.recognizerBusy }
+        guard preparationID == nil else { throw VoiceError.recognizerBusy }
         let currentPreparationID = UUID()
         preparationID = currentPreparationID
         defer {
@@ -28,8 +29,10 @@ public actor WhisperCPPRecognizer: SpeechRecognizer {
         let verifier = self.verifier
         let started = ContinuousClock.now
         let newContext = try await Task.detached(priority: .userInitiated) {
-            let verifiedURL = try verifier.verify(modelURL, against: descriptor)
-            return try WhisperContextBox.load(from: verifiedURL)
+            let verifiedModel = try verifier.verify(modelURL, against: descriptor)
+            let context = try WhisperContextBox.load(from: verifiedModel)
+            try verifiedModel.revalidate()
+            return context
         }.value
         try Task.checkCancellation()
 
@@ -148,14 +151,21 @@ private final class WhisperContextBox: @unchecked Sendable {
         whisper_free(pointer)
     }
 
-    static func load(from modelURL: URL) throws -> WhisperContextBox {
+    static func load(from verifiedModel: VerifiedWhisperModel) throws -> WhisperContextBox {
         var parameters = whisper_context_default_params()
         #if targetEnvironment(simulator)
         parameters.use_gpu = false
         #else
         parameters.flash_attn = true
         #endif
-        guard let pointer = whisper_init_from_file_with_params(modelURL.path, parameters) else {
+        let pointer = verifiedModel.modelBytes.withUnsafeBytes { bytes in
+            whisper_init_from_buffer_with_params(
+                UnsafeMutableRawPointer(mutating: bytes.baseAddress),
+                bytes.count,
+                parameters
+            )
+        }
+        guard let pointer else {
             throw VoiceError.modelLoadFailed
         }
         return WhisperContextBox(pointer: pointer)

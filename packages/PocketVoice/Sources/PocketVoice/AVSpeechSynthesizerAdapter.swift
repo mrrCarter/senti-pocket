@@ -23,6 +23,7 @@ public actor AVSpeechSynthesizerAdapter: SpeechSynthesizer {
             } onCancel: {
                 Task { await self.cancel(requestID: request.id) }
             }
+            try Task.checkCancellation()
             guard activeRequestID == request.id else { throw VoiceError.cancelled }
             activeRequestID = nil
             return SpeechPlaybackMetrics(
@@ -36,6 +37,9 @@ public actor AVSpeechSynthesizerAdapter: SpeechSynthesizer {
             )
         } catch {
             if activeRequestID == request.id { activeRequestID = nil }
+            if error is CancellationError || Task.isCancelled {
+                throw VoiceError.cancelled
+            }
             throw error
         }
     }

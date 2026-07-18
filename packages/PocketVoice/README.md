@@ -9,7 +9,7 @@ Offline speech recognition, duplex capture, deterministic barge-in, and pluggabl
 - `ggml-base.en.bin` byte count: `147964211`
 - `ggml-base.en.bin` SHA-256: `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`
 
-`WhisperCPPRecognizer.prepareModel` verifies the full file before loading it. Transcription accepts only finite 16 kHz mono PCM from 0.1 through 30 seconds and uses whisper.cpp's abort callback for cancellation.
+`WhisperCPPRecognizer.prepareModel` retains and hashes the exact bytes read from the model, then initializes whisper.cpp from that verified in-memory snapshot. A caller-visible path replacement cannot change the bytes loaded after verification. Transcription accepts only finite 16 kHz mono PCM from 0.1 through 30 seconds and uses whisper.cpp's abort callback for cancellation.
 
 ## Voice Loop
 

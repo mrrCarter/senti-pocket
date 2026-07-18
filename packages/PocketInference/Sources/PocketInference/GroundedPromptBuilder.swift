@@ -31,6 +31,9 @@ public struct GroundedPromptBuilder: Sendable {
                 current: bounded,
                 item: item,
                 checkpointId: request.checkpointId,
+                sessionId: request.sessionId,
+                sequenceStart: request.sequenceStart,
+                sequenceEnd: request.sequenceEnd,
                 question: request.question
             ) {
                 bounded = candidate
@@ -43,6 +46,9 @@ public struct GroundedPromptBuilder: Sendable {
 
         let text = try renderPrompt(
             checkpointId: request.checkpointId,
+            sessionId: request.sessionId,
+            sequenceStart: request.sequenceStart,
+            sequenceEnd: request.sequenceEnd,
             question: request.question,
             evidence: bounded
         )
@@ -54,10 +60,20 @@ public struct GroundedPromptBuilder: Sendable {
 
     private func renderPrompt(
         checkpointId: String,
+        sessionId: String,
+        sequenceStart: Int,
+        sequenceEnd: Int,
         question: String,
         evidence: [PromptEvidence]
     ) throws -> String {
-        let promptInput = PromptInput(checkpointId: checkpointId, question: question, evidence: evidence)
+        let promptInput = PromptInput(
+            checkpointId: checkpointId,
+            sessionId: sessionId,
+            sequenceStart: sequenceStart,
+            sequenceEnd: sequenceEnd,
+            question: question,
+            evidence: evidence
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let inputData = try encoder.encode(promptInput)
@@ -82,6 +98,9 @@ public struct GroundedPromptBuilder: Sendable {
         current: [PromptEvidence],
         item: EvidenceRef,
         checkpointId: String,
+        sessionId: String,
+        sequenceStart: Int,
+        sequenceEnd: Int,
         question: String
     ) throws -> [PromptEvidence]? {
         let characters = Array(utf8Prefix(item.snippet, maximumBytes: 800))
@@ -101,6 +120,9 @@ public struct GroundedPromptBuilder: Sendable {
             let candidate = current + [evidence]
             let text = try renderPrompt(
                 checkpointId: checkpointId,
+                sessionId: sessionId,
+                sequenceStart: sequenceStart,
+                sequenceEnd: sequenceEnd,
                 question: question,
                 evidence: candidate
             )
@@ -135,6 +157,9 @@ public struct GroundedPromptBuilder: Sendable {
 
 private struct PromptInput: Encodable {
     let checkpointId: String
+    let sessionId: String
+    let sequenceStart: Int
+    let sequenceEnd: Int
     let question: String
     let evidence: [PromptEvidence]
 }

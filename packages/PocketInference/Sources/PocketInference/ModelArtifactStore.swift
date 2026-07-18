@@ -1,5 +1,8 @@
 import CryptoKit
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public struct ModelDescriptor: Codable, Equatable, Sendable {
     public let identifier: String
@@ -36,17 +39,53 @@ public struct ModelDescriptor: Codable, Equatable, Sendable {
     }
 }
 
+struct ModelFileIdentity: Equatable, Sendable {
+    let deviceNumber: UInt64
+    let fileNumber: UInt64
+    let byteCount: Int64
+}
+
 public struct VerifiedModelArtifact: Equatable, Sendable {
     public let url: URL
     public let descriptor: ModelDescriptor
+    private let fileIdentity: ModelFileIdentity
 
-    init(url: URL, descriptor: ModelDescriptor) {
+    init(url: URL, descriptor: ModelDescriptor, fileIdentity: ModelFileIdentity) {
         self.url = url
         self.descriptor = descriptor
+        self.fileIdentity = fileIdentity
     }
 
     func revalidate() throws {
-        try ModelArtifactVerifier.verifyFile(at: url, descriptor: descriptor)
+        let currentIdentity = try ModelArtifactVerifier.verifyFile(at: url, descriptor: descriptor)
+        guard currentIdentity == fileIdentity else {
+            throw ModelArtifactError.fileChangedAfterVerification
+        }
+    }
+
+    func makeRuntimeSnapshot(in parentDirectory: URL) throws -> RuntimeModelSnapshot {
+        try ModelArtifactVerifier.makeRuntimeSnapshot(
+            from: url,
+            descriptor: descriptor,
+            in: parentDirectory
+        )
+    }
+}
+
+final class RuntimeModelSnapshot: @unchecked Sendable {
+    let url: URL
+    private let directory: URL
+    private let fileManager: FileManager
+
+    init(url: URL, directory: URL, fileManager: FileManager) {
+        self.url = url
+        self.directory = directory
+        self.fileManager = fileManager
+    }
+
+    deinit {
+        try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        try? fileManager.removeItem(at: directory)
     }
 }
 
@@ -74,8 +113,8 @@ public actor ModelArtifactStore {
 
     public func verifyInstalledModel(_ descriptor: ModelDescriptor) throws -> VerifiedModelArtifact {
         let url = installedURL(for: descriptor)
-        try verifyFile(at: url, descriptor: descriptor)
-        return VerifiedModelArtifact(url: url, descriptor: descriptor)
+        let identity = try ModelArtifactVerifier.verifyFile(at: url, descriptor: descriptor)
+        return VerifiedModelArtifact(url: url, descriptor: descriptor, fileIdentity: identity)
     }
 
     public func installLocalFile(
@@ -90,9 +129,10 @@ public actor ModelArtifactStore {
         defer { try? fileManager.removeItem(at: temporaryURL) }
 
         try fileManager.copyItem(at: sourceURL, to: temporaryURL)
-        try verifyFile(at: temporaryURL, descriptor: descriptor)
+        _ = try ModelArtifactVerifier.verifyFile(at: temporaryURL, descriptor: descriptor)
         let url = try commitVerifiedFile(at: temporaryURL, descriptor: descriptor)
-        return VerifiedModelArtifact(url: url, descriptor: descriptor)
+        let identity = try ModelArtifactVerifier.verifyFile(at: url, descriptor: descriptor)
+        return VerifiedModelArtifact(url: url, descriptor: descriptor, fileIdentity: identity)
     }
 
     public func downloadAndInstall(
@@ -149,13 +189,14 @@ public actor ModelArtifactStore {
         }
 
         try fileManager.moveItem(at: downloadedURL, to: temporaryURL)
-        try verifyFile(at: temporaryURL, descriptor: descriptor)
+        _ = try ModelArtifactVerifier.verifyFile(at: temporaryURL, descriptor: descriptor)
         let url = try commitVerifiedFile(at: temporaryURL, descriptor: descriptor)
-        return VerifiedModelArtifact(url: url, descriptor: descriptor)
+        let identity = try ModelArtifactVerifier.verifyFile(at: url, descriptor: descriptor)
+        return VerifiedModelArtifact(url: url, descriptor: descriptor, fileIdentity: identity)
     }
 
     public func verifyFile(at url: URL, descriptor: ModelDescriptor) throws {
-        try ModelArtifactVerifier.verifyFile(at: url, descriptor: descriptor)
+        _ = try ModelArtifactVerifier.verifyFile(at: url, descriptor: descriptor)
     }
 
     private func commitVerifiedFile(at temporaryURL: URL, descriptor: ModelDescriptor) throws -> URL {
@@ -187,10 +228,9 @@ public actor ModelArtifactStore {
 }
 
 private enum ModelArtifactVerifier {
-    static func verifyFile(at url: URL, descriptor: ModelDescriptor) throws {
-        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-        guard values.isRegularFile == true,
-              Int64(values.fileSize ?? -1) == descriptor.byteCount else {
+    static func verifyFile(at url: URL, descriptor: ModelDescriptor) throws -> ModelFileIdentity {
+        let before = try fileIdentity(at: url)
+        guard before.byteCount == descriptor.byteCount else {
             throw ModelArtifactError.byteCountMismatch
         }
 
@@ -198,15 +238,143 @@ private enum ModelArtifactVerifier {
         defer { try? handle.close() }
 
         var hasher = SHA256()
+        var observedByteCount: Int64 = 0
         while true {
             let chunk = try handle.read(upToCount: 1_048_576) ?? Data()
             if chunk.isEmpty { break }
+            observedByteCount += Int64(chunk.count)
             hasher.update(data: chunk)
+        }
+        let after = try fileIdentity(at: url)
+        guard before == after, observedByteCount == descriptor.byteCount else {
+            throw ModelArtifactError.fileChangedDuringVerification
         }
         let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         guard digest == descriptor.sha256 else {
             throw ModelArtifactError.digestMismatch
         }
+        return after
+    }
+
+    static func makeRuntimeSnapshot(
+        from sourceURL: URL,
+        descriptor: ModelDescriptor,
+        in parentDirectory: URL,
+        fileManager: FileManager = .default
+    ) throws -> RuntimeModelSnapshot {
+        guard sourceURL.isFileURL, parentDirectory.isFileURL else {
+            throw ModelArtifactError.invalidFileURL
+        }
+
+        try fileManager.createDirectory(at: parentDirectory, withIntermediateDirectories: true)
+        let directory = parentDirectory.appendingPathComponent(
+            ".aidenid-model-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        var shouldRemoveDirectory = true
+        defer {
+            if shouldRemoveDirectory {
+                try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+                try? fileManager.removeItem(at: directory)
+            }
+        }
+
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        var mutableDirectory = directory
+        try mutableDirectory.setResourceValues(resourceValues)
+
+        let snapshotURL = directory.appendingPathComponent(descriptor.fileName, isDirectory: false)
+        if cloneFileIfAvailable(from: sourceURL, to: snapshotURL) {
+            _ = try verifyFile(at: snapshotURL, descriptor: descriptor)
+        } else {
+            try copyVerifiedBytes(from: sourceURL, to: snapshotURL, descriptor: descriptor, fileManager: fileManager)
+        }
+
+        try fileManager.setAttributes([.posixPermissions: 0o400], ofItemAtPath: snapshotURL.path)
+        try fileManager.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        shouldRemoveDirectory = false
+        return RuntimeModelSnapshot(url: snapshotURL, directory: directory, fileManager: fileManager)
+    }
+
+    private static func cloneFileIfAvailable(from sourceURL: URL, to destinationURL: URL) -> Bool {
+        #if canImport(Darwin)
+        return sourceURL.withUnsafeFileSystemRepresentation { sourcePath in
+            destinationURL.withUnsafeFileSystemRepresentation { destinationPath in
+                guard let sourcePath, let destinationPath else { return false }
+                return clonefile(sourcePath, destinationPath, 0) == 0
+            }
+        }
+        #else
+        return false
+        #endif
+    }
+
+    private static func copyVerifiedBytes(
+        from sourceURL: URL,
+        to snapshotURL: URL,
+        descriptor: ModelDescriptor,
+        fileManager: FileManager
+    ) throws {
+        guard fileManager.createFile(
+            atPath: snapshotURL.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw ModelArtifactError.runtimeSnapshotFailed
+        }
+
+        let source = try FileHandle(forReadingFrom: sourceURL)
+        let destination = try FileHandle(forWritingTo: snapshotURL)
+        defer {
+            try? source.close()
+            try? destination.close()
+        }
+
+        var hasher = SHA256()
+        var observedByteCount: Int64 = 0
+        while true {
+            let chunk = try source.read(upToCount: 1_048_576) ?? Data()
+            if chunk.isEmpty { break }
+            observedByteCount += Int64(chunk.count)
+            guard observedByteCount <= descriptor.byteCount else {
+                throw ModelArtifactError.byteCountMismatch
+            }
+            hasher.update(data: chunk)
+            try destination.write(contentsOf: chunk)
+        }
+        try destination.synchronize()
+
+        guard observedByteCount == descriptor.byteCount else {
+            throw ModelArtifactError.byteCountMismatch
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard digest == descriptor.sha256 else {
+            throw ModelArtifactError.digestMismatch
+        }
+    }
+
+    private static func fileIdentity(at url: URL) throws -> ModelFileIdentity {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw ModelArtifactError.invalidFileURL
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let device = attributes[.systemNumber] as? NSNumber,
+              let file = attributes[.systemFileNumber] as? NSNumber,
+              let size = attributes[.size] as? NSNumber else {
+            throw ModelArtifactError.invalidFileURL
+        }
+        return ModelFileIdentity(
+            deviceNumber: device.uint64Value,
+            fileNumber: file.uint64Value,
+            byteCount: size.int64Value
+        )
     }
 }
 
@@ -259,4 +427,7 @@ public enum ModelArtifactError: Error, Equatable, Sendable {
     case invalidFileURL
     case byteCountMismatch
     case digestMismatch
+    case fileChangedDuringVerification
+    case fileChangedAfterVerification
+    case runtimeSnapshotFailed
 }

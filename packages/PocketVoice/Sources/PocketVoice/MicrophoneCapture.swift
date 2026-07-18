@@ -6,6 +6,7 @@ public actor MicrophoneCapture {
     private var continuation: AsyncThrowingStream<MicrophoneFrame, Error>.Continuation?
     private var tapInstalled = false
     private var notificationTokens: [NSObjectProtocol] = []
+    private var generations = CaptureGenerationGate()
 
     public init() {}
 
@@ -60,10 +61,11 @@ public actor MicrophoneCapture {
         let streamPair = AsyncThrowingStream<MicrophoneFrame, Error>.makeStream(
             bufferingPolicy: .bufferingNewest(8)
         )
+        let captureID = generations.begin()
         let stream = streamPair.stream
         continuation = streamPair.continuation
         streamPair.continuation.onTermination = { @Sendable _ in
-            Task { await self.stop() }
+            Task { await self.stop(captureID: captureID) }
         }
 
         input.installTap(onBus: 0, bufferSize: 1_024, format: captureFormat) { [weak self] buffer, _ in
@@ -72,7 +74,7 @@ public actor MicrophoneCapture {
             guard let frame = try? MicrophoneFrame(samples: samples, sampleRate: captureFormat.sampleRate) else {
                 return
             }
-            Task { await self?.yield(frame) }
+            Task { await self?.yield(frame, captureID: captureID) }
         }
         tapInstalled = true
 
@@ -80,11 +82,12 @@ public actor MicrophoneCapture {
             engine.prepare()
             try engine.start()
             self.engine = engine
-            installAudioSessionObservers()
+            installAudioSessionObservers(captureID: captureID)
             return stream
         } catch {
             input.removeTap(onBus: 0)
             tapInstalled = false
+            _ = generations.end(captureID)
             continuation?.finish(throwing: VoiceError.audioSessionFailed(error.localizedDescription))
             continuation = nil
             throw VoiceError.audioSessionFailed(error.localizedDescription)
@@ -92,6 +95,12 @@ public actor MicrophoneCapture {
     }
 
     public func stop() async {
+        guard let captureID = generations.activeID else { return }
+        await stop(captureID: captureID)
+    }
+
+    private func stop(captureID: UUID) async {
+        guard generations.end(captureID) else { return }
         removeAudioSessionObservers()
         if tapInstalled, let engine {
             engine.inputNode.removeTap(onBus: 0)
@@ -107,11 +116,12 @@ public actor MicrophoneCapture {
         #endif
     }
 
-    private func yield(_ frame: MicrophoneFrame) {
+    private func yield(_ frame: MicrophoneFrame, captureID: UUID) {
+        guard generations.accepts(captureID) else { return }
         continuation?.yield(frame)
     }
 
-    private func installAudioSessionObservers() {
+    private func installAudioSessionObservers(captureID: UUID) {
         #if os(iOS)
         let center = NotificationCenter.default
         notificationTokens.append(
@@ -121,7 +131,7 @@ public actor MicrophoneCapture {
                 queue: nil
             ) { [weak self] notification in
                 let rawValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-                Task { await self?.handleInterruption(rawValue) }
+                Task { await self?.handleInterruption(rawValue, captureID: captureID) }
             }
         )
         notificationTokens.append(
@@ -131,7 +141,7 @@ public actor MicrophoneCapture {
                 queue: nil
             ) { [weak self] notification in
                 let rawValue = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-                Task { await self?.handleRouteChange(rawValue) }
+                Task { await self?.handleRouteChange(rawValue, captureID: captureID) }
             }
         )
         notificationTokens.append(
@@ -140,7 +150,7 @@ public actor MicrophoneCapture {
                 object: AVAudioSession.sharedInstance(),
                 queue: nil
             ) { [weak self] _ in
-                Task { await self?.failActiveCapture("audio media services reset") }
+                Task { await self?.failActiveCapture("audio media services reset", captureID: captureID) }
             }
         )
         #endif
@@ -153,29 +163,50 @@ public actor MicrophoneCapture {
         notificationTokens.removeAll()
     }
 
-    private func handleInterruption(_ rawValue: UInt?) async {
+    private func handleInterruption(_ rawValue: UInt?, captureID: UUID) async {
         #if os(iOS)
         guard let rawValue,
               AVAudioSession.InterruptionType(rawValue: rawValue) == .began else { return }
-        await failActiveCapture("audio session interrupted")
+        await failActiveCapture("audio session interrupted", captureID: captureID)
         #endif
     }
 
-    private func handleRouteChange(_ rawValue: UInt?) async {
+    private func handleRouteChange(_ rawValue: UInt?, captureID: UUID) async {
         #if os(iOS)
         guard let rawValue, let reason = AVAudioSession.RouteChangeReason(rawValue: rawValue) else { return }
         switch reason {
         case .oldDeviceUnavailable, .noSuitableRouteForCategory, .routeConfigurationChange:
-            await failActiveCapture("audio route became unavailable")
+            await failActiveCapture("audio route became unavailable", captureID: captureID)
         default:
             break
         }
         #endif
     }
 
-    private func failActiveCapture(_ reason: String) async {
+    private func failActiveCapture(_ reason: String, captureID: UUID) async {
+        guard generations.accepts(captureID) else { return }
         continuation?.finish(throwing: VoiceError.audioSessionFailed(reason))
         continuation = nil
-        await stop()
+        await stop(captureID: captureID)
+    }
+}
+
+struct CaptureGenerationGate: Sendable {
+    private(set) var activeID: UUID?
+
+    mutating func begin() -> UUID {
+        let id = UUID()
+        activeID = id
+        return id
+    }
+
+    func accepts(_ id: UUID) -> Bool {
+        activeID == id
+    }
+
+    mutating func end(_ id: UUID) -> Bool {
+        guard activeID == id else { return false }
+        activeID = nil
+        return true
     }
 }

@@ -139,24 +139,8 @@ jobs:
       - name: Report Swift toolchain
         run: swift --version
 
-      - name: Detect package on this ref
-        id: package
-        shell: bash
-        run: |
-          if [[ -f "packages/${{ matrix.package }}/Package.swift" ]]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Resolve package
-        if: steps.package.outputs.exists == 'true'
         run: swift package --package-path "packages/${{ matrix.package }}" resolve
 
       - name: Build and test package
-        if: steps.package.outputs.exists == 'true'
         run: swift test --package-path "packages/${{ matrix.package }}" --parallel
-
-      - name: Report package absent on this ref
-        if: steps.package.outputs.exists != 'true'
-        run: echo "packages/${{ matrix.package }} is not present on this ref"

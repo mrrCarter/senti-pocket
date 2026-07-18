@@ -68,6 +68,7 @@ public actor GatewayStreamingSpeechSynthesizer: SpeechSynthesizer {
             } onCancel: {
                 task.cancel()
             }
+            try Task.checkCancellation()
             guard activeRequestID == request.id else { throw VoiceError.cancelled }
             activeRequestID = nil
             activeTask = nil

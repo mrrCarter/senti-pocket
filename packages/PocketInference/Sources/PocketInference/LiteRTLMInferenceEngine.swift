@@ -10,7 +10,7 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
     private let promptBuilder: GroundedPromptBuilder
     private let answerDecoder: GroundedAnswerDecoder
 
-    private var modelArtifact: VerifiedModelArtifact?
+    private var runtimeModelSnapshot: RuntimeModelSnapshot?
     private var engine: Engine?
     private var preparationID: UUID?
     private var benchmarkID: UUID?
@@ -35,6 +35,9 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
     }
 
     public func prepareModel(_ artifact: VerifiedModelArtifact) async throws -> ModelPreparationMetrics {
+        guard preparationID == nil else {
+            throw InferenceError.invalidRequest("model preparation is already in progress")
+        }
         guard benchmarkID == nil else {
             throw InferenceError.invalidRequest("model preparation cannot overlap a benchmark")
         }
@@ -52,6 +55,9 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
         guard (2_048...32_768).contains(maximumTokens) else {
             throw InferenceError.invalidRequest("maximumTokens must be within 2048...32768")
         }
+        guard cacheDirectory.isFileURL else {
+            throw InferenceError.invalidRequest("cacheDirectory must be a local file URL")
+        }
 
         supersedeActiveRun()
         supersedePendingAnswer()
@@ -64,8 +70,13 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
         let started = ContinuousClock.now
         try artifact.revalidate()
         try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let cacheValues = try cacheDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard cacheValues.isDirectory == true, cacheValues.isSymbolicLink != true else {
+            throw InferenceError.invalidRequest("cacheDirectory must be a regular directory")
+        }
+        let runtimeSnapshot = try artifact.makeRuntimeSnapshot(in: cacheDirectory)
         let config = try EngineConfig(
-            modelPath: verifiedModelURL.path,
+            modelPath: runtimeSnapshot.url.path,
             backend: liteRTBackend,
             maxNumTokens: maximumTokens,
             cacheDir: cacheDirectory.path
@@ -74,13 +85,14 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
         try await newEngine.initialize()
         _ = try await newEngine.createConversation(with: conversationConfiguration())
         try Task.checkCancellation()
+        try artifact.revalidate()
 
         guard preparationID == currentPreparationID else {
             throw InferenceError.superseded
         }
 
         engine = newEngine
-        modelArtifact = artifact
+        runtimeModelSnapshot = runtimeSnapshot
 
         return ModelPreparationMetrics(
             modelIdentifier: modelIdentifier,
@@ -114,7 +126,15 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
             if let stopReason = stopReasons.removeValue(forKey: currentAnswerID) {
                 throw stopReason
             }
+            if error is CancellationError || Task.isCancelled {
+                throw InferenceError.cancelled
+            }
             throw error
+        }
+        if Task.isCancelled {
+            if pendingAnswerID == currentAnswerID { pendingAnswerID = nil }
+            try? conversation.cancel()
+            throw InferenceError.cancelled
         }
         if let stopReason = stopReasons.removeValue(forKey: currentAnswerID) {
             try? conversation.cancel()
@@ -144,6 +164,9 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
                         throw InferenceError.malformedModelOutput
                     }
                 }
+                try Task.checkCancellation()
+                if let stopReason = stopReasons[generation] { throw stopReason }
+                guard activeRun?.id == generation else { throw InferenceError.superseded }
             } onCancel: {
                 Task { await self.cancel(generation: generation) }
             }
@@ -167,6 +190,7 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
             question: request.question,
             allowedEvidenceIds: prompt.admittedEvidenceIds
         )
+        guard !Task.isCancelled else { throw InferenceError.cancelled }
         let metrics = InferenceRunMetrics(
             timeToFirstTokenMilliseconds: started.duration(to: firstTokenAt).pocketMilliseconds,
             totalMilliseconds: started.duration(to: .now).pocketMilliseconds,
@@ -174,6 +198,7 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
             residentMemoryBytes: DeviceRuntimeSnapshot.residentMemoryBytes,
             thermalState: DeviceRuntimeSnapshot.thermalLevel
         )
+        guard !Task.isCancelled else { throw InferenceError.cancelled }
         return GroundedInferenceResult(questionAnswer: questionAnswer, metrics: metrics)
     }
 
@@ -189,7 +214,7 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
     }
 
     public func benchmark(prefillTokens: Int = 256, decodeTokens: Int = 128) async throws -> DeviceBenchmarkReport {
-        guard let modelArtifact else { throw InferenceError.modelNotPrepared }
+        guard let runtimeModelSnapshot else { throw InferenceError.modelNotPrepared }
         guard preparationID == nil, benchmarkID == nil, pendingAnswerID == nil, activeRun == nil else {
             throw InferenceError.invalidRequest("benchmark requires an idle engine")
         }
@@ -203,9 +228,8 @@ public actor LiteRTLMInferenceEngine: LocalInferenceEngine {
             if benchmarkID == currentBenchmarkID { benchmarkID = nil }
         }
 
-        try modelArtifact.revalidate()
         let info = try await LiteRTLMBenchmarkGate.shared.run(
-            modelPath: modelArtifact.url.path,
+            modelPath: runtimeModelSnapshot.url.path,
             backend: backend,
             prefillTokens: prefillTokens,
             decodeTokens: decodeTokens,

@@ -10,14 +10,46 @@ public protocol LocalInferenceEngine: Sendable {
 
 public struct GroundedInferenceRequest: Sendable {
     public let checkpointId: String
+    public let sessionId: String
+    public let sequenceStart: Int
+    public let sequenceEnd: Int
     public let question: String
     public let evidence: [EvidenceRef]
 
-    public init(checkpointId: String, question: String, evidence: [EvidenceRef]) throws {
+    public init(bundle: PocketBundle, question: String, evidence: [EvidenceRef]? = nil) throws {
+        let selectedEvidence = evidence ?? bundle.evidence
+        guard selectedEvidence.allSatisfy(bundle.evidence.contains) else {
+            throw InferenceError.invalidRequest("evidence must be an exact subset of the supplied bundle")
+        }
+        try self.init(
+            checkpointId: bundle.checkpointId,
+            sessionId: bundle.sessionId,
+            sequenceStart: bundle.sequenceStart,
+            sequenceEnd: bundle.sequenceEnd,
+            question: question,
+            evidence: selectedEvidence
+        )
+    }
+
+    init(
+        checkpointId: String,
+        sessionId: String,
+        sequenceStart: Int,
+        sequenceEnd: Int,
+        question: String,
+        evidence: [EvidenceRef]
+    ) throws {
         let trimmedCheckpointId = checkpointId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSessionId = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedCheckpointId.isEmpty, trimmedCheckpointId.utf8.count <= 256 else {
             throw InferenceError.invalidRequest("checkpointId must contain 1...256 UTF-8 bytes")
+        }
+        guard !trimmedSessionId.isEmpty, trimmedSessionId.utf8.count <= 256 else {
+            throw InferenceError.invalidRequest("sessionId must contain 1...256 UTF-8 bytes")
+        }
+        guard sequenceStart > 0, sequenceEnd >= sequenceStart else {
+            throw InferenceError.invalidRequest("checkpoint sequence range is invalid")
         }
         guard !trimmedQuestion.isEmpty, trimmedQuestion.utf8.count <= 2_000 else {
             throw InferenceError.invalidRequest("question must contain 1...2000 UTF-8 bytes")
@@ -32,10 +64,12 @@ public struct GroundedInferenceRequest: Sendable {
                   item.id.utf8.count <= 128,
                   !item.agentId.isEmpty,
                   item.agentId.utf8.count <= 128,
+                  item.sessionId == trimmedSessionId,
                   item.sequence > 0,
+                  (sequenceStart...sequenceEnd).contains(item.sequence),
                   !item.snippet.isEmpty,
                   item.snippet.utf8.count <= 8_000 else {
-                throw InferenceError.invalidRequest("evidence entries must be bounded and addressable")
+                throw InferenceError.invalidRequest("evidence entries must be bounded and belong to the checkpoint session and sequence range")
             }
             guard evidenceIds.insert(item.id).inserted else {
                 throw InferenceError.invalidRequest("evidence IDs must be unique")
@@ -43,6 +77,9 @@ public struct GroundedInferenceRequest: Sendable {
         }
 
         self.checkpointId = trimmedCheckpointId
+        self.sessionId = trimmedSessionId
+        self.sequenceStart = sequenceStart
+        self.sequenceEnd = sequenceEnd
         self.question = trimmedQuestion
         self.evidence = evidence
     }

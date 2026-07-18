@@ -10,6 +10,8 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
     private let offline: any SpeechSynthesizer
     private let connectivity: any ConnectivityProviding
     private var activeRequestID: UUID?
+    private var stopTail: Task<Void, Never>?
+    private var stopTailID: UUID?
 
     public init(
         premium: any SpeechSynthesizer,
@@ -23,9 +25,7 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
 
     public func speak(_ request: SpeechSynthesisRequest) async throws -> SpeechPlaybackMetrics {
         activeRequestID = request.id
-        async let premiumStop: Void = premium.stop()
-        async let offlineStop: Void = offline.stop()
-        _ = await (premiumStop, offlineStop)
+        await quiesceBackends()
         try ensureActive(request.id)
 
         guard await connectivity.isOnline() else {
@@ -52,9 +52,7 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
 
     public func stop() async {
         activeRequestID = nil
-        async let premiumStop: Void = premium.stop()
-        async let offlineStop: Void = offline.stop()
-        _ = await (premiumStop, offlineStop)
+        await quiesceBackends()
     }
 
     private func finishOffline(_ request: SpeechSynthesisRequest) async throws -> SpeechPlaybackMetrics {
@@ -81,6 +79,32 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
 
     private func clearIfCurrent(_ requestID: UUID) {
         if activeRequestID == requestID { activeRequestID = nil }
+    }
+
+    func hasActiveRequest(_ requestID: UUID) -> Bool {
+        activeRequestID == requestID
+    }
+
+    /// Serialize stop operations across actor reentrancy. A newer request cannot start playback until every stop
+    /// queued by an older request has completed, so stale cleanup can never stop the newer generation.
+    private func quiesceBackends() async {
+        let previous = stopTail
+        let premium = self.premium
+        let offline = self.offline
+        let tailID = UUID()
+        let tail = Task {
+            if let previous { await previous.value }
+            async let premiumStop: Void = premium.stop()
+            async let offlineStop: Void = offline.stop()
+            _ = await (premiumStop, offlineStop)
+        }
+        stopTail = tail
+        stopTailID = tailID
+        await tail.value
+        if stopTailID == tailID {
+            stopTail = nil
+            stopTailID = nil
+        }
     }
 }
 

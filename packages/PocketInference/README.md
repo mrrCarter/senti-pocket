@@ -8,7 +8,7 @@ On-device, evidence-bounded checkpoint Q&A using LiteRT-LM. The package never ex
 - Swift product: `LiteRTLM`
 - Model input: a local, integrity-verified `.litertlm` file
 
-The deployment manifest must supply the expected model SHA-256 and byte count through `ModelDescriptor`. `ModelArtifactStore` installs only an exact size/digest match, cancels downloads that exceed the descriptor, uses an ephemeral no-cookie session, rejects redirects/non-HTTPS URLs/embedded credentials, and excludes the installed model from device backup. Only the store can issue `VerifiedModelArtifact`; the engine revalidates it immediately before initialization and benchmarking.
+The deployment manifest must supply the expected model SHA-256 and byte count through `ModelDescriptor`. `ModelArtifactStore` installs only an exact size/digest match, cancels downloads that exceed the descriptor, uses an ephemeral no-cookie session, rejects redirects/non-HTTPS URLs/embedded credentials, and excludes the installed model from device backup. Only the store can issue `VerifiedModelArtifact`. Before initialization, the engine materializes a private runtime snapshot using an APFS copy-on-write clone when available and a bounded streaming copy otherwise, then verifies the exact snapshot bytes and makes the file read-only. LiteRT-LM initialization and benchmarking use that unexposed snapshot rather than reopening the caller-visible installed path.
 
 ## Integration
 
@@ -30,11 +30,7 @@ let engine = LiteRTLMInferenceEngine(
 )
 let loadMetrics = try await engine.prepareModel(artifact)
 let result = try await engine.answer(
-    GroundedInferenceRequest(
-        checkpointId: bundle.checkpointId,
-        question: question,
-        evidence: bundle.evidence
-    )
+    GroundedInferenceRequest(bundle: bundle, question: question)
 )
 ```
 
@@ -42,7 +38,7 @@ let result = try await engine.answer(
 
 ## Measurement Contract
 
-- `loadMilliseconds`: final model integrity revalidation, initialization, and conversation-config validation.
+- `loadMilliseconds`: exact-byte runtime snapshot verification, initialization, and conversation-config validation.
 - `timeToFirstTokenMilliseconds`: invocation to the first LiteRT-LM message chunk.
 - `totalMilliseconds`: invocation through strict JSON/citation validation.
 - `residentMemoryBytes`: process resident memory sampled after the operation.
