@@ -9,6 +9,14 @@ import { execFileSync } from 'node:child_process';
 export const ALLOWED_KINDS = new Set(['threadedReply', 'opinionRequest']);
 
 /**
+ * canonicalPayload is delimiter (\n)-separated, so any NON-TERMINAL field that could contain the
+ * delimiter would let two different proposals produce identical bytes (hash ambiguity — Echo, 5f45364).
+ * kind is an enum (safe) and targetSequence is an int (safe); targetSessionId is free-form-ish, so we
+ * strict-validate it as a UUID (which cannot contain \n). renderedPreview is LAST, so newlines in it are safe.
+ */
+export const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
  * The EXACT canonical bytes the hash covers — MUST byte-match PocketContracts.swift v0.1.2:
  *   "pocket.actionproposal.v1\n{kind}\n{targetSessionId}\n{targetSequence}\n{renderedPreview}"
  */
@@ -35,6 +43,7 @@ export function validateProposal(p, { knownSessionIds } = {}) {
   if (!ALLOWED_KINDS.has(p.kind)) problems.push(`kind not allowed: ${p.kind}`);
   if (!p.id) problems.push('no proposal id');
   if (!p.targetSessionId) problems.push('no targetSessionId');
+  else if (!SESSION_ID_RE.test(p.targetSessionId)) problems.push('targetSessionId is not a valid session UUID (delimiter/format guard)');
   else if (Array.isArray(knownSessionIds) && !knownSessionIds.includes(p.targetSessionId)) {
     problems.push('targetSessionId is not a known session (possible model free-text / wrong-session)');
   }
