@@ -38,13 +38,17 @@ export const storeKey = (humanId, id) => `${String(humanId).length}:${humanId}:$
  * }} deps
  */
 export function createGateway(deps) {
+  // Route scope requirements, aligned to AIdenID's granted scopes (token carries `pocket:read pocket:write`).
+  // Override via deps.scopes if the scope contract changes. write => execute; read => sync + briefing/tts.
+  const SCOPES = { execute: 'pocket:write', sync: 'pocket:read', tts: 'pocket:read', ...(deps.scopes || {}) };
+
   async function authenticate(req) {
     if (typeof deps.verifyToken !== 'function') return null; // no verifier wired => deny everything (fail-closed)
     try { return await deps.verifyToken(req.headers || {}); } catch { return null; }
   }
 
   async function handleSync(req, ctx) {
-    if (!hasScope(ctx, 'bundles:read')) return json(403, { error: 'missing scope bundles:read' });
+    if (!hasScope(ctx, SCOPES.sync)) return json(403, { error: 'missing scope ' + SCOPES.sync });
     if (!deps.bundleStore) return json(501, { error: 'sync backend not configured' });
     const since = Number((req.query && req.query.since) || 0);
     const sinceSeq = Number.isSafeInteger(since) && since > 0 ? since : 0;
@@ -54,7 +58,7 @@ export function createGateway(deps) {
   }
 
   async function handleExecute(req, ctx) {
-    if (!hasScope(ctx, 'actions:execute')) return json(403, { error: 'missing scope actions:execute' });
+    if (!hasScope(ctx, SCOPES.execute)) return json(403, { error: 'missing scope ' + SCOPES.execute });
     const body = readBody(req.body);
     if (!body) return json(400, { error: 'invalid JSON body' });
     const { proposal, confirmation } = body;
@@ -111,7 +115,7 @@ export function createGateway(deps) {
   }
 
   async function handleTts(req, ctx) {
-    if (!hasScope(ctx, 'tts')) return json(403, { error: 'missing scope tts' });
+    if (!hasScope(ctx, SCOPES.tts)) return json(403, { error: 'missing scope ' + SCOPES.tts });
     if (typeof deps.ttsBackend !== 'function') return json(501, { error: 'tts backend not configured' });
     const body = readBody(req.body);
     if (!body || typeof body.text !== 'string' || body.text.length === 0) return json(400, { error: 'text required' });

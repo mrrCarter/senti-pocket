@@ -1,0 +1,3 @@
+# KAV fixtures are byte-exact interop vectors — git must NEVER convert their line endings
+# (a CRLF rewrite would change the SHA-256 and break the byte-exact hash self-check).
+* -text

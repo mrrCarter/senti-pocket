@@ -12,7 +12,7 @@ const { privateKey: KEY } = generateSigningKeypair();
 
 const verifyToken = async (headers) => {
   const a = headers && (headers.authorization || headers.Authorization);
-  if (a === 'Bearer good') return { humanId: 'consumer-123', scopes: ['actions:execute', 'bundles:read', 'tts'] };
+  if (a === 'Bearer good') return { humanId: 'consumer-123', scopes: ['pocket:read', 'pocket:write'] };
   if (a === 'Bearer noscope') return { humanId: 'consumer-123', scopes: [] };
   return null;
 };
@@ -130,7 +130,7 @@ test('POST /tts proxies audio; the provider key never appears in the response', 
 
 test('cross-human isolation: same proposal.id from two humans does NOT share idempotency/lock state', async () => {
   const store = createInMemoryStore();
-  const vt = async (h) => { const a = h && h.authorization; if (a === 'Bearer alice') return { humanId: 'alice', scopes: ['actions:execute'] }; if (a === 'Bearer bob') return { humanId: 'bob', scopes: ['actions:execute'] }; return null; };
+  const vt = async (h) => { const a = h && h.authorization; if (a === 'Bearer alice') return { humanId: 'alice', scopes: ['pocket:write'] }; if (a === 'Bearer bob') return { humanId: 'bob', scopes: ['pocket:write'] }; return null; };
   const state = { replies: 0 };
   const run = (args) => {
     if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
@@ -152,8 +152,8 @@ test('durable state keyed by PRINCIPAL, not sub: same pairwise sub across sites 
   const store = createInMemoryStore();
   const vt = async (h) => {
     const a = h && h.authorization;
-    if (a === 'Bearer siteA') return { humanId: 'sub-1', principal: 'siteA|sub-1', scopes: ['actions:execute'] };
-    if (a === 'Bearer siteB') return { humanId: 'sub-1', principal: 'siteB|sub-1', scopes: ['actions:execute'] };
+    if (a === 'Bearer siteA') return { humanId: 'sub-1', principal: 'siteA|sub-1', scopes: ['pocket:write'] };
+    if (a === 'Bearer siteB') return { humanId: 'sub-1', principal: 'siteB|sub-1', scopes: ['pocket:write'] };
     return null;
   };
   const state = { replies: 0 };
