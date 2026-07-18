@@ -101,14 +101,20 @@ export function validateProposal(p, { knownSessionIds } = {}) {
   if (!p || typeof p !== 'object') return ['proposal missing'];
   if (!ALLOWED_KINDS.has(p.kind)) problems.push(`kind not allowed: ${p.kind}`);
   if (!p.id) problems.push('no proposal id');
+  if (typeof p.id === 'string' && p.id.length > 128) problems.push('id exceeds 128 bytes');
   if (!p.targetSessionId) problems.push('no targetSessionId');
   else if (!SESSION_ID_RE.test(p.targetSessionId)) problems.push('targetSessionId is not a valid session UUID (delimiter/format guard)');
-  else if (Array.isArray(knownSessionIds) && !knownSessionIds.includes(p.targetSessionId)) {
+  else if (!Array.isArray(knownSessionIds) || knownSessionIds.length === 0) {
+    problems.push('no known-session allowlist provided (fail-closed: refuse rather than trust any UUID)');
+  } else if (!knownSessionIds.includes(p.targetSessionId)) {
     problems.push('targetSessionId is not a known session (possible model free-text / wrong-session)');
   }
-  if (!Number.isInteger(p.targetSequence) || p.targetSequence <= 0) problems.push('invalid targetSequence');
+  if (!Number.isSafeInteger(p.targetSequence) || p.targetSequence <= 0) problems.push('invalid targetSequence');
   if (typeof p.renderedPreview !== 'string' || p.renderedPreview.length === 0) problems.push('empty renderedPreview');
+  else if (Buffer.byteLength(p.renderedPreview, 'utf8') > 4096) problems.push('renderedPreview exceeds 4096 bytes');
   if (p.requiresConfirmation !== true) problems.push('requiresConfirmation must be true');
+  const cms = typeof p.createdAt === 'number' ? p.createdAt : new Date(p.createdAt).getTime();
+  if (!Number.isFinite(cms) || cms < -SANE_MS_BOUND || cms > SANE_MS_BOUND) problems.push('createdAt non-finite/out-of-range');
   if (!hashMatchesContent(p)) problems.push('proposalHash does not match content (tampered or malformed)');
   return problems;
 }
@@ -231,14 +237,48 @@ export function verifyActionLanded(sessionId, parsed, { run, agent = 'claude-poc
     try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
     let j;
     try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '25', '--agent', agent, '--json'])); } catch { continue; }
-    const hit = (j.events || []).find((e) => e && (e.eventId === wantEventId
-      || (typeof e.idempotencyToken === 'string' && e.idempotencyToken.includes(parsed.actionId))));
+    const hit = (j.events || []).find((e) => e && e.eventId === wantEventId); // EXACT action identity (no substring)
     if (hit) {
       const who = (hit.agent && hit.agent.id) || hit.agentId;
       const tseq = hit.payload && hit.payload.targetSequenceId;
       return who === agent && Number(tseq) === parsed.targetSequenceId;
     }
   }
+  return false;
+}
+
+/**
+ * Freeze a primitive snapshot of every authority-bearing proposal field in a SINGLE read each (a getter/Proxy
+ * fires exactly once here). The value hashed+confirmed+posted MUST be identical, so nothing downstream re-reads
+ * proposal.* (first-post content TOCTOU, Echo). createdAt is captured as an epoch-ms number.
+ */
+export function snapshotProposal(p) {
+  if (!p || typeof p !== 'object') return null;
+  const id = p.id, kind = p.kind, targetSessionId = p.targetSessionId, targetSequence = p.targetSequence,
+    renderedPreview = p.renderedPreview, requiresConfirmation = p.requiresConfirmation,
+    createdAt = p.createdAt, sourceQuestionId = p.sourceQuestionId, proposalHash = p.proposalHash;
+  return Object.freeze({
+    id: typeof id === 'string' ? id : null,
+    kind: typeof kind === 'string' ? kind : null,
+    targetSessionId: typeof targetSessionId === 'string' ? targetSessionId : null,
+    targetSequence: typeof targetSequence === 'number' ? targetSequence : NaN,
+    renderedPreview: typeof renderedPreview === 'string' ? renderedPreview : null,
+    requiresConfirmation: requiresConfirmation === true,
+    createdAt: new Date(createdAt).getTime(), // epoch-ms number (NaN if bad) — one coercion, frozen
+    sourceQuestionId: sourceQuestionId == null ? null : (typeof sourceQuestionId === 'string' ? sourceQuestionId : null),
+    proposalHash: typeof proposalHash === 'string' ? proposalHash : null,
+  });
+}
+
+/** Structural bounds on an ActionResultRef before it can be signed into a .posted receipt. */
+export function validateActionResultRef(ref) {
+  if (!ref || typeof ref !== 'object') return false;
+  if (ref.kind === 'action') {
+    return typeof ref.actionId === 'string' && ref.actionId.length > 0 && ref.actionId.length <= 256
+      && toSafeSequence(ref.targetSequenceId) != null
+      && (ref.targetCursor == null || (typeof ref.targetCursor === 'string' && ref.targetCursor.length <= 256));
+  }
+  if (ref.kind === 'sequence') return toSafeSequence(ref.sequenceId) != null;
   return false;
 }
 
@@ -250,31 +290,37 @@ export function verifyActionLanded(sessionId, parsed, { run, agent = 'claude-poc
  * @returns ActionReceipt
  */
 export function executeAction(proposal, confirmation, opts = {}) {
+  // NOTE: the default Map is single-instance. Production (multi-Lambda) MUST inject a distributed atomic store
+  // (e.g. DynamoDB conditional-put keyed by proposal.id) so idempotency + single-consume hold across instances.
   const store = opts.store || new Map();
   const now = opts.now || new Date().toISOString();
   const agent = opts.agent || 'claude-pocket-relay';
   const online = opts.online !== false;
   const run = opts.run || ((args) => execFileSync('sl', args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
 
-  // Idempotency: only a TERMINAL .posted is single-use. A stored pendingConnectivity MUST allow a later
-  // online flush to execute + replace it (single-use pending->posted flush semantics — Echo (C)).
-  const prior = proposal ? store.get(proposal.id) : undefined;
+  // FROZEN snapshot: read every authority-bearing proposal field EXACTLY once; hash/bind/post ONLY from it, so a
+  // getter/Proxy/mutation cannot make the posted content differ from the confirmed content (first-post TOCTOU, Echo).
+  const snap = snapshotProposal(proposal);
+  if (!snap) return receipt(null, 'failed', { failureReason: 'proposal missing', confirmedByHumanAt: confirmation?.confirmedAt ?? now });
+
+  // Idempotency: only a TERMINAL .posted is single-use; a stored pending must allow a later online flush.
+  const prior = snap.id ? store.get(snap.id) : undefined;
   if (prior && prior.status === 'posted') return prior;
 
-  // 1) deterministic validation (kind, known target, sequence, preview, hash-integrity)
-  const problems = validateProposal(proposal, { knownSessionIds: opts.knownSessionIds });
+  // 1) strict validation of the SNAPSHOT (kind, known target, safe seq, preview bounds, sane createdAt, hash-integrity)
+  const problems = validateProposal(snap, { knownSessionIds: opts.knownSessionIds });
   if (problems.length) {
-    return receipt(proposal, 'failed', { failureReason: 'invalid proposal: ' + problems.join('; '), confirmedByHumanAt: confirmation?.confirmedAt ?? now });
+    return receipt(snap, 'failed', { failureReason: 'invalid proposal: ' + problems.join('; '), confirmedByHumanAt: confirmation?.confirmedAt ?? now });
   }
 
-  // 2) single-use confirmation bound to the EXACT proposal hash (all three must agree: content, stored, confirmed)
-  const live = computeProposalHash(proposal);
+  // 2) confirmation bound to the EXACT snapshot hash (content hashed == content posted == content confirmed)
+  const live = computeProposalHash(snap);
   const bound = confirmation
-    && confirmation.proposalId === proposal.id
+    && confirmation.proposalId === snap.id
     && confirmation.confirmedProposalHash === live
-    && proposal.proposalHash === live;
+    && snap.proposalHash === live;
   if (!bound) {
-    return receipt(proposal, 'failed', {
+    return receipt(snap, 'failed', {
       failureReason: 'confirmation missing or hash mismatch (stale/replayed/tampered/wrong-proposal)',
       confirmedByHumanAt: confirmation?.confirmedAt ?? now,
     });
@@ -284,13 +330,13 @@ export function executeAction(proposal, confirmation, opts = {}) {
   // date-sanity): a pending OR posted receipt with a non-sane confirmedByHumanAt is structurally invalid.
   const confirmedAtSnap = normalizeSaneDate(confirmation.confirmedAt);
   if (!confirmedAtSnap) {
-    return receipt(proposal, 'failed', { failureReason: 'confirmedAt missing/non-finite/out-of-range (no receipt stored)', confirmedProposalHash: live });
+    return receipt(snap, 'failed', { failureReason: 'confirmedAt missing/non-finite/out-of-range (no receipt stored)', confirmedProposalHash: live });
   }
 
   // 3) offline => honest pending; NEVER "sent". Stored so a later flush is single (idempotent by id).
   if (!online) {
-    const r = receipt(proposal, 'pendingConnectivity', { confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
-    store.set(proposal.id, r);
+    const r = receipt(snap, 'pendingConnectivity', { confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    store.set(snap.id, r);
     return r;
   }
 
@@ -301,41 +347,53 @@ export function executeAction(proposal, confirmation, opts = {}) {
   let signingKeyObj = null;
   try { signingKeyObj = loadEd25519Private(opts.signingKey); } catch { signingKeyObj = null; }
   if (!keyIdOk || !signingKeyObj) {
-    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials missing/invalid: a private Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    return receipt(snap, 'failed', { failureReason: 'gateway signing credentials missing/invalid: a private Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
   // date sanity BEFORE posting: normalize `now` to an IMMUTABLE snapshot (confirmedAt already snapped). If the
   // server timestamp isn't sane we do NOT post — Node must never post+sign a receipt Swift hasSaneDates rejects.
   const nowSnap = normalizeSaneDate(now);
   if (!nowSnap) {
-    return receipt(proposal, 'failed', { failureReason: 'server timestamp non-finite/out-of-range (no post attempted)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    return receipt(snap, 'failed', { failureReason: 'server timestamp non-finite/out-of-range (no post attempted)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+  }
+  // server-time FRESHNESS (Echo): the gateway clock is authority; client confirmedAt is telemetry. Reject a
+  // confirmation older than freshnessSeconds or beyond a small forward skew (a years-old/future confirm must NOT post).
+  const nowMs = new Date(nowSnap).getTime();
+  const confMs = new Date(confirmedAtSnap).getTime();
+  const maxAgeMs = (opts.freshnessSeconds ?? 300) * 1000;
+  const skewMs = (opts.clockSkewSeconds ?? 60) * 1000;
+  if (confMs < nowMs - maxAgeMs || confMs > nowMs + skewMs) {
+    return receipt(snap, 'failed', { failureReason: 'confirmation outside server-time freshness window (stale or future)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
   // execute the real Senti post (credentials + dates validated -> a .posted is always signable + Swift-sane).
   // Only immutable snapshots (nowSnap/confirmedAtSnap) flow into the receipt — never the caller's mutable inputs.
   try {
-    const out = run(['session', 'reply', proposal.targetSessionId, String(proposal.targetSequence), proposal.renderedPreview, '--agent', agent, '--json']);
+    const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--json']);
     const parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
     if (!parsed) {
-      return receipt(proposal, 'failed', { failureReason: 'post returned no structured action result', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+      return receipt(snap, 'failed', { failureReason: 'post returned no structured action result', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     }
-    if (parsed.targetSequenceId !== proposal.targetSequence) {
-      return receipt(proposal, 'failed', { failureReason: 'posted action threads under a different target sequence than the proposal', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    if (parsed.targetSequenceId !== snap.targetSequence) {
+      return receipt(snap, 'failed', { failureReason: 'posted action threads under a different target sequence than the proposal', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     }
     // bounded read-back VERIFY the action actually landed (authored by us, under the target). Injectable for tests.
     const verified = opts.verifyReadback
-      ? opts.verifyReadback(proposal.targetSessionId, parsed, { run, agent })
-      : verifyActionLanded(proposal.targetSessionId, parsed, { run, agent });
+      ? opts.verifyReadback(snap.targetSessionId, parsed, { run, agent })
+      : verifyActionLanded(snap.targetSessionId, parsed, { run, agent });
     if (!verified) {
-      return receipt(proposal, 'failed', { failureReason: 'writeback not confirmed landed by read-back (never claim posted unverified)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+      return receipt(snap, 'failed', { failureReason: 'writeback not confirmed landed by read-back (never claim posted unverified)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     }
     const result = { kind: 'action', actionId: parsed.actionId, targetSequenceId: parsed.targetSequenceId, targetCursor: parsed.targetCursor };
+    if (!validateActionResultRef(result)) {
+      return receipt(snap, 'failed', { failureReason: 'malformed action result ref (structural bounds)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    }
     const r = signReceipt(
       receipt(proposal, 'posted', { result, confirmedProposalHash: live, executedAt: nowSnap, confirmedByHumanAt: confirmedAtSnap }),
       signingKeyObj, opts.signingKeyId,
     );
-    store.set(proposal.id, r);
+    store.set(snap.id, r);
     return r;
   } catch (e) {
     // transient failure: do NOT store (allow retry of the same proposal id later)
-    return receipt(proposal, 'failed', { failureReason: String(e?.message ?? e).slice(0, 300), confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+    return receipt(snap, 'failed', { failureReason: String(e?.message ?? e).slice(0, 300), confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
 }

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {
   canonicalPayload, computeProposalHash, hashMatchesContent, validateProposal, executeAction, ALLOWED_KINDS,
   signReceipt, verifyReceipt, canonicalReceiptPayload, actionResultCanonicalToken, parseActionResult,
-  verifyActionLanded, toSafeSequence,
+  verifyActionLanded, toSafeSequence, snapshotProposal, validateActionResultRef,
 } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
 import { generateKeyPairSync } from 'node:crypto';
@@ -356,4 +356,66 @@ test('toSafeSequence still guards positive safe integers', () => {
   for (const bad of [true, -1, 0, 1.5, 9007199254740992, '0', '1e3', ' 1 ', 'x']) assert.equal(toSafeSequence(bad), null);
   assert.equal(toSafeSequence(123), 123);
   assert.equal(toSafeSequence('123'), 123);
+});
+
+test('(TOCTOU) getter-backed renderedPreview: EVIL content is never posted (snapshot reads once)', () => {
+  const SAFE = 'SAFE CONFIRMED';
+  const base = { id: 'pgetter', kind: 'threadedReply', targetSessionId: KNOWN, targetSequence: 230160, requiresConfirmation: true, createdAt: '2026-07-18T12:00:00Z', sourceQuestionId: null };
+  const safeHash = computeProposalHash({ ...base, renderedPreview: SAFE });
+  let reads = 0;
+  const evil = { ...base };
+  Object.defineProperty(evil, 'renderedPreview', { enumerable: true, get() { return reads++ === 0 ? SAFE : 'EVIL POSTED'; } });
+  Object.defineProperty(evil, 'proposalHash', { enumerable: true, value: safeHash });
+  const confirmation = { proposalId: 'pgetter', confirmedProposalHash: safeHash, confirmedAt: '2026-07-18T12:01:00Z' };
+  const { run, calls } = recordingRun('act_g');
+  const r = executeAction(evil, confirmation, opts({ run }));
+  const postedPreview = (calls.find((c) => c[1] === 'reply') || [])[4];
+  assert.notEqual(postedPreview, 'EVIL POSTED', 'EVIL content must never be posted');
+  if (r.status === 'posted') assert.equal(postedPreview, SAFE);
+});
+
+test('(freshness) years-old confirmation => failed, ZERO posts', () => {
+  const p = makeProposal({ id: 'pold' });
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p, { confirmedAt: '2000-01-01T00:00:00Z' }), opts({ run, now: '2026-07-18T12:02:00Z' }));
+  assert.equal(r.status, 'failed');
+  assert.match(r.failureReason, /freshness|stale|future/i);
+  assert.equal(calls.length, 0);
+});
+
+test('(freshness) far-future confirmation => failed, ZERO posts', () => {
+  const p = makeProposal({ id: 'pfut' });
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p, { confirmedAt: '2027-01-01T00:00:00Z' }), opts({ run, now: '2026-07-18T12:02:00Z' }));
+  assert.equal(r.status, 'failed');
+  assert.equal(calls.length, 0);
+});
+
+test('(fail-closed) omitted knownSessionIds => failed, ZERO posts (never trust any UUID)', () => {
+  const p = makeProposal();
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, knownSessionIds: undefined }));
+  assert.equal(r.status, 'failed');
+  assert.match(r.failureReason, /allowlist|known session/i);
+  assert.equal(calls.length, 0);
+});
+
+test('validateActionResultRef structural bounds', () => {
+  assert.equal(validateActionResultRef({ kind: 'action', actionId: 'a', targetSequenceId: 5, targetCursor: null }), true);
+  assert.equal(validateActionResultRef({ kind: 'action', actionId: '', targetSequenceId: 5 }), false);
+  assert.equal(validateActionResultRef({ kind: 'action', actionId: 'a', targetSequenceId: 0 }), false);
+  assert.equal(validateActionResultRef({ kind: 'sequence', sequenceId: 10 }), true);
+  assert.equal(validateActionResultRef({ kind: 'sequence', sequenceId: -1 }), false);
+  assert.equal(validateActionResultRef({ kind: 'nope' }), false);
+});
+
+test('snapshotProposal reads each field once + freezes', () => {
+  let reads = 0;
+  const p = { id: 'p', kind: 'threadedReply', targetSessionId: KNOWN, targetSequence: 1, requiresConfirmation: true, createdAt: '2026-07-18T12:00:00Z', sourceQuestionId: null, proposalHash: 'h' };
+  Object.defineProperty(p, 'renderedPreview', { enumerable: true, get() { reads++; return 'x'; } });
+  const s = snapshotProposal(p);
+  assert.equal(reads, 1, 'renderedPreview read exactly once');
+  assert.equal(s.renderedPreview, 'x');
+  assert.equal(Object.isFrozen(s), true);
+  assert.equal(typeof s.createdAt, 'number');
 });
