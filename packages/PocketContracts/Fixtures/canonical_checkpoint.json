@@ -1,6 +1,6 @@
 {
   "_note": "Canonical PocketBundle fixture v0.1 — FROZEN by Atlas. Every lane builds/tests against THIS. It decodes cleanly into PocketBundle (PocketContracts.swift). Regenerate via services/pocket-gateway from a real RawCheckpoint; keep this shape stable within v0.1.",
-  "contractsVersion": "0.1.0",
+  "contractsVersion": "0.1.2",
   "checkpointId": "cp_954233b7_000012",
   "sessionId": "954233b7-1822-42bc-9cfe-1eb95eb0357a",
   "sequenceStart": 230100,
@@ -14,6 +14,10 @@
       {
         "agentId": "claude-pocket-relay",
         "summary": "Proved live checkpoint extraction on room 954233b7 (41 auto-checkpoints); fixed the atk_ token parser to match the live format.",
+        "claims": [
+          { "id": "c_relay_1", "text": "Live checkpoint extraction works on room 954233b7 (41 auto-checkpoints).", "kind": "fact", "evidenceIds": ["ev_1"] },
+          { "id": "c_relay_2", "text": "Freeze contracts before broad writeback to avoid rework.", "kind": "recommendation", "evidenceIds": [] }
+        ],
         "evidence": [
           { "id": "ev_1", "sessionId": "954233b7-1822-42bc-9cfe-1eb95eb0357a", "sequence": 230141, "agentId": "claude-pocket-relay", "snippet": "ACCESS_TOKEN_PATTERN now matches atk_<payload>.<43-char-HMAC>", "ts": "2026-07-18T10:35:00Z" }
         ]
@@ -21,6 +25,10 @@
       {
         "agentId": "claude-warden",
         "summary": "STRONG PASS on the canary once the entryPoint predicate became exact-equality; no unaudited merge lands while CI is down.",
+        "claims": [
+          { "id": "c_warden_1", "text": "The canary's entryPoint predicate is now exact-equality (was always-false).", "kind": "fact", "evidenceIds": ["ev_2"] },
+          { "id": "c_warden_2", "text": "The stack is safe to merge once billing/CI returns.", "kind": "inference", "evidenceIds": ["ev_2"] }
+        ],
         "evidence": [
           { "id": "ev_2", "sessionId": "954233b7-1822-42bc-9cfe-1eb95eb0357a", "sequence": 230160, "agentId": "claude-warden", "snippet": "entryPoint predicate is now exact-equality; positive-accept fixture present", "ts": "2026-07-18T10:36:34Z" }
         ]
