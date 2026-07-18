@@ -1,0 +1,176 @@
+#if canImport(SwiftUI)
+import SwiftUI
+
+public struct IncomingBriefingView: View {
+    private let state: IncomingBriefingState
+    private let connectivity: PocketConnectivity
+    private let send: (PocketUIIntent) -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var pulse = false
+
+    public init(
+        state: IncomingBriefingState,
+        connectivity: PocketConnectivity,
+        send: @escaping (PocketUIIntent) -> Void
+    ) {
+        self.state = state
+        self.connectivity = connectivity
+        self.send = send
+    }
+
+    public var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                ConnectivityBanner(connectivity: connectivity)
+
+                Spacer(minLength: 8)
+                callMark
+
+                VStack(spacing: 8) {
+                    Text("Senti is calling")
+                        .font(.largeTitle.weight(.bold))
+                        .multilineTextAlignment(.center)
+                        .accessibilityAddTraits(.isHeader)
+
+                    Text(state.sessionDisplayName ?? "Agent checkpoint")
+                        .font(.title3.weight(.medium))
+                        .foregroundStyle(PocketPalette.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    IntegrityBadge(integrity: state.integrity)
+                    if state.integrity.allowsBriefing {
+                        Text(verbatim: state.bundle.summary.headline)
+                            .font(.title3.weight(.semibold))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Session \(state.bundle.sessionId) · sequences \(state.bundle.sequenceStart)–\(state.bundle.sequenceEnd)")
+                            .font(.caption)
+                            .foregroundStyle(PocketPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Checkpoint content hidden")
+                            .font(.title3.weight(.semibold))
+                        Text("Senti will not display or narrate content until integrity verification succeeds.")
+                            .font(.body)
+                            .foregroundStyle(PocketPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .pocketCard()
+
+                if let failureReason = state.integrity.failureReason {
+                    Label(
+                        "Briefing blocked. Integrity verification is unavailable or failed: \(failureReason)",
+                        systemImage: "exclamationmark.shield.fill"
+                    )
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(PocketPalette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .pocketCard()
+                    .accessibilityAddTraits(.isHeader)
+                }
+
+                callActions
+            }
+            .padding(20)
+            .frame(maxWidth: 620)
+            .frame(maxWidth: .infinity)
+        }
+        .accessibilityIdentifier(PocketAccessibilityID.incomingScreen)
+        .navigationBarBackButtonHidden(true)
+        .pocketCanvas()
+        .onAppear {
+            if !reduceMotion { pulse = true }
+        }
+        .onChange(of: reduceMotion) { shouldReduce in
+            pulse = !shouldReduce
+        }
+    }
+
+    private var callMark: some View {
+        ZStack {
+            Circle()
+                .stroke(PocketPalette.accent.opacity(0.22), lineWidth: 2)
+                .frame(width: 164, height: 164)
+                .scaleEffect(pulse ? 1.18 : 0.94)
+                .opacity(reduceMotion ? 0.6 : (pulse ? 0.08 : 0.55))
+                .animation(
+                    reduceMotion ? nil : .easeInOut(duration: 1.25).repeatForever(autoreverses: true),
+                    value: pulse
+                )
+            Circle()
+                .fill(PocketPalette.accent.opacity(0.14))
+                .frame(width: 128, height: 128)
+            Image(systemName: "waveform.and.mic")
+                .font(.system(size: 50, weight: .semibold))
+                .foregroundStyle(PocketPalette.accent)
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var callActions: some View {
+        let context = CheckpointContext(bundle: state.bundle)
+        return VStack(spacing: 12) {
+            Button {
+                send(.answer(context))
+            } label: {
+                Label("Answer briefing", systemImage: "phone.fill")
+                    .font(.title3.weight(.bold))
+                    .frame(maxWidth: .infinity, minHeight: 58)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(PocketPalette.accent)
+            .foregroundStyle(Color.black.opacity(0.82))
+            .accessibilityIdentifier(PocketAccessibilityID.answer)
+            .accessibilityHint(
+                state.integrity.allowsBriefing
+                    ? "Starts the cached checkpoint briefing"
+                    : "Unavailable until checkpoint integrity verification succeeds"
+            )
+            .disabled(!state.integrity.allowsBriefing)
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    listenLaterButton(context: context)
+                    snoozeMenu(context: context)
+                }
+                VStack(spacing: 12) {
+                    listenLaterButton(context: context)
+                    snoozeMenu(context: context)
+                }
+            }
+        }
+    }
+
+    private func listenLaterButton(context: CheckpointContext) -> some View {
+        Button {
+            send(.listenLater(context))
+        } label: {
+            Label("Listen later", systemImage: "bookmark")
+                .frame(maxWidth: .infinity, minHeight: 50)
+        }
+        .buttonStyle(.bordered)
+        .accessibilityIdentifier(PocketAccessibilityID.listenLater)
+    }
+
+    private func snoozeMenu(context: CheckpointContext) -> some View {
+        Menu {
+            ForEach(SnoozeOption.allCases, id: \.self) { option in
+                Button(option.title) {
+                    send(.snooze(context, option))
+                }
+            }
+        } label: {
+            Label("Snooze", systemImage: "alarm")
+                .frame(maxWidth: .infinity, minHeight: 50)
+        }
+        .buttonStyle(.bordered)
+        .accessibilityIdentifier(PocketAccessibilityID.snooze)
+        .accessibilityHint("Choose how long to silence this briefing")
+    }
+}
+#endif

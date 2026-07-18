@@ -10,12 +10,17 @@ options:
 packages:
   PocketContracts:
     path: ../../packages/PocketContracts
-  # Feature packages plug in here as lanes hand them up (Atlas integrates):
-  # PocketUI:            { path: ../../packages/PocketUI }
-  # PocketInference:     { path: ../../packages/PocketInference }
-  # PocketVoice:         { path: ../../packages/PocketVoice }
-  # PocketSyncClient:    { path: ../../packages/PocketSyncClient }
-  # PocketActionsClient: { path: ../../packages/PocketActionsClient }
+  PocketCall:
+    path: ../../packages/PocketCall
+  PocketBriefing:
+    path: ../../packages/PocketBriefing
+  PocketUI:
+    path: ../../packages/PocketUI
+  PocketInference:
+    path: ../../packages/PocketInference
+  PocketVoice:
+    path: ../../packages/PocketVoice
+  # Relay's PocketSyncClient/PocketActionsClient are Phase-B (real gateway); not wired for the Phase-A fixture build.
 targets:
   SentiPocketApp:
     type: application
@@ -26,6 +31,11 @@ targets:
         buildPhase: resources
     dependencies:
       - package: PocketContracts
+      - package: PocketCall
+      - package: PocketBriefing
+      - package: PocketUI
+      - package: PocketInference
+      - package: PocketVoice
     info:
       path: Sources/Info.plist
       properties:
