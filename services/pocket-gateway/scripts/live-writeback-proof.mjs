@@ -2,9 +2,9 @@
 // Usage: node scripts/live-writeback-proof.mjs <sessionId> <targetSequence>
 // Proves the full path: sl session reply -> parseActionResult -> real verifyActionLanded read-back
 // -> result=.action -> Ed25519-signed .posted receipt that verifies. NEVER run against a live room.
-import { execFileSync } from 'node:child_process';
 import { executeAction, computeProposalHash, verifyReceipt } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
+import { makeSlRunner } from '../src/sl-runner.mjs';
 
 const [sid, tseqStr] = process.argv.slice(2);
 const tseq = Number(tseqStr);
@@ -13,8 +13,9 @@ if (!sid || !Number.isInteger(tseq)) {
   process.exit(1);
 }
 
-// Windows-safe sl runner: cmd /c sl <args...> (resolves the npm sl.cmd shim; args passed as argv so spaces are safe).
-const run = (args) => execFileSync('cmd', ['/c', 'sl', ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+// SHELL-FREE sl runner (Echo #233114): node + SL_CLI_JS, never `cmd /c` (which re-parses metacharacters). On Windows
+// set SL_CLI_JS to the sentinelayer-cli.js path.
+const run = makeSlRunner({ maxBuffer: 256 * 1024 * 1024 });
 
 const { publicKey, privateKey } = generateSigningKeypair();
 const p = {
