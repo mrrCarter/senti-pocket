@@ -2,8 +2,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  stableStringify, canonicalBundleBytes, dedupEvidence,
-  buildBundle, signBundle, verifyBundle, buildSignedBundle, generateSigningKeypair, CONTRACTS_VERSION,
+  canonicalBundlePayload, dedupEvidence,
+  buildBundle, verifyBundle, buildSignedBundle, generateSigningKeypair, CONTRACTS_VERSION,
 } from '../src/bundle.mjs';
 
 const RAW = {
@@ -27,9 +27,10 @@ const SUMMARY = {
   blockers: ['Carter gate: billing -> CI.'],
 };
 
-test('stableStringify is order-independent', () => {
-  assert.equal(stableStringify({ b: 1, a: 2 }), stableStringify({ a: 2, b: 1 }));
-  assert.equal(stableStringify({ a: [3, { y: 1, x: 2 }] }), '{"a":[3,{"x":2,"y":1}]}');
+test('canonicalBundlePayload is deterministic + domain-tagged pocket.bundle.v1', () => {
+  const b = buildBundle(RAW, SUMMARY, { signingKeyId: 'k1', createdAt: '2026-07-18T10:40:00Z' });
+  assert.ok(canonicalBundlePayload(b).startsWith('pocket.bundle.v1\n'));
+  assert.equal(canonicalBundlePayload(b), canonicalBundlePayload({ ...b }), 'stable');
 });
 
 test('dedupEvidence removes dupes and sorts by sequence', () => {

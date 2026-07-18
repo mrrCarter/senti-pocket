@@ -4,25 +4,40 @@
 import { sign as edSign, verify as edVerify, generateKeyPairSync, createPrivateKey, createPublicKey } from 'node:crypto';
 import { scrubText } from './scrub.mjs';
 
-export const CONTRACTS_VERSION = '0.1.0';
+export const CONTRACTS_VERSION = '0.1.8';
 /** Max UTF-8 bytes for any single phone-visible evidence snippet (bounded egress). */
 export const MAX_EVIDENCE_SNIPPET_BYTES = 2048;
 /** Max UTF-8 bytes for the entire signed bundle body (defense against a pathological summary). */
 export const MAX_BUNDLE_BYTES = 512 * 1024;
 
-/** Deterministic JSON: recursively sorted object keys, no incidental whitespace. Signer + verifier must agree byte-for-byte. */
-export function stableStringify(v) {
-  if (v === null || typeof v !== 'object') return JSON.stringify(v);
-  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
-  const keys = Object.keys(v).sort();
-  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
-}
+// ---- pocket.bundle.v1 canonical — MUST byte-match PocketContracts.swift canonicalBundlePayload() (@b25347a) ----
+// Length+count-prefixed, presence-flagged grade, CHECKED epoch-millis dates, binds ALL fields except `signature`.
+// Same discipline as canonicalReceiptPayload v4 / ActionProposal v3: injection-proof AND cross-language deterministic
+// (Swift's Date round-trip loses raw-JSON date spellings, so dates are epoch-millis, never re-serialized JSON).
+const BUNDLE_MS_BOUND = 253402300800000; // ~year 9999 in epoch ms (mirrors Swift ActionReceipt.safeEpochMillis bound)
+const lpB = (s) => `${Buffer.byteLength(String(s ?? ''), 'utf8')}:${s ?? ''}`;
+const iB = (n) => lpB(String(n));
+const bundleEpochMs = (d) => { if (d == null) return ''; const m = new Date(d).getTime(); return (Number.isFinite(m) && m >= -BUNDLE_MS_BOUND && m <= BUNDLE_MS_BOUND) ? String(m) : ''; };
+const msB = (d) => lpB(bundleEpochMs(d));
+const optB = (s) => (s != null ? '1' + lpB(s) : '0');
+const arrB = (xs, f) => lpB(String((xs || []).length)) + (xs || []).map(f).join('');
+const evB = (e) => lpB(e.id) + lpB(e.sessionId) + iB(e.sequence) + lpB(e.agentId) + lpB(e.snippet) + msB(e.ts);
+const claimB = (c) => lpB(c.id) + lpB(c.text) + lpB(c.kind) + arrB(c.evidenceIds, lpB);
+const agentB = (a) => lpB(a.agentId) + lpB(a.summary) + arrB(a.claims, claimB) + arrB(a.evidence, evB);
 
-/** The exact bytes that are signed/verified: the bundle minus its own `signature` field. */
-export function canonicalBundleBytes(bundle) {
-  const { signature, ...signed } = bundle;
-  return Buffer.from(stableStringify(signed), 'utf8');
+/** The exact canonical string the bundle signature covers — byte-identical to Swift canonicalBundlePayload(). */
+export function canonicalBundlePayload(b) {
+  const s = b.summary || {};
+  const summaryCanon = lpB(s.checkpointId) + lpB(s.headline) + lpB(s.summaryBaselineSchema) + optB(s.grade)
+    + arrB(s.perAgent, agentB) + arrB(s.risks, lpB) + arrB(s.blockers, lpB);
+  return 'pocket.bundle.v1\n'
+    + lpB(b.contractsVersion) + lpB(b.checkpointId) + lpB(b.sessionId) + iB(b.sequenceStart) + iB(b.sequenceEnd)
+    + summaryCanon
+    + arrB(b.evidence, evB)
+    + msB(b.createdAt) + lpB(b.signingKeyId);
 }
+/** The exact bytes that are signed/verified (pocket.bundle.v1; binds every field except `signature`). */
+export function canonicalBundleBytes(bundle) { return Buffer.from(canonicalBundlePayload(bundle), 'utf8'); }
 
 /** Dedup EvidenceRefs by id, ordered by source sequence (bounded, stable UI order). */
 export function dedupEvidence(refs) {
@@ -55,11 +70,24 @@ export function projectEvidenceRef(r) {
   };
 }
 
-/** Project one AgentSummary to the frozen schema (agentId, summary, evidence[]); unknown keys dropped. */
+const CLAIM_KINDS = new Set(['fact', 'inference', 'recommendation']);
+/** Project one Claim to the frozen schema {id,text,kind,evidenceIds[]}; unknown kind => inference (fail-safe). */
+function projectClaim(c) {
+  if (!c || typeof c !== 'object') return null;
+  return {
+    id: scrubStr(c.id, SUMMARY_CAPS.str),
+    text: scrubStr(c.text, SUMMARY_CAPS.summary),
+    kind: CLAIM_KINDS.has(c.kind) ? c.kind : 'inference',
+    evidenceIds: Array.isArray(c.evidenceIds) ? c.evidenceIds.slice(0, SUMMARY_CAPS.evidence).map((x) => scrubStr(x, SUMMARY_CAPS.str)) : [],
+  };
+}
+
+/** Project one AgentSummary to the frozen schema (agentId, summary, claims[], evidence[]); unknown keys dropped. */
 function projectAgentSummary(a) {
   if (!a || typeof a !== 'object') return null;
   const evidence = Array.isArray(a.evidence) ? a.evidence.slice(0, SUMMARY_CAPS.evidence).map(projectEvidenceRef).filter(Boolean) : [];
-  return { agentId: scrubStr(a.agentId, SUMMARY_CAPS.str), summary: scrubStr(a.summary, SUMMARY_CAPS.summary), evidence };
+  const claims = Array.isArray(a.claims) ? a.claims.slice(0, SUMMARY_CAPS.evidence).map(projectClaim).filter(Boolean) : [];
+  return { agentId: scrubStr(a.agentId, SUMMARY_CAPS.str), summary: scrubStr(a.summary, SUMMARY_CAPS.summary), claims, evidence };
 }
 
 /**

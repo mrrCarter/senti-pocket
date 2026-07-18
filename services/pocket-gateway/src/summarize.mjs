@@ -59,7 +59,16 @@ export function summarize(rawCheckpoint, descriptor = {}) {
     const summary = clamp(`${agentId}: ${evs.length} message${evs.length === 1 ? '' : 's'} (${span}).`, LIMITS.SUMMARY_BYTES);
     // bounded citations: first, last, and evenly-spread interior events (deterministic).
     const picks = pickSpread(evs, LIMITS.EVIDENCE_PER_AGENT);
-    return { agentId, summary, evidence: picks.map((e) => evidenceFrom(rc, e)) };
+    const evidence = picks.map((e) => evidenceFrom(rc, e));
+    // one GROUNDED fact claim per agent: a count/span statement DIRECTLY supported by the cited evidence (kind=fact).
+    // The LLM-enriched summarizer adds inference/recommendation claims later, reusing the same evidence ids.
+    const claims = [{
+      id: `claim_${rc.checkpointId}_${agentId}`,
+      text: clamp(`${agentId} contributed ${evs.length} message${evs.length === 1 ? '' : 's'} (${span}).`, LIMITS.SUMMARY_BYTES),
+      kind: 'fact',
+      evidenceIds: evidence.map((e) => e.id),
+    }];
+    return { agentId, summary, claims, evidence };
   });
 
   const headline = clamp(
