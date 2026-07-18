@@ -38,14 +38,20 @@ const { publicKey: TESTPUB, privateKey: TESTKEY } = generateSigningKeypair();
 const opts = (extra) => ({ knownSessionIds: [KNOWN], store: new Map(), now: '2026-07-18T12:02:00Z', signingKey: TESTKEY, signingKeyId: 'gw-key', verifyReadback: () => true, ...extra });
 
 // ---------- canonical / KAV ----------
-test('canonicalPayload matches the frozen v0.1.8 v3 length-prefixed format exactly', () => {
+test('canonicalPayload matches the frozen v0.1.8 v3 format exactly (@7e1cfbe, sourceQuestionId presence-flag)', () => {
   const p = { id: 'p1', kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'post X', createdAt: new Date(1752835200 * 1000), sourceQuestionId: null };
-  assert.equal(canonicalPayload(p), 'pocket.actionproposal.v3\n2:p113:threadedReply2:s13:1006:post X13:17528352000000:');
+  // sourceQuestionId=null -> presence flag "0" (not lp("")); tail is ...13:17528352000000 + 0
+  assert.equal(canonicalPayload(p), 'pocket.actionproposal.v3\n2:p113:threadedReply2:s13:1006:post X13:17528352000000');
 });
 
-test('KAV: Node proposalHash byte-matches the Swift v0.1.8 v3 known-answer vector', () => {
+test('KAV: Node proposalHash byte-matches the Swift v0.1.8 v3 known-answer vector (@7e1cfbe)', () => {
   const p = { id: 'p1', kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'post X', createdAt: new Date(1752835200 * 1000), sourceQuestionId: null };
-  assert.equal(computeProposalHash(p), 'fYV2Bi_mHlJC76SyRGtBZ3wWksXAKUeXTNqor9aLLPk', 'Node hash == Swift v3 KAV');
+  assert.equal(computeProposalHash(p), 'Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY', 'Node hash == Swift v3 KAV @7e1cfbe');
+});
+
+test('sourceQuestionId presence flag: null distinct from empty string', () => {
+  const base = { id: 'p1', kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'x', createdAt: new Date(1752835200 * 1000) };
+  assert.notEqual(canonicalPayload({ ...base, sourceQuestionId: null }), canonicalPayload({ ...base, sourceQuestionId: '' }));
 });
 
 test('v3 binds id: same content, different id => distinct hashes (kills confirm-swap)', () => {

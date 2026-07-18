@@ -78,9 +78,10 @@ export function epochMs(t) {
  */
 export function canonicalPayload(p) {
   const lp = (s) => `${Buffer.byteLength(String(s), 'utf8')}:${s}`;
+  const src = p.sourceQuestionId != null ? '1' + lp(p.sourceQuestionId) : '0'; // presence flag: nil != some("") (Pulse #231475)
   return 'pocket.actionproposal.v3\n'
     + lp(p.id) + lp(p.kind) + lp(p.targetSessionId) + lp(String(p.targetSequence))
-    + lp(p.renderedPreview) + lp(epochMs(p.createdAt)) + lp(p.sourceQuestionId ?? '');
+    + lp(p.renderedPreview) + lp(epochMs(p.createdAt)) + src;
 }
 
 /** proposalHash = base64url(SHA-256(UTF-8(canonicalPayload))), '=' stripped — matches Swift computeHash. */
