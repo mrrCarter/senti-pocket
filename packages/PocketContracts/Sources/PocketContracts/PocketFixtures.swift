@@ -8,11 +8,11 @@ import CryptoKit
 /// nobody invents shapes. DEMO values (fixed timestamps, PLACEHOLDER signatures) — a placeholder signature
 /// must NEVER render as verified; a pending receipt must NEVER render as sent.
 public enum PocketFixtures {
-    public static let ts = Date(timeIntervalSince1970: 1_752_835_200)
+    public static let ts = Date(timeIntervalSince1970: 1_784_371_200)   // 2026-07-18T10:40Z — matches canonical_checkpoint.json
     public static let sessionId = "954233b7-1822-42bc-9cfe-1eb95eb0357a"
 
     public static let evidence: [EvidenceRef] = [
-        EvidenceRef(id: "ev_1", sessionId: sessionId, sequence: 230141, agentId: "claude-pocket-relay", snippet: "atk_ parser now matches the live token format", ts: ts),
+        EvidenceRef(id: "ev_1", sessionId: sessionId, sequence: 230141, agentId: "claude-pocket-relay", snippet: "ACCESS_TOKEN_PATTERN now matches atk_<payload>.<43-char-HMAC>", ts: ts),
         EvidenceRef(id: "ev_2", sessionId: sessionId, sequence: 230160, agentId: "claude-warden", snippet: "entryPoint predicate is now exact-equality; positive-accept fixture present", ts: ts)
     ]
 
