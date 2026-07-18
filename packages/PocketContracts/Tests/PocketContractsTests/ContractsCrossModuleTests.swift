@@ -88,7 +88,7 @@ final class ContractsCrossModuleTests: XCTestCase {
     func testKnownAnswerVectorCanonicalPayload() {
         XCTAssertEqual(
             ActionProposal.canonicalPayload(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: nil),
-            "pocket.actionproposal.v3\n2:p113:threadedReply2:s13:1006:post X13:17528352000000:")
+            "pocket.actionproposal.v3\n2:p113:threadedReply2:s13:1006:post X13:17528352000000")
     }
 
     /// Injection resistance: under OLD newline-delimiting these collide; length-prefix keeps them distinct.
@@ -119,7 +119,7 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertTrue(p.hashMatchesContent())
         XCTAssertTrue(p.isValidForConfirmation())
         // v0.1.8 KAV HASH: base64url(SHA-256(v3 canonical)) for (id p1, threadedReply, s1, 100, "post X", ts, nil).
-        XCTAssertEqual(p.proposalHash, "fYV2Bi_mHlJC76SyRGtBZ3wWksXAKUeXTNqor9aLLPk")
+        XCTAssertEqual(p.proposalHash, "Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY")
         let swapped = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post EVIL", createdAt: ts, sourceQuestionId: nil, proposalHash: p.proposalHash)
         XCTAssertFalse(swapped.isValidForConfirmation())
         let noConfirm = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", requiresConfirmation: false, createdAt: ts, sourceQuestionId: nil, proposalHash: p.proposalHash)
@@ -134,9 +134,11 @@ final class ContractsCrossModuleTests: XCTestCase {
         let bDiffId = ActionProposal(id: "B", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: nil)
         let cDiffTime = ActionProposal(id: "A", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts.addingTimeInterval(1), sourceQuestionId: nil)
         let dDiffProvenance = ActionProposal(id: "A", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: "q9")
+        let eEmptyProvenance = ActionProposal(id: "A", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: "")
         XCTAssertNotEqual(a.proposalHash, bDiffId.proposalHash)        // different id
         XCTAssertNotEqual(a.proposalHash, cDiffTime.proposalHash)      // different createdAt
         XCTAssertNotEqual(a.proposalHash, dDiffProvenance.proposalHash)// different sourceQuestionId
+        XCTAssertNotEqual(a.proposalHash, eEmptyProvenance.proposalHash)// nil vs some("") — presence flag (Pulse #231475)
     }
     #endif
 }

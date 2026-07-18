@@ -2,7 +2,8 @@
 // v0.1.8 (Echo #231350 re-audit): canonical ActionProposal v2 -> v3 binds id + createdAt + sourceQuestionId
 //   (was kind/session/sequence/preview ONLY) — two same-CONTENT proposals with different ids/times now get
 //   DISTINCT hashes, killing the confirm-swap where a stale A intent confirmed a same-content displayed B.
-//   proposalHash + KAV CHANGE (new HASH fYV2Bi_...). isValidForConfirmation also rejects an out-of-range createdAt.
+//   proposalHash + KAV CHANGE (new HASH Wk4lhn...; sourceQuestionId presence-flagged so nil != "" per Pulse #231475).
+//   isValidForConfirmation also rejects an out-of-range createdAt.
 //   (Pairs with PocketCall's opaque single-use ConfirmationCapability + VerifiedBundle ingress.) Relay re-mirror.
 // v0.1.7 (Relay/Echo/Pulse converged #231081-#231316): ActionReceipt.resultingSequence:Int -> `result:
 //   ActionResultRef?` tagged union — a true threadedReply is an ACTION (actionId + target it threads under),
@@ -232,9 +233,11 @@ public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
         // ids/times get DISTINCT hashes (kills the confirm-swap where A's intent confirmed a same-content B).
         // createdAt as CHECKED epoch-millis (never traps; "" only for an out-of-range date, which isValidForConfirmation rejects).
         let created = ActionReceipt.safeEpochMillis(createdAt).map(String.init) ?? ""
+        // presence flag so nil != some("") (Pulse #231475 — same fix as ActionResultRef's optional cursor).
+        let src = sourceQuestionId.map { "1" + lp($0) } ?? "0"
         return "pocket.actionproposal.v3\n"
             + lp(id) + lp(kind.rawValue) + lp(targetSessionId) + lp(String(targetSequence))
-            + lp(renderedPreview) + lp(created) + lp(sourceQuestionId ?? "")
+            + lp(renderedPreview) + lp(created) + src
     }
     #if canImport(CryptoKit)
     /// proposalHash = base64url(SHA-256(UTF-8(canonicalPayload))). Producers compute; confirm + writeback verify.
