@@ -133,6 +133,21 @@ test('validateBundleSemantics: accepts a well-formed bundle, flags each violatio
   assert.match(validateBundleSemantics({ ...good, createdAt: '2026-07-18T10:40:00.0005Z' }).errors.join(), /createdAt/);
 });
 
+test('validateBundleSemantics: rejects a same-id/different-content evidence clash (top-level vs per-agent)', () => {
+  const good = buildBundle(RAW, SUMMARY, { signingKeyId: 'k1', createdAt: '2026-07-18T10:40:00Z' });
+  // per-agent evidence reuses a top-level id but with different content => ambiguous identity, must be rejected.
+  const clash = { ...good, summary: { ...good.summary,
+    perAgent: [{ agentId: 'a', summary: 's', claims: [], evidence: [{ ...good.evidence[0], snippet: 'DIFFERENT CONTENT' }] }] } };
+  assert.match(validateBundleSemantics(clash).errors.join(), /conflicting evidence identity/);
+  // a fact citing per-agent-only evidence (not in top-level) is also rejected (resolves against top-level only).
+  const nestedOnly = { ...good, evidence: [good.evidence[0]], summary: { ...good.summary,
+    perAgent: [{ agentId: 'a', summary: 's', claims: [{ id: 'c1', text: 't', kind: 'fact', evidenceIds: ['nested_only'] }],
+      evidence: [{ id: 'nested_only', sessionId: RAW.sessionId, sequence: 9, agentId: 'a', snippet: 'x', ts: '2026-07-18T10:00:00Z' }] }] } };
+  const errs = validateBundleSemantics(nestedOnly).errors.join();
+  assert.match(errs, /not in top-level evidence/);
+  assert.match(errs, /cites foreign evidence/);
+});
+
 test('buildBundle FAILS CLOSED on an inverted sequence range', () => {
   assert.throws(
     () => buildBundle({ checkpointId: 'cp', sessionId: 's', startSequence: 300, endSequence: 100 },

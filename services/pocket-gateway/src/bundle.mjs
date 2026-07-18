@@ -199,17 +199,27 @@ export function validateBundleSemantics(b) {
   if (canonicalEpochMs(b.createdAt) == null) push(`createdAt: not an exact epoch-ms (${JSON.stringify(b.createdAt)})`);
   const sum = b.summary && typeof b.summary === 'object' ? b.summary : {};
   if (sum.checkpointId && b.checkpointId && sum.checkpointId !== b.checkpointId) push('summary.checkpointId != bundle.checkpointId');
+  // Canonical identity of an EvidenceRef (frozen scalar fields; ts normalized to exact epoch-ms) — used to reject a
+  // same-id / different-content clash between the top-level set and a per-agent list (Pulse's semantic adversary 2).
+  const evSig = (e) => JSON.stringify([e.id, e.sessionId ?? '', e.sequence ?? null, e.agentId ?? '', e.snippet ?? '', canonicalEpochMs(e.ts)]);
   const evIds = new Set();
+  const evById = new Map();
   for (const e of Array.isArray(b.evidence) ? b.evidence : []) {
     if (!e || !e.id) { push('evidence: missing id'); continue; }
     if (evIds.has(e.id)) push(`evidence: duplicate id ${e.id}`);
     evIds.add(e.id);
+    evById.set(e.id, evSig(e));
     if (b.sessionId && e.sessionId && e.sessionId !== b.sessionId) push(`evidence ${e.id}: foreign sessionId`);
     if (e.ts != null && e.ts !== '' && canonicalEpochMs(e.ts) == null) push(`evidence ${e.id}: ts not an exact epoch-ms (${JSON.stringify(e.ts)})`);
   }
+  // Every claim/briefing link resolves ONLY against the canonical TOP-LEVEL evidence set (that is what the phone's UI
+  // resolves). Per-agent evidence must be PRESENT in top-level AND byte-identical to it — a same-id/different-content
+  // clash is an ambiguous evidence identity and is rejected even if the bundle is correctly signed.
   for (const a of Array.isArray(sum.perAgent) ? sum.perAgent : []) {
     for (const ae of Array.isArray(a.evidence) ? a.evidence : []) {
-      if (ae && ae.id && !evIds.has(ae.id)) push(`agent ${a.agentId}: evidence ${ae.id} not in top-level evidence`);
+      if (!ae || !ae.id) continue;
+      if (!evIds.has(ae.id)) push(`agent ${a.agentId}: evidence ${ae.id} not in top-level evidence`);
+      else if (evById.get(ae.id) !== evSig(ae)) push(`agent ${a.agentId}: conflicting evidence identity ${ae.id} (per-agent content != top-level)`);
     }
     for (const c of Array.isArray(a.claims) ? a.claims : []) {
       const cited = Array.isArray(c.evidenceIds) ? c.evidenceIds : [];
