@@ -21,8 +21,18 @@ final class ContractsCrossModuleTests: XCTestCase {
         _ = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 230180, renderedPreview: "x", requiresConfirmation: true, createdAt: ts, sourceQuestionId: "q1", proposalHash: "H")
 
         XCTAssertEqual(rawCp.events.first?.sequenceId, 230141)
-        XCTAssertEqual(bundle.contractsVersion, "0.1.5")
+        XCTAssertEqual(bundle.contractsVersion, "0.1.6")
         XCTAssertEqual(agentSummary.claims.first?.kind, .fact)
+    }
+
+    /// Extreme decoded Date is rejected, NEVER trapped (Echo 62e08e9 A: Int(hugeDouble) crash/DoS).
+    func testExtremeDateRejectedNonTrapping() {
+        let extreme = Date(timeIntervalSince1970: 1e18)   // absurd; must be rejected, not crash
+        let r = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: extreme, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: "k1")
+        XCTAssertNil(ActionReceipt.safeEpochMillis(extreme))
+        XCTAssertFalse(r.hasSaneDates())
+        XCTAssertFalse(r.isStructurallyValid())
+        _ = r.canonicalReceiptPayload()                   // must not trap even on the bad date
     }
 
     /// Receipt KAV + per-field tamper (Echo 43b796b): canonicalReceiptPayload v2 binds every field except
@@ -32,7 +42,7 @@ final class ContractsCrossModuleTests: XCTestCase {
             ActionReceipt(id: id, proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: confirmedAt, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: keyId)
         }
         let base = receipt(confirmedAt: ts)
-        XCTAssertEqual(base.canonicalReceiptPayload(), "pocket.actionreceipt.v2\n2:r12:p16:posted3:2002:s11:H10:175283520010:17528352000:2:k1")
+        XCTAssertEqual(base.canonicalReceiptPayload(), "pocket.actionreceipt.v3\n2:r12:p16:posted3:2002:s11:H13:175283520000013:17528352000000:2:k1")
         // each previously-omitted field now changes the signed bytes:
         XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(id: "r2", confirmedAt: ts).canonicalReceiptPayload())
         XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(confirmedAt: ts.addingTimeInterval(1)).canonicalReceiptPayload())

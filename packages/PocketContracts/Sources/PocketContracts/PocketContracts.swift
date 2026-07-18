@@ -1,4 +1,9 @@
-// PocketContracts v0.1.5 — FROZEN by Atlas (claude-pocket-atlas).
+// PocketContracts v0.1.6 — FROZEN by Atlas (claude-pocket-atlas).
+// v0.1.6 (Echo 62e08e9 HOLD-A + tone): canonicalReceiptPayload -> v3 uses CHECKED epoch-MILLISECONDS
+//   (safeEpochMillis) — never TRAPS on an extreme decoded Date (Int(hugeDouble) trap = crash/DoS) and binds
+//   subsecond content; isStructurallyValid now rejects non-finite/out-of-range dates. Constrained BriefingTone
+//   enum + optional BriefingSegment.tone (closed set end-to-end; non-breaking). Receipt canon v2->v3: Relay re-mirror.
+//   (Relay owns the remaining gateway items B/C: require key before post; single-use pending->posted flush.)
 // v0.1.5 (Echo 43b796b HOLD): canonicalReceiptPayload -> v2 binds EVERY field except `signature` (adds id,
 //   confirmedByHumanAt, signingKeyId, failureReason) -> no field-substitution while ed25519 still verifies;
 //   SignatureState now returns .invalid (not .unsigned) when a signature is PRESENT but the receipt is
@@ -31,7 +36,7 @@ import CryptoKit
 #endif
 
 public enum PocketContracts {
-    public static let version = "0.1.5"
+    public static let version = "0.1.6"
 }
 
 // MARK: - Source (Relay produces RawCheckpoint + CheckpointSummary; gateway summarizes)
@@ -155,9 +160,16 @@ public struct BriefingSegment: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let text: String
     public let evidenceIds: [String]
-    public init(id: String, text: String, evidenceIds: [String]) {
-        self.id = id; self.text = text; self.evidenceIds = evidenceIds
+    public let tone: BriefingTone?              // v0.1.6 (Echo): CONSTRAINED narration tone (nil = neutral default)
+    public init(id: String, text: String, evidenceIds: [String], tone: BriefingTone? = nil) {
+        self.id = id; self.text = text; self.evidenceIds = evidenceIds; self.tone = tone
     }
+}
+
+/// Constrained narration tone (Echo 62e08e9): TTS/provider tone tags must be a CLOSED set end-to-end so the model
+/// cannot emit a free-form voice/style string that reaches the synthesizer. Add cases here (never accept raw strings).
+public enum BriefingTone: String, Codable, Equatable, Sendable {
+    case neutral, urgent, calm, celebratory
 }
 
 public struct QuestionAnswer: Codable, Equatable, Identifiable, Sendable {
@@ -282,6 +294,7 @@ public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
     /// signature + signingKeyId (and no failureReason); .pendingConnectivity MUST carry none of them; .failed
     /// MUST carry failureReason and none of the posted fields. The phone/gateway reject a receipt that fails this.
     public func isStructurallyValid() -> Bool {
+        guard hasSaneDates() else { return false }   // reject non-finite/out-of-range dates (Echo 62e08e9 A: no trap)
         switch status {
         case .posted:
             return resultingSequence != nil && executedAt != nil && signature != nil && signingKeyId != nil && failureReason == nil
@@ -292,21 +305,38 @@ public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
         }
     }
 
+    /// Safe CHECKED epoch-MILLISECONDS: nil for a non-finite or out-of-range Date — never TRAPS (Echo 62e08e9 A:
+    /// `Int(hugeDouble)` traps in Swift). Millis (not seconds) so subsecond Date content is actually BOUND.
+    public static func safeEpochMillis(_ date: Date) -> Int64? {
+        let t = date.timeIntervalSince1970
+        guard t.isFinite else { return nil }
+        let millis = (t * 1000).rounded()
+        let bound = 253_402_300_800_000.0   // ~year 9999
+        guard millis >= -bound, millis <= bound else { return nil }
+        return Int64(millis)
+    }
+    /// All dates finite + in range, so canonicalization/signing can never trap. Folded into isStructurallyValid.
+    public func hasSaneDates() -> Bool {
+        guard ActionReceipt.safeEpochMillis(confirmedByHumanAt) != nil else { return false }
+        if let e = executedAt, ActionReceipt.safeEpochMillis(e) == nil { return false }
+        return true
+    }
+
     /// The EXACT bytes the gateway ed25519-signs and the phone verifies. Length-prefixed (injection-proof),
-    /// versioned; mirror byte-for-byte in the Node gateway. v2 (Echo 43b796b): binds EVERY semantically-significant
-    /// field EXCEPT `signature` itself, so no field (id / confirmedByHumanAt / signingKeyId / …) can be substituted
-    /// while the ed25519 signature still verifies. Dates are Int epoch-seconds for cross-lane determinism.
+    /// versioned; mirror byte-for-byte in the Node gateway. v3 (Echo 62e08e9): CHECKED epoch-MILLISECONDS (binds
+    /// subsecond content + never traps on an extreme decoded Date). Binds every field EXCEPT `signature`.
     public func canonicalReceiptPayload() -> String {
         func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
-        return "pocket.actionreceipt.v2\n"
+        func ms(_ d: Date?) -> String { d.flatMap(ActionReceipt.safeEpochMillis).map(String.init) ?? "" }
+        return "pocket.actionreceipt.v3\n"
             + lp(id)
             + lp(proposalId)
             + lp(status.rawValue)
             + lp(resultingSequence.map(String.init) ?? "")
             + lp(targetSessionId)
             + lp(confirmedProposalHash)
-            + lp(String(Int(confirmedByHumanAt.timeIntervalSince1970)))
-            + lp(executedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "")
+            + lp(ms(confirmedByHumanAt))
+            + lp(ms(executedAt))
             + lp(failureReason ?? "")
             + lp(signingKeyId ?? "")
     }
