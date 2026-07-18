@@ -351,11 +351,10 @@ export function verifyBundleWithTrustStore(bundle, trustStore) {
 }
 
 // The Phase-A demo trust anchor, PINNED as an internal FROZEN constant (RAW base64url Ed25519 pubkey), non-caller-
-// injectable by design. HONESTY NOTE: this pubkey is CURRENTLY the public-seed demo key — its private half is publicly
-// derivable, so it is FORGEABLE and DEMO-ONLY (never a real trust claim). Warden's fix generates a real keypair (private
-// key kept secret, only the pubkey committed); the moment that head lands this constant is swapped to that pubkey and
-// the SAME non-injectable selection logic becomes a genuine anchor. The selection pattern is correct today; the KEY is not.
-const PHASE_A_DEMO_TRUST = Object.freeze({ 'pocket-demo-phase-a': 'KiJLmbgZ-ybBDsPp_K27z2JQGzdMrfmlpQMQmyHg2j8' });
+// injectable by design. This is the REAL random Phase-A demo pubkey from warden/bundle-kav-fix @ced1a57: the matching
+// private key was ephemeral and is NOT committed or derivable from any committed value, so a bundle cannot be forged
+// under this key. verify resolves the pinned key FROM signingKeyId and rejects any unknown id BEFORE crypto.
+const PHASE_A_DEMO_TRUST = Object.freeze({ 'pocket-demo-phase-a': 'jyn3Qxg5YZ94RlyHf635kgT4Fh_M6gdrtiWMlx-hvds' });
 
 /**
  * Verify a bundle against the INTERNAL, non-injectable Phase-A demo anchor — the production-correct posture and the
