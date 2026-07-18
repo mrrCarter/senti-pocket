@@ -1,4 +1,9 @@
-// PocketContracts v0.1.4 — FROZEN by Atlas (claude-pocket-atlas).
+// PocketContracts v0.1.5 — FROZEN by Atlas (claude-pocket-atlas).
+// v0.1.5 (Echo 43b796b HOLD): canonicalReceiptPayload -> v2 binds EVERY field except `signature` (adds id,
+//   confirmedByHumanAt, signingKeyId, failureReason) -> no field-substitution while ed25519 still verifies;
+//   SignatureState now returns .invalid (not .unsigned) when a signature is PRESENT but the receipt is
+//   structurally invalid (tamper signal). Receipt KAV + per-field tamper tests added. (Relay owns the
+//   companion gateway fix: require a signing key BEFORE online execution, never post-then-unsigned.)
 // v0.1.4 (Echo 84d463f HOLD): isValidForConfirmation now FAILS CLOSED without CryptoKit (was fail-open);
 //   ActionReceipt gains isStructurallyValid() (.posted requires seq/executedAt/sig/key; pending forbids all) +
 //   canonicalReceiptPayload() + first-class SignatureState via ed25519 verify (non-nil sig != verified); all
@@ -26,7 +31,7 @@ import CryptoKit
 #endif
 
 public enum PocketContracts {
-    public static let version = "0.1.4"
+    public static let version = "0.1.5"
 }
 
 // MARK: - Source (Relay produces RawCheckpoint + CheckpointSummary; gateway summarizes)
@@ -288,16 +293,22 @@ public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
     }
 
     /// The EXACT bytes the gateway ed25519-signs and the phone verifies. Length-prefixed (injection-proof),
-    /// versioned; mirror byte-for-byte in the Node gateway.
+    /// versioned; mirror byte-for-byte in the Node gateway. v2 (Echo 43b796b): binds EVERY semantically-significant
+    /// field EXCEPT `signature` itself, so no field (id / confirmedByHumanAt / signingKeyId / …) can be substituted
+    /// while the ed25519 signature still verifies. Dates are Int epoch-seconds for cross-lane determinism.
     public func canonicalReceiptPayload() -> String {
         func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
-        return "pocket.actionreceipt.v1\n"
+        return "pocket.actionreceipt.v2\n"
+            + lp(id)
             + lp(proposalId)
             + lp(status.rawValue)
             + lp(resultingSequence.map(String.init) ?? "")
             + lp(targetSessionId)
             + lp(confirmedProposalHash)
+            + lp(String(Int(confirmedByHumanAt.timeIntervalSince1970)))
             + lp(executedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "")
+            + lp(failureReason ?? "")
+            + lp(signingKeyId ?? "")
     }
 
     #if canImport(CryptoKit)
@@ -305,7 +316,8 @@ public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
     /// is a real ed25519 check over canonicalReceiptPayload with the trusted gateway key. The phone MUST render
     /// "sent/verified" ONLY on .verified.
     public func signatureState(gatewayPublicKeyBase64url pk: String) -> SignatureState {
-        guard status == .posted, isStructurallyValid(), let sig = signature else { return .unsigned }
+        guard let sig = signature else { return .unsigned }                       // truly no signature present
+        guard status == .posted, isStructurallyValid() else { return .invalid }   // sig present + bad structure = tamper (Echo)
         guard let pkData = Data(base64URLEncoded: pk),
               let sigData = Data(base64URLEncoded: sig),
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: pkData) else { return .invalid }

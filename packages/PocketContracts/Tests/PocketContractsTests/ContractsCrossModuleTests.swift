@@ -21,9 +21,33 @@ final class ContractsCrossModuleTests: XCTestCase {
         _ = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 230180, renderedPreview: "x", requiresConfirmation: true, createdAt: ts, sourceQuestionId: "q1", proposalHash: "H")
 
         XCTAssertEqual(rawCp.events.first?.sequenceId, 230141)
-        XCTAssertEqual(bundle.contractsVersion, "0.1.4")
+        XCTAssertEqual(bundle.contractsVersion, "0.1.5")
         XCTAssertEqual(agentSummary.claims.first?.kind, .fact)
     }
+
+    /// Receipt KAV + per-field tamper (Echo 43b796b): canonicalReceiptPayload v2 binds every field except
+    /// `signature`, so substituting id / confirmedByHumanAt / signingKeyId changes the signed bytes. Node mirrors this.
+    func testReceiptCanonicalPayloadBindsAllFields() {
+        func receipt(id: String = "r1", confirmedAt: Date, keyId: String = "k1") -> ActionReceipt {
+            ActionReceipt(id: id, proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: confirmedAt, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: keyId)
+        }
+        let base = receipt(confirmedAt: ts)
+        XCTAssertEqual(base.canonicalReceiptPayload(), "pocket.actionreceipt.v2\n2:r12:p16:posted3:2002:s11:H10:175283520010:17528352000:2:k1")
+        // each previously-omitted field now changes the signed bytes:
+        XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(id: "r2", confirmedAt: ts).canonicalReceiptPayload())
+        XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(confirmedAt: ts.addingTimeInterval(1)).canonicalReceiptPayload())
+        XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(confirmedAt: ts, keyId: "k2").canonicalReceiptPayload())
+    }
+
+    #if canImport(CryptoKit)
+    /// SignatureState ordering (Echo): a signature PRESENT on a structurally-invalid receipt is .invalid (tamper), not .unsigned.
+    func testSignatureStateInvalidOnStructuralTamper() {
+        let tampered = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: "sig", signingKeyId: "k1")
+        XCTAssertEqual(tampered.signatureState(gatewayPublicKeyBase64url: "AA"), .invalid)   // present sig + bad structure
+        let unsigned = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        XCTAssertEqual(unsigned.signatureState(gatewayPublicKeyBase64url: "AA"), .unsigned)  // truly no signature
+    }
+    #endif
 
     func testCodableRoundTripFromExternalModule() throws {
         let ev = EvidenceRef(id: "ev_1", sessionId: "s1", sequence: 1, agentId: "a1", snippet: "x", ts: ts)
