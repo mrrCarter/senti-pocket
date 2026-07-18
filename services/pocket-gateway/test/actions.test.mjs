@@ -374,6 +374,59 @@ test('(TOCTOU) getter-backed renderedPreview: EVIL content is never posted (snap
   if (r.status === 'posted') assert.equal(postedPreview, SAFE);
 });
 
+// ---------- Echo exact-head regressions @3f149b7 (locked so they can never silently return) ----------
+test('(TOCTOU/P1) SIGNED receipt binds SNAPSHOT identity, not a getter that flips id/session after snapshot', () => {
+  const EVIL_SESS = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+  const base = { kind: 'threadedReply', targetSequence: 230160, renderedPreview: 'ok', requiresConfirmation: true, createdAt: '2026-07-18T12:00:00Z', sourceQuestionId: null };
+  const goodHash = computeProposalHash({ ...base, id: 'good-id', targetSessionId: KNOWN });
+  let idR = 0, sR = 0;
+  const evil = { ...base };
+  Object.defineProperty(evil, 'id', { enumerable: true, get() { return idR++ === 0 ? 'good-id' : 'EVIL-id'; } });
+  Object.defineProperty(evil, 'targetSessionId', { enumerable: true, get() { return sR++ === 0 ? KNOWN : EVIL_SESS; } });
+  Object.defineProperty(evil, 'proposalHash', { enumerable: true, value: goodHash });
+  const confirmation = { proposalId: 'good-id', confirmedProposalHash: goodHash, confirmedAt: '2026-07-18T12:01:00Z' };
+  const r = executeAction(evil, confirmation, opts({ run: recordingRun('act_hg').run }));
+  assert.equal(r.status, 'posted');
+  // the ONE signed artifact must carry snapshot identity — never the post-snapshot EVIL flips.
+  assert.equal(r.id, 'good-id');
+  assert.equal(r.proposalId, 'good-id');
+  assert.equal(r.targetSessionId, KNOWN);
+  assert.notEqual(r.targetSessionId, EVIL_SESS);
+  assert.equal(verifyReceipt(r, TESTPUB), true);
+});
+
+test('(atomicity/P0) read-back miss never re-posts on retry; the emitted action finalizes exactly-once', () => {
+  const p = makeProposal({ id: 'pdup' });
+  const store = new Map();
+  let posts = 0;
+  const run = (args) => (args[1] === 'reply'
+    ? (posts++, JSON.stringify({ action: { id: 'act_dup_' + posts, targetSequenceId: Number(args[3]), targetCursor: 'c' } }))
+    : '{}');
+  const r1 = executeAction(p, makeConfirm(p), opts({ run, store, verifyReadback: () => false }));
+  assert.equal(r1.status, 'failed');
+  assert.equal(posts, 1);
+  const r2 = executeAction(p, makeConfirm(p), opts({ run, store, verifyReadback: () => false }));
+  assert.equal(r2.status, 'failed');
+  assert.equal(posts, 1, 'retry must NOT re-post an already-emitted governed write');
+  const r3 = executeAction(p, makeConfirm(p), opts({ run, store, verifyReadback: () => true }));
+  assert.equal(r3.status, 'posted');
+  assert.equal(posts, 1, 'finalize re-verifies the SAME emitted action; never re-posts');
+  assert.equal(r3.result.actionId, 'act_dup_1');
+  assert.equal(verifyReceipt(r3, TESTPUB), true);
+});
+
+test('(freshness/P0) NaN/negative/garbage freshness window cannot bypass the stale gate', () => {
+  const p = makeProposal({ id: 'pfresh', createdAt: '2000-01-01T00:00:00Z' });
+  const ancient = makeConfirm(p, { confirmedAt: '2000-01-01T00:00:05Z' }); // years before `now`
+  for (const bad of [{ freshnessSeconds: NaN }, { freshnessSeconds: -1 }, { clockSkewSeconds: NaN }, { freshnessSeconds: 'x' }, { freshnessSeconds: Infinity }]) {
+    const { run, calls } = recordingRun();
+    const r = executeAction(p, ancient, opts({ run, store: new Map(), ...bad }));
+    assert.equal(r.status, 'failed', JSON.stringify(bad));
+    assert.match(r.failureReason, /freshness|stale|future/i);
+    assert.equal(calls.length, 0, 'stale confirm must never post: ' + JSON.stringify(bad));
+  }
+});
+
 test('(freshness) years-old confirmation => failed, ZERO posts', () => {
   const p = makeProposal({ id: 'pold' });
   const { run, calls } = recordingRun();

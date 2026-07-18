@@ -306,6 +306,9 @@ export function executeAction(proposal, confirmation, opts = {}) {
   // Idempotency: only a TERMINAL .posted is single-use; a stored pending must allow a later online flush.
   const prior = snap.id ? store.get(snap.id) : undefined;
   if (prior && prior.status === 'posted') return prior;
+  // A post for this id that ALREADY executed leaves an EMITTED marker (reserved before the external write). It must
+  // NEVER be re-posted, even if last time's read-back could not confirm landing — a retry re-verifies only (Echo P0 atomicity).
+  const priorEmitted = (prior && prior.__emitted) ? prior.__emitted : null;
 
   // 1) strict validation of the SNAPSHOT (kind, known target, safe seq, preview bounds, sane createdAt, hash-integrity)
   const problems = validateProposal(snap, { knownSessionIds: opts.knownSessionIds });
@@ -334,7 +337,9 @@ export function executeAction(proposal, confirmation, opts = {}) {
   }
 
   // 3) offline => honest pending; NEVER "sent". Stored so a later flush is single (idempotent by id).
-  if (!online) {
+  // Skipped once a post was already emitted for this id: going offline can't un-happen a landed write, and a
+  // pending receipt must not clobber the emitted marker (that would re-enable a re-post on the next online retry).
+  if (!online && !priorEmitted) {
     const r = receipt(snap, 'pendingConnectivity', { confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     store.set(snap.id, r);
     return r;
@@ -355,45 +360,85 @@ export function executeAction(proposal, confirmation, opts = {}) {
   if (!nowSnap) {
     return receipt(snap, 'failed', { failureReason: 'server timestamp non-finite/out-of-range (no post attempted)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
-  // server-time FRESHNESS (Echo): the gateway clock is authority; client confirmedAt is telemetry. Reject a
-  // confirmation older than freshnessSeconds or beyond a small forward skew (a years-old/future confirm must NOT post).
-  const nowMs = new Date(nowSnap).getTime();
-  const confMs = new Date(confirmedAtSnap).getTime();
-  const maxAgeMs = (opts.freshnessSeconds ?? 300) * 1000;
-  const skewMs = (opts.clockSkewSeconds ?? 60) * 1000;
-  if (confMs < nowMs - maxAgeMs || confMs > nowMs + skewMs) {
-    return receipt(snap, 'failed', { failureReason: 'confirmation outside server-time freshness window (stale or future)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
-  }
-  // execute the real Senti post (credentials + dates validated -> a .posted is always signable + Swift-sane).
-  // Only immutable snapshots (nowSnap/confirmedAtSnap) flow into the receipt — never the caller's mutable inputs.
-  try {
-    const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--json']);
-    const parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
-    if (!parsed) {
-      return receipt(snap, 'failed', { failureReason: 'post returned no structured action result', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
-    }
-    if (parsed.targetSequenceId !== snap.targetSequence) {
-      return receipt(snap, 'failed', { failureReason: 'posted action threads under a different target sequence than the proposal', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
-    }
-    // bounded read-back VERIFY the action actually landed (authored by us, under the target). Injectable for tests.
-    const verified = opts.verifyReadback
-      ? opts.verifyReadback(snap.targetSessionId, parsed, { run, agent })
-      : verifyActionLanded(snap.targetSessionId, parsed, { run, agent });
-    if (!verified) {
-      return receipt(snap, 'failed', { failureReason: 'writeback not confirmed landed by read-back (never claim posted unverified)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
-    }
+
+  // Shared verify + finalize helpers (credentials are now known-valid). finalizePosted signs from the FROZEN snapshot,
+  // never the caller's mutable `proposal`: a hostile getter that flips AFTER snapshot would otherwise sign a receipt
+  // whose identity diverges from what was validated/confirmed/posted (hostile-getter TOCTOU on the signed artifact, Echo P1).
+  const doVerify = (parsed) => opts.verifyReadback
+    ? opts.verifyReadback(snap.targetSessionId, parsed, { run, agent })
+    : verifyActionLanded(snap.targetSessionId, parsed, { run, agent });
+  const finalizePosted = (parsed, executedAtSnap) => {
     const result = { kind: 'action', actionId: parsed.actionId, targetSequenceId: parsed.targetSequenceId, targetCursor: parsed.targetCursor };
     if (!validateActionResultRef(result)) {
       return receipt(snap, 'failed', { failureReason: 'malformed action result ref (structural bounds)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     }
     const r = signReceipt(
-      receipt(proposal, 'posted', { result, confirmedProposalHash: live, executedAt: nowSnap, confirmedByHumanAt: confirmedAtSnap }),
+      receipt(snap, 'posted', { result, confirmedProposalHash: live, executedAt: executedAtSnap, confirmedByHumanAt: confirmedAtSnap }),
       signingKeyObj, opts.signingKeyId,
     );
     store.set(snap.id, r);
     return r;
+  };
+
+  // EMITTED-RETRY (exactly-once, Echo P0 atomicity): a governed post for this id ALREADY executed (reserved before
+  // the external write). NEVER re-post — only re-verify. Closes the dup-post window where a read-back miss or a
+  // reentrant call would otherwise re-run run(reply). Freshness is intentionally skipped: the write already happened.
+  if (priorEmitted) {
+    if (priorEmitted.parsed && doVerify(priorEmitted.parsed)) return finalizePosted(priorEmitted.parsed, priorEmitted.executedAt);
+    return store.get(snap.id) || receipt(snap, 'failed', { failureReason: 'prior post emitted; not re-posted (read-back unverified or unidentifiable)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+  }
+
+  // server-time FRESHNESS (Echo P0): the gateway clock is authority; client confirmedAt is telemetry. Reject a
+  // confirmation older than freshnessSeconds or beyond a small forward skew. FINITE-GUARD the bounds — a caller-supplied
+  // NaN/negative/garbage window would otherwise make BOTH comparisons false and let a years-old/future confirm post.
+  const nowMs = new Date(nowSnap).getTime();
+  const confMs = new Date(confirmedAtSnap).getTime();
+  const fSec = Number.isFinite(opts.freshnessSeconds) && opts.freshnessSeconds >= 0 ? opts.freshnessSeconds : 300;
+  const sSec = Number.isFinite(opts.clockSkewSeconds) && opts.clockSkewSeconds >= 0 ? opts.clockSkewSeconds : 60;
+  const maxAgeMs = fSec * 1000;
+  const skewMs = sSec * 1000;
+  if (!Number.isFinite(confMs) || !Number.isFinite(nowMs) || confMs < nowMs - maxAgeMs || confMs > nowMs + skewMs) {
+    return receipt(snap, 'failed', { failureReason: 'confirmation outside server-time freshness window (stale or future)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
+  }
+
+  // RESERVE the id BEFORE the external post (Echo P0 atomicity): the protocol was get -> run(reply) -> set, so a
+  // concurrent/reentrant call — or a post-then-read-back-miss retry — could re-run run(reply) and double-post. Persist
+  // a reservation now; any re-entry takes the EMITTED-RETRY path above and re-verifies instead of re-posting.
+  // PROD store MUST make this a conditional put-if-absent (DynamoDB) with a short TTL (self-heal a crash-before-post)
+  // for true cross-Lambda atomicity — the default single-instance Map is documented at the top of executeAction.
+  const reserve = (parsed) => store.set(snap.id, {
+    ...receipt(snap, 'failed', {
+      failureReason: parsed ? 'post emitted; awaiting read-back verification' : 'post in progress (reserved before external write)',
+      confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap,
+    }),
+    __emitted: { parsed: parsed || null, executedAt: nowSnap },
+  });
+  reserve(null);
+
+  // execute the real Senti post (credentials + dates validated -> a .posted is always signable + Swift-sane).
+  // Only immutable snapshots (nowSnap/confirmedAtSnap) flow into the receipt — never the caller's mutable inputs.
+  try {
+    const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--json']);
+    const parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
+    if (!parsed || parsed.targetSequenceId !== snap.targetSequence) {
+      // The post returned but is unidentifiable, or landed under the WRONG sequence: it may have landed, so KEEP a
+      // block-re-post marker (parsed:null => never re-posted, never finalized) while reporting the SPECIFIC reason.
+      const why = !parsed ? 'post returned no structured action result' : 'posted action threads under a different target sequence than the proposal';
+      const r = { ...receipt(snap, 'failed', { failureReason: why, confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap }), __emitted: { parsed: null, executedAt: nowSnap } };
+      store.set(snap.id, r);
+      return r;
+    }
+    // upgrade the reservation to carry the actionId so a retry can re-verify + finalize (still never re-posts).
+    reserve(parsed);
+    // bounded read-back VERIFY the action actually landed (authored by us, under the target). Injectable for tests.
+    if (!doVerify(parsed)) return store.get(snap.id); // marker persists; a retry re-verifies, never re-posts
+    return finalizePosted(parsed, nowSnap);
   } catch (e) {
-    // transient failure: do NOT store (allow retry of the same proposal id later)
+    // The external post THREW before returning => it almost certainly did NOT land (spawn/connection error). RELEASE
+    // the reservation (only while it is still the pre-post placeholder, parsed===null) so a legitimate retry can re-post.
+    // Residual: an exception AFTER the server committed could still allow a re-post; the prod close is a server-side
+    // idempotency key on `sl session reply` — documented as a follow-up (sl has no such key today).
+    if ((store.get(snap.id)?.__emitted?.parsed ?? null) === null) store.delete(snap.id);
     return receipt(snap, 'failed', { failureReason: String(e?.message ?? e).slice(0, 300), confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
 }
