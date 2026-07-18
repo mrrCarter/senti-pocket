@@ -1,4 +1,9 @@
-// PocketContracts v0.1.2 — FROZEN by Atlas (claude-pocket-atlas).
+// PocketContracts v0.1.3 — FROZEN by Atlas (claude-pocket-atlas).
+// v0.1.3 (Echo 5f45364 + Pulse dea0776 reviews): INJECTION-PROOF length-prefixed canonicalPayload (was
+//   delimiter-only = collision-vulnerable) -> domain sep bumped to v2, hashes CHANGE vs v0.1.2; deterministic
+//   ActionProposal.isValidForConfirmation() (rejects requiresConfirmation=false / bad hash / unbounded fields);
+//   ActionReceipt.signature + signingKeyId (gateway-signed .posted receipts, nil never renders as verified).
+//   PocketFixtures adds typed UI scenarios (BriefingPlan/QuestionAnswer/ActionProposal/ActionReceipt) for Pulse.
 // v0.1.2 (warden gate #230840): [1 REQUIRED] ActionProposal.proposalHash + ActionReceipt.confirmedProposalHash
 //   = content-integrity binding for the governed write — confirm==execute at the Pulse<->Relay seam,
 //   invalidate-on-change, single-use (TOCTOU-proof). [2] AgentSummary.claims (fact/inference/recommendation)
@@ -16,7 +21,7 @@ import CryptoKit
 #endif
 
 public enum PocketContracts {
-    public static let version = "0.1.2"
+    public static let version = "0.1.3"
 }
 
 // MARK: - Source (Relay produces RawCheckpoint + CheckpointSummary; gateway summarizes)
@@ -182,10 +187,14 @@ public struct ActionProposal: Codable, Equatable, Identifiable {
         self.createdAt = createdAt; self.sourceQuestionId = sourceQuestionId; self.proposalHash = proposalHash
     }
 
-    /// The EXACT canonical bytes the hash covers — order-fixed, newline-delimited, versioned prefix. Every lane
-    /// MUST derive the hash from THIS (never re-serialize differently) or the confirm<->execute binding breaks.
+    /// The EXACT canonical bytes the hash covers. INJECTION-PROOF length-prefixed encoding (Echo review 5f45364):
+    /// each field is emitted as `<utf8-byte-count>:<field-bytes>`, so a field CONTAINING the delimiter cannot
+    /// shift boundaries (delimiter-only canonicalization was collision-vulnerable). Order-fixed, versioned domain
+    /// separator. Every lane (Swift + the Node gateway) MUST reproduce EXACTLY this — see the known-answer vector
+    /// in ContractsCrossModuleTests (KAV_1) and mirror it in Relay's Node tests.
     public static func canonicalPayload(kind: ActionKind, targetSessionId: String, targetSequence: Int, renderedPreview: String) -> String {
-        return "pocket.actionproposal.v1\n\(kind.rawValue)\n\(targetSessionId)\n\(targetSequence)\n\(renderedPreview)"
+        func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
+        return "pocket.actionproposal.v2\n" + lp(kind.rawValue) + lp(targetSessionId) + lp(String(targetSequence)) + lp(renderedPreview)
     }
     #if canImport(CryptoKit)
     /// proposalHash = base64url(SHA-256(UTF-8(canonicalPayload))). Producers compute; confirm + writeback verify.
@@ -207,6 +216,22 @@ public struct ActionProposal: Codable, Equatable, Identifiable {
         return proposalHash == ActionProposal.computeHash(kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview)
     }
     #endif
+
+    /// Deterministic pre-confirmation gate (Echo review 5f45364): the confirm UI AND the writeback MUST pass this
+    /// before acting. The explicit/decoded init can carry requiresConfirmation=false or an arbitrary hash — this
+    /// rejects those. On Apple/gateway (CryptoKit) it ALSO requires hashMatchesContent (full content-integrity).
+    public func isValidForConfirmation() -> Bool {
+        guard requiresConfirmation, targetSequence > 0,
+              !id.isEmpty, id.count <= 128,
+              !targetSessionId.isEmpty, targetSessionId.count <= 256,
+              !renderedPreview.isEmpty, renderedPreview.count <= 4096,
+              !proposalHash.isEmpty else { return false }
+        #if canImport(CryptoKit)
+        return hashMatchesContent()
+        #else
+        return true   // non-crypto host: caller MUST verify hashMatchesContent where CryptoKit is available
+        #endif
+    }
 }
 
 public enum ActionKind: String, Codable, Equatable {
@@ -227,11 +252,18 @@ public struct ActionReceipt: Codable, Equatable, Identifiable {
                                                // "what was posted == what was confirmed" (airtight core claim).
     public let executedAt: Date?
     public let failureReason: String?
-    public init(id: String, proposalId: String, status: ReceiptStatus, resultingSequence: Int?, targetSessionId: String, confirmedByHumanAt: Date, confirmedProposalHash: String, executedAt: Date?, failureReason: String?) {
+    public let signature: String?              // v0.1.3 (Pulse/Echo): gateway ed25519 signature over the canonical
+                                               // receipt bytes. Present ONLY on a real .posted receipt from the
+                                               // gateway. The phone MUST verify it before rendering "posted"; nil
+                                               // => NOT verified (pending/failed receipts are unsigned and must
+                                               // NEVER render as verified/sent — same honesty rule as the bundle).
+    public let signingKeyId: String?
+    public init(id: String, proposalId: String, status: ReceiptStatus, resultingSequence: Int?, targetSessionId: String, confirmedByHumanAt: Date, confirmedProposalHash: String, executedAt: Date?, failureReason: String?, signature: String?, signingKeyId: String?) {
         self.id = id; self.proposalId = proposalId; self.status = status; self.resultingSequence = resultingSequence
         self.targetSessionId = targetSessionId; self.confirmedByHumanAt = confirmedByHumanAt
         self.confirmedProposalHash = confirmedProposalHash
         self.executedAt = executedAt; self.failureReason = failureReason
+        self.signature = signature; self.signingKeyId = signingKeyId
     }
 }
 
