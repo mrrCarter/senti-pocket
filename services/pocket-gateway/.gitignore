@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+# never commit real exports — they contain private room transcripts
+*.export.json
+export_sample*.json
+scratch/
