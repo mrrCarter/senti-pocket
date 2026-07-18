@@ -48,7 +48,8 @@ export function createGateway(deps) {
     if (!deps.bundleStore) return json(501, { error: 'sync backend not configured' });
     const since = Number((req.query && req.query.since) || 0);
     const sinceSeq = Number.isSafeInteger(since) && since > 0 ? since : 0;
-    const bundles = await deps.bundleStore.listForHuman(ctx.humanId, sinceSeq);
+    // scope bundles to the full principal (tenant isolation) — a site-A credential never lists site-B bundles.
+    const bundles = await deps.bundleStore.listForHuman(ctx.principal || ctx.humanId, sinceSeq);
     return json(200, { bundles: Array.isArray(bundles) ? bundles : [] });
   }
 
@@ -65,9 +66,9 @@ export function createGateway(deps) {
 
     const id = proposal.id;
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
-    // CROSS-HUMAN ISOLATION (Echo P0): namespace ALL durable state + the lock by the authenticated human, so two
-    // humans reusing the same proposal.id never collide (no cross-tenant idempotency read, no shared lock).
-    const key = storeKey(ctx.humanId, id);
+    // CROSS-TENANT ISOLATION (Echo): namespace ALL durable state + the lock by the FULL principal (issuer + aud/
+    // resource + site + pairwise sub), not the sub alone — a credential for site A must never collide at site B.
+    const key = storeKey(ctx.principal || ctx.humanId, id);
 
     const lockRes = await withLock(deps.store, key, async () => {
       const rec = await deps.store.get(key);

@@ -26,6 +26,7 @@ export function createProdGateway(env = {}, deps = {}) {
     issuer: env.AIDENID_ISSUER,
     audience: env.GATEWAY_AUDIENCE,
     resource: env.GATEWAY_RESOURCE,                       // RFC 8707 resource indicator (optional)
+    siteId: env.GATEWAY_SITE_ID,                          // tenant isolation: reject tokens for another site
     requireDpop: env.REQUIRE_DPOP === 'true',
     replayGuard: createStoreReplayGuard(store),           // DPoP jti single-use across Lambda instances
   });

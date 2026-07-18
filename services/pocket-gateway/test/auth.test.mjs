@@ -126,5 +126,20 @@ test('AIdenID-shaped token interop: EdDSA access token (pairwise sub + resource 
   const ctx = await v({ authorization: 'Bearer ' + token, dpop: proof, 'x-http-method': 'POST', 'x-http-url': htu });
   assert.ok(ctx, 'AIdenID-shaped token + ES256 DPoP verifies');
   assert.equal(ctx.humanId, 'pairwise-xyz', 'humanId derives from the pairwise sub');
+  assert.equal(ctx.site, 'senti-pocket');
+  assert.ok(ctx.principal.includes('pairwise-xyz') && ctx.principal.includes('senti-pocket'), 'principal binds the full context');
   assert.equal(ctx.tokenClaims.dpopBound, true);
+});
+
+test('siteId enforced; principal namespaces the full context so a pairwise sub cannot collide across sites', async () => {
+  const RES = 'https://gateway.senti.app/actions';
+  const tokenFor = (site) => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, resource: RES, site, sub: 'pairwise-same', exp: nowSec + 300, scope: 'x' }, privateKey: idp.privateKey });
+  const vA = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, siteId: 'siteA', now: () => NOW });
+  assert.equal(await vA({ authorization: 'Bearer ' + tokenFor('siteB') }), null, 'a token minted for another site is rejected');
+  const ctxA = await vA({ authorization: 'Bearer ' + tokenFor('siteA') });
+  assert.ok(ctxA && ctxA.principal.includes('siteA'));
+  const vB = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, siteId: 'siteB', now: () => NOW });
+  const ctxB = await vB({ authorization: 'Bearer ' + tokenFor('siteB') });
+  assert.ok(ctxB);
+  assert.notEqual(ctxA.principal, ctxB.principal, 'same pairwise sub at different sites => different namespace');
 });

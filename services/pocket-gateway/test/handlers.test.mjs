@@ -148,6 +148,30 @@ test('cross-human isolation: same proposal.id from two humans does NOT share ide
   assert.notEqual(ra.body.result.actionId, rb.body.result.actionId);
 });
 
+test('durable state keyed by PRINCIPAL, not sub: same pairwise sub across sites does not collide', async () => {
+  const store = createInMemoryStore();
+  const vt = async (h) => {
+    const a = h && h.authorization;
+    if (a === 'Bearer siteA') return { humanId: 'sub-1', principal: 'siteA|sub-1', scopes: ['actions:execute'] };
+    if (a === 'Bearer siteB') return { humanId: 'sub-1', principal: 'siteB|sub-1', scopes: ['actions:execute'] };
+    return null;
+  };
+  const state = { replies: 0 };
+  const run = (args) => {
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_' + state.replies, agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160 } }] });
+    return '{}';
+  };
+  const gw = createGateway(baseDeps({ store, run, verifyToken: vt }));
+  const p = makeProposal({ id: 'shared' });
+  const body = { proposal: p, confirmation: makeConfirm(p) };
+  const ra = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer siteA' }, body });
+  const rb = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer siteB' }, body });
+  assert.equal(ra.body.status, 'posted');
+  assert.equal(rb.body.status, 'posted');
+  assert.equal(state.replies, 2, 'same sub + proposal.id at different sites executes independently (no cross-tenant collision)');
+});
+
 test('crash recovery: in-flight reservation + landed post => retry FINALIZES via content read-back, never re-posts', async () => {
   const store = createInMemoryStore();
   const POSTED = 'Approved.';
