@@ -23,8 +23,14 @@ function validateCliJs(cliJs) {
   if (typeof cliJs !== 'string' || !cliJs || cliJs.startsWith('-')) throw new Error('SL_CLI_JS must be an absolute path to sentinelayer-cli.js (not a flag/empty)');
   if (!isAbsolute(cliJs)) throw new Error('SL_CLI_JS must be ABSOLUTE (no PATH lookup / relative resolution)');
   let real;
-  try { real = realpathSync(cliJs); } catch { throw new Error('SL_CLI_JS does not resolve to a real path: ' + cliJs); }
+  try { real = realpathSync(cliJs); } catch { throw new Error('SL_CLI_JS does not resolve to a real path: ' + cliJs); } // symlink policy: RESOLVE, then validate the target
   if (!statSync(real).isFile()) throw new Error('SL_CLI_JS is not a regular file: ' + real);
+  // IDENTITY: the resolved target must be the sentinelayer-cli package entrypoint — not an arbitrary JS file. This
+  // rejects e.g. pointing SL_CLI_JS at our own src/demo-server.mjs (Echo #233248). Prod may pin a tighter allowlist.
+  const norm = real.replace(/\\/g, '/');
+  if (!/(^|\/)sentinelayer-cli\/.*\.(c|m)?js$/i.test(norm) && !/(^|\/)sentinelayer-cli\.(c|m)?js$/i.test(norm)) {
+    throw new Error('SL_CLI_JS must resolve to the sentinelayer-cli package entrypoint (got: ' + real + ')');
+  }
   return real;
 }
 

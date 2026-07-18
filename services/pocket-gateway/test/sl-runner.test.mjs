@@ -7,8 +7,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeSlRunner } from '../src/sl-runner.mjs';
 
-const CLI = join(mkdtempSync(join(tmpdir(), 'slr-')), 'cli.js');
+// the entrypoint must resolve to the sentinelayer-cli package (basename check) — name it accordingly
+const CLI = join(mkdtempSync(join(tmpdir(), 'slr-')), 'sentinelayer-cli.js');
 writeFileSync(CLI, '// fake sentinelayer-cli.js for tests');
+const NOT_CLI = join(mkdtempSync(join(tmpdir(), 'slr-')), 'random.js');
+writeFileSync(NOT_CLI, '// not the cli');
 
 test('dispatches via node + validated cli.js (no shell), byte-preserves metacharacters, minimal env, bounded timeout', () => {
   process.env.RELAY_TEST_SECRET = 'super-secret';
@@ -29,6 +32,7 @@ test('rejects untrusted/invalid CLI entrypoints at BOOT (flag, relative, missing
   assert.throws(() => makeSlRunner({ cliJs: '-p' }), /flag|absolute/i, 'a flag like -p is rejected (no node -p code exec)');
   assert.throws(() => makeSlRunner({ cliJs: 'relative/cli.js' }), /absolute/i);
   assert.throws(() => makeSlRunner({ cliJs: join(tmpdir(), 'nope-does-not-exist-xyz.js') }), /real path|resolve/i);
+  assert.throws(() => makeSlRunner({ cliJs: NOT_CLI }), /sentinelayer-cli/i, 'an arbitrary JS file (not the CLI package) is rejected');
   const prev = process.env.SL_CLI_JS; delete process.env.SL_CLI_JS;
   assert.throws(() => makeSlRunner({}), /SL_CLI_JS is required/);
   if (prev != null) process.env.SL_CLI_JS = prev;
