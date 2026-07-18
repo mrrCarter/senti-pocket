@@ -1,0 +1,83 @@
+// auth.test.mjs — real AIdenID verifier: signs actual JWTs + DPoP proofs with node:crypto (no live IdP).
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { generateKeyPairSync, sign as edSign, createHash } from 'node:crypto';
+import { createAidenIdVerifier, jwkThumbprint } from '../src/auth.mjs';
+
+const sha256 = (s) => createHash('sha256').update(s, 'utf8').digest();
+
+const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const NOW = 1_760_000_000_000; // fixed clock
+const nowSec = Math.floor(NOW / 1000);
+
+function ed25519() {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  return { publicKey, privateKey, jwk: publicKey.export({ format: 'jwk' }) };
+}
+function signJwt({ header, payload, privateKey }) {
+  const si = b64url(JSON.stringify(header)) + '.' + b64url(JSON.stringify(payload));
+  return si + '.' + b64url(edSign(null, Buffer.from(si), privateKey));
+}
+
+const ISSUER = 'https://api.aidenid.com';
+const AUD = 'https://gateway.senti.app';
+const idp = ed25519();
+const KID = 'idp-1';
+const jwks = [{ ...idp.jwk, kid: KID, alg: 'EdDSA' }];
+const verifier = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, now: () => NOW });
+
+const mint = (over = {}) => signJwt({
+  header: { alg: 'EdDSA', kid: KID, typ: 'JWT' },
+  payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'consumer-abc', scope: 'actions:execute bundles:read', ...over },
+  privateKey: idp.privateKey,
+});
+
+test('valid token verifies -> humanId + scopes', async () => {
+  const ctx = await verifier({ authorization: 'Bearer ' + mint() });
+  assert.equal(ctx.humanId, 'consumer-abc');
+  assert.deepEqual(ctx.scopes, ['actions:execute', 'bundles:read']);
+});
+
+test('rejects: tampered signature, wrong iss, wrong aud, expired, unknown kid, non-bearer', async () => {
+  const good = mint();
+  assert.equal(await verifier({ authorization: 'Bearer ' + good.slice(0, -4) + 'AAAA' }), null, 'tampered sig');
+  assert.equal(await verifier({ authorization: 'Bearer ' + mint({ iss: 'https://evil' }) }), null, 'wrong iss');
+  assert.equal(await verifier({ authorization: 'Bearer ' + mint({ aud: 'https://other' }) }), null, 'wrong aud');
+  assert.equal(await verifier({ authorization: 'Bearer ' + mint({ exp: nowSec - 3600 }) }), null, 'expired');
+  const otherIdp = ed25519();
+  const foreign = signJwt({ header: { alg: 'EdDSA', kid: 'idp-1', typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'x' }, privateKey: otherIdp.privateKey });
+  assert.equal(await verifier({ authorization: 'Bearer ' + foreign }), null, 'signed by a key not in JWKS');
+  assert.equal(await verifier({ authorization: 'Basic abc' }), null, 'non-bearer');
+  assert.equal(await verifier({}), null, 'no header');
+});
+
+test('no humanId claim => reject', async () => {
+  const noSub = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, scope: 'x' }, privateKey: idp.privateKey });
+  assert.equal(await verifier({ authorization: 'Bearer ' + noSub }), null);
+});
+
+// ---- DPoP (RFC 9449) sender-constrained token ----
+const client = ed25519();
+const jkt = jwkThumbprint(client.jwk);
+const mintDpopBound = () => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, consumerAccountId: 'consumer-dpop', scope: 'actions:execute', cnf: { jkt } }, privateKey: idp.privateKey });
+function dpopProof({ htm = 'POST', htu = 'https://gateway.senti.app/actions/execute', accessToken, iat = nowSec, key = client }) {
+  const ath = b64url(sha256(accessToken));
+  return signJwt({ header: { typ: 'dpop+jwt', alg: 'EdDSA', jwk: key.jwk }, payload: { htm, htu, iat, ath, jti: 'proof-1' }, privateKey: key.privateKey });
+}
+
+test('DPoP-bound token: valid proof passes; missing/mismatched proof rejected', async () => {
+  const token = mintDpopBound();
+  const htu = 'https://gateway.senti.app/actions/execute';
+  const base = { authorization: 'Bearer ' + token, 'x-http-method': 'POST', 'x-http-url': htu };
+  // valid proof
+  assert.ok(await verifier({ ...base, dpop: dpopProof({ accessToken: token }) }));
+  // missing proof
+  assert.equal(await verifier(base), null, 'no DPoP proof for a bound token');
+  // wrong method
+  assert.equal(await verifier({ ...base, dpop: dpopProof({ accessToken: token, htm: 'GET' }) }), null, 'method mismatch');
+  // proof signed by a DIFFERENT key (thumbprint != cnf.jkt)
+  const attacker = ed25519();
+  assert.equal(await verifier({ ...base, dpop: dpopProof({ accessToken: token, key: attacker }) }), null, 'wrong key thumbprint');
+  // stale iat
+  assert.equal(await verifier({ ...base, dpop: dpopProof({ accessToken: token, iat: nowSec - 100000 }) }), null, 'stale proof');
+});

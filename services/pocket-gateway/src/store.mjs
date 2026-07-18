@@ -34,6 +34,39 @@ export function createInMemoryStore() {
 }
 
 /**
+ * DynamoDB-backed store for PROD cross-instance exactly-once. Zero-dep: the caller injects a DocumentClient-like
+ * `client` with async get/put/delete (deploy wires @aws-sdk/lib-dynamodb). Lock + putIfAbsent use a conditional
+ * put (attribute_not_exists) so they are atomic across Lambda instances; the lock item carries a TTL that self-heals
+ * a crash-before-release. Records (idempotency/emitted markers) are durable with no TTL.
+ * @param {{ client:object, table:string, ttlSeconds?:number, now?:()=>number }} cfg
+ */
+export function createDynamoStore(cfg = {}) {
+  const { client, table, ttlSeconds = 900, now = () => Date.now() } = cfg;
+  if (!client || !table) throw new Error('createDynamoStore requires { client, table }');
+  const rk = (key) => ({ pk: key, sk: 'record' });
+  const lk = (key) => ({ pk: key, sk: 'lock' });
+  const isCond = (e) => e && (e.name === 'ConditionalCheckFailedException' || e.code === 'ConditionalCheckFailedException');
+  return {
+    async get(key) { const r = await client.get({ TableName: table, Key: rk(key) }); return r && r.Item ? r.Item.value : undefined; },
+    async put(key, value) { await client.put({ TableName: table, Item: { ...rk(key), value } }); return value; },
+    async delete(key) { await client.delete({ TableName: table, Key: rk(key) }); },
+    async acquireLock(key) {
+      try {
+        await client.put({ TableName: table, Item: { ...lk(key), ttl: Math.floor(now() / 1000) + ttlSeconds }, ConditionExpression: 'attribute_not_exists(pk)' });
+        return true;
+      } catch (e) { if (isCond(e)) return false; throw e; }
+    },
+    async releaseLock(key) { await client.delete({ TableName: table, Key: lk(key) }); },
+    async putIfAbsent(key, value) {
+      try {
+        await client.put({ TableName: table, Item: { ...rk(key), value }, ConditionExpression: 'attribute_not_exists(pk)' });
+        return true;
+      } catch (e) { if (isCond(e)) return false; throw e; }
+    },
+  };
+}
+
+/**
  * Run `fn` while holding the store's cross-instance lock for `key`. Releases in a finally (even on throw).
  * Returns { locked:false } without running fn if the lock is already held (caller decides 409 vs retry).
  */
