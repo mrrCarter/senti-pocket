@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createPublicKey, createHash } from 'node:crypto';
-import { verifyBundle, canonicalBundlePayload } from '../src/bundle.mjs';
+import { verifyBundle, canonicalBundlePayload, validateBundleSemantics, verifyBundleWithTrustStore } from '../src/bundle.mjs';
 import { verifyReceipt } from '../src/actions.mjs';
 
 // pocket.bundle.v1 canonical MUST byte-match PocketContracts.swift testBundleCanonicalKAV (@f49327f) exactly.
@@ -31,6 +31,28 @@ test('committed KAV fixture is stable (regenerate only intentionally)', () => {
   assert.equal(KAV.signingKeyId, 'kav-key');
   assert.equal(typeof KAV.publicKeyRawBase64url, 'string');
   assert.ok(createHash('sha256').update(RAW).digest('hex').length === 64);
+  // the anchor is LABELED demo/Phase-A-only so it can never be mistaken for a production trust root.
+  assert.equal(KAV.demoAnchor.keyClass, 'demo');
+  assert.equal(KAV.demoAnchor.phase, 'A');
+  assert.match(KAV.demoAnchor.note, /NEVER a production trust root/i);
+});
+
+test('committed KAV: signingKeyId SELECTS exactly the pinned demo pubkey (trust-anchor binding)', () => {
+  // keyBinding maps signingKeyId -> the pinned raw pubkey: the bundle's id must resolve to THIS exact key.
+  assert.equal(KAV.keyBinding[KAV.signingKeyId], KAV.publicKeyRawBase64url, 'signingKeyId resolves to the pinned pubkey');
+  assert.equal(KAV.bundle.signingKeyId, KAV.signingKeyId, 'the signed bundle carries that same id');
+  // verify ONLY through the trust store — the id selects the pinned key; a caller-supplied key is never trusted.
+  assert.equal(verifyBundleWithTrustStore(KAV.bundle, KAV.keyBinding), true, 'verified against the key its id selects');
+  // an UNKNOWN signingKeyId has no pinned key => reject even though the signature itself is cryptographically valid.
+  assert.equal(verifyBundleWithTrustStore({ ...KAV.bundle, signingKeyId: 'attacker-key' }, KAV.keyBinding), false, 'unknown id => reject');
+  // the real id bound to a DIFFERENT (attacker-supplied) key must not verify.
+  assert.equal(verifyBundleWithTrustStore(KAV.bundle, { 'kav-key': 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }), false, 'wrong pinned key => reject');
+});
+
+test('committed KAV: bundle is SEMANTICALLY valid (warden bundle-KAV gate)', () => {
+  const v = validateBundleSemantics(KAV.bundle);
+  assert.deepEqual(v.errors, [], 'no semantic violations');
+  assert.equal(v.ok, true);
 });
 
 test('committed KAV: bundle signature verifies with the RAW base64url key', () => {

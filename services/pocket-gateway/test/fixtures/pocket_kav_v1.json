@@ -1,7 +1,16 @@
 {
   "schema": "pocket_kav_v1",
+  "demoAnchor": {
+    "keyClass": "demo",
+    "phase": "A",
+    "seedHex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "note": "DEMO Phase-A-only Ed25519 anchor generated from a FIXED seed; pinned by the demo phone. NEVER a production trust root."
+  },
   "signingKeyId": "kav-key",
   "publicKeyRawBase64url": "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU",
+  "keyBinding": {
+    "kav-key": "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU"
+  },
   "bundle": {
     "contractsVersion": "0.1.8",
     "checkpointId": "cp_kav",

@@ -35,6 +35,23 @@ const receipt = signReceipt({
   executedAt: '2026-07-18T00:04:30Z', failureReason: null, signingKeyId: null,
 }, privateKey, 'kav-key');
 
-const fixture = { schema: 'pocket_kav_v1', signingKeyId: 'kav-key', publicKeyRawBase64url: rawPub, bundle, receipt };
+// The fixture is a LABELED demo trust anchor. `demoAnchor` makes the Phase-A-only nature unmistakable (never a prod
+// root); `keyBinding` maps signingKeyId -> the pinned raw pubkey so a consumer PROVES its signingKeyId selects exactly
+// this public key (verifyBundleWithTrustStore rejects any other/unknown id). Additive metadata: the bundle/receipt
+// objects (and their signatures) are byte-identical to before; Swift decodes only bundle/receipt/publicKeyRawBase64url.
+const fixture = {
+  schema: 'pocket_kav_v1',
+  demoAnchor: {
+    keyClass: 'demo',
+    phase: 'A',
+    seedHex: 'a1'.repeat(32),
+    note: 'DEMO Phase-A-only Ed25519 anchor generated from a FIXED seed; pinned by the demo phone. NEVER a production trust root.',
+  },
+  signingKeyId: 'kav-key',
+  publicKeyRawBase64url: rawPub,
+  keyBinding: { 'kav-key': rawPub }, // signingKeyId -> pinned RAW base64url Ed25519 pubkey (trust-anchor selection)
+  bundle,
+  receipt,
+};
 writeFileSync(new URL('../test/fixtures/pocket_kav_v1.json', import.meta.url), JSON.stringify(fixture, null, 2) + '\n');
 console.log('wrote pocket_kav_v1.json  rawPub=' + rawPub + '  bundle.sig=' + bundle.signature.slice(0, 16) + '...  receipt.sig=' + receipt.signature.slice(0, 16) + '...');

@@ -130,6 +130,7 @@ export function buildBundle(rawCheckpoint, summary, opts = {}) {
     signature: '',
     signingKeyId: opts.signingKeyId || 'pocket-gateway-dev-key',
   };
+  assertBundleSemantics(bundle); // FAIL-CLOSED: never SIGN a semantically-invalid bundle (warden bundle-KAV gate)
   const bodyBytes = canonicalBundleBytes(bundle).length; // signature stripped; the exact bytes that get signed
   if (bodyBytes > MAX_BUNDLE_BYTES) throw new Error(`bundle exceeds MAX_BUNDLE_BYTES (${bodyBytes} > ${MAX_BUNDLE_BYTES})`);
   return bundle;
@@ -155,6 +156,92 @@ export function verifyBundle(bundle, publicKey) {
   } catch {
     return false;
   }
+}
+
+// ---- pre-sign SEMANTIC validity (warden bundle-KAV gate) + cross-language date guard (Pulse caution 2) ----
+// Crypto-authenticity is NOT sufficient: even a trusted-key-signed bundle is REJECTED if it is semantically invalid.
+// buildBundle enforces this FAIL-CLOSED so the gateway can never SIGN a bundle the phone's verify/consume path rejects.
+
+/**
+ * Strict cross-language epoch-ms guard. A bundle date is safe ONLY if Node and Swift compute the SAME integer epoch-ms
+ * from it. Accepts an integer-ms number, a Date (integer ms), or an ISO-8601 string with AT MOST millisecond precision
+ * (`.SSS`) and an EXPLICIT timezone. Rejects sub-ms strings (4+ fractional digits — Swift's ISO8601 parser returns nil
+ * where Node returns a rounded ms => DIVERGENCE), timezone-less strings (ambiguous), non-finite/non-integer, and |ms|
+ * beyond BUNDLE_MS_BOUND (~year 9999, mirrors Swift safeEpochMillis). Returns the integer ms, else null.
+ */
+export function canonicalEpochMs(d) {
+  if (typeof d === 'number') return Number.isInteger(d) && Math.abs(d) <= BUNDLE_MS_BOUND ? d : null;
+  if (d instanceof Date) { const m = d.getTime(); return Number.isInteger(m) && Math.abs(m) <= BUNDLE_MS_BOUND ? m : null; }
+  if (typeof d === 'string') {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.test(d)) return null; // ms-precision + explicit tz only
+    const m = new Date(d).getTime();
+    return Number.isFinite(m) && Number.isInteger(m) && Math.abs(m) <= BUNDLE_MS_BOUND ? m : null;
+  }
+  return null;
+}
+
+/**
+ * SEMANTIC validity of a PocketBundle — the warden bundle-KAV gate criteria, enforced PRE-SIGN. Returns {ok,errors}.
+ * A trusted-key-signed bundle must STILL be rejected if any hold: wrong version/schema, inverted sequence range,
+ * mismatched checkpoint/session ids, duplicate/foreign evidence, uncited fact/inference claims, or invalid/sub-ms
+ * dates. (`recommendation` claims may be uncited; evidence `ts` may be empty but, if present, must be canonical.)
+ */
+export function validateBundleSemantics(b) {
+  const errors = [];
+  const push = (m) => errors.push(m);
+  if (!b || typeof b !== 'object') return { ok: false, errors: ['bundle: not an object'] };
+  if (b.contractsVersion !== CONTRACTS_VERSION) push(`contractsVersion: expected ${CONTRACTS_VERSION}, got ${JSON.stringify(b.contractsVersion)}`);
+  if (!b.checkpointId) push('checkpointId: empty');
+  if (!b.sessionId) push('sessionId: empty');
+  const s0 = b.sequenceStart, s1 = b.sequenceEnd;
+  if (!Number.isSafeInteger(s0) || !Number.isSafeInteger(s1) || s0 < 0 || s1 < 0) push('sequence: not finite non-negative integers');
+  else if (s0 > s1) push(`sequence: inverted range (${s0} > ${s1})`);
+  if (canonicalEpochMs(b.createdAt) == null) push(`createdAt: not an exact epoch-ms (${JSON.stringify(b.createdAt)})`);
+  const sum = b.summary && typeof b.summary === 'object' ? b.summary : {};
+  if (sum.checkpointId && b.checkpointId && sum.checkpointId !== b.checkpointId) push('summary.checkpointId != bundle.checkpointId');
+  const evIds = new Set();
+  for (const e of Array.isArray(b.evidence) ? b.evidence : []) {
+    if (!e || !e.id) { push('evidence: missing id'); continue; }
+    if (evIds.has(e.id)) push(`evidence: duplicate id ${e.id}`);
+    evIds.add(e.id);
+    if (b.sessionId && e.sessionId && e.sessionId !== b.sessionId) push(`evidence ${e.id}: foreign sessionId`);
+    if (e.ts != null && e.ts !== '' && canonicalEpochMs(e.ts) == null) push(`evidence ${e.id}: ts not an exact epoch-ms (${JSON.stringify(e.ts)})`);
+  }
+  for (const a of Array.isArray(sum.perAgent) ? sum.perAgent : []) {
+    for (const ae of Array.isArray(a.evidence) ? a.evidence : []) {
+      if (ae && ae.id && !evIds.has(ae.id)) push(`agent ${a.agentId}: evidence ${ae.id} not in top-level evidence`);
+    }
+    for (const c of Array.isArray(a.claims) ? a.claims : []) {
+      const cited = Array.isArray(c.evidenceIds) ? c.evidenceIds : [];
+      if ((c.kind === 'fact' || c.kind === 'inference') && cited.length === 0) push(`claim ${c.id} (${c.kind}): uncited`);
+      for (const id of cited) if (!evIds.has(id)) push(`claim ${c.id}: cites foreign evidence ${id}`);
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+/** Throw unless the bundle is semantically valid (fail-closed PRE-SIGN guard used by buildBundle). */
+export function assertBundleSemantics(b) {
+  const { ok, errors } = validateBundleSemantics(b);
+  if (!ok) throw new Error(`bundle semantic validation failed: ${errors.join('; ')}`);
+}
+
+/**
+ * Reference TRUST-ANCHOR verify (mirrors the Swift verifiesSignature P1 fix): verify a bundle ONLY against the PINNED
+ * key its signingKeyId selects from `trustStore` (signingKeyId -> RAW base64url Ed25519 pubkey — exactly what the phone
+ * pins). A caller-supplied key is NEVER trusted; an empty or unknown signingKeyId is REJECTED (no pinned key => no
+ * trust). Reference/test utility (the gateway SIGNS, the phone VERIFIES) that proves the signingKeyId->pinned-key
+ * selection on the Node side and documents the exact reject order for the Swift mirror.
+ */
+export function verifyBundleWithTrustStore(bundle, trustStore) {
+  try {
+    const kid = bundle && typeof bundle.signingKeyId === 'string' ? bundle.signingKeyId : '';
+    if (!kid) return false;                                                    // no key id => cannot select a pinned key
+    const rawPub = trustStore && Object.prototype.hasOwnProperty.call(trustStore, kid) ? trustStore[kid] : null;
+    if (typeof rawPub !== 'string' || rawPub.length === 0) return false;       // unknown signingKeyId => not a trusted anchor
+    const key = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: rawPub }, format: 'jwk' });
+    return verifyBundle(bundle, key);                                          // ed25519 over the PINNED key only
+  } catch { return false; }
 }
 
 /** Convenience: build + sign in one step. */
