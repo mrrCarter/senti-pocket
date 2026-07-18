@@ -12,7 +12,8 @@ const { privateKey: KEY } = generateSigningKeypair();
 
 const verifyToken = async (headers) => {
   const a = headers && (headers.authorization || headers.Authorization);
-  if (a === 'Bearer good') return { humanId: 'consumer-123', scopes: ['pocket:read', 'pocket:write'] };
+  if (a === 'Bearer good') return { humanId: 'consumer-123', scopes: ['pocket:read', 'pocket:write', 'pocket:voice'] };
+  if (a === 'Bearer rw') return { humanId: 'consumer-123', scopes: ['pocket:read', 'pocket:write'] }; // no voice
   if (a === 'Bearer noscope') return { humanId: 'consumer-123', scopes: [] };
   return null;
 };
@@ -199,6 +200,20 @@ test('crash recovery: in-flight reservation but post NOT found => safe to post (
   const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
   assert.equal(r.body.status, 'posted');
   assert.equal(state.replies, 1, 'pre-post crash: re-posting once is correct (nothing landed to recover)');
+});
+
+test('POST /tts requires the distinct pocket:voice scope (a read+write token is denied)', async () => {
+  const ttsBackend = async () => ({ audio: Buffer.from([1, 2]), format: 'pcm_s16le_24000' });
+  const gw = createGateway(baseDeps({ ttsBackend }));
+  // read+write only (no voice) => 403 even though it can execute/sync
+  const denied = await gw.handle({ method: 'POST', path: '/tts', headers: { authorization: 'Bearer rw' }, body: { text: 'hi', voiceId: 'v' } });
+  assert.equal(denied.status, 403);
+  assert.match(denied.body.error, /pocket:voice/);
+  // a read+write token still authorizes the action + sync routes
+  assert.equal((await gw.handle({ method: 'GET', path: '/sync', headers: { authorization: 'Bearer rw' } })).status, 501); // authorized (no bundleStore => 501, not 403)
+  // a token WITH pocket:voice => 200
+  const ok = await gw.handle({ method: 'POST', path: '/tts', headers: { authorization: 'Bearer good' }, body: { text: 'hi', voiceId: 'v' } });
+  assert.equal(ok.status, 200);
 });
 
 test('POST /tts rejects oversized text and missing backend', async () => {

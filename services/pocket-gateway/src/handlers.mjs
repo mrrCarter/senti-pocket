@@ -38,9 +38,10 @@ export const storeKey = (humanId, id) => `${String(humanId).length}:${humanId}:$
  * }} deps
  */
 export function createGateway(deps) {
-  // Route scope requirements, aligned to AIdenID's granted scopes (token carries `pocket:read pocket:write`).
-  // Override via deps.scopes if the scope contract changes. write => execute; read => sync + briefing/tts.
-  const SCOPES = { execute: 'pocket:write', sync: 'pocket:read', tts: 'pocket:read', ...(deps.scopes || {}) };
+  // Route scope requirements, aligned to AIdenID's granted scopes. write => execute; read => sync. TTS requires a
+  // DISTINCT least-privilege `pocket:voice` (Echo): it triggers third-party voice processing/egress, not a passive
+  // read, so a read+write token must NOT authorize it. Override via deps.scopes if the contract changes.
+  const SCOPES = { execute: 'pocket:write', sync: 'pocket:read', tts: 'pocket:voice', ...(deps.scopes || {}) };
 
   async function authenticate(req) {
     if (typeof deps.verifyToken !== 'function') return null; // no verifier wired => deny everything (fail-closed)
