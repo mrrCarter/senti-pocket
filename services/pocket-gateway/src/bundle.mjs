@@ -2,8 +2,11 @@
 // The phone caches a PocketBundle and MUST verify its signature before briefing from it.
 // Signature covers the whole bundle EXCEPT the `signature` field itself (so signingKeyId is bound too).
 import { sign as edSign, verify as edVerify, generateKeyPairSync, createPrivateKey, createPublicKey } from 'node:crypto';
+import { scrubDeep, scrubText } from './scrub.mjs';
 
 export const CONTRACTS_VERSION = '0.1.0';
+/** Max UTF-8 bytes for any single phone-visible evidence snippet (bounded egress). */
+export const MAX_EVIDENCE_SNIPPET_BYTES = 2048;
 
 /** Deterministic JSON: recursively sorted object keys, no incidental whitespace. Signer + verifier must agree byte-for-byte. */
 export function stableStringify(v) {
@@ -26,16 +29,33 @@ export function dedupEvidence(refs) {
   return [...seen.values()].sort((a, b) => Number(a.sequence) - Number(b.sequence));
 }
 
-/** Build an UNSIGNED PocketBundle draft from a RawCheckpoint + CheckpointSummary. `signature` is empty until signed. */
+/** Recursively scrub + byte-bound every string field of an EvidenceRef (snippet/quote/text and any nested string). */
+function scrubEvidenceRef(ref) {
+  const scrubbed = scrubDeep(ref).value;
+  for (const k of Object.keys(scrubbed)) {
+    if (typeof scrubbed[k] === 'string' && Buffer.byteLength(scrubbed[k], 'utf8') > MAX_EVIDENCE_SNIPPET_BYTES) {
+      scrubbed[k] = Buffer.from(scrubbed[k], 'utf8').subarray(0, MAX_EVIDENCE_SNIPPET_BYTES).toString('utf8') + '…';
+    }
+  }
+  return scrubbed;
+}
+
+/**
+ * Build an UNSIGNED PocketBundle draft from a RawCheckpoint + CheckpointSummary. `signature` is empty until signed.
+ * FINAL EGRESS redaction (Echo P0): best-effort scrub EVERY phone-visible string (summary + evidence) and bound
+ * evidence snippet size, right before signing. This is defense-in-depth, NOT a guarantee — residual content is
+ * untrusted (see scrub.mjs). The bundle carries the SUMMARY + bounded evidence only; raw room events never cross.
+ */
 export function buildBundle(rawCheckpoint, summary, opts = {}) {
-  const evidence = dedupEvidence((summary.perAgent || []).flatMap((a) => a.evidence || []));
+  const evidence = dedupEvidence((summary.perAgent || []).flatMap((a) => a.evidence || [])).map(scrubEvidenceRef);
+  const scrubbedSummary = scrubDeep(summary).value;
   return {
     contractsVersion: opts.contractsVersion || CONTRACTS_VERSION,
     checkpointId: rawCheckpoint.checkpointId,
     sessionId: rawCheckpoint.sessionId,
     sequenceStart: rawCheckpoint.startSequence,
     sequenceEnd: rawCheckpoint.endSequence,
-    summary,
+    summary: scrubbedSummary,
     evidence,
     createdAt: opts.createdAt || new Date().toISOString(),
     signature: '',

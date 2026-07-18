@@ -4,10 +4,11 @@
 // (avoids security-scanner false positives on fixtures).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { scrubText, scrubPayload } from '../src/scrub.mjs';
+import { scrubText, scrubPayload, scrubDeep } from '../src/scrub.mjs';
 import {
-  sliceEvents, toRawEvent, buildRawCheckpoint, validateRawCheckpoint, extractCheckpoint, normalizeTs,
+  sliceEvents, toRawEvent, buildRawCheckpoint, validateRawCheckpoint, extractCheckpoint, normalizeTs, toSeq, LIMITS,
 } from '../src/extract.mjs';
+import { buildBundle } from '../src/bundle.mjs';
 
 // --- dynamic fake secrets (never real; assembled so scanners see no literal token) ---
 const fakeApiKey = 'sk-' + 'A1b2C3d4'.repeat(3);          // OpenAI-style
@@ -114,4 +115,85 @@ test('extractCheckpoint runs the full pipeline with an injected sl runner', () =
   assert.equal(rawCheckpoint.checkpointId, 'cp_954233b7_000012');
   assert.equal(rawCheckpoint.events.length, 2);
   assert.deepEqual(validateRawCheckpoint(rawCheckpoint), []);
+  assert.equal(rawCheckpoint.provenance.kind, 'durable');
+});
+
+// ---------- Echo extract/scrub batch regressions (locked) ----------
+test('(P0 completeness) checkpoint range not fully contained in export => throws, no partial slice', () => {
+  // extends BELOW the export window
+  assert.throws(() => buildRawCheckpoint({ ...CANNED_CKPT, startSequence: 229900, endSequence: 230160 }, CANNED_EXPORT), /not fully contained|partial/i);
+  // extends ABOVE the export window
+  assert.throws(() => buildRawCheckpoint({ ...CANNED_CKPT, startSequence: 230141, endSequence: 230300 }, CANNED_EXPORT), /not fully contained|partial/i);
+});
+
+test('(P0 provenance) overlap-but-not-contained checkpoint is NOT selected; no synthesis fallback', () => {
+  const older = { checkpointId: 'cp_old', sessionId: CANNED_CKPT.sessionId, startSequence: 229990, endSequence: 230050 }; // start < exMin
+  const runOverlap = (args) => (args.includes('list') ? JSON.stringify([older]) : JSON.stringify(CANNED_EXPORT));
+  assert.throws(() => extractCheckpoint(CANNED_CKPT.sessionId, { run: runOverlap }), /no durable checkpoint|contained|retryable/i);
+  const runEmpty = (args) => (args.includes('list') ? JSON.stringify([]) : JSON.stringify(CANNED_EXPORT));
+  assert.throws(() => extractCheckpoint(CANNED_CKPT.sessionId, { run: runEmpty }), /no durable checkpoint|retryable/i);
+});
+
+test('(P0 provenance) buildRawCheckpoint refuses a synthesized checkpoint', () => {
+  assert.throws(() => buildRawCheckpoint({ ...CANNED_CKPT, synthesized: true }, CANNED_EXPORT), /synthesized/i);
+});
+
+test('(P1 numeric) sliceEvents drops fractional + duplicate ids (no silent collapse), strictly increasing', () => {
+  const events = [
+    { sequenceId: 230141, event: 'm', agent: { id: 'a' }, payload: { text: 'ok' }, ts: '2026-07-18T10:35:00Z' },
+    { sequenceId: 230141, event: 'm', agent: { id: 'a' }, payload: { text: 'dup' }, ts: '2026-07-18T10:35:01Z' },
+    { sequenceId: 230150.5, event: 'm', agent: { id: 'a' }, payload: { text: 'frac' }, ts: '2026-07-18T10:35:02Z' },
+    { sequenceId: 230160, event: 'm', agent: { id: 'b' }, payload: { text: 'ok2' }, ts: '2026-07-18T10:36:00Z' },
+  ];
+  assert.deepEqual(sliceEvents(events, 230100, 230180).map((e) => e.sequenceId), [230141, 230160]);
+});
+
+test('(P1 numeric) toSeq rejects fractional/unsafe/zero/negative/leading-zero', () => {
+  for (const bad of [1.5, 0, -1, 9007199254740992, '1.5', '01', 'x', NaN, Infinity, true, null]) assert.equal(toSeq(bad), null, String(bad));
+  assert.equal(toSeq(230141), 230141);
+  assert.equal(toSeq('230141'), 230141);
+});
+
+test('(P1 bounding) oversized payload is byte-bounded with a marker', () => {
+  // prose-like (spaces break the high-entropy opaque-token rule) so we exercise the SIZE bound, not redaction.
+  const { rawEvent } = toRawEvent({ sequenceId: 100, event: 'm', agent: { id: 'a' }, payload: { text: 'word '.repeat(5000) }, ts: '2026-07-18T10:00:00Z' });
+  assert.ok(Buffer.byteLength(rawEvent.payload, 'utf8') <= LIMITS.MAX_PAYLOAD_BYTES + 32);
+  assert.ok(rawEvent.payload.endsWith('[truncated]'));
+});
+
+test('(P1 participants) export-only / out-of-range actor is never labeled a participant', () => {
+  const exportData = {
+    session: { id: 's', title: 't' },
+    agents: ['inside', 'outside-only'],
+    participants: ['outside-only'],
+    events: [
+      { sequenceId: 90, event: 'm', agent: { id: 'outside-only' }, payload: { text: 'before' }, ts: '2026-07-18T09:00:00Z' },
+      { sequenceId: 100, event: 'm', agent: { id: 'inside' }, payload: { text: 'hi' }, ts: '2026-07-18T10:00:00Z' },
+      { sequenceId: 110, event: 'm', agent: { id: 'outside-only' }, payload: { text: 'after' }, ts: '2026-07-18T11:00:00Z' },
+    ],
+  };
+  const { rawCheckpoint } = buildRawCheckpoint({ checkpointId: 'cp_p', sessionId: 's', startSequence: 95, endSequence: 105 }, exportData);
+  assert.deepEqual(rawCheckpoint.agents, ['inside']);
+});
+
+test('(P0 secret-egress) HONEST: unknown-format secret survives scrub; known formats redacted incl. nested', () => {
+  const { text } = scrubText('the client credential is correct horse battery staple');
+  assert.ok(text.includes('correct horse battery staple'), 'best-effort scrub does not claim to catch arbitrary secrets');
+  const { value, redactions } = scrubDeep({ note: `key ${fakeApiKey}`, nested: { deep: `atk ${fakeAtk}` } });
+  assert.ok(!JSON.stringify(value).includes(fakeApiKey));
+  assert.ok(!JSON.stringify(value).includes(fakeAtk));
+  assert.ok(redactions.includes('api-key') && redactions.includes('aidenid-token'));
+});
+
+test('(P0 secret-egress) buildBundle final-egress-scrubs summary + evidence; raw events never cross', () => {
+  const rc = { checkpointId: 'cp_e', sessionId: 's', startSequence: 100, endSequence: 105 };
+  const summary = {
+    headline: `overall: token ${fakeApiKey}`,
+    perAgent: [{ agentId: 'a', evidence: [{ id: 'e1', sequence: 100, snippet: `quote with ${fakeBearer}` }] }],
+  };
+  const bundle = buildBundle(rc, summary);
+  const s = JSON.stringify(bundle);
+  assert.ok(!s.includes(fakeApiKey), 'summary secret scrubbed at egress');
+  assert.ok(!s.includes('q'.repeat(32)), 'evidence snippet secret scrubbed at egress');
+  assert.equal(bundle.events, undefined, 'no raw room events in the phone bundle');
 });

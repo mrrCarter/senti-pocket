@@ -7,7 +7,7 @@ Node ESM, **zero external deps** (uses `node:child_process`, `node:crypto`, `nod
 ## Pipeline
 ```
 sl session checkpoint list <SID>  ─┐
-sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  RawCheckpoint (secret-scrubbed)
+sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  RawCheckpoint (best-effort scrubbed; durable+contained only)
                                             │
                                             ├─► summarize()      ─► CheckpointSummary (perAgent + evidence)   [P1]
                                             └─► buildBundle()    ─► PocketBundle (Ed25519 signed)             [P1]
@@ -22,9 +22,11 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 - **P3 (held):** governed writeback (`ActionProposal` → deterministic target resolution → single-use confirm bound to proposal hash → `sl session reply` → `ActionReceipt`; offline ⇒ `pendingConnectivity`, never "sent"). Held until the P1 offline slice passes 5×.
 
 ## Safety invariants (Relay-owned)
-- Every payload is secret-scrubbed **before** it can enter a `RawEvent`/bundle that reaches the phone.
+- **Secret redaction is BEST-EFFORT, not a guarantee.** `scrub.mjs` is a known-format denylist + conservative high-entropy heuristics; it cannot prove content is secret-free (an arbitrary/natural-language secret survives). Mitigated by defense-in-depth: minimal-field projection + size bounds (`extract.mjs`), a **final egress scrub over every phone-visible string before signing** (`bundle.mjs`), and treating all residual content as untrusted. Raw room events never cross to the phone — only the summary + bounded evidence do.
+- **Checkpoint completeness/provenance:** a bundle is built ONLY from a real durable checkpoint whose entire range is contained in the export window (never overlap, never a synthesized/fabricated checkpoint). Missing/partial range ⇒ honest retryable error, no bundle.
+- **Numeric bounds:** sequence ids are positive safe integers, strictly increasing + unique; event/agent counts, span, and field/payload sizes are all bounded before allocation/signing.
 - No secrets or unrestricted private room history in fixtures.
-- Writes: deterministic target/sequence resolution, single-use confirmation bound to the exact proposal hash, real resulting sequence or explicit failure — never a false "sent".
+- Writes: snapshot-frozen proposal, single-use confirmation bound to the exact proposal hash, server-time freshness, reserve-before-post exactly-once, read-back verification, real `ActionResultRef` or explicit failure — never a false "sent".
 
 ## Test
 ```
