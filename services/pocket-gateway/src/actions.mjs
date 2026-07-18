@@ -85,21 +85,17 @@ const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/
  */
 export function canonicalReceiptPayload(r) {
   const lp = (s) => { const v = s == null ? '' : String(s); return `${Buffer.byteLength(v, 'utf8')}:${v}`; };
-  const toUnix = (t) => {
-    if (!t) return '';
-    const ms = new Date(t).getTime();
-    if (!Number.isFinite(ms)) throw new RangeError('non-finite receipt timestamp'); // (A) reject extreme/NaN dates
-    return String(Math.floor(ms / 1000));
-  };
-  return 'pocket.actionreceipt.v2\n'
+  // safeEpochMillis mirror (v0.1.6 v3): epoch MILLISECONDS; absent/non-finite -> "" (non-trapping, matches Swift).
+  const ms = (t) => { if (!t) return ''; const m = new Date(t).getTime(); return Number.isFinite(m) ? String(m) : ''; };
+  return 'pocket.actionreceipt.v3\n'
     + lp(r.id)
     + lp(r.proposalId)
     + lp(r.status)
     + lp(r.resultingSequence == null ? '' : String(r.resultingSequence))
     + lp(r.targetSessionId)
     + lp(r.confirmedProposalHash)
-    + lp(toUnix(r.confirmedByHumanAt))
-    + lp(toUnix(r.executedAt))
+    + lp(ms(r.confirmedByHumanAt))
+    + lp(ms(r.executedAt))
     + lp(r.failureReason ?? '')
     + lp(r.signingKeyId ?? '');
 }
@@ -181,12 +177,23 @@ export function executeAction(proposal, confirmation, opts = {}) {
     return r;
   }
 
-  // 4) REQUIRE signing credentials BEFORE any online side effect (Echo (B)): a .posted receipt MUST be
-  // signable, so we must never perform the post and then be unable to return a valid signed .posted.
-  if (!opts.signingKey || !opts.signingKeyId) {
-    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials required before writeback (never post an unsigned .posted)', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+  // 4) PREFLIGHT signing credentials BEFORE any online side effect (Echo (B)): the key must be a USABLE
+  // Ed25519 key and keyId a bounded non-blank string. A malformed/wrong-type key must fail with ZERO posts —
+  // never perform the post and then discover the credentials can't sign a valid .posted.
+  const keyIdOk = typeof opts.signingKeyId === 'string' && opts.signingKeyId.trim().length > 0 && opts.signingKeyId.length <= 256;
+  let signingKeyObj = null;
+  try {
+    if (!opts.signingKey) throw new Error('missing signing key');
+    signingKeyObj = (typeof opts.signingKey === 'string' || Buffer.isBuffer(opts.signingKey))
+      ? createPrivateKey(opts.signingKey) : opts.signingKey;
+    if (!signingKeyObj || signingKeyObj.asymmetricKeyType !== 'ed25519') throw new Error('not an ed25519 key');
+  } catch {
+    signingKeyObj = null;
   }
-  // execute the real Senti post via the existing CLI/MCP
+  if (!keyIdOk || !signingKeyObj) {
+    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials missing/invalid: an Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+  }
+  // execute the real Senti post via the existing CLI/MCP (credentials already validated -> a .posted is always signable)
   try {
     const out = run(['session', 'reply', proposal.targetSessionId, String(proposal.targetSequence), proposal.renderedPreview, '--agent', agent, '--json']);
     const resultingSequence = parseResultingSequence(out);
@@ -196,7 +203,7 @@ export function executeAction(proposal, confirmation, opts = {}) {
     }
     const r = signReceipt(
       receipt(proposal, 'posted', { resultingSequence, confirmedProposalHash: live, executedAt: now, confirmedByHumanAt: confirmation.confirmedAt }),
-      opts.signingKey, opts.signingKeyId,
+      signingKeyObj, opts.signingKeyId,
     );
     store.set(proposal.id, r);
     return r;

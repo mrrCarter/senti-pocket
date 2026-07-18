@@ -7,6 +7,7 @@ import {
   signReceipt, verifyReceipt, canonicalReceiptPayload,
 } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
+import { generateKeyPairSync } from 'node:crypto';
 
 const KNOWN = '6cf7e861-546a-4b9f-b937-39182a5bd395';
 
@@ -57,13 +58,13 @@ test('KAV: Node proposalHash byte-matches the Swift contract known-answer vector
   );
 });
 
-test('canonicalReceiptPayload matches v0.1.5 v2 (all fields bound; unix timestamps)', () => {
+test('canonicalReceiptPayload matches v0.1.6 v3 (all fields bound; epoch-millisecond timestamps)', () => {
   const r = { id: 'p1', proposalId: 'p1', status: 'posted', resultingSequence: 231111, targetSessionId: 's1', confirmedProposalHash: 'H', confirmedByHumanAt: '2026-07-18T12:01:00Z', executedAt: '2026-07-18T12:02:00Z', failureReason: null, signature: null, signingKeyId: 'k' };
-  const cu = String(Math.floor(Date.parse(r.confirmedByHumanAt) / 1000));
-  const eu = String(Math.floor(Date.parse(r.executedAt) / 1000));
+  const cu = String(Date.parse(r.confirmedByHumanAt)); // epoch ms
+  const eu = String(Date.parse(r.executedAt));
   assert.equal(
     canonicalReceiptPayload(r),
-    `pocket.actionreceipt.v2\n2:p12:p16:posted6:2311112:s11:H${cu.length}:${cu}${eu.length}:${eu}0:1:k`,
+    `pocket.actionreceipt.v3\n2:p12:p16:posted6:2311112:s11:H${cu.length}:${cu}${eu.length}:${eu}0:1:k`,
   );
 });
 
@@ -178,7 +179,7 @@ test('(B) online writeback WITHOUT signing credentials => failed, ZERO posts', (
   const { run, calls } = recordingRun();
   const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: undefined, signingKeyId: undefined }));
   assert.equal(r.status, 'failed');
-  assert.match(r.failureReason, /signing credentials required/);
+  assert.match(r.failureReason, /credentials|invalid|ed25519/i);
   assert.equal(calls.length, 0, 'no online side effect without credentials');
 });
 
@@ -198,9 +199,40 @@ test('(C) offline pending then online flush posts exactly once (pending is not t
   assert.equal(calls.length, 1, 'no double-post after terminal');
 });
 
-test('(A) a receipt with a non-finite timestamp is rejected by verification (no trap)', () => {
-  const bad = { id: 'p1', proposalId: 'p1', status: 'posted', resultingSequence: 1, targetSessionId: 's1', confirmedProposalHash: 'H', confirmedByHumanAt: 'not-a-date', executedAt: '2026-07-18T12:02:00Z', failureReason: null, signature: 'AAAA', signingKeyId: 'k' };
-  assert.equal(verifyReceipt(bad, TESTPUB), false);
+test('(A) non-finite timestamp is handled safely (no trap) and does not verify', () => {
+  const p = makeProposal({ id: 'padate' });
+  const { run } = recordingRun(241000);
+  const signed = executeAction(p, makeConfirm(p), opts({ run }));
+  assert.equal(signed.status, 'posted');
+  assert.equal(verifyReceipt(signed, TESTPUB), true);
+  const tampered = { ...signed, executedAt: 'not-a-date' }; // non-finite -> "" canonical (safe, no trap)
+  assert.equal(verifyReceipt(tampered, TESTPUB), false);
+});
+
+test('(B) malformed signing key => failed, ZERO posts (preflight before side effect)', () => {
+  const p = makeProposal();
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: 'not-a-key' }));
+  assert.equal(r.status, 'failed');
+  assert.match(r.failureReason, /credentials|invalid|ed25519/i);
+  assert.equal(calls.length, 0, 'malformed key: no online post');
+});
+
+test('(B) wrong key type (x25519, not ed25519) => failed, ZERO posts', () => {
+  const { privateKey: x } = generateKeyPairSync('x25519');
+  const p = makeProposal();
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: x }));
+  assert.equal(r.status, 'failed');
+  assert.equal(calls.length, 0, 'non-ed25519 key: no online post');
+});
+
+test('(B) blank keyId => failed, ZERO posts', () => {
+  const p = makeProposal();
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, signingKeyId: '   ' }));
+  assert.equal(r.status, 'failed');
+  assert.equal(calls.length, 0);
 });
 
 test('delimiter-injection guard: a targetSessionId carrying the \\n delimiter is rejected, never posted', () => {
