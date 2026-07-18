@@ -21,40 +21,59 @@ final class ContractsCrossModuleTests: XCTestCase {
         _ = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 230180, renderedPreview: "x", requiresConfirmation: true, createdAt: ts, sourceQuestionId: "q1", proposalHash: "H")
 
         XCTAssertEqual(rawCp.events.first?.sequenceId, 230141)
-        XCTAssertEqual(bundle.contractsVersion, "0.1.6")
+        XCTAssertEqual(bundle.contractsVersion, "0.1.7")
         XCTAssertEqual(agentSummary.claims.first?.kind, .fact)
     }
 
     /// Extreme decoded Date is rejected, NEVER trapped (Echo 62e08e9 A: Int(hugeDouble) crash/DoS).
     func testExtremeDateRejectedNonTrapping() {
         let extreme = Date(timeIntervalSince1970: 1e18)   // absurd; must be rejected, not crash
-        let r = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: extreme, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: "k1")
+        let r = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, result: .sequence(sequenceId: 200), targetSessionId: "s1", confirmedByHumanAt: extreme, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: "k1")
         XCTAssertNil(ActionReceipt.safeEpochMillis(extreme))
         XCTAssertFalse(r.hasSaneDates())
         XCTAssertFalse(r.isStructurallyValid())
         _ = r.canonicalReceiptPayload()                   // must not trap even on the bad date
     }
 
-    /// Receipt KAV + per-field tamper (Echo 43b796b): canonicalReceiptPayload v2 binds every field except
+    /// Receipt KAV + per-field tamper (Echo 43b796b): canonicalReceiptPayload v4 binds every field except
     /// `signature`, so substituting id / confirmedByHumanAt / signingKeyId changes the signed bytes. Node mirrors this.
+    /// v4 (v0.1.7): the `result` field is the length-prefixed ActionResultRef token (here .sequence(200)).
     func testReceiptCanonicalPayloadBindsAllFields() {
         func receipt(id: String = "r1", confirmedAt: Date, keyId: String = "k1") -> ActionReceipt {
-            ActionReceipt(id: id, proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: confirmedAt, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: keyId)
+            ActionReceipt(id: id, proposalId: "p1", status: .posted, result: .sequence(sequenceId: 200), targetSessionId: "s1", confirmedByHumanAt: confirmedAt, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: keyId)
         }
         let base = receipt(confirmedAt: ts)
-        XCTAssertEqual(base.canonicalReceiptPayload(), "pocket.actionreceipt.v3\n2:r12:p16:posted3:2002:s11:H13:175283520000013:17528352000000:2:k1")
+        XCTAssertEqual(base.canonicalReceiptPayload(), "pocket.actionreceipt.v4\n2:r12:p16:posted15:8:sequence3:2002:s11:H13:175283520000013:17528352000000:2:k1")
         // each previously-omitted field now changes the signed bytes:
         XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(id: "r2", confirmedAt: ts).canonicalReceiptPayload())
         XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(confirmedAt: ts.addingTimeInterval(1)).canonicalReceiptPayload())
         XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(confirmedAt: ts, keyId: "k2").canonicalReceiptPayload())
     }
 
+    /// ActionResultRef (v0.1.7) — the tagged union that replaced resultingSequence:Int. Codable round-trips both
+    /// variants (explicit kind-discriminated JSON); canonical tokens are Node-mirrorable KAVs; nil cursor stays
+    /// distinct from "" via the presence flag. Relay's gateway MUST match these tokens byte-for-byte.
+    func testActionResultRefTaggedUnion() throws {
+        let action = ActionResultRef.action(actionId: "act_1", targetSequenceId: 230180, targetCursor: "cur_9")
+        let sequence = ActionResultRef.sequence(sequenceId: 230195)
+        for ref in [action, sequence, ActionResultRef.action(actionId: "act_2", targetSequenceId: 5, targetCursor: nil)] {
+            XCTAssertEqual(ref, try JSONDecoder().decode(ActionResultRef.self, from: JSONEncoder().encode(ref)))
+        }
+        // Canonical token KAVs (Node mirror):
+        XCTAssertEqual(action.canonicalToken(), "6:action5:act_16:23018015:cur_9")
+        XCTAssertEqual(sequence.canonicalToken(), "8:sequence6:230195")
+        // nil cursor MUST stay distinct from an empty-string cursor (presence flag, injection-proof).
+        XCTAssertNotEqual(
+            ActionResultRef.action(actionId: "a", targetSequenceId: 1, targetCursor: nil).canonicalToken(),
+            ActionResultRef.action(actionId: "a", targetSequenceId: 1, targetCursor: "").canonicalToken())
+    }
+
     #if canImport(CryptoKit)
     /// SignatureState ordering (Echo): a signature PRESENT on a structurally-invalid receipt is .invalid (tamper), not .unsigned.
     func testSignatureStateInvalidOnStructuralTamper() {
-        let tampered = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: "sig", signingKeyId: "k1")
+        let tampered = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: "sig", signingKeyId: "k1")
         XCTAssertEqual(tampered.signatureState(gatewayPublicKeyBase64url: "AA"), .invalid)   // present sig + bad structure
-        let unsigned = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        let unsigned = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
         XCTAssertEqual(unsigned.signatureState(gatewayPublicKeyBase64url: "AA"), .unsigned)  // truly no signature
     }
     #endif
@@ -81,16 +100,16 @@ final class ContractsCrossModuleTests: XCTestCase {
 
     func testReceiptStructuralInvariants() {
         // pending: no posted fields -> valid.
-        let pending = ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        let pending = ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
         XCTAssertTrue(pending.isStructurallyValid())
         // pending WITH a signature -> invalid (a pending write must never look sent/signed).
-        let pendingSigned = ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: "sig", signingKeyId: "k")
+        let pendingSigned = ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: "sig", signingKeyId: "k")
         XCTAssertFalse(pendingSigned.isStructurallyValid())
         // posted MISSING signature/seq -> invalid.
-        let postedBad = ActionReceipt(id: "p1", proposalId: "p1", status: .posted, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        let postedBad = ActionReceipt(id: "p1", proposalId: "p1", status: .posted, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
         XCTAssertFalse(postedBad.isStructurallyValid())
         // fully-formed posted -> valid.
-        let postedGood = ActionReceipt(id: "p1", proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: "k")
+        let postedGood = ActionReceipt(id: "p1", proposalId: "p1", status: .posted, result: .sequence(sequenceId: 200), targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: "k")
         XCTAssertTrue(postedGood.isStructurallyValid())
     }
 

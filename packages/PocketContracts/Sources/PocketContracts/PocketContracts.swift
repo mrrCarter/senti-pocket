@@ -1,4 +1,10 @@
-// PocketContracts v0.1.6 — FROZEN by Atlas (claude-pocket-atlas).
+// PocketContracts v0.1.7 by Atlas (claude-pocket-atlas).
+// v0.1.7 (Relay/Echo/Pulse converged #231081-#231316): ActionReceipt.resultingSequence:Int -> `result:
+//   ActionResultRef?` tagged union — a true threadedReply is an ACTION (actionId + target it threads under),
+//   NOT a bare sequence; a say is a sequence. Explicit kind-discriminated Codable (Node-mirrorable). Receipt
+//   canon v3->v4: `result` bound as a length-prefixed ActionResultRef.canonicalToken() — Relay re-mirror + new
+//   KAVs (6:action.../8:sequence...). isStructurallyValid: .posted requires result!=nil. Pulse renders the
+//   tagged result (no fake numeric sequence for a reply); Relay implements the gateway result on this.
 // v0.1.6 (Echo 62e08e9 HOLD-A + tone): canonicalReceiptPayload -> v3 uses CHECKED epoch-MILLISECONDS
 //   (safeEpochMillis) — never TRAPS on an extreme decoded Date (Int(hugeDouble) trap = crash/DoS) and binds
 //   subsecond content; isStructurallyValid now rejects non-finite/out-of-range dates. Constrained BriefingTone
@@ -36,7 +42,7 @@ import CryptoKit
 #endif
 
 public enum PocketContracts {
-    public static let version = "0.1.6"
+    public static let version = "0.1.7"
 }
 
 // MARK: - Source (Relay produces RawCheckpoint + CheckpointSummary; gateway summarizes)
@@ -264,11 +270,71 @@ public enum ActionKind: String, Codable, Equatable, Sendable {
     // NO destructive/deploy/tool kinds in Sunday scope.
 }
 
+/// The concrete result of a governed write, as a TAGGED UNION (v0.1.7, agreed Relay/Echo/Pulse #231081-#231316).
+/// A true threaded reply is an ACTION — it has its own action id and the event it threads under — NOT a bare
+/// sequence number; representing a reply as a numeric `resultingSequence` mislabels it (loses thread association)
+/// and fabricates a sequence identity it does not have. A top-level say genuinely IS a new sequence.
+///
+/// Explicit, Node-mirrorable Codable (a `kind` discriminator — never Swift's opaque synthesized enum encoding):
+///   action   -> {"kind":"action","actionId":"...","targetSequenceId":123,"targetCursor":"..."|absent}
+///   sequence -> {"kind":"sequence","sequenceId":123}
+public enum ActionResultRef: Codable, Equatable, Sendable {
+    /// A threaded reply via the message-action channel: its own actionId + the target it threads under.
+    case action(actionId: String, targetSequenceId: Int, targetCursor: String?)
+    /// A top-level say: the new sequence id it created.
+    case sequence(sequenceId: Int)
+
+    private enum CodingKeys: String, CodingKey { case kind, actionId, targetSequenceId, targetCursor, sequenceId }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .action(actionId, targetSequenceId, targetCursor):
+            try c.encode("action", forKey: .kind)
+            try c.encode(actionId, forKey: .actionId)
+            try c.encode(targetSequenceId, forKey: .targetSequenceId)
+            try c.encodeIfPresent(targetCursor, forKey: .targetCursor)
+        case let .sequence(sequenceId):
+            try c.encode("sequence", forKey: .kind)
+            try c.encode(sequenceId, forKey: .sequenceId)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(String.self, forKey: .kind) {
+        case "action":
+            self = .action(actionId: try c.decode(String.self, forKey: .actionId),
+                           targetSequenceId: try c.decode(Int.self, forKey: .targetSequenceId),
+                           targetCursor: try c.decodeIfPresent(String.self, forKey: .targetCursor))
+        case "sequence":
+            self = .sequence(sequenceId: try c.decode(Int.self, forKey: .sequenceId))
+        case let other:
+            throw DecodingError.dataCorruptedError(forKey: .kind, in: c, debugDescription: "unknown ActionResultRef kind \(other)")
+        }
+    }
+
+    /// Deterministic, injection-proof token folded (length-prefixed) into `canonicalReceiptPayload`. Mirror
+    /// byte-for-byte in the Node gateway. Optional cursor carries an explicit presence flag so nil stays distinct
+    /// from "". Each variable field is itself length-prefixed; the whole token is length-prefixed by the receipt.
+    public func canonicalToken() -> String {
+        func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
+        switch self {
+        case let .action(actionId, targetSequenceId, targetCursor):
+            let cursor = targetCursor.map { "1" + lp($0) } ?? "0"
+            return lp("action") + lp(actionId) + lp(String(targetSequenceId)) + cursor
+        case let .sequence(sequenceId):
+            return lp("sequence") + lp(String(sequenceId))
+        }
+    }
+}
+
 public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let proposalId: String
     public let status: ReceiptStatus
-    public let resultingSequence: Int?
+    public let result: ActionResultRef?         // v0.1.7: tagged union (reply=action / say=sequence), replacing
+                                                // the overloaded resultingSequence:Int. Set ONLY on .posted.
     public let targetSessionId: String
     public let confirmedByHumanAt: Date
     public let confirmedProposalHash: String   // v0.1.2: the EXACT ActionProposal.proposalHash the human confirmed.
@@ -282,26 +348,26 @@ public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
                                                // => NOT verified (pending/failed receipts are unsigned and must
                                                // NEVER render as verified/sent — same honesty rule as the bundle).
     public let signingKeyId: String?
-    public init(id: String, proposalId: String, status: ReceiptStatus, resultingSequence: Int?, targetSessionId: String, confirmedByHumanAt: Date, confirmedProposalHash: String, executedAt: Date?, failureReason: String?, signature: String?, signingKeyId: String?) {
-        self.id = id; self.proposalId = proposalId; self.status = status; self.resultingSequence = resultingSequence
+    public init(id: String, proposalId: String, status: ReceiptStatus, result: ActionResultRef?, targetSessionId: String, confirmedByHumanAt: Date, confirmedProposalHash: String, executedAt: Date?, failureReason: String?, signature: String?, signingKeyId: String?) {
+        self.id = id; self.proposalId = proposalId; self.status = status; self.result = result
         self.targetSessionId = targetSessionId; self.confirmedByHumanAt = confirmedByHumanAt
         self.confirmedProposalHash = confirmedProposalHash
         self.executedAt = executedAt; self.failureReason = failureReason
         self.signature = signature; self.signingKeyId = signingKeyId
     }
 
-    /// Type-enforced status invariant (Echo 84d463f): .posted MUST carry resultingSequence + executedAt +
-    /// signature + signingKeyId (and no failureReason); .pendingConnectivity MUST carry none of them; .failed
-    /// MUST carry failureReason and none of the posted fields. The phone/gateway reject a receipt that fails this.
+    /// Type-enforced status invariant (Echo 84d463f): .posted MUST carry result + executedAt + signature +
+    /// signingKeyId (and no failureReason); .pendingConnectivity MUST carry none of them; .failed MUST carry
+    /// failureReason and none of the posted fields. The phone/gateway reject a receipt that fails this.
     public func isStructurallyValid() -> Bool {
         guard hasSaneDates() else { return false }   // reject non-finite/out-of-range dates (Echo 62e08e9 A: no trap)
         switch status {
         case .posted:
-            return resultingSequence != nil && executedAt != nil && signature != nil && signingKeyId != nil && failureReason == nil
+            return result != nil && executedAt != nil && signature != nil && signingKeyId != nil && failureReason == nil
         case .pendingConnectivity:
-            return resultingSequence == nil && executedAt == nil && signature == nil && signingKeyId == nil && failureReason == nil
+            return result == nil && executedAt == nil && signature == nil && signingKeyId == nil && failureReason == nil
         case .failed:
-            return failureReason != nil && resultingSequence == nil && executedAt == nil && signature == nil && signingKeyId == nil
+            return failureReason != nil && result == nil && executedAt == nil && signature == nil && signingKeyId == nil
         }
     }
 
@@ -328,11 +394,11 @@ public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
     public func canonicalReceiptPayload() -> String {
         func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
         func ms(_ d: Date?) -> String { d.flatMap(ActionReceipt.safeEpochMillis).map(String.init) ?? "" }
-        return "pocket.actionreceipt.v3\n"
+        return "pocket.actionreceipt.v4\n"                      // v4: `result` tagged union replaces resultingSequence:Int
             + lp(id)
             + lp(proposalId)
             + lp(status.rawValue)
-            + lp(resultingSequence.map(String.init) ?? "")
+            + lp(result.map { $0.canonicalToken() } ?? "")
             + lp(targetSessionId)
             + lp(confirmedProposalHash)
             + lp(ms(confirmedByHumanAt))
@@ -375,6 +441,6 @@ private extension Data {
 
 public enum ReceiptStatus: String, Codable, Equatable, Sendable {
     case pendingConnectivity   // offline: NEVER represent as sent
-    case posted                // success: resultingSequence is set
+    case posted                // success: result (action|sequence) is set
     case failed                // failureReason is set
 }

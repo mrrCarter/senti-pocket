@@ -23,10 +23,10 @@ final class PocketCallMachineTests: XCTestCase {
     }
     /// A pending receipt correctly bound to a given proposal (offline-first queue; never signed).
     private func boundPendingReceipt(for p: ActionProposal) -> ActionReceipt {
-        ActionReceipt(id: "r1", proposalId: p.id, status: .pendingConnectivity, resultingSequence: nil, targetSessionId: p.targetSessionId, confirmedByHumanAt: ts, confirmedProposalHash: p.proposalHash, executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        ActionReceipt(id: "r1", proposalId: p.id, status: .pendingConnectivity, result: nil, targetSessionId: p.targetSessionId, confirmedByHumanAt: ts, confirmedProposalHash: p.proposalHash, executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
     }
     private func receipt() -> ActionReceipt {
-        ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
     }
 
     func testFlowUpToAwaitingConfirmation() {
@@ -124,10 +124,10 @@ final class PocketCallMachineTests: XCTestCase {
         ], gatewayKey: key)
         guard case .executing = executing else { return XCTFail("valid confirm -> executing, got \(executing)") }
         // A receipt for a DIFFERENT proposal id must NOT complete the call.
-        let foreign = ActionReceipt(id: "r9", proposalId: "pX", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: valid.proposalHash, executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        let foreign = ActionReceipt(id: "r9", proposalId: "pX", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: valid.proposalHash, executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
         guard case .executing = PocketCall.reduce(executing, .executed(foreign), gatewayKey: key) else { return XCTFail("unbound receipt must NOT complete") }
         // A receipt with a mismatched confirmedProposalHash must NOT complete either.
-        let hashMismatch = ActionReceipt(id: "r9", proposalId: "p1", status: .pendingConnectivity, resultingSequence: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "NOPE", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        let hashMismatch = ActionReceipt(id: "r9", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "NOPE", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
         guard case .executing = PocketCall.reduce(executing, .executed(hashMismatch), gatewayKey: key) else { return XCTFail("hash-mismatch receipt must NOT complete") }
         // The correctly-bound pending receipt completes.
         guard case .completed = PocketCall.reduce(executing, .executed(boundPendingReceipt(for: valid)), gatewayKey: key) else { return XCTFail("bound receipt -> completed") }
@@ -144,9 +144,9 @@ final class PocketCallMachineTests: XCTestCase {
         ], gatewayKey: pub)
         guard case .executing = executing else { return XCTFail("expected executing") }
         // Canonical payload excludes the signature field, so we can compute it on a placeholder then re-wrap.
-        let toSign = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: valid.proposalHash, executedAt: ts, failureReason: nil, signature: "PLACEHOLDER", signingKeyId: "gw")
+        let toSign = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, result: .action(actionId: "act_p1", targetSequenceId: 10, targetCursor: nil), targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: valid.proposalHash, executedAt: ts, failureReason: nil, signature: "PLACEHOLDER", signingKeyId: "gw")
         let sig = b64url(try signingKey.signature(for: Data(toSign.canonicalReceiptPayload().utf8)))
-        let signed = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, resultingSequence: 200, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: valid.proposalHash, executedAt: ts, failureReason: nil, signature: sig, signingKeyId: "gw")
+        let signed = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, result: .action(actionId: "act_p1", targetSequenceId: 10, targetCursor: nil), targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: valid.proposalHash, executedAt: ts, failureReason: nil, signature: sig, signingKeyId: "gw")
         XCTAssertEqual(signed.signatureState(gatewayPublicKeyBase64url: pub), .verified)
         // Correct pinned key -> completes.
         guard case .completed = PocketCall.reduce(executing, .executed(signed), gatewayKey: pub) else { return XCTFail("verified posted -> completed") }

@@ -40,13 +40,15 @@ public enum PocketFixtures {
 
     /// PENDING (offline) receipt — MUST render "queued", never "sent"/"verified" (signature is nil).
     public static let pendingReceipt = ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity,
-        resultingSequence: nil, targetSessionId: sessionId, confirmedByHumanAt: ts,
+        result: nil, targetSessionId: sessionId, confirmedByHumanAt: ts,
         confirmedProposalHash: actionProposal.proposalHash, executedAt: nil, failureReason: nil,
         signature: nil, signingKeyId: nil)
 
     /// POSTED receipt — PLACEHOLDER signature; a real gateway ed25519 signature must VERIFY before "verified" shows.
+    /// The proposal is a threadedReply, so the result is an ACTION threading under seq 230180 (v0.1.7), not a say.
     public static let postedReceipt = ActionReceipt(id: "p1", proposalId: "p1", status: .posted,
-        resultingSequence: 230195, targetSessionId: sessionId, confirmedByHumanAt: ts,
+        result: .action(actionId: "act_fixture_p1", targetSequenceId: 230180, targetCursor: nil),
+        targetSessionId: sessionId, confirmedByHumanAt: ts,
         confirmedProposalHash: actionProposal.proposalHash, executedAt: ts, failureReason: nil,
         signature: "FIXTURE_PLACEHOLDER_SIG_verify_before_trust", signingKeyId: "pocket-gateway-fixture-key")
 }
