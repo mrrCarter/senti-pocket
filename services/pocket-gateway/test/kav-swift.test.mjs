@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 import { createHash, createPrivateKey, createPublicKey, sign as edSign } from 'node:crypto';
 import {
   canonicalBundlePayload, canonicalBundleBytes, verifyBundle,
-  validateBundleSemantics, verifyBundleWithTrustStore,
+  validateBundleSemantics, verifyBundleWithTrustStore, verifyBundlePhaseADemo,
 } from '../src/bundle.mjs';
 
 const FX = JSON.parse(readFileSync(new URL('./fixtures/pocket_bundle_kav_swift.json', import.meta.url), 'utf8'));
@@ -52,4 +52,13 @@ test('Swift-KAV: signingKeyId selects the pinned key; unknown id rejected; bundl
   assert.equal(verifyBundleWithTrustStore({ ...mapped, signature: sigStd }, trust), true, 'id selects pinned key');
   assert.equal(verifyBundleWithTrustStore({ ...mapped, signature: sigStd, signingKeyId: 'attacker' }, trust), false, 'unknown id => reject');
   assert.deepEqual(validateBundleSemantics(mapped).errors, [], 'semantically valid');
+});
+
+test('Swift-KAV: internal non-injectable Phase-A anchor verifies the demo bundle (mirrors Swift .phaseADemo)', () => {
+  const sigStd = Buffer.from(FX.kav.signatureBase64url, 'base64url').toString('base64');
+  // no caller can inject a key: verifyBundlePhaseADemo takes NO trust-store param. Verifying the real KAV under it
+  // also drift-guards the pinned constant against the fixture's demo pubkey (fails if either changes).
+  assert.equal(verifyBundlePhaseADemo({ ...mapped, signature: sigStd }), true, 'internal pinned anchor verifies');
+  assert.equal(verifyBundlePhaseADemo({ ...mapped, signature: sigStd, signingKeyId: 'attacker' }), false, 'unknown id => reject');
+  assert.equal(verifyBundlePhaseADemo({ ...mapped, summary: { ...mapped.summary, headline: 'demo EVIL' }, signature: sigStd }), false, 'tamper => reject');
 });

@@ -254,6 +254,20 @@ export function verifyBundleWithTrustStore(bundle, trustStore) {
   } catch { return false; }
 }
 
+// The Phase-A demo trust anchor, PINNED as an internal FROZEN constant (RAW base64url Ed25519 pubkey derived from the
+// PUBLIC seed phrase "senti-pocket phase-a demo gateway key -- NEVER PRODUCTION"). Non-caller-injectable by design.
+const PHASE_A_DEMO_TRUST = Object.freeze({ 'pocket-demo-phase-a': 'KiJLmbgZ-ybBDsPp_K27z2JQGzdMrfmlpQMQmyHg2j8' });
+
+/**
+ * Verify a bundle against the INTERNAL, non-injectable Phase-A demo anchor — the production-correct posture and the
+ * Node mirror of the Swift PocketTrustAnchor.phaseADemo fix: the pinned key is a fixed constant resolved FROM the
+ * bundle's signingKeyId, NEVER a caller-supplied key (this function takes no trust-store parameter, so a caller can
+ * neither pin their own key nor self-sign a bypass). Rejects any signingKeyId not in the pinned set. Demo/Phase-A only.
+ */
+export function verifyBundlePhaseADemo(bundle) {
+  return verifyBundleWithTrustStore(bundle, PHASE_A_DEMO_TRUST);
+}
+
 /** Convenience: build + sign in one step. */
 export function buildSignedBundle(rawCheckpoint, summary, privateKey, opts = {}) {
   return signBundle(buildBundle(rawCheckpoint, summary, opts), privateKey, opts.signingKeyId);
