@@ -178,9 +178,13 @@ public struct VerifiedBundle: Equatable, Sendable {
     private init(bundle: PocketBundle) { self.bundle = bundle }
 
     public static func verify(_ bundle: PocketBundle, gatewayPublicKeyBase64url key: String) -> VerifiedBundle? {
-        // TODO(Relay bundle-signing KAV): verify `bundle.signature` (ed25519) over the agreed canonical bundle
-        // payload using `key`. Until the canonical payload is byte-matched cross-lane, fail closed.
+        // v0.1.9: real ed25519 verification over the `pocket.bundle.v1` canonical bytes under the PINNED key
+        // (PocketContracts.PocketBundle.verifiesSignature). Mints ONLY on a genuine pass; fails closed off-crypto.
+        #if canImport(CryptoKit)
+        return bundle.verifiesSignature(gatewayPublicKeyBase64url: key) ? VerifiedBundle(bundle: bundle) : nil
+        #else
         return nil
+        #endif
     }
 
     #if DEBUG

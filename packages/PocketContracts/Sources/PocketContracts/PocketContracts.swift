@@ -1,4 +1,9 @@
 // PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
+// v0.1.8+ (Pulse #231475 P0 / bundle-ingress): ADDITIVE, no wire/shape change -> NOT a version bump. Adds
+//   PocketBundle.canonicalBundlePayload() (`pocket.bundle.v1`, length+count-prefixed) + verifiesSignature();
+//   VerifiedBundle.verify now does REAL ed25519 over the pinned key (was fail-closed nil). The Phase-A fixture is
+//   genuinely SIGNED (on the Mac) + verifies -> the UI's fail-closed gate opens WITHOUT rendering unverified content.
+//   Relay mirrors pocket.bundle.v1 to sign real bundles. KAV = testBundleCanonicalKAV.
 // v0.1.8 (Echo #231350 re-audit): canonical ActionProposal v2 -> v3 binds id + createdAt + sourceQuestionId
 //   (was kind/session/sequence/preview ONLY) — two same-CONTENT proposals with different ids/times now get
 //   DISTINCT hashes, killing the confirm-swap where a stale A intent confirmed a same-content displayed B.
@@ -156,6 +161,45 @@ public struct EvidenceRef: Codable, Equatable, Identifiable, Sendable {
         self.id = id; self.sessionId = sessionId; self.sequence = sequence
         self.agentId = agentId; self.snippet = snippet; self.ts = ts
     }
+}
+
+public extension PocketBundle {
+    /// v0.1.9: the EXACT canonical bytes the gateway ed25519-signs and the phone verifies (`pocket.bundle.v1`).
+    /// Length-prefixed strings `<utf8ByteCount>:<s>`, COUNT-prefixed arrays (`lp(count)` then each element), a
+    /// presence flag for the optional `grade` (nil != ""), CHECKED epoch-millis for dates (never traps) — so it is
+    /// injection-proof + deterministic. Binds EVERY field except `signature` (incl. signingKeyId). Mirror this
+    /// byte-for-byte in the Node gateway (Relay) and the fixture signer; see the KAV in ContractsCrossModuleTests.
+    func canonicalBundlePayload() -> String {
+        func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
+        func i(_ n: Int) -> String { lp(String(n)) }
+        func ms(_ d: Date) -> String { lp(ActionReceipt.safeEpochMillis(d).map(String.init) ?? "") }
+        func opt(_ s: String?) -> String { s.map { "1" + lp($0) } ?? "0" }
+        func arr<T>(_ xs: [T], _ f: (T) -> String) -> String { lp(String(xs.count)) + xs.map(f).joined() }
+        func ev(_ e: EvidenceRef) -> String { lp(e.id) + lp(e.sessionId) + i(e.sequence) + lp(e.agentId) + lp(e.snippet) + ms(e.ts) }
+        func claim(_ c: Claim) -> String { lp(c.id) + lp(c.text) + lp(c.kind.rawValue) + arr(c.evidenceIds, lp) }
+        func agent(_ a: AgentSummary) -> String { lp(a.agentId) + lp(a.summary) + arr(a.claims, claim) + arr(a.evidence, ev) }
+        let s = summary
+        let summaryCanon = lp(s.checkpointId) + lp(s.headline) + lp(s.summaryBaselineSchema) + opt(s.grade)
+            + arr(s.perAgent, agent) + arr(s.risks, lp) + arr(s.blockers, lp)
+        return "pocket.bundle.v1\n"
+            + lp(contractsVersion) + lp(checkpointId) + lp(sessionId) + i(sequenceStart) + i(sequenceEnd)
+            + summaryCanon
+            + arr(evidence, ev)
+            + ms(createdAt) + lp(signingKeyId)
+    }
+
+    #if canImport(CryptoKit)
+    /// True IFF `signature` is a valid ed25519 signature over `canonicalBundlePayload()` under the pinned key AND
+    /// the required fields are present + createdAt is sane. This is the ONLY path to a trusted bundle; fails closed.
+    func verifiesSignature(gatewayPublicKeyBase64url pk: String) -> Bool {
+        guard !checkpointId.isEmpty, !sessionId.isEmpty, !signingKeyId.isEmpty, !signature.isEmpty,
+              ActionReceipt.safeEpochMillis(createdAt) != nil else { return false }
+        guard let pkData = Data(base64URLEncoded: pk),
+              let sigData = Data(base64URLEncoded: signature),
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: pkData) else { return false }
+        return key.isValidSignature(sigData, for: Data(canonicalBundlePayload().utf8))
+    }
+    #endif
 }
 
 // MARK: - Briefing + Q&A (Echo/Pulse consume; local, offline-capable)

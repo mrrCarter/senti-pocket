@@ -68,6 +68,18 @@ final class ContractsCrossModuleTests: XCTestCase {
             ActionResultRef.action(actionId: "a", targetSequenceId: 1, targetCursor: "").canonicalToken())
     }
 
+    /// KAV — the exact `pocket.bundle.v1` canonical bytes (v0.1.9). Relay's Node gateway MUST reproduce this
+    /// byte-for-byte to sign real bundles; the `signature` field is excluded (any value -> same canonical).
+    func testBundleCanonicalKAV() {
+        let summary = CheckpointSummary(checkpointId: "cp1", headline: "h", summaryBaselineSchema: "sch", grade: nil, perAgent: [], risks: [], blockers: [])
+        let bundle = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp1", sessionId: "s1", sequenceStart: 1, sequenceEnd: 2, summary: summary, evidence: [], createdAt: ts, signature: "IGNORED", signingKeyId: "k1")
+        XCTAssertEqual(bundle.canonicalBundlePayload(),
+            "pocket.bundle.v1\n5:0.1.83:cp12:s11:11:23:cp11:h3:sch01:01:01:01:013:17528352000002:k1")
+        // signature is NOT bound: changing it does not change the canonical.
+        let other = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp1", sessionId: "s1", sequenceStart: 1, sequenceEnd: 2, summary: summary, evidence: [], createdAt: ts, signature: "DIFFERENT", signingKeyId: "k1")
+        XCTAssertEqual(bundle.canonicalBundlePayload(), other.canonicalBundlePayload())
+    }
+
     #if canImport(CryptoKit)
     /// SignatureState ordering (Echo): a signature PRESENT on a structurally-invalid receipt is .invalid (tamper), not .unsigned.
     func testSignatureStateInvalidOnStructuralTamper() {

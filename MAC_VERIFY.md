@@ -15,11 +15,25 @@ cd senti-pocket
 git checkout atlas/pocket-contracts-v0.1     # verify HEAD is 7e1cfbe (or later)
 git rev-parse --short HEAD
 
-# Each package is independent (PocketCall + PocketBriefing depend on PocketContracts via a local path).
-for pkg in packages/PocketContracts packages/PocketCall packages/PocketBriefing; do
+# Logic packages — pure SwiftPM, verify with `swift test` (local path deps resolve automatically).
+for pkg in packages/PocketContracts packages/PocketCall packages/PocketBriefing packages/PocketUI; do
   echo "==== $pkg ===="
   ( cd "$pkg" && swift build && swift test )
 done
+
+# ML packages — pull heavy EXTERNAL deps; `swift build` fetches them (LiteRT-LM source, whisper.cpp binary xcframework).
+# These may be better validated via the app's xcodegen build (iOS SDK) than standalone swift test:
+for pkg in packages/PocketInference packages/PocketVoice; do
+  echo "==== $pkg (external deps) ===="
+  ( cd "$pkg" && swift build ) || echo "  ^ if LiteRT-LM/whisper resolution fails, route to Echo (owning lane)"
+done
+```
+
+## The full app (all six packages wired)
+`apps/SentiPocketApp` depends on all six packages (project.yml). Build it via XcodeGen:
+```bash
+cd apps/SentiPocketApp && xcodegen generate && xcodebuild -scheme SentiPocketApp \
+  -destination 'generic/platform=iOS Simulator' build
 ```
 
 ## Expected
