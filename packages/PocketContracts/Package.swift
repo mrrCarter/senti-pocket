@@ -9,6 +9,6 @@ let package = Package(
     ],
     targets: [
         .target(name: "PocketContracts"),
-        .testTarget(name: "PocketContractsTests", dependencies: ["PocketContracts"], resources: [.copy("../../Fixtures/canonical_checkpoint.json")])
+        .testTarget(name: "PocketContractsTests", dependencies: ["PocketContracts"])
     ]
 )
