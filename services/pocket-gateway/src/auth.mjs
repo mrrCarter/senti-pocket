@@ -95,7 +95,9 @@ async function verifyDpop(dpopHeader, { jkt, htm, htu, accessToken, nowSec, cloc
   if (d.payload.ath !== ath) return false;                                        // binds the exact access token
   if (replayGuard) {                                                              // REPLAY defense (RFC 9449 §11.1)
     if (typeof d.payload.jti !== 'string' || !d.payload.jti) return false;        // a proof MUST carry a unique jti
-    if (await replayGuard.seen(d.payload.jti, nowSec + maxAge, nowSec)) return false; // reused jti within window => reject
+    // Retain the jti through the proof's LAST valid instant (iat + maxAge) + skew, not now+maxAge: a future-skewed
+    // iat stays valid past now+maxAge, so a shorter retention would let it replay at the boundary (Echo P1).
+    if (await replayGuard.seen(d.payload.jti, d.payload.iat + maxAge + clockSkewSec, nowSec)) return false;
   }
   return true;
 }
@@ -140,6 +142,9 @@ export function createAidenIdVerifier(cfg = {}) {
       if (p.nbf != null && nowSec < p.nbf - clockSkewSec) return null; // not yet valid
       if (p.iat > p.exp || (p.nbf != null && p.nbf > p.exp)) return null; // ordering
 
+      // The PAIRWISE sub is the principal anchor and is REQUIRED (Echo P1): a token lacking it must not authorize —
+      // otherwise a consumerAccountId-only token would build a principal with an empty sub segment.
+      if (typeof p.sub !== 'string' || !p.sub) return null;
       const humanId = p[humanIdClaim] || p.sub;
       if (typeof humanId !== 'string' || !humanId) return null;
 

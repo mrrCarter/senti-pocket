@@ -100,8 +100,8 @@ function fakeDynamo() {
         const cur = items.get(key);
         const nowV = ExpressionAttributeValues && ExpressionAttributeValues[':now'];
         if (ConditionExpression === 'attribute_not_exists(pk)') { if (cur) throwCond(); }
-        else if (ConditionExpression === 'attribute_not_exists(pk) OR #ttl < :now') {
-          const expired = cur && Number.isFinite(cur.ttl) && Number.isFinite(nowV) && cur.ttl < nowV;
+        else if (ConditionExpression === 'attribute_not_exists(pk) OR #ttl <= :now') {
+          const expired = cur && Number.isFinite(cur.ttl) && Number.isFinite(nowV) && cur.ttl <= nowV; // <= : reacquire AT expiry
           if (cur && !expired) throwCond();
         } else throw new Error('unmodeled put ConditionExpression: ' + ConditionExpression);
       }
@@ -155,6 +155,15 @@ test('createDynamoStore: a LOGICALLY-EXPIRED lock is re-acquirable before Dynamo
   const t2 = await store.acquireLock('kexp');
   assert.ok(t2, 'expired lock re-acquired without waiting for eventual TTL sweep');
   assert.notEqual(t1, t2);
+});
+
+test('createDynamoStore: lock is re-acquirable AT the exact expiry boundary (ttl <= now)', async () => {
+  const client = fakeDynamo();
+  let clock = 2_000_000_000_000;
+  const store = createDynamoStore({ client, table: 'pocket', ttlSeconds: 10, now: () => clock });
+  assert.ok(await store.acquireLock('kb'));
+  clock += 10_000; // EXACTLY ttlSeconds later => stored ttl == now
+  assert.ok(await store.acquireLock('kb'), 're-acquirable at the exact expiry instant (uses <=, not <)');
 });
 
 test('createDynamoStore: putIfAbsent sets a TOP-LEVEL ttl (so DynamoDB TTL can expire replay records)', async () => {

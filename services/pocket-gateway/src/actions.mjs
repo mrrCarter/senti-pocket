@@ -249,16 +249,16 @@ export function verifyActionLanded(sessionId, parsed, { run, agent = 'claude-poc
 
 /**
  * Crash-recovery read-back: after a durable "in-flight" reservation whose emitted actionId was LOST to a crash
- * (post landed but the emitted marker was never persisted), find OUR already-landed action by CONTENT — an action
- * event authored by us, threading under the exact target sequence, whose body equals the confirmed renderedPreview.
- * Returns {actionId, targetSequenceId, targetCursor} or null. Lets the handler finalize (never re-post) an ambiguous
- * post. NOTE: content-match is a heuristic disambiguator (proposal.id is single-use so at most one such post exists);
- * the deterministic close is a server-side idempotency key on `sl session reply`, which the CLI does not expose.
+ * (post landed but the emitted marker was never persisted), find OUR already-landed action by the DETERMINISTIC
+ * PROPOSAL IDENTITY — the idempotency key our post set (= computeProposalHash, which v3 binds to id+content+time),
+ * authored by us under the exact target sequence. Matching the idempotency key (not the message body) means an
+ * older, identical-CONTENT action carries a DIFFERENT key and can never be mis-finalized as this proposal (Echo P1).
+ * Returns {actionId, targetSequenceId, targetCursor} or null.
  */
-export function findLandedByContent(sessionId, { proposal, run, agent = 'claude-pocket-relay', attempts = 2 } = {}) {
+export function findLandedByProposal(sessionId, { proposal, run, agent = 'claude-pocket-relay', attempts = 2 } = {}) {
   if (!run || !proposal) return null;
-  const want = String(proposal.renderedPreview);
   const wantSeq = proposal.targetSequence;
+  const wantKey = computeProposalHash(proposal); // deterministic proposal identity — NOT the body
   for (let i = 0; i < attempts; i++) {
     try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
     let j;
@@ -267,10 +267,9 @@ export function findLandedByContent(sessionId, { proposal, run, agent = 'claude-
       if (!e || typeof e.eventId !== 'string' || !e.eventId.startsWith('session-action-')) continue;
       const who = (e.agent && e.agent.id) || e.agentId;
       const p = e.payload || {};
-      const tseq = p.targetSequenceId;
-      const body = p.text ?? p.body ?? p.renderedPreview ?? p.message;
-      if (who === agent && Number(tseq) === wantSeq && typeof body === 'string' && body === want) {
-        return { actionId: e.eventId.slice('session-action-'.length), targetSequenceId: Number(tseq), targetCursor: (typeof p.targetCursor === 'string' ? p.targetCursor : null) };
+      const tok = e.idempotencyToken ?? p.idempotencyToken ?? p.idempotencyKey;
+      if (who === agent && Number(p.targetSequenceId) === wantSeq && typeof tok === 'string' && tok === wantKey) {
+        return { actionId: e.eventId.slice('session-action-'.length), targetSequenceId: Number(p.targetSequenceId), targetCursor: (typeof p.targetCursor === 'string' ? p.targetCursor : null) };
       }
     }
   }
@@ -448,7 +447,9 @@ export function executeAction(proposal, confirmation, opts = {}) {
   // execute the real Senti post (credentials + dates validated -> a .posted is always signable + Swift-sane).
   // Only immutable snapshots (nowSnap/confirmedAtSnap) flow into the receipt — never the caller's mutable inputs.
   try {
-    const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--json']);
+    // --idempotency-key = the proposal hash (deterministic, unique per proposal): gives server-side dedup AND lets a
+    // crash-recovery read-back bind to THIS exact proposal, not merely matching content (Echo P1).
+    const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--idempotency-key', live, '--json']);
     const parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
     if (!parsed || parsed.targetSequenceId !== snap.targetSequence) {
       // The post returned but is unidentifiable, or landed under the WRONG sequence: it may have landed, so KEEP a

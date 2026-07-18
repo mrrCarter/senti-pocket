@@ -65,7 +65,7 @@ export function createDynamoStore(cfg = {}) {
         await client.put({
           TableName: table,
           Item: { ...lk(key), owner: token, ttl: nowSec() + ttlSeconds },
-          ConditionExpression: 'attribute_not_exists(pk) OR #ttl < :now',
+          ConditionExpression: 'attribute_not_exists(pk) OR #ttl <= :now',
           ExpressionAttributeNames: { '#ttl': 'ttl' },
           ExpressionAttributeValues: { ':now': nowSec() },
         });

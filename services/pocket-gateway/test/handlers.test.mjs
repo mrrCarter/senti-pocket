@@ -173,22 +173,39 @@ test('durable state keyed by PRINCIPAL, not sub: same pairwise sub across sites 
   assert.equal(state.replies, 2, 'same sub + proposal.id at different sites executes independently (no cross-tenant collision)');
 });
 
-test('crash recovery: in-flight reservation + landed post => retry FINALIZES via content read-back, never re-posts', async () => {
+test('crash recovery: in-flight reservation + landed post => retry FINALIZES via idempotency-key read-back, never re-posts', async () => {
   const store = createInMemoryStore();
-  const POSTED = 'Approved.';
+  const p = makeProposal({ id: 'pcrash', renderedPreview: 'Approved.' });
+  const KEY = computeProposalHash(p); // the reply was posted with --idempotency-key = proposal hash
   const state = { replies: 0 };
   const run = (args) => {
     if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_crash', targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
-    if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_crash', agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160, text: POSTED } }] });
+    if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_crash', agent: { id: 'claude-pocket-relay' }, idempotencyToken: KEY, payload: { targetSequenceId: 230160 } }] });
     return '{}';
   };
   const gw = createGateway(baseDeps({ store, run }));
-  const p = makeProposal({ id: 'pcrash', renderedPreview: POSTED });
   await store.put(storeKey('consumer-123', 'pcrash'), { state: 'in-flight', proposalId: 'pcrash', reservedAt: '2026-07-18T12:02:00Z' }); // crashed after post
   const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
   assert.equal(r.body.status, 'posted', 'finalized the already-landed post');
   assert.equal(r.body.result.actionId, 'act_crash');
   assert.equal(state.replies, 0, 'crash recovery must NOT re-post');
+});
+
+test('reconciliation binds to PROPOSAL IDENTITY, not body: an older identical-content action is never finalized (Echo P1)', async () => {
+  const store = createInMemoryStore();
+  const p = makeProposal({ id: 'pident', renderedPreview: 'Approved.' });
+  const state = { replies: 0 };
+  const run = (args) => {
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_new', targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    // an OLDER action with the SAME body but a DIFFERENT idempotency key (a different proposal)
+    if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_OLD', agent: { id: 'claude-pocket-relay' }, idempotencyToken: 'a-different-proposal-hash', payload: { targetSequenceId: 230160, text: 'Approved.' } }] });
+    return '{}';
+  };
+  const gw = createGateway(baseDeps({ store, run }));
+  await store.put(storeKey('consumer-123', 'pident'), { state: 'in-flight', proposalId: 'pident', reservedAt: '2026-07-18T12:02:00Z' });
+  const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
+  assert.equal(r.status, 409, 'an older identical-content action has a different key => not mis-finalized => unknown/409');
+  assert.equal(state.replies, 0, 'never re-posts either');
 });
 
 test('unknown prior send: in-flight reservation with NO read-back match does NOT re-post (Echo P0)', async () => {
@@ -202,17 +219,17 @@ test('unknown prior send: in-flight reservation with NO read-back match does NOT
   assert.equal(state.replies, 0, 'must NOT re-post');
 });
 
-test('ambiguous send (run throws AFTER commit): retry reconciles via read-back and finalizes, never double-posts', async () => {
+test('ambiguous send (run throws AFTER commit): retry reconciles via idempotency-key read-back, never double-posts', async () => {
   const store = createInMemoryStore();
-  const POSTED = 'Approved.';
+  const p = makeProposal({ id: 'pamb', renderedPreview: 'Approved.' });
+  const KEY = computeProposalHash(p);
   let phase = 'throw'; // first attempt: reply throws AFTER the server committed
   const run = (args) => {
     if (args[1] === 'reply') { if (phase === 'throw') { phase = 'landed'; throw new Error('network reset after send'); } throw new Error('MUST NOT re-post'); }
-    if (args[1] === 'read') return JSON.stringify({ events: phase === 'landed' ? [{ eventId: 'session-action-act_amb', agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160, text: POSTED } }] : [] });
+    if (args[1] === 'read') return JSON.stringify({ events: phase === 'landed' ? [{ eventId: 'session-action-act_amb', agent: { id: 'claude-pocket-relay' }, idempotencyToken: KEY, payload: { targetSequenceId: 230160 } }] : [] });
     return '{}';
   };
   const gw = createGateway(baseDeps({ store, run }));
-  const p = makeProposal({ id: 'pamb', renderedPreview: POSTED });
   const body = { proposal: p, confirmation: makeConfirm(p) };
   const r1 = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body });
   assert.equal(r1.body.status, 'failed'); // ambiguous => failed, but the durable reservation is PRESERVED

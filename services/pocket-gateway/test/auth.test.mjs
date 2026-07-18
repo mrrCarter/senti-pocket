@@ -33,7 +33,7 @@ const verifier = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, no
 
 const mint = (over = {}) => signJwt({
   header: { alg: 'EdDSA', kid: KID, typ: 'JWT' },
-  payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, consumerAccountId: 'consumer-abc', scope: 'actions:execute bundles:read', ...over },
+  payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, sub: 'pairwise-abc', consumerAccountId: 'consumer-abc', scope: 'actions:execute bundles:read', ...over },
   privateKey: idp.privateKey,
 });
 
@@ -64,7 +64,7 @@ test('no humanId claim => reject', async () => {
 // ---- DPoP (RFC 9449) sender-constrained token ----
 const client = ed25519();
 const jkt = jwkThumbprint(client.jwk);
-const mintDpopBound = () => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, consumerAccountId: 'consumer-dpop', scope: 'actions:execute', cnf: { jkt } }, privateKey: idp.privateKey });
+const mintDpopBound = (over = {}) => signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, sub: 'pairwise-dpop', consumerAccountId: 'consumer-dpop', scope: 'actions:execute', cnf: { jkt }, ...over }, privateKey: idp.privateKey });
 function dpopProof({ htm = 'POST', htu = 'https://gateway.senti.app/actions/execute', accessToken, iat = nowSec, key = client }) {
   const ath = b64url(sha256(accessToken));
   return signJwt({ header: { typ: 'dpop+jwt', alg: 'EdDSA', jwk: key.jwk }, payload: { htm, htu, iat, ath, jti: 'proof-1' }, privateKey: key.privateKey });
@@ -101,10 +101,26 @@ test('DPoP replay: a reused jti is rejected when a replayGuard is configured', a
   assert.equal(await v({ ...base, dpop: noJti }), null, 'proof without jti rejected when replay guard is on');
 });
 
+test('P1: a valid token WITHOUT a pairwise sub is rejected (sub required)', async () => {
+  assert.equal(await verifier({ authorization: 'Bearer ' + mint({ sub: undefined }) }), null, 'consumerAccountId-only token (no sub) rejected');
+});
+
+test('P1: replay retention covers a FUTURE-skewed iat through its last valid instant + skew', async () => {
+  const guard = createInMemoryReplayGuard();
+  const cfg = { jwks, issuer: ISSUER, audience: AUD, replayGuard: guard, clockSkewSec: 300 };
+  const token = mintDpopBound();
+  const htu = 'https://gateway.senti.app/actions/execute';
+  const base = { authorization: 'Bearer ' + token, 'x-http-method': 'POST', 'x-http-url': htu };
+  const proof = dpopProof({ accessToken: token, iat: nowSec + 300 }); // future-skewed but accepted
+  assert.ok(await createAidenIdVerifier({ ...cfg, now: () => NOW })({ ...base, dpop: proof }), 'future-skewed proof accepted once');
+  // replay the SAME jti at now+maxAge: a now+maxAge retention would have swept it; the fix keeps it -> rejected
+  assert.equal(await createAidenIdVerifier({ ...cfg, now: () => NOW + 300_000 })({ ...base, dpop: proof }), null, 'replayed future-skewed jti rejected at the boundary');
+});
+
 test('resource indicator (RFC 8707) enforced when configured', async () => {
   const RES = 'https://gateway.senti.app/actions';
   const v = createAidenIdVerifier({ jwks, issuer: ISSUER, audience: AUD, resource: RES, now: () => NOW });
-  const withRes = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, consumerAccountId: 'c', scope: 'x', resource: RES }, privateKey: idp.privateKey });
+  const withRes = signJwt({ header: { alg: 'EdDSA', kid: KID, typ: 'JWT' }, payload: { iss: ISSUER, aud: AUD, exp: nowSec + 300, iat: nowSec, sub: 'pairwise-r', consumerAccountId: 'c', scope: 'x', resource: RES }, privateKey: idp.privateKey });
   assert.ok(await v({ authorization: 'Bearer ' + withRes }));
   assert.equal(await v({ authorization: 'Bearer ' + mint() }), null, 'missing/mismatched resource rejected');
 });

@@ -7,7 +7,7 @@
 // (knownSessionIdsFor(humanId)) — a client can never name an arbitrary target session.
 // Token model (per Echo's AIdenID research): atk_ = workload/project token; the phone uses a human-bound,
 // audience/resource-scoped token minted via /v1/sessions/exchange (DPoP-bound). deps.verifyToken owns that check.
-import { executeAction, findLandedByContent } from './actions.mjs';
+import { executeAction, findLandedByProposal } from './actions.mjs';
 import { withLock } from './store.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
@@ -88,7 +88,7 @@ export function createGateway(deps) {
         // by content read-back BEFORE any re-post. If our post is in the room -> finalize it. If NOT found, we must NOT
         // convert an ambiguous outcome into a re-post from one bounded read miss — preserve the unknown state and
         // require reconciliation rather than risk a duplicate governed write.
-        const landed = findLandedByContent(proposal.targetSessionId, { proposal, run: deps.run, agent: deps.agent });
+        const landed = findLandedByProposal(proposal.targetSessionId, { proposal, run: deps.run, agent: deps.agent });
         if (landed) map.set(id, { status: 'failed', proposalId: id, __emitted: { parsed: landed, executedAt: rec.reservedAt || now() } });
         else return json(409, { error: 'prior send outcome unknown; not re-posting — reconciliation required', proposalId: id });
       } else {
