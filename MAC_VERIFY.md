@@ -61,15 +61,19 @@ cd apps/SentiPocketApp && xcodegen generate \
     KAVs (`6:action…`, `8:sequence…`); receipt canonical **v4** KAV; proposal canonical **v3** KAV +
     proposalHash `Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY`; same-content/different-identity hash
     distinctness; injection-proof canonicalization; receipt structural invariants; extreme-date no-trap.
-  - **bundle trust anchor + signed KAV (warden/bundle-kav-fix):**
-    - `testBundleSignedKAV` — the pinned demo pubkey equals the key derived from the PUBLIC seed
-      phrase; `canonicalBundlePayload()` matches the frozen `pocket.bundle.v1` bytes
-      (`Fixtures/bundle_kav.json`); the frozen ed25519 signature verifies under the pinned key.
-    - `testBundleTrustAnchorRejectsUnknownIdAndWrongKey` — unknown `signingKeyId` rejected BEFORE
-      crypto; wrong pinned/supplied key rejected by crypto.
+  - **bundle trust anchor + signed KAV (warden/bundle-kav-fix):** the KAV is a bundled test RESOURCE
+    (`Tests/PocketContractsTests/Fixtures/bundle_kav.json`, wired in `Package.swift`), loaded via
+    `Bundle.module` — the demo key is a REAL random ed25519 keypair; only the PUBLIC key + signature are
+    committed (no private key / seed anywhere).
+    - `testBundleSignedKAVFromResource` — pinned pubkey == the fixture's; `canonicalBundlePayload()` ==
+      the fixture's `pocket.bundle.v1` bytes; the committed real-key signature verifies under the pinned key.
+    - `testBundleVerifyRejectsUntrustedIdAndWrongKey` — untrusted `signingKeyId` rejected before crypto;
+      a trusted id signed by a THROWAWAY keypair fails the pinned-key check (there is no API to pass a key).
     - `testBundleSignatureRejectsTamper` — summary/evidence/keyId/ordering tamper all fail.
-    - `testBundleSemanticValidity` — wrong version/schema, inverted range, id mismatch, session
-      mismatch, out-of-range/duplicate/foreign evidence, uncited fact/inference, unsane/sub-ms dates.
+    - `testBundleSemanticValidity` (+ `testSemanticRejectsPerAgentOnlyCitation` /
+      `…PerAgentEvidenceMismatch`) — wrong version/schema, inverted/negative range, empty/oversized fields,
+      id mismatch, session mismatch, out-of-range/duplicate/foreign evidence, duplicate claim id, per-agent
+      evidence not byte-identical to top-level, uncited fact/inference, unsane/sub-ms dates.
 - **PocketCall** — flow reducer safety (no-shortcut-into-executing, wrong-session refused, confirm-swap
   refused, wrong/empty-challenge refused, receipt-must-bind, real-ed25519 posted-receipt verify) AND
   `testVerifiedBundleMintsOnPinnedTrust` / `testVerifiedBundleRejectsUnknownIdWrongKeyAndSemanticInvalid`

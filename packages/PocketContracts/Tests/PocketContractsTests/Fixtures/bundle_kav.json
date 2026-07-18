@@ -1,0 +1,55 @@
+{
+  "_note": "pocket.bundle.v1 SIGNED known-answer vector (warden/bundle-kav-fix, FIX2). Proves the Phase-A demo gateway key signs a bundle whose ed25519 signature the phone verifies under the PINNED public key. The keypair is a REAL random ed25519 pair generated ONCE: only the PUBLIC key + this signature are committed; the private key was ephemeral and is NOT committed or derivable from anything here. Relay's Node gateway (services/pocket-gateway) reproduces `canonicalBytesUtf8` byte-for-byte and signs REAL bundles with the real gateway key; the phone pins the real public key the same way. This fixture is wired as a PocketContracts test resource and loaded by ContractsCrossModuleTests (no duplicated literals).",
+  "demoKey": {
+    "PHASE_A_ONLY": true,
+    "neverProduction": true,
+    "signingKeyId": "pocket-demo-phase-a",
+    "privateKeyCommitted": false,
+    "note": "Real random ed25519 public key. The matching private key is NOT committed and NOT derivable from any committed value; a forged bundle cannot be signed under this key.",
+    "publicKeyBase64url": "jyn3Qxg5YZ94RlyHf635kgT4Fh_M6gdrtiWMlx-hvds"
+  },
+  "bundle": {
+    "contractsVersion": "0.1.8",
+    "checkpointId": "cp_demo_1",
+    "sessionId": "sess_demo_1",
+    "sequenceStart": 100,
+    "sequenceEnd": 200,
+    "createdAtEpochMillis": 1752835200000,
+    "signingKeyId": "pocket-demo-phase-a",
+    "summary": {
+      "checkpointId": "cp_demo_1",
+      "headline": "demo briefing",
+      "summaryBaselineSchema": "checkpoint_summary_sections_v1",
+      "grade": "A",
+      "perAgent": [
+        {
+          "agentId": "agent-a",
+          "summary": "did the thing",
+          "claims": [{ "id": "c1", "text": "a fact", "kind": "fact", "evidenceIds": ["ev1"] }],
+          "evidence": [{ "id": "ev1", "sessionId": "sess_demo_1", "sequence": 150, "agentId": "agent-a", "snippet": "snippet", "tsEpochMillis": 1752835200000 }]
+        }
+      ],
+      "risks": ["r1"],
+      "blockers": ["b1"]
+    },
+    "evidence": [{ "id": "ev1", "sessionId": "sess_demo_1", "sequence": 150, "agentId": "agent-a", "snippet": "snippet", "tsEpochMillis": 1752835200000 }]
+  },
+  "kav": {
+    "canonicalBytesUtf8": "pocket.bundle.v1\n5:0.1.89:cp_demo_111:sess_demo_13:1003:2009:cp_demo_113:demo briefing30:checkpoint_summary_sections_v111:A1:17:agent-a13:did the thing1:12:c16:a fact4:fact1:13:ev11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:17528352000001:12:r11:12:b11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:175283520000013:175283520000019:pocket-demo-phase-a",
+    "canonicalSha256Hex": "be4c9e360624c1bab4f2ad13afeda10c87e2f680ada48e2aa020f0afb069e9e3",
+    "signatureBase64url": "zbwO9VPxqC0Hl82m_DQA9YRBCNDc4NpBkzuNm0GAIQb8Kvl4W_4r5NE9fTX19dAKimC-yFeMQcIzepspRSUVCg",
+    "verifiesUnderPinnedKey": true
+  },
+  "tamperVectors": {
+    "_note": "Any mutation to a signed field changes canonicalBytesUtf8, so the committed signature no longer verifies. Semantic mutations are ALSO rejected by isSemanticallyValid(); an untrusted signingKeyId is rejected before crypto. A wrong-key signature (throwaway keypair) does not verify under the pinned public key.",
+    "examples": [
+      "summary.headline 'demo briefing' -> 'demo EVIL'  (signature fails)",
+      "evidence[0].snippet 'snippet' -> 'x'             (signature fails)",
+      "signingKeyId 'pocket-demo-phase-a' -> 'other'    (untrusted id: rejected BEFORE crypto)",
+      "evidence order swapped                            (canonical changes: signature fails)",
+      "per-agent ev1 with a FOREIGN session             (semantic reject: per-agent evidence must match top-level)",
+      "sequenceStart 100 -> 300 (inverted) / -1 / oversized (semantic reject, never narrated)"
+    ]
+  },
+  "verifyRecipe": "pub = base64urlDecode(demoKey.publicKeyBase64url); ok = ed25519.verify(canonicalBytesUtf8 (utf8), base64urlDecode(kav.signatureBase64url), pub)  ->  true. (No private key is needed to verify; it is not committed.)"
+}

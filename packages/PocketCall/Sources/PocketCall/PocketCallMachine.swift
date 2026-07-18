@@ -183,7 +183,9 @@ public struct VerifiedBundle: Equatable, Sendable {
     /// its own key). An unknown signingKeyId, malformed content, or a bad/foreign signature all fail closed.
     public static func verify(_ bundle: PocketBundle) -> VerifiedBundle? {
         #if canImport(CryptoKit)
-        guard bundle.isSemanticallyValid(),
+        // P1.4 — cheap reject FIRST: an UNTRUSTED signingKeyId never reaches the (bounded) semantic scan or any crypto.
+        guard bundle.hasTrustedSigningKeyId(),
+              bundle.isSemanticallyValid(),
               bundle.verifiesSignature() else { return nil }
         return VerifiedBundle(bundle: bundle)
         #else

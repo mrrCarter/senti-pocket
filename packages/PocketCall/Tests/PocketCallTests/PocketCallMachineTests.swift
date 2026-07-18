@@ -166,37 +166,40 @@ final class PocketCallMachineTests: XCTestCase {
 
     // MARK: - Bundle ingress trust anchor (warden/bundle-kav-fix)
 
-    private func demoSigningKey() throws -> Curve25519.Signing.PrivateKey {
-        try Curve25519.Signing.PrivateKey(rawRepresentation: Data(SHA256.hash(data: Data(PocketDemoGatewayKey.seedPhrase.utf8))))
-    }
-    /// A GENUINELY-SIGNED demo bundle (pinned demo key). `invertRange` signs a semantically-INVALID bundle so we can
-    /// prove verify() refuses it even though the ed25519 signature verifies.
-    private func signedDemoBundle(invertRange: Bool = false, signingKeyId: String = "pocket-demo-phase-a", signWith: Curve25519.Signing.PrivateKey? = nil) throws -> PocketBundle {
+    /// The canonical demo bundle (matches the KAV fixture); the caller supplies the signature.
+    private func demoBundle(signature: String, signingKeyId: String = "pocket-demo-phase-a", invertRange: Bool = false) -> PocketBundle {
         let ev = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "snippet", ts: ts)
         let ag = AgentSummary(agentId: "agent-a", summary: "did the thing", claims: [Claim(id: "c1", text: "a fact", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev])
         let sum = CheckpointSummary(checkpointId: "cp_demo_1", headline: "demo briefing", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
         let start = invertRange ? 300 : 100
-        func make(_ signature: String) -> PocketBundle {
-            PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: start, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
-        }
-        let signer = try (signWith ?? demoSigningKey())
-        return make(b64url(try signer.signature(for: Data(make("").canonicalBundlePayload().utf8))))
+        return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: start, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
+    }
+    /// Sign the demo bundle's canonical with a THROWAWAY keypair (negative tests only — must NOT verify under the pinned key).
+    private func signed(with signer: Curve25519.Signing.PrivateKey, signingKeyId: String = "pocket-demo-phase-a", invertRange: Bool = false) throws -> PocketBundle {
+        let canonical = demoBundle(signature: "", signingKeyId: signingKeyId, invertRange: invertRange).canonicalBundlePayload()
+        return demoBundle(signature: b64url(try signer.signature(for: Data(canonical.utf8))), signingKeyId: signingKeyId, invertRange: invertRange)
+    }
+    /// The COMMITTED real-key signature, loaded from the PocketContracts KAV fixture (monorepo path; no literal dup, no private key).
+    private func kavSignature() throws -> String {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("../../../PocketContracts/Tests/PocketContractsTests/Fixtures/bundle_kav.json").standardizedFileURL
+        let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        return (obj["kav"] as! [String: Any])["signatureBase64url"] as! String
     }
 
-    /// FIX1+FIX2: VerifiedBundle mints ONLY from a pinned-key ed25519 pass; there is NO caller key/anchor.
+    /// FIX1+FIX2: VerifiedBundle mints ONLY from a pinned-key ed25519 pass (the committed real-key signature); no caller key/anchor.
     func testVerifiedBundleMintsOnPinnedTrust() throws {
-        XCTAssertNotNil(VerifiedBundle.verify(try signedDemoBundle()))
+        XCTAssertNotNil(VerifiedBundle.verify(demoBundle(signature: try kavSignature())))
     }
 
-    /// FIX1+FIX3 (P1): an UNTRUSTED signingKeyId, a WRONG (attacker) signing key, and a correctly-SIGNED-but-
+    /// FIX1+FIX3+P1.4: an UNTRUSTED signingKeyId (rejected before the semantic scan), a WRONG (throwaway) signing key, and a
     /// semantically-INVALID bundle all fail closed. No caller key/anchor exists to inject.
     func testVerifiedBundleRejectsUntrustedIdWrongKeyAndSemanticInvalid() throws {
-        XCTAssertNil(VerifiedBundle.verify(try signedDemoBundle(signingKeyId: "not-a-trusted-key")))         // untrusted id (pre-crypto)
-        XCTAssertNil(VerifiedBundle.verify(try signedDemoBundle(signWith: Curve25519.Signing.PrivateKey()))) // attacker key
-        let signedButInvalid = try signedDemoBundle(invertRange: true)
-        XCTAssertTrue(signedButInvalid.verifiesSignature())        // signature genuinely verifies under the pinned key
-        XCTAssertFalse(signedButInvalid.isSemanticallyValid())     // but the content is invalid
-        XCTAssertNil(VerifiedBundle.verify(signedButInvalid))      // so verify() refuses to mint (FIX3)
+        XCTAssertNil(VerifiedBundle.verify(demoBundle(signature: try kavSignature(), signingKeyId: "not-a-trusted-key")))  // untrusted id (pre-scan)
+        XCTAssertNil(VerifiedBundle.verify(try signed(with: Curve25519.Signing.PrivateKey())))                             // throwaway key -> crypto fails
+        let invalid = try signed(with: Curve25519.Signing.PrivateKey(), invertRange: true)
+        XCTAssertFalse(invalid.isSemanticallyValid())               // inverted range -> semantically invalid
+        XCTAssertNil(VerifiedBundle.verify(invalid))                // rejected (semantic + crypto)
     }
 
     private func b64url(_ d: Data) -> String {

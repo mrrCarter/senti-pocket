@@ -1,15 +1,19 @@
 // PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
-// v0.1.8++ (warden/bundle-kav-fix): ADDITIVE, version stays EXACTLY "0.1.8" (bound in canonicalBundlePayload).
-//   FIX1 TRUST ANCHOR (P1 re-audit — no caller-injectable key): `PocketBundle.verifiesSignature()` takes NO key/anchor;
-//     it resolves the trusted ed25519 key INTERNALLY from `signingKeyId` against the FIXED, file-private
-//     `pocketTrustedGatewayKeys` store (Phase A pins ONLY the demo key), REJECTS an unknown id BEFORE any crypto, and
-//     verifies under the pinned key. There is no public trust-store initializer, so an attacker cannot pin its own key.
-//   FIX3 SEMANTIC VALIDITY: `PocketBundle.isSemanticallyValid()` rejects a bundle — EVEN A CORRECTLY-SIGNED ONE — with
-//     wrong version/schema, inverted range, mismatched checkpoint/session ids, duplicate/foreign evidence (citations
-//     resolved against TOP-LEVEL `bundle.evidence` ONLY — the exact set the UI consumes), uncited fact/inference
-//     claims, or unsane/sub-millisecond dates. FIX2: a frozen DEMO keypair (`PocketDemoGatewayKey`; seed = SHA-256 of a
-//     PUBLIC phrase, no private key committed) + a signed `pocket.bundle.v1` KAV in Fixtures/bundle_kav.json,
-//     reproducible Node<->Swift. `VerifiedBundle.verify(_:)` (PocketCall) requires BOTH semantic validity AND the pass.
+// v0.1.8++ (warden/bundle-kav-fix, P1 re-audit x2): ADDITIVE, version stays EXACTLY "0.1.8" (bound in canonicalBundlePayload).
+//   FIX1 TRUST ANCHOR (non-injectable, non-forgeable): `PocketBundle.verifiesSignature()` takes NO key/anchor; it
+//     resolves the trusted ed25519 key INTERNALLY from `signingKeyId` against the FIXED, file-private
+//     `pocketTrustedGatewayKeys` store, REJECTS an unknown id, and verifies under the pinned key. No public trust-store
+//     initializer -> a caller cannot pin its own key. The demo key is now a REAL random keypair: only the PUBLIC key is
+//     committed; the private key was used once to sign the KAV and DISCARDED (the earlier public-seed-phrase design was
+//     publicly forgeable and is removed).
+//   FIX3 SEMANTIC VALIDITY (bounded ingress): `isSemanticallyValid()` rejects a bundle — EVEN A CORRECTLY-SIGNED ONE —
+//     with wrong version/schema, inverted OR negative sequence ranges, empty required fields, oversized strings/arrays,
+//     mismatched checkpoint/session ids, duplicate evidence/claim ids, foreign citations (resolved against TOP-LEVEL
+//     `bundle.evidence` ONLY — the set the UI consumes), per-agent evidence not byte-identical to top-level, uncited
+//     fact/inference, or unsane/sub-millisecond dates. Ingress rejects an UNTRUSTED signingKeyId (cheap
+//     `hasTrustedSigningKeyId()`) BEFORE the bounded scan.
+//   FIX2: a signed `pocket.bundle.v1` KAV wired as a test resource (Tests/.../Fixtures/bundle_kav.json), loaded by the
+//     test (no duplicated literals). `VerifiedBundle.verify(_:)` (PocketCall) requires trusted-id + semantic validity + the ed25519 pass.
 // v0.1.8+ (Pulse #231475 P0 / bundle-ingress): ADDITIVE, no wire/shape change -> NOT a version bump. Adds
 //   PocketBundle.canonicalBundlePayload() (`pocket.bundle.v1`, length+count-prefixed) + verifiesSignature();
 //   VerifiedBundle.verify now does REAL ed25519 over the pinned key (was fail-closed nil). The Phase-A fixture is
@@ -228,18 +232,17 @@ public extension PocketBundle {
 
 // MARK: - Trust anchor (FIX1: FIXED, non-injectable pinned bundle signing keys)
 
-/// PHASE-A DEMO signing identity — a THROWAWAY key for the offline demo, NEVER production. The 32-byte ed25519 seed
-/// is DERIVED (`SHA-256` of the PUBLIC phrase) at sign/verify time, so NO private key is committed anywhere; only the
-/// PUBLIC key is pinned below (a public key + a signature are not secrets). The real gateway uses a real, rotated key
-/// with its own `signingKeyId`, added to the FIXED trust store below the same way. Reproduced identically in Node —
-/// see Fixtures/bundle_kav.json.
+/// PHASE-A DEMO signing identity — a REAL random ed25519 keypair for the offline demo, NEVER production. Only the
+/// PUBLIC key is committed here; the PRIVATE key was generated ONCE, used to sign the KAV fixture, and DISCARDED — it
+/// is NOT committed and NOT derivable from any committed value, so a forged bundle CANNOT be signed under this key.
+/// (The earlier design derived the private key from a PUBLIC seed phrase, which made it publicly forgeable — removed.)
+/// The real gateway uses a real, rotated key with its own `signingKeyId`, added to the FIXED trust store below the same
+/// way. Verify the committed signature under this public key: Tests/PocketContractsTests/Fixtures/bundle_kav.json.
 public enum PocketDemoGatewayKey {
     /// The `signingKeyId` the DEMO gateway stamps on bundles.
     public static let signingKeyId = "pocket-demo-phase-a"
-    /// Public phrase the demo seed derives from: `seed = SHA-256(UTF-8(seedPhrase))`.
-    public static let seedPhrase = "senti-pocket phase-a demo gateway key -- NEVER PRODUCTION"
-    /// PINNED base64url ed25519 PUBLIC key derived from that seed (public, not a secret).
-    public static let publicKeyBase64url = "KiJLmbgZ-ybBDsPp_K27z2JQGzdMrfmlpQMQmyHg2j8"
+    /// PINNED base64url ed25519 PUBLIC key (public, not a secret). The matching private key is not committed anywhere.
+    public static let publicKeyBase64url = "jyn3Qxg5YZ94RlyHf635kgT4Fh_M6gdrtiWMlx-hvds"
 }
 
 /// The FIXED, NON-INJECTABLE trust store: `signingKeyId -> trusted base64url ed25519 public key`. A file-private
@@ -259,50 +262,85 @@ public enum BundleSemanticIssue: String, Equatable, Sendable {
     case wrongContractsVersion, wrongSummarySchema, invertedSequenceRange, checkpointIdMismatch
     case evidenceSessionMismatch, evidenceSequenceOutOfRange, duplicateEvidenceId
     case uncitedFactOrInference, foreignClaimCitation, unsaneDate, subMillisecondDate
+    // P1.3 bounded ingress + P1.2 per-agent cross-check:
+    case negativeSequence, emptyRequiredField, duplicateClaimId, oversizedField, perAgentEvidenceMismatch
 }
 
 public extension PocketBundle {
     /// The summary schema every Phase-A bundle must declare.
     static var expectedSummarySchema: String { "checkpoint_summary_sections_v1" }
+    // P1.3 bounded-ingress caps — reject oversized content before trusting/narrating (a DoS/abuse bound).
+    static var maxIdLength: Int { 256 }
+    static var maxStringLength: Int { 8192 }
+    static var maxArrayCount: Int { 2048 }
 
-    /// FIX3: all content-validity issues (deterministic order; empty == valid). Independent of the signature.
+    /// P1.4 — cheap, no-crypto: is this bundle's `signingKeyId` one the phone pins? The ingress rejects an unknown id
+    /// with THIS before running the (bounded) semantic scan or any crypto.
+    func hasTrustedSigningKeyId() -> Bool { pocketTrustedGatewayKeys[signingKeyId] != nil }
+
+    /// FIX3 + P1.2/P1.3: all content-validity issues (deterministic order; empty == valid). Independent of the signature.
     func semanticIssues() -> [BundleSemanticIssue] {
         var issues: [BundleSemanticIssue] = []
+        func tooLong(_ s: String, _ cap: Int) -> Bool { s.count > cap }
+
         if contractsVersion != PocketContracts.version { issues.append(.wrongContractsVersion) }
         if summary.summaryBaselineSchema != PocketBundle.expectedSummarySchema { issues.append(.wrongSummarySchema) }
-        if sequenceStart > sequenceEnd { issues.append(.invertedSequenceRange) }
         if summary.checkpointId != checkpointId { issues.append(.checkpointIdMismatch) }
 
-        // P1.2 — validate ONLY top-level `bundle.evidence`: it is the EXACT set the UI resolves evidence links
-        // against (ConversationView / EvidenceResolution). Per-agent `AgentSummary.evidence` is NOT the authoritative
-        // resolution set, so a claim citing an id present ONLY in per-agent evidence is a FOREIGN citation (an
-        // unresolvable link on the phone), and duplicate detection is over the top-level set the UI actually consumes.
-        // (Mirrors Relay's Node validateBundleSemantics — both adversaries rejected.)
-        var seen = Set<String>()
-        for e in evidence where !seen.insert(e.id).inserted { issues.append(.duplicateEvidenceId) }
-        for e in evidence {
-            if e.sessionId != sessionId { issues.append(.evidenceSessionMismatch) }
-            if e.sequence < sequenceStart || e.sequence > sequenceEnd { issues.append(.evidenceSequenceOutOfRange) }
-            if !PocketBundle.dateIsSaneAndMillisExact(e.ts) {
-                issues.append(ActionReceipt.safeEpochMillis(e.ts) == nil ? .unsaneDate : .subMillisecondDate)
-            }
+        // P1.3 sequence-range bounds: inverted (start>end) and negative are both rejected.
+        if sequenceStart > sequenceEnd { issues.append(.invertedSequenceRange) }
+        if sequenceStart < 0 || sequenceEnd < 0 { issues.append(.negativeSequence) }
+
+        // P1.3 required non-empty top-level fields + oversized caps.
+        if checkpointId.isEmpty || sessionId.isEmpty || signingKeyId.isEmpty { issues.append(.emptyRequiredField) }
+        if tooLong(checkpointId, PocketBundle.maxIdLength) || tooLong(sessionId, PocketBundle.maxIdLength)
+            || tooLong(signingKeyId, PocketBundle.maxIdLength) || tooLong(summary.headline, PocketBundle.maxStringLength)
+            || evidence.count > PocketBundle.maxArrayCount || summary.perAgent.count > PocketBundle.maxArrayCount
+            || summary.risks.count > PocketBundle.maxArrayCount || summary.blockers.count > PocketBundle.maxArrayCount {
+            issues.append(.oversizedField)
         }
 
-        // Claims: fact/inference MUST cite; every cited id must resolve to a TOP-LEVEL evidence id (no foreign citation).
+        // Top-level `bundle.evidence` — the EXACT set the UI resolves links against (ConversationView /
+        // EvidenceResolution): required non-empty fields, bounded, in-session, non-negative + in-range sequence, sane
+        // millisecond-exact dates, unique ids. This is the authoritative resolution + duplicate set.
+        var topSeen = Set<String>()
+        var topById: [String: EvidenceRef] = [:]
+        for e in evidence {
+            if e.id.isEmpty || e.agentId.isEmpty || e.snippet.isEmpty { issues.append(.emptyRequiredField) }
+            if tooLong(e.id, PocketBundle.maxIdLength) || tooLong(e.agentId, PocketBundle.maxStringLength) || tooLong(e.snippet, PocketBundle.maxStringLength) { issues.append(.oversizedField) }
+            if e.sessionId != sessionId { issues.append(.evidenceSessionMismatch) }
+            if e.sequence < 0 { issues.append(.negativeSequence) }
+            if e.sequence < sequenceStart || e.sequence > sequenceEnd { issues.append(.evidenceSequenceOutOfRange) }
+            if !PocketBundle.dateIsSaneAndMillisExact(e.ts) { issues.append(ActionReceipt.safeEpochMillis(e.ts) == nil ? .unsaneDate : .subMillisecondDate) }
+            if !topSeen.insert(e.id).inserted { issues.append(.duplicateEvidenceId) }
+            topById[e.id] = e
+        }
+
+        // P1.2 per-agent cross-check: every `AgentSummary.evidence` item MUST be PRESENT in top-level `bundle.evidence`
+        // AND byte-identical (same id + every field). Absent, or present-but-differing (foreign session/sequence/snippet),
+        // is rejected — otherwise per-agent evidence could carry content the UI never resolves against.
+        for agent in summary.perAgent {
+            if agent.agentId.isEmpty { issues.append(.emptyRequiredField) }
+            if agent.evidence.count > PocketBundle.maxArrayCount || agent.claims.count > PocketBundle.maxArrayCount { issues.append(.oversizedField) }
+            for pe in agent.evidence where topById[pe.id] != pe { issues.append(.perAgentEvidenceMismatch) }
+        }
+
+        // Claims: bounded, non-empty id/text, unique ids across the bundle, fact/inference MUST cite, and every cited id
+        // resolves to a TOP-LEVEL evidence id (no foreign citation).
         let knownIds = Set(evidence.map { $0.id })
+        var claimSeen = Set<String>()
         for agent in summary.perAgent {
             for claim in agent.claims {
-                if (claim.kind == .fact || claim.kind == .inference) && claim.evidenceIds.isEmpty {
-                    issues.append(.uncitedFactOrInference)
-                }
+                if claim.id.isEmpty || claim.text.isEmpty { issues.append(.emptyRequiredField) }
+                if tooLong(claim.id, PocketBundle.maxIdLength) || tooLong(claim.text, PocketBundle.maxStringLength) || claim.evidenceIds.count > PocketBundle.maxArrayCount { issues.append(.oversizedField) }
+                if !claimSeen.insert(claim.id).inserted { issues.append(.duplicateClaimId) }
+                if (claim.kind == .fact || claim.kind == .inference) && claim.evidenceIds.isEmpty { issues.append(.uncitedFactOrInference) }
                 if !claim.evidenceIds.allSatisfy({ knownIds.contains($0) }) { issues.append(.foreignClaimCitation) }
             }
         }
 
         // createdAt is bound as epoch-millis in the canonical -> it must be sane + millisecond-exact.
-        if !PocketBundle.dateIsSaneAndMillisExact(createdAt) {
-            issues.append(ActionReceipt.safeEpochMillis(createdAt) == nil ? .unsaneDate : .subMillisecondDate)
-        }
+        if !PocketBundle.dateIsSaneAndMillisExact(createdAt) { issues.append(ActionReceipt.safeEpochMillis(createdAt) == nil ? .unsaneDate : .subMillisecondDate) }
         return issues
     }
 
