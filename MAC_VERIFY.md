@@ -9,14 +9,28 @@ exactly what cannot run on Windows.
 ## Prereqs
 - macOS with Xcode or the Command Line Tools (`xcode-select --install`). Check: `swift --version`.
 
-## Pin the exact commit (do NOT verify a different SHA)
+## Pin the exact commit — ABORTS on any SHA mismatch (never verifies a moved tip)
+Pass the exact **40-char** SHA from the warden's handoff as `EXPECTED_SHA`. The script fetches, checks out that
+EXACT commit **detached**, and aborts unless `HEAD` equals it — so a branch tip that moved after the handoff can
+never be silently verified. With no `EXPECTED_SHA`, it defaults to the current origin tip and prints an UNPINNED warning.
 ```bash
-git clone https://github.com/mrrCarter/senti-pocket.git   # or: git -C senti-pocket fetch origin
+set -euo pipefail
+git clone https://github.com/mrrCarter/senti-pocket.git 2>/dev/null || true
 cd senti-pocket
-git checkout warden/bundle-kav-fix
-git rev-parse --short HEAD        # MUST equal the SHA in the warden's handoff for this branch
+git fetch --all --prune
+
+if [ -z "${EXPECTED_SHA:-}" ]; then
+  EXPECTED_SHA="$(git rev-parse origin/warden/bundle-kav-fix)"
+  echo "WARNING: EXPECTED_SHA not set -> defaulting to current origin tip $EXPECTED_SHA (UNPINNED). Pass EXPECTED_SHA=<40-char> from the handoff to pin." >&2
+fi
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ABORT: EXPECTED_SHA must be a full 40-char commit SHA (got '$EXPECTED_SHA')." >&2; exit 1; }
+
+git checkout --detach "$EXPECTED_SHA"
+ACTUAL="$(git rev-parse HEAD)"
+[ "$ACTUAL" = "$EXPECTED_SHA" ] || { echo "ABORT: HEAD $ACTUAL != EXPECTED_SHA $EXPECTED_SHA." >&2; exit 1; }
+echo "OK: pinned + verified at $EXPECTED_SHA"
 ```
-This runbook is committed on `warden/bundle-kav-fix`; verifying any other SHA is meaningless.
+This runbook is committed on `warden/bundle-kav-fix`; verifying any SHA other than the handoff's is meaningless.
 
 ## Run EVERY lane — fail loud, swallow nothing
 ```bash

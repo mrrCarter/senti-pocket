@@ -171,34 +171,32 @@ final class PocketCallMachineTests: XCTestCase {
     }
     /// A GENUINELY-SIGNED demo bundle (pinned demo key). `invertRange` signs a semantically-INVALID bundle so we can
     /// prove verify() refuses it even though the ed25519 signature verifies.
-    private func signedDemoBundle(invertRange: Bool = false) throws -> PocketBundle {
+    private func signedDemoBundle(invertRange: Bool = false, signingKeyId: String = "pocket-demo-phase-a", signWith: Curve25519.Signing.PrivateKey? = nil) throws -> PocketBundle {
         let ev = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "snippet", ts: ts)
         let ag = AgentSummary(agentId: "agent-a", summary: "did the thing", claims: [Claim(id: "c1", text: "a fact", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev])
         let sum = CheckpointSummary(checkpointId: "cp_demo_1", headline: "demo briefing", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
         let start = invertRange ? 300 : 100
         func make(_ signature: String) -> PocketBundle {
-            PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: start, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: "pocket-demo-phase-a")
+            PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: start, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
         }
-        let sig = b64url(try demoSigningKey().signature(for: Data(make("").canonicalBundlePayload().utf8)))
-        return make(sig)
+        let signer = try (signWith ?? demoSigningKey())
+        return make(b64url(try signer.signature(for: Data(make("").canonicalBundlePayload().utf8))))
     }
 
-    /// FIX1+FIX2: VerifiedBundle mints ONLY from a pinned-key ed25519 pass (both entry points).
+    /// FIX1+FIX2: VerifiedBundle mints ONLY from a pinned-key ed25519 pass; there is NO caller key/anchor.
     func testVerifiedBundleMintsOnPinnedTrust() throws {
-        let b = try signedDemoBundle()
-        XCTAssertNotNil(VerifiedBundle.verify(b, trustAnchor: .phaseADemo))
-        XCTAssertNotNil(VerifiedBundle.verify(b, gatewayPublicKeyBase64url: PocketDemoGatewayKey.publicKeyBase64url))
+        XCTAssertNotNil(VerifiedBundle.verify(try signedDemoBundle()))
     }
 
-    /// FIX1+FIX3: unknown signingKeyId, a non-pinned key, and a correctly-SIGNED-but-semantically-INVALID bundle all fail closed.
-    func testVerifiedBundleRejectsUnknownIdWrongKeyAndSemanticInvalid() throws {
-        let b = try signedDemoBundle()
-        XCTAssertNil(VerifiedBundle.verify(b, trustAnchor: PocketTrustAnchor(pinned: ["other-id": PocketDemoGatewayKey.publicKeyBase64url])))  // unknown id (pre-crypto)
-        XCTAssertNil(VerifiedBundle.verify(b, gatewayPublicKeyBase64url: b64url(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)))   // supplied != pinned
+    /// FIX1+FIX3 (P1): an UNTRUSTED signingKeyId, a WRONG (attacker) signing key, and a correctly-SIGNED-but-
+    /// semantically-INVALID bundle all fail closed. No caller key/anchor exists to inject.
+    func testVerifiedBundleRejectsUntrustedIdWrongKeyAndSemanticInvalid() throws {
+        XCTAssertNil(VerifiedBundle.verify(try signedDemoBundle(signingKeyId: "not-a-trusted-key")))         // untrusted id (pre-crypto)
+        XCTAssertNil(VerifiedBundle.verify(try signedDemoBundle(signWith: Curve25519.Signing.PrivateKey()))) // attacker key
         let signedButInvalid = try signedDemoBundle(invertRange: true)
-        XCTAssertTrue(signedButInvalid.verifiesSignature(trustAnchor: .phaseADemo))    // signature genuinely verifies
-        XCTAssertFalse(signedButInvalid.isSemanticallyValid())                         // but the content is invalid
-        XCTAssertNil(VerifiedBundle.verify(signedButInvalid, trustAnchor: .phaseADemo))// so verify() refuses to mint (FIX3)
+        XCTAssertTrue(signedButInvalid.verifiesSignature())        // signature genuinely verifies under the pinned key
+        XCTAssertFalse(signedButInvalid.isSemanticallyValid())     // but the content is invalid
+        XCTAssertNil(VerifiedBundle.verify(signedButInvalid))      // so verify() refuses to mint (FIX3)
     }
 
     private func b64url(_ d: Data) -> String {

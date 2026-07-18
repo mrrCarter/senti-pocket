@@ -199,6 +199,19 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertFalse(semBundle(claimKind: .recommendation, claimEv: []).semanticIssues().contains(.uncitedFactOrInference))
     }
 
+    /// P1.2 adversary — a claim citing evidence present ONLY in per-agent `AgentSummary.evidence` (NOT top-level
+    /// `bundle.evidence`, the set the UI resolves against) MUST fail semantic validity. Under the old allEvidence
+    /// set-union this false-passed; now citations resolve against top-level evidence only.
+    func testSemanticRejectsPerAgentOnlyCitation() {
+        let evTop = EvidenceRef(id: "evTop", sessionId: "sess_demo_1", sequence: 150, agentId: "a", snippet: "s", ts: ts)
+        let evAgentOnly = EvidenceRef(id: "evAgentOnly", sessionId: "sess_demo_1", sequence: 150, agentId: "a", snippet: "s", ts: ts)
+        let ag = AgentSummary(agentId: "a", summary: "s", claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: ["evAgentOnly"])], evidence: [evAgentOnly])
+        let sum = CheckpointSummary(checkpointId: "cp_demo_1", headline: "h", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [ag], risks: [], blockers: [])
+        let b = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: 100, sequenceEnd: 200, summary: sum, evidence: [evTop], createdAt: ts, signature: "sig", signingKeyId: "pocket-demo-phase-a")
+        XCTAssertTrue(b.semanticIssues().contains(.foreignClaimCitation))
+        XCTAssertFalse(b.isSemanticallyValid())
+    }
+
     #if canImport(CryptoKit)
     private func b64url(_ d: Data) -> String {
         d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
@@ -225,28 +238,31 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertEqual(b.canonicalBundlePayload(),
             "pocket.bundle.v1\n5:0.1.89:cp_demo_111:sess_demo_13:1003:2009:cp_demo_113:demo briefing30:checkpoint_summary_sections_v111:A1:17:agent-a13:did the thing1:12:c16:a fact4:fact1:13:ev11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:17528352000001:12:r11:12:b11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:175283520000013:175283520000019:pocket-demo-phase-a")
         XCTAssertTrue(b.isSemanticallyValid())
-        XCTAssertTrue(b.verifiesSignature(trustAnchor: .phaseADemo))                                    // pinned trust path
-        XCTAssertTrue(b.verifiesSignature(gatewayPublicKeyBase64url: PocketDemoGatewayKey.publicKeyBase64url))  // hardened 2-arg path
+        XCTAssertTrue(b.verifiesSignature())   // pinned key resolved INTERNALLY from signingKeyId (no caller key/anchor)
     }
 
-    /// FIX1 — unknown signingKeyId is rejected BEFORE crypto; a wrong pinned/supplied key is rejected by crypto.
-    func testBundleTrustAnchorRejectsUnknownIdAndWrongKey() throws {
-        let sig = b64url(try demoPrivateKey().signature(for: Data(demoBundle(signature: "").canonicalBundlePayload().utf8)))
-        let signed = demoBundle(signature: sig)
-        XCTAssertTrue(signed.verifiesSignature(trustAnchor: .phaseADemo))
-        XCTAssertFalse(signed.verifiesSignature(trustAnchor: PocketTrustAnchor(pinned: ["some-other-id": PocketDemoGatewayKey.publicKeyBase64url])))  // unknown id
-        let wrongKey = b64url(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)
-        XCTAssertFalse(signed.verifiesSignature(trustAnchor: PocketTrustAnchor(pinned: ["pocket-demo-phase-a": wrongKey])))  // wrong pinned key
-        XCTAssertFalse(signed.verifiesSignature(gatewayPublicKeyBase64url: wrongKey))                                        // supplied != pinned
+    /// FIX1 (P1) — with NO caller key/anchor, rejection is driven by the bundle's own fields: an UNTRUSTED signingKeyId
+    /// is rejected BEFORE crypto; a TRUSTED signingKeyId signed by the WRONG (attacker) key fails the pinned-key check.
+    /// There is no API surface to pass a key, so the caller-key-injection bypass is structurally impossible.
+    func testBundleVerifyRejectsUntrustedIdAndWrongKey() throws {
+        // valid: trusted id, signed by the demo key
+        XCTAssertTrue(demoBundle(signature: b64url(try demoPrivateKey().signature(for: Data(demoBundle(signature: "").canonicalBundlePayload().utf8)))).verifiesSignature())
+        // UNTRUSTED signingKeyId (even signed by the demo key over its own canonical) -> rejected pre-crypto
+        let unknown = demoBundle(signature: "", signingKeyId: "not-a-trusted-key")
+        let sigU = b64url(try demoPrivateKey().signature(for: Data(unknown.canonicalBundlePayload().utf8)))
+        XCTAssertFalse(demoBundle(signature: sigU, signingKeyId: "not-a-trusted-key").verifiesSignature())
+        // TRUSTED signingKeyId but signed by an ATTACKER key -> pinned-key crypto check fails (attacker lacks the pinned key)
+        let attackerSig = b64url(try Curve25519.Signing.PrivateKey().signature(for: Data(demoBundle(signature: "").canonicalBundlePayload().utf8)))
+        XCTAssertFalse(demoBundle(signature: attackerSig).verifiesSignature())
     }
 
     /// FIX2 — tamper vectors: mutating any signed field (summary/evidence), the signingKeyId, or the array ORDER breaks verification.
     func testBundleSignatureRejectsTamper() throws {
         let sig = b64url(try demoPrivateKey().signature(for: Data(demoBundle(signature: "").canonicalBundlePayload().utf8)))
-        XCTAssertTrue(demoBundle(signature: sig).verifiesSignature(trustAnchor: .phaseADemo))
-        XCTAssertFalse(demoBundle(signature: sig, headline: "demo EVIL").verifiesSignature(trustAnchor: .phaseADemo))    // summary tamper
-        XCTAssertFalse(demoBundle(signature: sig, snippet: "x").verifiesSignature(trustAnchor: .phaseADemo))            // evidence tamper
-        XCTAssertFalse(demoBundle(signature: sig, signingKeyId: "pocket-demo-EVIL").verifiesSignature(trustAnchor: .phaseADemo))  // keyId tamper (unknown id)
+        XCTAssertTrue(demoBundle(signature: sig).verifiesSignature())
+        XCTAssertFalse(demoBundle(signature: sig, headline: "demo EVIL").verifiesSignature())    // summary tamper
+        XCTAssertFalse(demoBundle(signature: sig, snippet: "x").verifiesSignature())            // evidence tamper
+        XCTAssertFalse(demoBundle(signature: sig, signingKeyId: "pocket-demo-EVIL").verifiesSignature())  // keyId tamper (unknown id)
         // ordering is bound: two evidence items in different order produce different canonical bytes.
         let e1 = EvidenceRef(id: "ev1", sessionId: "s", sequence: 1, agentId: "a", snippet: "1", ts: ts)
         let e2 = EvidenceRef(id: "ev2", sessionId: "s", sequence: 2, agentId: "a", snippet: "2", ts: ts)
