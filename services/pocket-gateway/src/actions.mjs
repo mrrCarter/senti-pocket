@@ -16,6 +16,21 @@ export function isSaneDate(t) {
 }
 
 /**
+ * Coerce a date input EXACTLY ONCE and return an IMMUTABLE primitive ISO snapshot, or null if not sane.
+ * Defeats TOCTOU (a mutable/coercible object that passes a check then coerces differently later, or a Date
+ * mutated during the live post) — callers use the returned string thereafter, never the original object.
+ */
+export function normalizeSaneDate(t) {
+  if (t == null) return null;
+  // Accept ONLY well-typed inputs; reject arbitrary coercible objects (a {valueOf} that flips value is exactly
+  // the TOCTOU vector). string ISO / number epoch / Date instance only.
+  if (typeof t !== 'string' && typeof t !== 'number' && !(t instanceof Date)) return null;
+  const ms = t instanceof Date ? t.getTime() : new Date(t).getTime(); // capture once
+  if (!Number.isFinite(ms) || ms < -SANE_MS_BOUND || ms > SANE_MS_BOUND) return null;
+  return new Date(ms).toISOString(); // frozen primitive snapshot
+}
+
+/**
  * Normalize ANY signing-key input to a usable Ed25519 PRIVATE KeyObject, or throw.
  * Rejects (Echo bypasses): public KeyObjects (.type==='public'), spoofed plain objects (not a KeyObject),
  * and non-ed25519 keys. createPrivateKey does NOT accept a KeyObject, so branch on the input shape.
@@ -205,9 +220,16 @@ export function executeAction(proposal, confirmation, opts = {}) {
     });
   }
 
+  // Normalize confirmedAt to an IMMUTABLE snapshot BEFORE any receipt is built/stored (TOCTOU + Swift
+  // date-sanity): a pending OR posted receipt with a non-sane confirmedByHumanAt is structurally invalid.
+  const confirmedAtSnap = normalizeSaneDate(confirmation.confirmedAt);
+  if (!confirmedAtSnap) {
+    return receipt(proposal, 'failed', { failureReason: 'confirmedAt missing/non-finite/out-of-range (no receipt stored)', confirmedProposalHash: live });
+  }
+
   // 3) offline => honest pending; NEVER "sent". Stored so a later flush is single (idempotent by id).
   if (!online) {
-    const r = receipt(proposal, 'pendingConnectivity', { confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+    const r = receipt(proposal, 'pendingConnectivity', { confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     store.set(proposal.id, r);
     return r;
   }
@@ -221,27 +243,29 @@ export function executeAction(proposal, confirmation, opts = {}) {
   if (!keyIdOk || !signingKeyObj) {
     return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials missing/invalid: a private Ed25519 key + bounded non-blank keyId are required before writeback', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
   }
-  // date sanity BEFORE posting: the .posted receipt's timestamps must pass Swift hasSaneDates, else the phone
-  // would reject a receipt we already posted+signed (Node<->Swift parity, Echo).
-  if (!isSaneDate(now) || !isSaneDate(confirmation.confirmedAt)) {
-    return receipt(proposal, 'failed', { failureReason: 'non-finite/out-of-range timestamp would fail receipt date-sanity (no post attempted)', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+  // date sanity BEFORE posting: normalize `now` to an IMMUTABLE snapshot (confirmedAt already snapped). If the
+  // server timestamp isn't sane we do NOT post — Node must never post+sign a receipt Swift hasSaneDates rejects.
+  const nowSnap = normalizeSaneDate(now);
+  if (!nowSnap) {
+    return receipt(proposal, 'failed', { failureReason: 'server timestamp non-finite/out-of-range (no post attempted)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
-  // execute the real Senti post via the existing CLI/MCP (credentials already validated -> a .posted is always signable)
+  // execute the real Senti post (credentials + dates validated -> a .posted is always signable + Swift-sane).
+  // Only immutable snapshots (nowSnap/confirmedAtSnap) flow into the receipt — never the caller's mutable inputs.
   try {
     const out = run(['session', 'reply', proposal.targetSessionId, String(proposal.targetSequence), proposal.renderedPreview, '--agent', agent, '--json']);
     const resultingSequence = parseResultingSequence(out);
     if (resultingSequence == null) {
       // no verifiable sequence => do NOT claim posted; leave unstored so it can be retried
-      return receipt(proposal, 'failed', { failureReason: 'post returned no verifiable resulting sequence', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+      return receipt(proposal, 'failed', { failureReason: 'post returned no verifiable resulting sequence', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     }
     const r = signReceipt(
-      receipt(proposal, 'posted', { resultingSequence, confirmedProposalHash: live, executedAt: now, confirmedByHumanAt: confirmation.confirmedAt }),
+      receipt(proposal, 'posted', { resultingSequence, confirmedProposalHash: live, executedAt: nowSnap, confirmedByHumanAt: confirmedAtSnap }),
       signingKeyObj, opts.signingKeyId,
     );
     store.set(proposal.id, r);
     return r;
   } catch (e) {
     // transient failure: do NOT store (allow retry of the same proposal id later)
-    return receipt(proposal, 'failed', { failureReason: String(e?.message ?? e).slice(0, 300), confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+    return receipt(proposal, 'failed', { failureReason: String(e?.message ?? e).slice(0, 300), confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
   }
 }

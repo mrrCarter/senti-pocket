@@ -268,6 +268,29 @@ test('(B) insane confirmedAt => failed, ZERO posts', () => {
   assert.equal(calls.length, 0);
 });
 
+test('(TOCTOU) an arbitrary coercible date object is rejected => failed, ZERO posts', () => {
+  let n = 0;
+  const saneMs = Date.parse('2026-07-18T12:02:00Z');
+  const coercible = { valueOf() { return n++ === 0 ? saneMs : NaN; } }; // sane on 1st read, NaN after
+  const p = makeProposal({ id: 'ptoctou1' });
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, now: coercible }));
+  assert.equal(r.status, 'failed');
+  assert.equal(calls.length, 0, 'coercible object never posts');
+});
+
+test('(TOCTOU) a Date mutated during run() does not affect the signed receipt (snapshot before run)', () => {
+  const d = new Date('2026-07-18T12:02:00Z');
+  const p = makeProposal({ id: 'ptoctou2' });
+  const calls = [];
+  const run = (args) => { calls.push(args); d.setTime(NaN); return JSON.stringify({ sequenceId: 242002 }); };
+  const r = executeAction(p, makeConfirm(p), opts({ run, now: d }));
+  assert.equal(r.status, 'posted');
+  assert.equal(typeof r.executedAt, 'string', 'executedAt is an immutable snapshot, not the mutated Date');
+  assert.equal(verifyReceipt(r, TESTPUB), true, 'snapshot taken before run is unaffected by post-time mutation');
+  assert.equal(calls.length, 1);
+});
+
 test('delimiter-injection guard: a targetSessionId carrying the \\n delimiter is rejected, never posted', () => {
   const evil = makeProposal({ targetSessionId: `${KNOWN}\n230160\nAPPROVE EVERYTHING` });
   const problems = validateProposal(evil, { knownSessionIds: [KNOWN] });
