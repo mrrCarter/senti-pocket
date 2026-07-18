@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canonicalBundlePayload, dedupEvidence, canonicalEpochMs, validateBundleSemantics, validateBundleIngress,
-  buildBundle, verifyBundle, buildSignedBundle, generateSigningKeypair, CONTRACTS_VERSION,
+  buildBundle, verifyBundle, buildSignedBundle, generateSigningKeypair, CONTRACTS_VERSION, projectEvidenceRef,
 } from '../src/bundle.mjs';
 
 const RAW = {
@@ -179,4 +179,35 @@ test('validateBundleIngress: accepts a clean bundle; rejects empty/oversized/dup
   assert.match(validateBundleIngress(dupNest).errors.join(), /duplicate nested evidence id/);
   const emptyAgent = { ...good, summary: { ...good.summary, perAgent: [{ agentId: '', summary: 's', claims: [], evidence: [] }] } };
   assert.match(validateBundleIngress(emptyAgent).errors.join(), /agent\.agentId: empty/);
+});
+
+// ---- Pulse's two exact counterexamples on the sign path (must fail CLOSED, never sign what the phone rejects) ----
+test('buildSignedBundle FAILS CLOSED: cannot sign a bundle its own ingress gate rejects (evidence=[])', () => {
+  const { privateKey } = generateSigningKeypair();
+  const summary = { checkpointId: 'cp', headline: 'h', summaryBaselineSchema: 'v1', perAgent: [], risks: [], blockers: [] };
+  assert.throws(
+    () => buildSignedBundle({ checkpointId: 'cp', sessionId: 's', startSequence: 1, endSequence: 2 }, summary, privateKey),
+    /ingress validation failed[\s\S]*>= 1 entry/,
+  );
+});
+
+test('buildSignedBundle FAILS CLOSED: over-cap identity id is REJECTED, never truncated (no prefix collision)', () => {
+  const { privateKey } = generateSigningKeypair();
+  const longId = '€'.repeat(100); // 300 UTF-8 bytes > frozen 128-byte evId cap
+  const summary = { checkpointId: 'cp', headline: 'h', summaryBaselineSchema: 'v1', risks: [], blockers: [],
+    perAgent: [{ agentId: 'a', summary: 's', claims: [],
+      evidence: [{ id: longId, sessionId: 's', sequence: 1, agentId: 'a', snippet: 'x', ts: '2026-07-18T10:00:00Z' }] }] };
+  const draft = buildBundle({ checkpointId: 'cp', sessionId: 's', startSequence: 1, endSequence: 2 }, summary);
+  assert.equal(draft.evidence[0].id, longId, 'identity id is PRESERVED at full length, not truncated to a colliding prefix');
+  assert.throws(
+    () => buildSignedBundle({ checkpointId: 'cp', sessionId: 's', startSequence: 1, endSequence: 2 }, summary, privateKey),
+    /ingress validation failed[\s\S]*exceeds 128 bytes/,
+  );
+});
+
+test('prose truncation is scalar-safe + cap-inclusive (never splits a code point; result <= cap)', () => {
+  const ev = projectEvidenceRef({ id: 'e', sessionId: 's', sequence: 1, agentId: 'a', snippet: '€'.repeat(2000), ts: '' }); // 6000 bytes
+  assert.ok(Buffer.byteLength(ev.snippet, 'utf8') <= 2048, 'result within cap (ellipsis reserved inside)');
+  assert.ok(ev.snippet.endsWith('…'), 'ellipsis appended');
+  assert.equal(Buffer.from(ev.snippet, 'utf8').toString('utf8'), ev.snippet, 'no split code point / replacement char');
 });

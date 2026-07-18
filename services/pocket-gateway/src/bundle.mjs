@@ -48,8 +48,25 @@ export function dedupEvidence(refs) {
 
 /** UTF-8 byte length + bounded/scrubbed string helpers (final egress projection is best-effort + minimizing). */
 const b8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
-const boundStr = (v, maxBytes) => { const s = String(v ?? ''); return b8(s) > maxBytes ? Buffer.from(s, 'utf8').subarray(0, maxBytes).toString('utf8') + '…' : s; };
+/**
+ * PROSE truncation: scalar-safe (NEVER splits a UTF-8 code point) and CAP-INCLUSIVE (the 3-byte '…' is reserved WITHIN
+ * maxBytes, so the result is ALWAYS <= maxBytes). Use ONLY for prose — never for identity/citation ids (see scrubId).
+ */
+const boundStr = (v, maxBytes) => {
+  const s = String(v ?? '');
+  if (b8(s) <= maxBytes) return s;
+  const budget = Math.max(0, maxBytes - 3); // reserve 3 bytes for the '…'
+  let out = '', used = 0;
+  for (const ch of s) { const cb = Buffer.byteLength(ch, 'utf8'); if (used + cb > budget) break; out += ch; used += cb; }
+  return out + '…';
+};
 const scrubStr = (v, maxBytes) => boundStr(scrubText(String(v ?? '')).text, maxBytes);
+/**
+ * IDENTITY/citation ids: scrubbed for secrets but NEVER length-truncated — truncating an id could collapse two distinct
+ * ids that share a prefix (a silent identity forgery). An over-cap id survives to validateBundleIngress, which REJECTS
+ * it (preserving identity, fail-closed at sign) rather than mangling it.
+ */
+const scrubId = (v) => scrubText(String(v ?? '')).text;
 
 /**
  * Per-field caps for the projected, phone-visible CheckpointSummary. `id`/`evId`/snippet are pinned to the FROZEN
@@ -68,11 +85,11 @@ export const SUMMARY_CAPS = Object.freeze({
 export function projectEvidenceRef(r) {
   if (!r || typeof r !== 'object') return null;
   return {
-    id: scrubStr(r.id, SUMMARY_CAPS.evId),
-    sessionId: scrubStr(r.sessionId, SUMMARY_CAPS.id),
+    id: scrubId(r.id),                 // identity: never truncated (ingress rejects over-cap)
+    sessionId: scrubId(r.sessionId),   // identity
     sequence: Number.isSafeInteger(r.sequence) && r.sequence > 0 ? r.sequence : 0,
-    agentId: scrubStr(r.agentId, SUMMARY_CAPS.evId),
-    snippet: scrubStr(r.snippet, SUMMARY_CAPS.snippet),
+    agentId: scrubId(r.agentId),       // identity
+    snippet: scrubStr(r.snippet, SUMMARY_CAPS.snippet), // prose: scalar-safe bounded
     ts: typeof r.ts === 'string' ? boundStr(r.ts, SUMMARY_CAPS.str) : (r.ts instanceof Date ? r.ts.toISOString() : ''),
   };
 }
@@ -82,10 +99,10 @@ const CLAIM_KINDS = new Set(['fact', 'inference', 'recommendation']);
 function projectClaim(c) {
   if (!c || typeof c !== 'object') return null;
   return {
-    id: scrubStr(c.id, SUMMARY_CAPS.str),
-    text: scrubStr(c.text, SUMMARY_CAPS.summary),
+    id: scrubId(c.id), // identity: never truncated
+    text: scrubStr(c.text, SUMMARY_CAPS.summary), // prose
     kind: CLAIM_KINDS.has(c.kind) ? c.kind : 'inference',
-    evidenceIds: Array.isArray(c.evidenceIds) ? c.evidenceIds.slice(0, SUMMARY_CAPS.evidence).map((x) => scrubStr(x, SUMMARY_CAPS.evId)) : [],
+    evidenceIds: Array.isArray(c.evidenceIds) ? c.evidenceIds.slice(0, SUMMARY_CAPS.evidence).map((x) => scrubId(x)) : [], // citation identity
   };
 }
 
@@ -94,7 +111,7 @@ function projectAgentSummary(a) {
   if (!a || typeof a !== 'object') return null;
   const evidence = Array.isArray(a.evidence) ? a.evidence.slice(0, SUMMARY_CAPS.evidence).map(projectEvidenceRef).filter(Boolean) : [];
   const claims = Array.isArray(a.claims) ? a.claims.slice(0, SUMMARY_CAPS.evidence).map(projectClaim).filter(Boolean) : [];
-  return { agentId: scrubStr(a.agentId, SUMMARY_CAPS.evId), summary: scrubStr(a.summary, SUMMARY_CAPS.summary), claims, evidence };
+  return { agentId: scrubId(a.agentId), summary: scrubStr(a.summary, SUMMARY_CAPS.summary), claims, evidence };
 }
 
 /**
@@ -105,7 +122,7 @@ function projectAgentSummary(a) {
 export function projectSummary(summary) {
   const s = summary && typeof summary === 'object' ? summary : {};
   return {
-    checkpointId: scrubStr(s.checkpointId, SUMMARY_CAPS.id),
+    checkpointId: scrubId(s.checkpointId), // identity
     headline: scrubStr(s.headline, SUMMARY_CAPS.headline),
     summaryBaselineSchema: scrubStr(s.summaryBaselineSchema, SUMMARY_CAPS.str),
     grade: s.grade == null ? null : scrubStr(s.grade, SUMMARY_CAPS.str),
@@ -143,11 +160,20 @@ export function buildBundle(rawCheckpoint, summary, opts = {}) {
   return bundle;
 }
 
+/** Throw unless the bundle passes the FULL consume-side ingress gate (bounds + semantics). */
+export function assertBundleIngress(b) {
+  const { ok, errors } = validateBundleIngress(b);
+  if (!ok) throw new Error(`bundle ingress validation failed: ${errors.join('; ')}`);
+}
+
 /** Sign a bundle draft with an Ed25519 private key (KeyObject or PEM). Returns a new signed bundle. */
 export function signBundle(draft, privateKey, signingKeyId) {
   const key = typeof privateKey === 'string' ? createPrivateKey(privateKey) : privateKey;
   const toSign = { ...draft, signature: '' };
   if (signingKeyId) toSign.signingKeyId = signingKeyId;
+  // FAIL-CLOSED: never crypto-sign a bundle the consume gate / phone would reject (Pulse: gateway must not sign what
+  // its own ingress validator rejects). This runs the FULL ingress (bounds + semantics) over the exact bytes to sign.
+  assertBundleIngress(toSign);
   const sig = edSign(null, canonicalBundleBytes(toSign), key); // Ed25519 => algorithm is null
   return { ...toSign, signature: sig.toString('base64') };
 }
