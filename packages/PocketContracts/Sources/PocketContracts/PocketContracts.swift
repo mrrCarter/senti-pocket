@@ -1,4 +1,9 @@
-// PocketContracts v0.1.7 by Atlas (claude-pocket-atlas).
+// PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
+// v0.1.8 (Echo #231350 re-audit): canonical ActionProposal v2 -> v3 binds id + createdAt + sourceQuestionId
+//   (was kind/session/sequence/preview ONLY) — two same-CONTENT proposals with different ids/times now get
+//   DISTINCT hashes, killing the confirm-swap where a stale A intent confirmed a same-content displayed B.
+//   proposalHash + KAV CHANGE (new HASH fYV2Bi_...). isValidForConfirmation also rejects an out-of-range createdAt.
+//   (Pairs with PocketCall's opaque single-use ConfirmationCapability + VerifiedBundle ingress.) Relay re-mirror.
 // v0.1.7 (Relay/Echo/Pulse converged #231081-#231316): ActionReceipt.resultingSequence:Int -> `result:
 //   ActionResultRef?` tagged union — a true threadedReply is an ACTION (actionId + target it threads under),
 //   NOT a bare sequence; a say is a sequence. Explicit kind-discriminated Codable (Node-mirrorable). Receipt
@@ -42,7 +47,7 @@ import CryptoKit
 #endif
 
 public enum PocketContracts {
-    public static let version = "0.1.7"
+    public static let version = "0.1.8"
 }
 
 // MARK: - Source (Relay produces RawCheckpoint + CheckpointSummary; gateway summarizes)
@@ -205,8 +210,9 @@ public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
     public let sourceQuestionId: String?
     /// v0.1.2: deterministic digest binding the CONFIRMABLE content = base64url(SHA-256(UTF-8(canonicalPayload))).
     /// Pulse verifies it at read-back/confirm; Relay verifies it again at writeback; ActionReceipt.confirmedProposalHash
-    /// echoes exactly this. ANY change to kind/targetSessionId/targetSequence/renderedPreview changes the hash and
-    /// INVALIDATES a prior confirmation (single-use, TOCTOU-proof at the Pulse<->Relay seam).
+    /// echoes exactly this. v0.1.8 (Echo #231350): binds id + kind + targetSessionId + targetSequence + renderedPreview
+    /// + createdAt + sourceQuestionId — so two same-CONTENT proposals with different ids/times get DISTINCT hashes.
+    /// ANY change to those fields changes the hash and INVALIDATES a prior confirmation (single-use, TOCTOU-proof).
     public let proposalHash: String
     /// Explicit-hash init (cross-platform; used by decode + non-Apple hosts). Producers on Apple use the convenience init.
     public init(id: String, kind: ActionKind, targetSessionId: String, targetSequence: Int, renderedPreview: String, requiresConfirmation: Bool, createdAt: Date, sourceQuestionId: String?, proposalHash: String) {
@@ -220,14 +226,20 @@ public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
     /// shift boundaries (delimiter-only canonicalization was collision-vulnerable). Order-fixed, versioned domain
     /// separator. Every lane (Swift + the Node gateway) MUST reproduce EXACTLY this — see the known-answer vector
     /// in ContractsCrossModuleTests (KAV_1) and mirror it in Relay's Node tests.
-    public static func canonicalPayload(kind: ActionKind, targetSessionId: String, targetSequence: Int, renderedPreview: String) -> String {
+    public static func canonicalPayload(id: String, kind: ActionKind, targetSessionId: String, targetSequence: Int, renderedPreview: String, createdAt: Date, sourceQuestionId: String?) -> String {
         func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
-        return "pocket.actionproposal.v2\n" + lp(kind.rawValue) + lp(targetSessionId) + lp(String(targetSequence)) + lp(renderedPreview)
+        // v3 (Echo #231350): bind id + createdAt + sourceQuestionId so two same-CONTENT proposals with different
+        // ids/times get DISTINCT hashes (kills the confirm-swap where A's intent confirmed a same-content B).
+        // createdAt as CHECKED epoch-millis (never traps; "" only for an out-of-range date, which isValidForConfirmation rejects).
+        let created = ActionReceipt.safeEpochMillis(createdAt).map(String.init) ?? ""
+        return "pocket.actionproposal.v3\n"
+            + lp(id) + lp(kind.rawValue) + lp(targetSessionId) + lp(String(targetSequence))
+            + lp(renderedPreview) + lp(created) + lp(sourceQuestionId ?? "")
     }
     #if canImport(CryptoKit)
     /// proposalHash = base64url(SHA-256(UTF-8(canonicalPayload))). Producers compute; confirm + writeback verify.
-    public static func computeHash(kind: ActionKind, targetSessionId: String, targetSequence: Int, renderedPreview: String) -> String {
-        let bytes = Data(canonicalPayload(kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview).utf8)
+    public static func computeHash(id: String, kind: ActionKind, targetSessionId: String, targetSequence: Int, renderedPreview: String, createdAt: Date, sourceQuestionId: String?) -> String {
+        let bytes = Data(canonicalPayload(id: id, kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview, createdAt: createdAt, sourceQuestionId: sourceQuestionId).utf8)
         let d = SHA256.hash(data: bytes)
         return Data(d).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
@@ -236,12 +248,12 @@ public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
     }
     /// Producer convenience (Apple): builds a proposal with a freshly-computed hash + requiresConfirmation = true.
     public init(id: String, kind: ActionKind, targetSessionId: String, targetSequence: Int, renderedPreview: String, createdAt: Date, sourceQuestionId: String?) {
-        let h = ActionProposal.computeHash(kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview)
+        let h = ActionProposal.computeHash(id: id, kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview, createdAt: createdAt, sourceQuestionId: sourceQuestionId)
         self.init(id: id, kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview, requiresConfirmation: true, createdAt: createdAt, sourceQuestionId: sourceQuestionId, proposalHash: h)
     }
     /// Verify the stored hash still matches the content. Call at CONFIRM and again at WRITEBACK; refuse on mismatch.
     public func hashMatchesContent() -> Bool {
-        return proposalHash == ActionProposal.computeHash(kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview)
+        return proposalHash == ActionProposal.computeHash(id: id, kind: kind, targetSessionId: targetSessionId, targetSequence: targetSequence, renderedPreview: renderedPreview, createdAt: createdAt, sourceQuestionId: sourceQuestionId)
     }
     #endif
 
@@ -253,6 +265,7 @@ public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
               !id.isEmpty, id.count <= 128,
               !targetSessionId.isEmpty, targetSessionId.count <= 256,
               !renderedPreview.isEmpty, renderedPreview.count <= 4096,
+              ActionReceipt.safeEpochMillis(createdAt) != nil,   // v0.1.8: createdAt is bound in the hash -> must be sane
               !proposalHash.isEmpty else { return false }
         #if canImport(CryptoKit)
         return hashMatchesContent()
