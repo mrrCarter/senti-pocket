@@ -1,0 +1,39 @@
+# XcodeGen manifest — Atlas owns this + the generated project. Reproducible from these Windows-authored
+# sources: on a Mac run `xcodegen generate` (brew install xcodegen) then open SentiPocketApp.xcodeproj.
+# Keeps the Xcode project OUT of git-conflict territory (only this yaml + Swift sources are tracked).
+name: SentiPocketApp
+options:
+  bundleIdPrefix: com.plexaura.sentipocket
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+packages:
+  PocketContracts:
+    path: ../../packages/PocketContracts
+  # Feature packages plug in here as lanes hand them up (Atlas integrates):
+  # PocketUI:            { path: ../../packages/PocketUI }
+  # PocketInference:     { path: ../../packages/PocketInference }
+  # PocketVoice:         { path: ../../packages/PocketVoice }
+  # PocketSyncClient:    { path: ../../packages/PocketSyncClient }
+  # PocketActionsClient: { path: ../../packages/PocketActionsClient }
+targets:
+  SentiPocketApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources
+        buildPhase: resources
+    dependencies:
+      - package: PocketContracts
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Senti Pocket
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: false
+        SWIFT_VERSION: "5.9"
