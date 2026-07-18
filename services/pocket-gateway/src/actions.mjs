@@ -85,7 +85,12 @@ const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/
  */
 export function canonicalReceiptPayload(r) {
   const lp = (s) => { const v = s == null ? '' : String(s); return `${Buffer.byteLength(v, 'utf8')}:${v}`; };
-  const toUnix = (t) => (t ? String(Math.floor(new Date(t).getTime() / 1000)) : '');
+  const toUnix = (t) => {
+    if (!t) return '';
+    const ms = new Date(t).getTime();
+    if (!Number.isFinite(ms)) throw new RangeError('non-finite receipt timestamp'); // (A) reject extreme/NaN dates
+    return String(Math.floor(ms / 1000));
+  };
   return 'pocket.actionreceipt.v2\n'
     + lp(r.id)
     + lp(r.proposalId)
@@ -145,8 +150,10 @@ export function executeAction(proposal, confirmation, opts = {}) {
   const online = opts.online !== false;
   const run = opts.run || ((args) => execFileSync('sl', args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
 
-  // Idempotency: a given proposal.id executes AT MOST once. Re-submits return the SAME receipt.
-  if (proposal && store.has(proposal.id)) return store.get(proposal.id);
+  // Idempotency: only a TERMINAL .posted is single-use. A stored pendingConnectivity MUST allow a later
+  // online flush to execute + replace it (single-use pending->posted flush semantics — Echo (C)).
+  const prior = proposal ? store.get(proposal.id) : undefined;
+  if (prior && prior.status === 'posted') return prior;
 
   // 1) deterministic validation (kind, known target, sequence, preview, hash-integrity)
   const problems = validateProposal(proposal, { knownSessionIds: opts.knownSessionIds });
@@ -174,7 +181,12 @@ export function executeAction(proposal, confirmation, opts = {}) {
     return r;
   }
 
-  // 4) execute the real Senti post via the existing CLI/MCP
+  // 4) REQUIRE signing credentials BEFORE any online side effect (Echo (B)): a .posted receipt MUST be
+  // signable, so we must never perform the post and then be unable to return a valid signed .posted.
+  if (!opts.signingKey || !opts.signingKeyId) {
+    return receipt(proposal, 'failed', { failureReason: 'gateway signing credentials required before writeback (never post an unsigned .posted)', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
+  }
+  // execute the real Senti post via the existing CLI/MCP
   try {
     const out = run(['session', 'reply', proposal.targetSessionId, String(proposal.targetSequence), proposal.renderedPreview, '--agent', agent, '--json']);
     const resultingSequence = parseResultingSequence(out);
@@ -182,8 +194,10 @@ export function executeAction(proposal, confirmation, opts = {}) {
       // no verifiable sequence => do NOT claim posted; leave unstored so it can be retried
       return receipt(proposal, 'failed', { failureReason: 'post returned no verifiable resulting sequence', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
     }
-    let r = receipt(proposal, 'posted', { resultingSequence, confirmedProposalHash: live, executedAt: now, confirmedByHumanAt: confirmation.confirmedAt });
-    if (opts.signingKey) r = signReceipt(r, opts.signingKey, opts.signingKeyId); // only .posted is gateway-signed
+    const r = signReceipt(
+      receipt(proposal, 'posted', { resultingSequence, confirmedProposalHash: live, executedAt: now, confirmedByHumanAt: confirmation.confirmedAt }),
+      opts.signingKey, opts.signingKeyId,
+    );
     store.set(proposal.id, r);
     return r;
   } catch (e) {

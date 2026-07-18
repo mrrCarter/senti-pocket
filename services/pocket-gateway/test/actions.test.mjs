@@ -25,7 +25,9 @@ function recordingRun(seq = 230999) {
   const run = (args) => { calls.push(args); return JSON.stringify({ sequenceId: seq }); };
   return { run, calls };
 }
-const opts = (extra) => ({ knownSessionIds: [KNOWN], store: new Map(), now: '2026-07-18T12:02:00Z', ...extra });
+const { publicKey: TESTPUB, privateKey: TESTKEY } = generateSigningKeypair();
+// online writeback now REQUIRES signing credentials, so they are part of the default opts.
+const opts = (extra) => ({ knownSessionIds: [KNOWN], store: new Map(), now: '2026-07-18T12:02:00Z', signingKey: TESTKEY, signingKeyId: 'gw-key', ...extra });
 
 test('canonicalPayload matches the frozen v0.1.3 length-prefixed format exactly', () => {
   // lp(s) = "<utf8ByteCount>:<s>": 13:threadedReply, 36:<uuid>, 6:230160, 2:hi
@@ -169,6 +171,36 @@ test('posted receipt is Ed25519-signed + verifies; pending receipts stay unsigne
   assert.equal(pending.status, 'pendingConnectivity');
   assert.equal(pending.signature, null, 'pending receipt is unsigned');
   assert.equal(verifyReceipt(pending, publicKey), false, 'unsigned pending never verifies as sent');
+});
+
+test('(B) online writeback WITHOUT signing credentials => failed, ZERO posts', () => {
+  const p = makeProposal();
+  const { run, calls } = recordingRun();
+  const r = executeAction(p, makeConfirm(p), opts({ run, signingKey: undefined, signingKeyId: undefined }));
+  assert.equal(r.status, 'failed');
+  assert.match(r.failureReason, /signing credentials required/);
+  assert.equal(calls.length, 0, 'no online side effect without credentials');
+});
+
+test('(C) offline pending then online flush posts exactly once (pending is not terminal)', () => {
+  const p = makeProposal({ id: 'pflush' });
+  const store = new Map();
+  const { run, calls } = recordingRun(240001);
+  const pending = executeAction(p, makeConfirm(p), opts({ run, store, online: false }));
+  assert.equal(pending.status, 'pendingConnectivity');
+  assert.equal(calls.length, 0);
+  const flushed = executeAction(p, makeConfirm(p), opts({ run, store, online: true }));
+  assert.equal(flushed.status, 'posted', 'pending flushes to posted when back online');
+  assert.equal(flushed.resultingSequence, 240001);
+  assert.equal(calls.length, 1, 'posted exactly once on flush');
+  const again = executeAction(p, makeConfirm(p), opts({ run, store, online: true }));
+  assert.deepEqual(again, flushed, 'now terminal: same posted receipt');
+  assert.equal(calls.length, 1, 'no double-post after terminal');
+});
+
+test('(A) a receipt with a non-finite timestamp is rejected by verification (no trap)', () => {
+  const bad = { id: 'p1', proposalId: 'p1', status: 'posted', resultingSequence: 1, targetSessionId: 's1', confirmedProposalHash: 'H', confirmedByHumanAt: 'not-a-date', executedAt: '2026-07-18T12:02:00Z', failureReason: null, signature: 'AAAA', signingKeyId: 'k' };
+  assert.equal(verifyReceipt(bad, TESTPUB), false);
 });
 
 test('delimiter-injection guard: a targetSessionId carrying the \\n delimiter is rejected, never posted', () => {
