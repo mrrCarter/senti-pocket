@@ -41,27 +41,35 @@ rings and speaks than a perfect core with an unproven UI. **Prioritize the scree
   targetSessionId, confirmedProposalHash, confirmedByHumanAt, executedAt?, failureReason?, signature, signingKeyId }`.
   A signed receipt exists ONLY for a real `posted` write. `pendingConnectivity`/`failed` are NEVER shown as sent.
 
-## 5. The backend is DONE — you point the app at it (no AWS needed tonight)
+## 5. The backend (PHASE B only — under re-audit; the ROOM/warden clearance wins)
+> The demo backend/launcher is **NO-GO for real write-back until warden posts "launcher CLEARED"** (Echo #233248).
+> Phase A needs NO backend. Treat this section as the intended wire shape; do not run/integrate the launcher for a
+> real write-back until cleared. For Phase A, brief from the frozen `canonical_checkpoint.json` fixture.
+
 Run the local demo gateway on the Mac (from the repo):
 ```
-cd services/pocket-gateway
-DEMO_SESSION=<a-disposable-senti-session-id> node scripts/local-server.mjs   # real write-back to a throwaway session
-#   or, briefing-only (no write-back):  node scripts/local-server.mjs
+# briefing-only (loopback):
+node scripts/local-server.mjs
+# real write-back over LAN (once cleared) — disposable session must be re-confirmed; sl entrypoint must be absolute:
+LAN=1 DEMO_SESSION=<disposable-id> DEMO_SESSION_DISPOSABLE_CONFIRM=<same-id> \
+  SL_CLI_JS=<abs path to sentinelayer-cli.js> node scripts/local-server.mjs
 ```
-It prints: the **LAN URL** (`http://<mac-ip>:8787`), the **dev bearer token** (`demo-pocket-token`, LOCAL-DEMO only —
-NOT production trust), and the **bundle-signing public key** (pin it in the app to verify bundles).
+It prints: the **LAN URL**; a **RANDOM per-run pairing token** (ephemeral — type into the phone, do NOT log/commit);
+the **raw base64url Ed25519 verify key** (keyId `demo-bundle-key`/`demo-receipt-key`); and the committed KAV pointer.
+Defaults to **loopback** (`LAN=1` is explicit opt-in; LAN is cleartext HTTP — trusted LAN only).
 
-Endpoints (send `Authorization: Bearer demo-pocket-token`):
+Endpoints (send `Authorization: Bearer <printed pairing token>`; exact `application/json` MIME for POST):
 - `GET  /sync` → one **real Ed25519-signed** PocketBundle to brief from.
-- `POST /actions/execute` `{ proposal, confirmation }` → with `DEMO_SESSION` set, a **real** governed write-back
-  (real `sl` post to the disposable session) → **real sequence + signed receipt**. Without it, an **honest
-  non-posted** response (`status:failed`, unsigned) — it **NEVER fabricates `posted`**. (`sl` must be on PATH + authed.)
-- `POST /tts` `{ text, voiceId }` → PCM audio (needs the `pocket:voice` scope; the real voice path is on-device/Echo).
+- `POST /actions/execute` `{ proposal, confirmation }` → with a **confirmed disposable** session, a **real** governed
+  write-back (shell-free `sl`) → **real sequence + signed receipt**. A proposal that cannot be bound to a confirmation
+  returns a **typed `422 { error:"proposal_rejected" }` envelope** — never a null-hash "receipt", never a fake `posted`.
+- `POST /tts` `{ text, voiceId }` → PCM (needs the `pocket:voice` scope; the real voice path is on-device/Echo).
+- **KAV**: `test/fixtures/pocket_kav_v1.json` — verify the bundle + receipt with the raw base64url key in Swift too.
 
 Product-truth rules you MUST honor in the UI (Pulse enforces fail-closed):
-- **Verify the bundle signature** before speaking a briefing. If it fails, do not brief.
+- **Verify the bundle signature** (raw base64url Ed25519) before speaking a briefing. If it fails, do not brief.
 - **Never render a non-`posted` receipt as sent.** Only a `posted` + signature-verifying receipt = "written back".
-- The demo bearer/keys are local-demo only; do not present them as AIdenID / production trust.
+- The pairing token/keys are local-demo only; do not present them as AIdenID / production trust.
 
 ## 6. What is DONE vs what is YOURS
 DONE (do not rebuild): the whole gateway — checkpoint extract → grounded summary → strict-egress signed bundle →
