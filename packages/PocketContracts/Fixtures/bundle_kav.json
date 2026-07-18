@@ -1,0 +1,54 @@
+{
+  "_note": "pocket.bundle.v1 SIGNED known-answer vector (warden/bundle-kav-fix, FIX2). Proves the Phase-A demo gateway key signs a bundle whose ed25519 signature the phone verifies under the PINNED public key. Reproducible Node<->Swift: the seed derives from a PUBLIC phrase (no private key committed); Node signs, Swift (CryptoKit) verifies. Relay's Node gateway (services/pocket-gateway) MUST reproduce `canonicalBytesUtf8` byte-for-byte and sign with the real gateway key; the phone pins the real public key the same way.",
+  "demoKey": {
+    "PHASE_A_ONLY": true,
+    "neverProduction": true,
+    "signingKeyId": "pocket-demo-phase-a",
+    "seedDerivation": "seed = SHA-256(UTF-8(seedPhrase))  (32 bytes; ed25519 raw private seed)",
+    "seedPhrase": "senti-pocket phase-a demo gateway key -- NEVER PRODUCTION",
+    "publicKeyBase64url": "KiJLmbgZ-ybBDsPp_K27z2JQGzdMrfmlpQMQmyHg2j8"
+  },
+  "bundle": {
+    "contractsVersion": "0.1.8",
+    "checkpointId": "cp_demo_1",
+    "sessionId": "sess_demo_1",
+    "sequenceStart": 100,
+    "sequenceEnd": 200,
+    "createdAtEpochMillis": 1752835200000,
+    "signingKeyId": "pocket-demo-phase-a",
+    "summary": {
+      "checkpointId": "cp_demo_1",
+      "headline": "demo briefing",
+      "summaryBaselineSchema": "checkpoint_summary_sections_v1",
+      "grade": "A",
+      "perAgent": [
+        {
+          "agentId": "agent-a",
+          "summary": "did the thing",
+          "claims": [{ "id": "c1", "text": "a fact", "kind": "fact", "evidenceIds": ["ev1"] }],
+          "evidence": [{ "id": "ev1", "sessionId": "sess_demo_1", "sequence": 150, "agentId": "agent-a", "snippet": "snippet", "tsEpochMillis": 1752835200000 }]
+        }
+      ],
+      "risks": ["r1"],
+      "blockers": ["b1"]
+    },
+    "evidence": [{ "id": "ev1", "sessionId": "sess_demo_1", "sequence": 150, "agentId": "agent-a", "snippet": "snippet", "tsEpochMillis": 1752835200000 }]
+  },
+  "kav": {
+    "canonicalBytesUtf8": "pocket.bundle.v1\n5:0.1.89:cp_demo_111:sess_demo_13:1003:2009:cp_demo_113:demo briefing30:checkpoint_summary_sections_v111:A1:17:agent-a13:did the thing1:12:c16:a fact4:fact1:13:ev11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:17528352000001:12:r11:12:b11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:175283520000013:175283520000019:pocket-demo-phase-a",
+    "canonicalSha256Hex": "be4c9e360624c1bab4f2ad13afeda10c87e2f680ada48e2aa020f0afb069e9e3",
+    "signatureBase64url": "tYpQ9zM-uZp74-5SCezawEjcUWPH56S1pzu12vBfwyxzR2dJeFRi0zkX1R-5163KsRq6tGQzTxiEH1jUChnBCA",
+    "verifiesUnderPinnedKey": true
+  },
+  "tamperVectors": {
+    "_note": "Any mutation to a signed field changes canonicalBytesUtf8, so the frozen signature no longer verifies. Semantic mutations are ALSO rejected pre-crypto by isSemanticallyValid().",
+    "examples": [
+      "summary.headline 'demo briefing' -> 'demo EVIL'  (signature fails)",
+      "evidence[0].snippet 'snippet' -> 'x'             (signature fails)",
+      "signingKeyId 'pocket-demo-phase-a' -> 'other'    (unknown id: rejected BEFORE crypto)",
+      "evidence order swapped                            (canonical changes: signature fails)",
+      "sequenceStart 100 -> 300 (inverted)               (semantic reject, never narrated)"
+    ]
+  },
+  "nodeRecipe": "seed=sha256(seedPhrase); pkcs8=0x302e020100300506032b657004220420||seed; priv=createPrivateKey(pkcs8,der,pkcs8); pub raw = jwk.x; sig = crypto.sign(null, canonicalBytesUtf8, priv); base64url(sig) == signatureBase64url."
+}

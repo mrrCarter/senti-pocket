@@ -1,61 +1,71 @@
 # MAC_VERIFY — compile + test the Swift packages on a Mac
 
 **Why this exists:** the packages are authored on Windows (no Swift/Xcode there), so nothing is
-compile-verified yet. On any Mac with Xcode command-line tools, this is a one-shot verification of
-the three SwiftPM packages. macOS has **CryptoKit**, so every `#if canImport(CryptoKit)` test path
-(hashing, ed25519 signature verification) actually runs — which is exactly what can't run on Windows.
+compile-verified yet. On any Mac with Xcode command-line tools this is a one-shot, **fail-loud**
+verification of every SwiftPM package. macOS has **CryptoKit**, so every `#if canImport(CryptoKit)`
+path (SHA-256 hashing, ed25519 bundle/receipt signature verification) actually runs — which is
+exactly what cannot run on Windows.
 
 ## Prereqs
 - macOS with Xcode or the Command Line Tools (`xcode-select --install`). Check: `swift --version`.
 
-## Steps
+## Pin the exact commit (do NOT verify a different SHA)
 ```bash
-git clone https://github.com/mrrCarter/senti-pocket.git   # or: git -C senti-pocket pull
+git clone https://github.com/mrrCarter/senti-pocket.git   # or: git -C senti-pocket fetch origin
 cd senti-pocket
-git checkout atlas/pocket-contracts-v0.1     # verify HEAD is 7e1cfbe (or later)
-git rev-parse --short HEAD
-
-# Logic packages — pure SwiftPM, verify with `swift test` (local path deps resolve automatically).
-for pkg in packages/PocketContracts packages/PocketCall packages/PocketBriefing packages/PocketUI; do
-  echo "==== $pkg ===="
-  ( cd "$pkg" && swift build && swift test )
-done
-
-# ML packages — pull heavy EXTERNAL deps; `swift build` fetches them (LiteRT-LM source, whisper.cpp binary xcframework).
-# These may be better validated via the app's xcodegen build (iOS SDK) than standalone swift test:
-for pkg in packages/PocketInference packages/PocketVoice; do
-  echo "==== $pkg (external deps) ===="
-  ( cd "$pkg" && swift build ) || echo "  ^ if LiteRT-LM/whisper resolution fails, route to Echo (owning lane)"
-done
+git checkout warden/bundle-kav-fix
+git rev-parse --short HEAD        # MUST equal the SHA in the warden's handoff for this branch
 ```
+This runbook is committed on `warden/bundle-kav-fix`; verifying any other SHA is meaningless.
 
-## The full app (all six packages wired)
-`apps/SentiPocketApp` depends on all six packages (project.yml). Build it via XcodeGen:
+## Run EVERY lane — fail loud, swallow nothing
 ```bash
-cd apps/SentiPocketApp && xcodegen generate && xcodebuild -scheme SentiPocketApp \
-  -destination 'generic/platform=iOS Simulator' build
+set -euo pipefail                 # any build/test failure aborts immediately with a non-zero exit
+for pkg in PocketContracts PocketCall PocketBriefing PocketUI PocketInference PocketVoice; do
+  echo "==== packages/$pkg ===="
+  ( cd "packages/$pkg" && swift build && swift test )
+done
+echo "ALL PACKAGE TESTS PASSED"
+```
+- `set -e` means the **first** failing package stops the run — that is intended: a green result
+  requires **all six** packages to build and pass.
+- **Do NOT** wrap `PocketInference` / `PocketVoice` in `|| true` or `|| echo`. They pull heavy
+  external deps (LiteRT-LM source, whisper.cpp xcframework); if resolution or a test fails, the run
+  MUST fail loudly so the gap is visible — never silently skipped. If they fail on dependency
+  resolution specifically, capture the exact error and route it to Echo (owning lane), but the
+  overall verification is **not** green until they pass.
+
+## The full app (all packages wired)
+```bash
+cd apps/SentiPocketApp && xcodegen generate \
+  && xcodebuild -scheme SentiPocketApp -destination 'generic/platform=iOS Simulator' build
 ```
 
-## Expected
-- **All three build clean and all tests pass** (0 failures). Coverage that MUST pass:
-  - **PocketContracts** — cross-module construction; Codable round-trips; `ActionResultRef` tagged-union
-    Codable + canonical-token KAVs (`6:action…`, `8:sequence…`); receipt canonical **v4** KAV
-    (`pocket.actionreceipt.v4\n…15:8:sequence3:200…`); proposal canonical **v3** KAV +
+## Expected — all six build clean, 0 test failures. Coverage that MUST pass:
+- **PocketContracts**
+  - cross-module construction; Codable round-trips; `ActionResultRef` tagged-union Codable + token
+    KAVs (`6:action…`, `8:sequence…`); receipt canonical **v4** KAV; proposal canonical **v3** KAV +
     proposalHash `Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY`; same-content/different-identity hash
-    distinctness (incl. nil-vs-`""` provenance); injection-proof canonicalization; receipt structural
-    invariants; extreme-date no-trap; SignatureState.
-  - **PocketCall** — the flow reducer: no-shortcut-into-executing, wrong-session refused, confirm-swap
-    refused, wrong/empty-challenge refused, receipt-must-bind, real-ed25519 posted-receipt verify
-    (correct key → completed, wrong key → not completed), plan/QA provenance. Uses
-    `@testable import PocketCall` for the DEBUG-only `VerifiedBundle.makeUnverifiedForTesting`.
-  - **PocketBriefing** — deterministic briefing plan.
+    distinctness; injection-proof canonicalization; receipt structural invariants; extreme-date no-trap.
+  - **bundle trust anchor + signed KAV (warden/bundle-kav-fix):**
+    - `testBundleSignedKAV` — the pinned demo pubkey equals the key derived from the PUBLIC seed
+      phrase; `canonicalBundlePayload()` matches the frozen `pocket.bundle.v1` bytes
+      (`Fixtures/bundle_kav.json`); the frozen ed25519 signature verifies under the pinned key.
+    - `testBundleTrustAnchorRejectsUnknownIdAndWrongKey` — unknown `signingKeyId` rejected BEFORE
+      crypto; wrong pinned/supplied key rejected by crypto.
+    - `testBundleSignatureRejectsTamper` — summary/evidence/keyId/ordering tamper all fail.
+    - `testBundleSemanticValidity` — wrong version/schema, inverted range, id mismatch, session
+      mismatch, out-of-range/duplicate/foreign evidence, uncited fact/inference, unsane/sub-ms dates.
+- **PocketCall** — flow reducer safety (no-shortcut-into-executing, wrong-session refused, confirm-swap
+  refused, wrong/empty-challenge refused, receipt-must-bind, real-ed25519 posted-receipt verify) AND
+  `testVerifiedBundleMintsOnPinnedTrust` / `testVerifiedBundleRejectsUnknownIdWrongKeyAndSemanticInvalid`
+  (a correctly-signed but semantically-invalid bundle must NOT mint a `VerifiedBundle`).
+- **PocketBriefing** — deterministic briefing plan.
+- **PocketUI** — evidence resolution, proposal-confirmation gate, receipt presentation, safety states.
+- **PocketInference / PocketVoice** — build + tests (fail loud on any dependency or test failure).
 
 ## If something fails
-Report back the **exact** first error with `file:line` (compile error) or the failing XCTest name +
-assertion. That is the ground truth that supersedes any static review — please paste it verbatim into
-Senti so Atlas can fix the source.
-
-## Not covered here (needs Xcode, not just `swift test`)
-`apps/SentiPocketApp` is an iOS app target built via **XcodeGen** — see `apps/SentiPocketApp/README.md`
-(`brew install xcodegen && xcodegen generate && open …`). It requires an iOS simulator; the three
-packages above are the logic/contract core and verify without the simulator.
+Report back the **exact** first error: `file:line` (compile) or the failing XCTest name + assertion.
+That is the ground truth that supersedes any static review — paste it verbatim so Atlas can fix the
+source. Cross-language note: the bundle/receipt/proposal KAVs are the Swift↔Node contract; if a KAV
+assertion fails, the Node gateway (Relay) and the Swift canonicalization have diverged — fix to the KAV.

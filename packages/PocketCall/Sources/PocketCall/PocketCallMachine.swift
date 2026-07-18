@@ -177,11 +177,29 @@ public struct VerifiedBundle: Equatable, Sendable {
     public let bundle: PocketBundle
     private init(bundle: PocketBundle) { self.bundle = bundle }
 
+    /// Back-compatible ingress. HARDENED (warden/bundle-kav-fix): mints ONLY if the bundle is SEMANTICALLY VALID
+    /// (FIX3) AND its ed25519 signature verifies where the supplied `key` EQUALS the pinned trusted key for the
+    /// bundle's `signingKeyId` (FIX1 — `PocketBundle.verifiesSignature(gatewayPublicKeyBase64url:)` now enforces the
+    /// pin under `.phaseADemo`). An unknown signingKeyId, a non-pinned key, malformed content, or a bad signature all
+    /// fail closed. Prefer `verify(_:trustAnchor:)`.
     public static func verify(_ bundle: PocketBundle, gatewayPublicKeyBase64url key: String) -> VerifiedBundle? {
-        // v0.1.9: real ed25519 verification over the `pocket.bundle.v1` canonical bytes under the PINNED key
-        // (PocketContracts.PocketBundle.verifiesSignature). Mints ONLY on a genuine pass; fails closed off-crypto.
         #if canImport(CryptoKit)
-        return bundle.verifiesSignature(gatewayPublicKeyBase64url: key) ? VerifiedBundle(bundle: bundle) : nil
+        guard bundle.isSemanticallyValid(),
+              bundle.verifiesSignature(gatewayPublicKeyBase64url: key) else { return nil }
+        return VerifiedBundle(bundle: bundle)
+        #else
+        return nil
+        #endif
+    }
+
+    /// PREFERRED ingress (FIX1): verify against a PINNED trust anchor. The trusted key is resolved FROM the bundle's
+    /// `signingKeyId` (an unknown id is rejected BEFORE any crypto); the caller never supplies a key. Requires BOTH
+    /// semantic validity (FIX3) and a genuine ed25519 pass under the pinned key. The phone uses `.phaseADemo`.
+    public static func verify(_ bundle: PocketBundle, trustAnchor anchor: PocketTrustAnchor) -> VerifiedBundle? {
+        #if canImport(CryptoKit)
+        guard bundle.isSemanticallyValid(),
+              bundle.verifiesSignature(trustAnchor: anchor) else { return nil }
+        return VerifiedBundle(bundle: bundle)
         #else
         return nil
         #endif

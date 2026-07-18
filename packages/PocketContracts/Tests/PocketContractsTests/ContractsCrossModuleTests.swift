@@ -1,5 +1,8 @@
 import XCTest
 import PocketContracts   // SEPARATE module — this test IS the external-consumer proof (v0.1.1 fix).
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 /// Cross-module construction (compile-guard on public inits); Codable round-trip; hash binding invalidates on
 /// change; injection-proof canonicalization + a published known-answer HASH (Echo 84d463f) mirrored by Node;
@@ -160,6 +163,98 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertNotEqual(a.proposalHash, cDiffTime.proposalHash)      // different createdAt
         XCTAssertNotEqual(a.proposalHash, dDiffProvenance.proposalHash)// different sourceQuestionId
         XCTAssertNotEqual(a.proposalHash, eEmptyProvenance.proposalHash)// nil vs some("") — presence flag (Pulse #231475)
+    }
+    #endif
+
+    // MARK: - Bundle trust anchor + signed KAV + semantic validity (warden/bundle-kav-fix)
+
+    /// FIX3 — a bundle failing ANY content rule is rejected, independent of the signature. Each mutation flips exactly
+    /// one rule; a recommendation may be uncited (only fact/inference must cite).
+    func testBundleSemanticValidity() {
+        func semBundle(version: String = "0.1.8", schema: String = "checkpoint_summary_sections_v1",
+                       seqStart: Int = 100, seqEnd: Int = 200, cpBundle: String = "cp_demo_1", cpSummary: String = "cp_demo_1",
+                       evSession: String = "sess_demo_1", evSeq: Int = 150, secondEvidenceId: String? = nil,
+                       claimKind: ClaimKind = .fact, claimEv: [String] = ["ev1"], date: Date? = nil) -> PocketBundle {
+            let t = date ?? ts
+            let ev = EvidenceRef(id: "ev1", sessionId: evSession, sequence: evSeq, agentId: "agent-a", snippet: "sn", ts: t)
+            var top = [ev]
+            if let dup = secondEvidenceId { top.append(EvidenceRef(id: dup, sessionId: evSession, sequence: evSeq, agentId: "agent-a", snippet: "sn2", ts: t)) }
+            let ag = AgentSummary(agentId: "agent-a", summary: "s", claims: [Claim(id: "c1", text: "x", kind: claimKind, evidenceIds: claimEv)], evidence: [ev])
+            let sum = CheckpointSummary(checkpointId: cpSummary, headline: "h", summaryBaselineSchema: schema, grade: "A", perAgent: [ag], risks: [], blockers: [])
+            return PocketBundle(contractsVersion: version, checkpointId: cpBundle, sessionId: "sess_demo_1", sequenceStart: seqStart, sequenceEnd: seqEnd, summary: sum, evidence: top, createdAt: t, signature: "sig", signingKeyId: "pocket-demo-phase-a")
+        }
+        XCTAssertEqual(semBundle().semanticIssues(), [])
+        XCTAssertTrue(semBundle().isSemanticallyValid())
+        XCTAssertTrue(semBundle(version: "0.1.7").semanticIssues().contains(.wrongContractsVersion))
+        XCTAssertTrue(semBundle(schema: "other").semanticIssues().contains(.wrongSummarySchema))
+        XCTAssertTrue(semBundle(seqStart: 300).semanticIssues().contains(.invertedSequenceRange))
+        XCTAssertTrue(semBundle(cpSummary: "OTHER").semanticIssues().contains(.checkpointIdMismatch))
+        XCTAssertTrue(semBundle(evSession: "OTHER").semanticIssues().contains(.evidenceSessionMismatch))
+        XCTAssertTrue(semBundle(evSeq: 9999).semanticIssues().contains(.evidenceSequenceOutOfRange))
+        XCTAssertTrue(semBundle(secondEvidenceId: "ev1").semanticIssues().contains(.duplicateEvidenceId))
+        XCTAssertTrue(semBundle(claimKind: .fact, claimEv: []).semanticIssues().contains(.uncitedFactOrInference))
+        XCTAssertTrue(semBundle(claimEv: ["ev_FOREIGN"]).semanticIssues().contains(.foreignClaimCitation))
+        XCTAssertTrue(semBundle(date: Date(timeIntervalSince1970: 1e18)).semanticIssues().contains(.unsaneDate))
+        XCTAssertTrue(semBundle(date: Date(timeIntervalSince1970: 1_752_835_200.0005)).semanticIssues().contains(.subMillisecondDate))
+        XCTAssertFalse(semBundle(claimKind: .recommendation, claimEv: []).semanticIssues().contains(.uncitedFactOrInference))
+    }
+
+    #if canImport(CryptoKit)
+    private func b64url(_ d: Data) -> String {
+        d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    /// The FROZEN Phase-A demo signer, derived from the PUBLIC seed phrase (no private key committed anywhere).
+    private func demoPrivateKey() throws -> Curve25519.Signing.PrivateKey {
+        try Curve25519.Signing.PrivateKey(rawRepresentation: Data(SHA256.hash(data: Data(PocketDemoGatewayKey.seedPhrase.utf8))))
+    }
+    /// The canonical, semantically-valid demo bundle (matches Fixtures/bundle_kav.json). Tamper params flip a signed field.
+    private func demoBundle(signature: String, headline: String = "demo briefing", snippet: String = "snippet", signingKeyId: String = "pocket-demo-phase-a") -> PocketBundle {
+        let ev = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: snippet, ts: ts)
+        let ag = AgentSummary(agentId: "agent-a", summary: "did the thing", claims: [Claim(id: "c1", text: "a fact", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev])
+        let sum = CheckpointSummary(checkpointId: "cp_demo_1", headline: headline, summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
+        return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: 100, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
+    }
+
+    /// FIX2 — the committed pocket.bundle.v1 signed KAV. The pinned pubkey equals the key derived from the PUBLIC seed
+    /// phrase (Node<->Swift agreement); the canonical bytes match the fixture; the frozen Node signature verifies under
+    /// the pinned key via BOTH trust paths.
+    func testBundleSignedKAV() throws {
+        XCTAssertEqual(b64url(try demoPrivateKey().publicKey.rawRepresentation), PocketDemoGatewayKey.publicKeyBase64url)
+        let frozenSig = "tYpQ9zM-uZp74-5SCezawEjcUWPH56S1pzu12vBfwyxzR2dJeFRi0zkX1R-5163KsRq6tGQzTxiEH1jUChnBCA"
+        let b = demoBundle(signature: frozenSig)
+        XCTAssertEqual(b.canonicalBundlePayload(),
+            "pocket.bundle.v1\n5:0.1.89:cp_demo_111:sess_demo_13:1003:2009:cp_demo_113:demo briefing30:checkpoint_summary_sections_v111:A1:17:agent-a13:did the thing1:12:c16:a fact4:fact1:13:ev11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:17528352000001:12:r11:12:b11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:175283520000013:175283520000019:pocket-demo-phase-a")
+        XCTAssertTrue(b.isSemanticallyValid())
+        XCTAssertTrue(b.verifiesSignature(trustAnchor: .phaseADemo))                                    // pinned trust path
+        XCTAssertTrue(b.verifiesSignature(gatewayPublicKeyBase64url: PocketDemoGatewayKey.publicKeyBase64url))  // hardened 2-arg path
+    }
+
+    /// FIX1 — unknown signingKeyId is rejected BEFORE crypto; a wrong pinned/supplied key is rejected by crypto.
+    func testBundleTrustAnchorRejectsUnknownIdAndWrongKey() throws {
+        let sig = b64url(try demoPrivateKey().signature(for: Data(demoBundle(signature: "").canonicalBundlePayload().utf8)))
+        let signed = demoBundle(signature: sig)
+        XCTAssertTrue(signed.verifiesSignature(trustAnchor: .phaseADemo))
+        XCTAssertFalse(signed.verifiesSignature(trustAnchor: PocketTrustAnchor(pinned: ["some-other-id": PocketDemoGatewayKey.publicKeyBase64url])))  // unknown id
+        let wrongKey = b64url(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)
+        XCTAssertFalse(signed.verifiesSignature(trustAnchor: PocketTrustAnchor(pinned: ["pocket-demo-phase-a": wrongKey])))  // wrong pinned key
+        XCTAssertFalse(signed.verifiesSignature(gatewayPublicKeyBase64url: wrongKey))                                        // supplied != pinned
+    }
+
+    /// FIX2 — tamper vectors: mutating any signed field (summary/evidence), the signingKeyId, or the array ORDER breaks verification.
+    func testBundleSignatureRejectsTamper() throws {
+        let sig = b64url(try demoPrivateKey().signature(for: Data(demoBundle(signature: "").canonicalBundlePayload().utf8)))
+        XCTAssertTrue(demoBundle(signature: sig).verifiesSignature(trustAnchor: .phaseADemo))
+        XCTAssertFalse(demoBundle(signature: sig, headline: "demo EVIL").verifiesSignature(trustAnchor: .phaseADemo))    // summary tamper
+        XCTAssertFalse(demoBundle(signature: sig, snippet: "x").verifiesSignature(trustAnchor: .phaseADemo))            // evidence tamper
+        XCTAssertFalse(demoBundle(signature: sig, signingKeyId: "pocket-demo-EVIL").verifiesSignature(trustAnchor: .phaseADemo))  // keyId tamper (unknown id)
+        // ordering is bound: two evidence items in different order produce different canonical bytes.
+        let e1 = EvidenceRef(id: "ev1", sessionId: "s", sequence: 1, agentId: "a", snippet: "1", ts: ts)
+        let e2 = EvidenceRef(id: "ev2", sessionId: "s", sequence: 2, agentId: "a", snippet: "2", ts: ts)
+        func canon(_ es: [EvidenceRef]) -> String {
+            let sum = CheckpointSummary(checkpointId: "cp", headline: "h", summaryBaselineSchema: "sch", grade: nil, perAgent: [], risks: [], blockers: [])
+            return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp", sessionId: "s", sequenceStart: 1, sequenceEnd: 2, summary: sum, evidence: es, createdAt: ts, signature: "X", signingKeyId: "k").canonicalBundlePayload()
+        }
+        XCTAssertNotEqual(canon([e1, e2]), canon([e2, e1]))
     }
     #endif
 }

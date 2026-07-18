@@ -1,4 +1,14 @@
 // PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
+// v0.1.8++ (warden/bundle-kav-fix): ADDITIVE, version stays EXACTLY "0.1.8" (bound in canonicalBundlePayload).
+//   FIX1 TRUST ANCHOR: bundle verification resolves the trusted ed25519 key FROM `signingKeyId` via a PINNED
+//     `PocketTrustAnchor` (`.phaseADemo` pins ONLY the throwaway demo key), REJECTS an unknown signingKeyId BEFORE
+//     any crypto, and rejects a supplied key != the pinned key. `verifiesSignature(gatewayPublicKeyBase64url:)` no
+//     longer trusts an arbitrary caller key. FIX3 SEMANTIC VALIDITY: `PocketBundle.isSemanticallyValid()` rejects a
+//     bundle — EVEN A CORRECTLY-SIGNED ONE — with wrong version/schema, inverted range, mismatched checkpoint/session
+//     ids, duplicate/foreign evidence, uncited fact/inference claims, or unsane/sub-millisecond dates. FIX2: a frozen
+//     DEMO keypair (`PocketDemoGatewayKey`; seed = SHA-256 of a PUBLIC phrase, no private key committed) + a signed
+//     `pocket.bundle.v1` KAV in Fixtures/bundle_kav.json, reproducible Node<->Swift. `VerifiedBundle.verify` (PocketCall)
+//     now requires BOTH semantic validity AND a pinned-key ed25519 pass.
 // v0.1.8+ (Pulse #231475 P0 / bundle-ingress): ADDITIVE, no wire/shape change -> NOT a version bump. Adds
 //   PocketBundle.canonicalBundlePayload() (`pocket.bundle.v1`, length+count-prefixed) + verifiesSignature();
 //   VerifiedBundle.verify now does REAL ed25519 over the pinned key (was fail-closed nil). The Phase-A fixture is
@@ -189,9 +199,11 @@ public extension PocketBundle {
     }
 
     #if canImport(CryptoKit)
-    /// True IFF `signature` is a valid ed25519 signature over `canonicalBundlePayload()` under the pinned key AND
-    /// the required fields are present + createdAt is sane. This is the ONLY path to a trusted bundle; fails closed.
-    func verifiesSignature(gatewayPublicKeyBase64url pk: String) -> Bool {
+    /// LOW-LEVEL ed25519 check: true IFF `signature` verifies over `canonicalBundlePayload()` under EXACTLY `pk`,
+    /// with required fields present + a sane createdAt. This is NOT a trust decision on its own — `pk` must already
+    /// be a PINNED trusted key. Private so no lane can accidentally verify under an arbitrary key; the trust gates
+    /// below are the only public paths.
+    private func verifiesSignatureRaw(underKeyBase64url pk: String) -> Bool {
         guard !checkpointId.isEmpty, !sessionId.isEmpty, !signingKeyId.isEmpty, !signature.isEmpty,
               ActionReceipt.safeEpochMillis(createdAt) != nil else { return false }
         guard let pkData = Data(base64URLEncoded: pk),
@@ -199,7 +211,118 @@ public extension PocketBundle {
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: pkData) else { return false }
         return key.isValidSignature(sigData, for: Data(canonicalBundlePayload().utf8))
     }
+
+    /// FIX1 — TRUST-ANCHORED verification (the safe gate): resolve the trusted key FROM this bundle's `signingKeyId`
+    /// via `anchor`, REJECT an UNKNOWN id BEFORE any crypto, then ed25519-verify under the PINNED key. A caller can
+    /// never smuggle in its own key: the key is chosen by the pinned trust store, not by the caller or the bundle.
+    func verifiesSignature(trustAnchor anchor: PocketTrustAnchor) -> Bool {
+        guard let pinned = anchor.pinnedKey(forSigningKeyId: signingKeyId) else { return false }
+        return verifiesSignatureRaw(underKeyBase64url: pinned)
+    }
+
+    /// FIX1 — back-compatible entry point, now HARDENED. The supplied `pk` is accepted ONLY if it EQUALS the pinned
+    /// trusted key for this bundle's `signingKeyId` in `anchor` (default: the phone's `.phaseADemo` store). An unknown
+    /// signingKeyId, or a `pk` != the pinned key, is rejected BEFORE any crypto (was: trusted any caller-supplied key).
+    func verifiesSignature(gatewayPublicKeyBase64url pk: String, trustAnchor anchor: PocketTrustAnchor = .phaseADemo) -> Bool {
+        guard let pinned = anchor.pinnedKey(forSigningKeyId: signingKeyId), pinned == pk else { return false }
+        return verifiesSignatureRaw(underKeyBase64url: pinned)
+    }
     #endif
+}
+
+// MARK: - Trust anchor (FIX1: pinned bundle signing keys)
+
+/// PHASE-A DEMO signing identity — a THROWAWAY key for the offline demo, NEVER production. The 32-byte ed25519 seed
+/// is DERIVED (`SHA-256` of the PUBLIC phrase) at sign/verify time, so NO private key is committed anywhere; only the
+/// PUBLIC key is pinned below (a public key + a signature are not secrets). The real gateway uses a real, rotated key
+/// with its own `signingKeyId`, pinned the same way. Reproduced identically in Node — see Fixtures/bundle_kav.json.
+public enum PocketDemoGatewayKey {
+    /// The `signingKeyId` the DEMO gateway stamps on bundles.
+    public static let signingKeyId = "pocket-demo-phase-a"
+    /// Public phrase the demo seed derives from: `seed = SHA-256(UTF-8(seedPhrase))`.
+    public static let seedPhrase = "senti-pocket phase-a demo gateway key -- NEVER PRODUCTION"
+    /// PINNED base64url ed25519 PUBLIC key derived from that seed (public, not a secret).
+    public static let publicKeyBase64url = "KiJLmbgZ-ybBDsPp_K27z2JQGzdMrfmlpQMQmyHg2j8"
+}
+
+/// A pinned trust store: `signingKeyId -> trusted base64url ed25519 public key`. Verification resolves the key FROM
+/// the id here and REJECTS an unknown id BEFORE any crypto — the phone trusts keys it has pinned, never a key the
+/// bundle or a caller supplies. Phase A pins ONLY the demo key; production pins the real gateway key(s).
+public struct PocketTrustAnchor: Sendable, Equatable {
+    private let pinned: [String: String]
+    public init(pinned: [String: String]) { self.pinned = pinned }
+    /// The pinned public key for `signingKeyId`, or nil if the id is UNKNOWN (→ reject before crypto).
+    public func pinnedKey(forSigningKeyId keyId: String) -> String? { pinned[keyId] }
+    public var pinnedSigningKeyIds: Set<String> { Set(pinned.keys) }
+    /// The phone's Phase-A trust store: pins ONLY the demo gateway key.
+    public static let phaseADemo = PocketTrustAnchor(pinned: [
+        PocketDemoGatewayKey.signingKeyId: PocketDemoGatewayKey.publicKeyBase64url
+    ])
+}
+
+// MARK: - Semantic validity (FIX3: crypto-valid != content-valid)
+
+/// Content-level rejection reasons — a bundle failing ANY of these must NEVER be narrated, even if its ed25519
+/// signature verifies under a trusted key (a trusted key signing malformed content still yields malformed content).
+public enum BundleSemanticIssue: String, Equatable, Sendable {
+    case wrongContractsVersion, wrongSummarySchema, invertedSequenceRange, checkpointIdMismatch
+    case evidenceSessionMismatch, evidenceSequenceOutOfRange, duplicateEvidenceId
+    case uncitedFactOrInference, foreignClaimCitation, unsaneDate, subMillisecondDate
+}
+
+public extension PocketBundle {
+    /// The summary schema every Phase-A bundle must declare.
+    static var expectedSummarySchema: String { "checkpoint_summary_sections_v1" }
+
+    /// FIX3: all content-validity issues (deterministic order; empty == valid). Independent of the signature.
+    func semanticIssues() -> [BundleSemanticIssue] {
+        var issues: [BundleSemanticIssue] = []
+        if contractsVersion != PocketContracts.version { issues.append(.wrongContractsVersion) }
+        if summary.summaryBaselineSchema != PocketBundle.expectedSummarySchema { issues.append(.wrongSummarySchema) }
+        if sequenceStart > sequenceEnd { issues.append(.invertedSequenceRange) }
+        if summary.checkpointId != checkpointId { issues.append(.checkpointIdMismatch) }
+
+        // Every evidence item (top-level + per-agent) must belong to THIS session, sit inside the range, and carry a
+        // sane, millisecond-exact timestamp. Top-level evidence ids must be unique (no duplicate/foreign evidence).
+        let allEvidence = evidence + summary.perAgent.flatMap { $0.evidence }
+        var seen = Set<String>()
+        for e in evidence where !seen.insert(e.id).inserted { issues.append(.duplicateEvidenceId) }
+        for e in allEvidence {
+            if e.sessionId != sessionId { issues.append(.evidenceSessionMismatch) }
+            if e.sequence < sequenceStart || e.sequence > sequenceEnd { issues.append(.evidenceSequenceOutOfRange) }
+            if !PocketBundle.dateIsSaneAndMillisExact(e.ts) {
+                issues.append(ActionReceipt.safeEpochMillis(e.ts) == nil ? .unsaneDate : .subMillisecondDate)
+            }
+        }
+
+        // Claims: fact/inference MUST cite; every cited id must resolve to a known evidence id (no foreign citation).
+        let knownIds = Set(allEvidence.map { $0.id })
+        for agent in summary.perAgent {
+            for claim in agent.claims {
+                if (claim.kind == .fact || claim.kind == .inference) && claim.evidenceIds.isEmpty {
+                    issues.append(.uncitedFactOrInference)
+                }
+                if !claim.evidenceIds.allSatisfy({ knownIds.contains($0) }) { issues.append(.foreignClaimCitation) }
+            }
+        }
+
+        // createdAt is bound as epoch-millis in the canonical -> it must be sane + millisecond-exact.
+        if !PocketBundle.dateIsSaneAndMillisExact(createdAt) {
+            issues.append(ActionReceipt.safeEpochMillis(createdAt) == nil ? .unsaneDate : .subMillisecondDate)
+        }
+        return issues
+    }
+
+    /// FIX3: content-valid IFF there are no semantic issues. `VerifiedBundle.verify` requires this AND a pinned-key pass.
+    func isSemanticallyValid() -> Bool { semanticIssues().isEmpty }
+
+    /// A date is acceptable IFF finite/in-range (safeEpochMillis) AND exactly on a millisecond boundary — so nothing
+    /// sub-millisecond can diverge between the DISPLAYED date and the epoch-millis the signature actually covers.
+    static func dateIsSaneAndMillisExact(_ date: Date) -> Bool {
+        guard ActionReceipt.safeEpochMillis(date) != nil else { return false }
+        let m = date.timeIntervalSince1970 * 1000
+        return abs(m - m.rounded()) <= 1e-6
+    }
 }
 
 // MARK: - Briefing + Q&A (Echo/Pulse consume; local, offline-capable)
