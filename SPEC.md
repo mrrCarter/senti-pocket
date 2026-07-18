@@ -39,7 +39,7 @@ Senti Pocket turns a real Senti checkpoint into a signed, evidence-backed iPhone
 6. A dictated supported action becomes a typed preview. The user sees and hears the exact target and message, explicitly confirms it, and the gateway posts once to that target.
 7. The resulting posted receipt includes the actual Senti sequence and verifies against the trusted gateway Ed25519 public key. Invalid or unsigned receipts never render as sent.
 8. Wrong-session, stale-confirmation, replay, delimiter injection, prompt/tool injection, malformed artifact, oversized input/output, and offline false-success tests pass.
-9. `swift test` passes for every Swift package on a macOS runner. The local review scan has no P1/P2 findings, and Omar Gate has no P0/P1 findings; repository-readiness P2 findings are resolved or explicitly adjudicated.
+9. `swift test` passes for every Swift package on a macOS runner. The local review scan and Omar Gate have no P0/P1/P2 findings.
 10. Five consecutive physical-device runs complete the full loop without deadlock, uncontrolled speech, false listening state, uncited answers, duplicate writes, or false success.
 
 ## Merge And Evidence Gate
