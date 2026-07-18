@@ -1,0 +1,38 @@
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+*.xcworkspace/xcshareddata/swiftpm/.build/
+.swiftpm/
+Package.resolved
+
+# Swift PM
+.build/
+*.o
+*.swiftmodule
+
+# Models / large binaries — never commit weights
+*.gguf
+*.task
+*.tflite
+*.litertlm
+*.bin
+Models/
+models/
+
+# node (sidecars / tooling)
+node_modules/
+.env
+.env.*
+
+# Senti session state (never commit)
+.sentinelayer/
+*.credentials.json
+
+# secrets
+*.pem
+*.key
+secrets/
+ElevenLabs*.txt
