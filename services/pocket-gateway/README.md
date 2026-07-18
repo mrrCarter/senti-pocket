@@ -17,9 +17,11 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 ```
 
 ## Status
-- **P0 (done):** `src/scrub.mjs` (secret redaction) + `src/extract.mjs` (`sl export` → `[start,end]` slice → `RawCheckpoint`, contract-validated). Tests: `node --test` (hermetic; injected `sl` runner).
-- **P1 (next):** summarizer (senti `summarySections` baseline → per-agent evidence-cited claims) + Ed25519 `PocketBundle` signing → must decode into the frozen `canonical_checkpoint.json` shape.
-- **P3 (held):** governed writeback (`ActionProposal` → deterministic target resolution → single-use confirm bound to proposal hash → `sl session reply` → `ActionReceipt`; offline ⇒ `pendingConnectivity`, never "sent"). Held until the P1 offline slice passes 5×.
+- **P0 (done):** `src/scrub.mjs` (best-effort redaction) + `src/extract.mjs` (`sl export` → durable+contained `[start,end]` slice → `RawCheckpoint`, eventCount-complete, bounded, contract-validated). Tests: `node --test` (hermetic; injected `sl` runner).
+- **P1 (done):** `src/summarize.mjs` (deterministic grounded baseline: senti `summarySections` passthrough + per-agent evidence anchored to real event sequences) → `src/bundle.mjs` Ed25519 `PocketBundle` signing with strict frozen-schema egress projection. Full pipeline `extract → summarize → buildSignedBundle → verifyBundle` is tested end-to-end.
+- **API (done):** `src/handlers.mjs` (`GET /health`, `GET /sync`, `POST /actions/execute`, `POST /tts`) + `src/store.mjs` (async store; in-memory impl + documented DynamoDB conditional-put/TTL-lock contract). Fail-closed AIdenID auth boundary; cross-instance exactly-once writeback.
+- **Writeback (done):** governed writeback (`ActionProposal` → snapshot-frozen deterministic target → single-use confirm bound to proposal hash → server-time freshness → reserve-before-post exactly-once → `sl session reply` → read-back verify → signed `ActionReceipt`; offline ⇒ `pendingConnectivity`, never "sent"). Live-proven twice.
+- **Open:** DynamoDB adapter deploy (needs AWS creds); concrete AIdenID token verifier (pluggable `verifyToken` seam, pending AIdenID JWKS/DPoP contract); LLM-enriched summary prose (reuses the same grounded evidence); Swift client packages (need a Mac).
 
 ## Safety invariants (Relay-owned)
 - **Secret redaction is BEST-EFFORT, not a guarantee.** `scrub.mjs` is a known-format denylist + conservative high-entropy heuristics; it cannot prove content is secret-free (an arbitrary/natural-language secret survives). Mitigated by defense-in-depth: minimal-field projection + size bounds (`extract.mjs`), a **final egress scrub over every phone-visible string before signing** (`bundle.mjs`), and treating all residual content as untrusted. Raw room events never cross to the phone — only the summary + bounded evidence do.
