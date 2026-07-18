@@ -1,4 +1,9 @@
-// PocketContracts v0.1.3 — FROZEN by Atlas (claude-pocket-atlas).
+// PocketContracts v0.1.4 — FROZEN by Atlas (claude-pocket-atlas).
+// v0.1.4 (Echo 84d463f HOLD): isValidForConfirmation now FAILS CLOSED without CryptoKit (was fail-open);
+//   ActionReceipt gains isStructurallyValid() (.posted requires seq/executedAt/sig/key; pending forbids all) +
+//   canonicalReceiptPayload() + first-class SignatureState via ed25519 verify (non-nil sig != verified); all
+//   contract types are now Sendable; KAV test asserts the actual computeHash (base64url mNZp-a77...). ADDITIVE
+//   except the fail-closed predicate + Sendable (both source-compatible).
 // v0.1.3 (Echo 5f45364 + Pulse dea0776 reviews): INJECTION-PROOF length-prefixed canonicalPayload (was
 //   delimiter-only = collision-vulnerable) -> domain sep bumped to v2, hashes CHANGE vs v0.1.2; deterministic
 //   ActionProposal.isValidForConfirmation() (rejects requiresConfirmation=false / bad hash / unbounded fields);
@@ -21,12 +26,12 @@ import CryptoKit
 #endif
 
 public enum PocketContracts {
-    public static let version = "0.1.3"
+    public static let version = "0.1.4"
 }
 
 // MARK: - Source (Relay produces RawCheckpoint + CheckpointSummary; gateway summarizes)
 
-public struct RawCheckpoint: Codable, Equatable {
+public struct RawCheckpoint: Codable, Equatable, Sendable {
     public let checkpointId: String
     public let sessionId: String
     public let sessionTitle: String
@@ -42,7 +47,7 @@ public struct RawCheckpoint: Codable, Equatable {
     }
 }
 
-public struct RawEvent: Codable, Equatable {
+public struct RawEvent: Codable, Equatable, Sendable {
     public let sequenceId: Int
     public let event: String
     public let agentId: String
@@ -55,7 +60,7 @@ public struct RawEvent: Codable, Equatable {
     }
 }
 
-public struct CheckpointSummary: Codable, Equatable {
+public struct CheckpointSummary: Codable, Equatable, Sendable {
     public let checkpointId: String
     public let headline: String
     public let summaryBaselineSchema: String
@@ -69,7 +74,7 @@ public struct CheckpointSummary: Codable, Equatable {
     }
 }
 
-public struct AgentSummary: Codable, Equatable {
+public struct AgentSummary: Codable, Equatable, Sendable {
     public let agentId: String
     public let summary: String                  // free-text overview (per-agent; disagreement preserved, no false consensus)
     public let claims: [Claim]                  // v0.1.2: epistemic-status-tagged, evidence-cited claims (grounding wedge)
@@ -82,7 +87,7 @@ public struct AgentSummary: Codable, Equatable {
 /// A single grounded claim with explicit epistemic status (baseline §2: distinguish fact/inference/recommendation),
 /// so the grounding eval can grade honesty and the briefing can LABEL it aloud. Fact/inference MUST cite
 /// EvidenceRef.ids; a recommendation may be uncited.
-public struct Claim: Codable, Equatable, Identifiable {
+public struct Claim: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let text: String
     public let kind: ClaimKind
@@ -92,7 +97,7 @@ public struct Claim: Codable, Equatable, Identifiable {
     }
 }
 
-public enum ClaimKind: String, Codable, Equatable {
+public enum ClaimKind: String, Codable, Equatable, Sendable {
     case fact            // directly supported by cited evidence
     case inference       // reasoned from evidence (must still cite the basis)
     case recommendation  // suggested action/opinion (may be uncited)
@@ -100,7 +105,7 @@ public enum ClaimKind: String, Codable, Equatable {
 
 // MARK: - Bundle (what the phone caches + briefs from)
 
-public struct PocketBundle: Codable, Equatable {
+public struct PocketBundle: Codable, Equatable, Sendable {
     public let contractsVersion: String
     public let checkpointId: String
     public let sessionId: String
@@ -118,7 +123,7 @@ public struct PocketBundle: Codable, Equatable {
     }
 }
 
-public struct EvidenceRef: Codable, Equatable, Identifiable {
+public struct EvidenceRef: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let sessionId: String
     public let sequence: Int
@@ -133,7 +138,7 @@ public struct EvidenceRef: Codable, Equatable, Identifiable {
 
 // MARK: - Briefing + Q&A (Echo/Pulse consume; local, offline-capable)
 
-public struct BriefingPlan: Codable, Equatable {
+public struct BriefingPlan: Codable, Equatable, Sendable {
     public let checkpointId: String
     public let segments: [BriefingSegment]
     public init(checkpointId: String, segments: [BriefingSegment]) {
@@ -141,7 +146,7 @@ public struct BriefingPlan: Codable, Equatable {
     }
 }
 
-public struct BriefingSegment: Codable, Equatable, Identifiable {
+public struct BriefingSegment: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let text: String
     public let evidenceIds: [String]
@@ -150,7 +155,7 @@ public struct BriefingSegment: Codable, Equatable, Identifiable {
     }
 }
 
-public struct QuestionAnswer: Codable, Equatable, Identifiable {
+public struct QuestionAnswer: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let checkpointId: String
     public let question: String
@@ -166,7 +171,7 @@ public struct QuestionAnswer: Codable, Equatable, Identifiable {
 
 // MARK: - Governed write (SAFETY-CRITICAL)
 
-public struct ActionProposal: Codable, Equatable, Identifiable {
+public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let kind: ActionKind
     public let targetSessionId: String
@@ -229,18 +234,20 @@ public struct ActionProposal: Codable, Equatable, Identifiable {
         #if canImport(CryptoKit)
         return hashMatchesContent()
         #else
-        return true   // non-crypto host: caller MUST verify hashMatchesContent where CryptoKit is available
+        return false  // FAIL CLOSED (Echo 84d463f): no CryptoKit -> cannot verify the hash -> NOT confirmable.
+                      // A security predicate must never fail open. Non-CryptoKit hosts must inject a verifier and
+                      // check hashMatchesContent separately before treating a proposal as confirmable.
         #endif
     }
 }
 
-public enum ActionKind: String, Codable, Equatable {
+public enum ActionKind: String, Codable, Equatable, Sendable {
     case threadedReply
     case opinionRequest
     // NO destructive/deploy/tool kinds in Sunday scope.
 }
 
-public struct ActionReceipt: Codable, Equatable, Identifiable {
+public struct ActionReceipt: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public let proposalId: String
     public let status: ReceiptStatus
@@ -265,9 +272,66 @@ public struct ActionReceipt: Codable, Equatable, Identifiable {
         self.executedAt = executedAt; self.failureReason = failureReason
         self.signature = signature; self.signingKeyId = signingKeyId
     }
+
+    /// Type-enforced status invariant (Echo 84d463f): .posted MUST carry resultingSequence + executedAt +
+    /// signature + signingKeyId (and no failureReason); .pendingConnectivity MUST carry none of them; .failed
+    /// MUST carry failureReason and none of the posted fields. The phone/gateway reject a receipt that fails this.
+    public func isStructurallyValid() -> Bool {
+        switch status {
+        case .posted:
+            return resultingSequence != nil && executedAt != nil && signature != nil && signingKeyId != nil && failureReason == nil
+        case .pendingConnectivity:
+            return resultingSequence == nil && executedAt == nil && signature == nil && signingKeyId == nil && failureReason == nil
+        case .failed:
+            return failureReason != nil && resultingSequence == nil && executedAt == nil && signature == nil && signingKeyId == nil
+        }
+    }
+
+    /// The EXACT bytes the gateway ed25519-signs and the phone verifies. Length-prefixed (injection-proof),
+    /// versioned; mirror byte-for-byte in the Node gateway.
+    public func canonicalReceiptPayload() -> String {
+        func lp(_ s: String) -> String { "\(s.utf8.count):\(s)" }
+        return "pocket.actionreceipt.v1\n"
+            + lp(proposalId)
+            + lp(status.rawValue)
+            + lp(resultingSequence.map(String.init) ?? "")
+            + lp(targetSessionId)
+            + lp(confirmedProposalHash)
+            + lp(executedAt.map { String(Int($0.timeIntervalSince1970)) } ?? "")
+    }
+
+    #if canImport(CryptoKit)
+    /// First-class signature state (Echo 84d463f): a non-nil signature string is NOT "verified" — verification
+    /// is a real ed25519 check over canonicalReceiptPayload with the trusted gateway key. The phone MUST render
+    /// "sent/verified" ONLY on .verified.
+    public func signatureState(gatewayPublicKeyBase64url pk: String) -> SignatureState {
+        guard status == .posted, isStructurallyValid(), let sig = signature else { return .unsigned }
+        guard let pkData = Data(base64URLEncoded: pk),
+              let sigData = Data(base64URLEncoded: sig),
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: pkData) else { return .invalid }
+        return key.isValidSignature(sigData, for: Data(canonicalReceiptPayload().utf8)) ? .verified : .invalid
+    }
+    #endif
 }
 
-public enum ReceiptStatus: String, Codable, Equatable {
+/// A receipt's signature status — verification is an explicit crypto result, never mere string presence.
+public enum SignatureState: String, Codable, Equatable, Sendable {
+    case unsigned            // no signature (pending/failed, or a .posted missing the field -> not renderable as sent)
+    case verified            // ed25519 signature verified over the canonical receipt payload with the trusted key
+    case invalid             // a signature is present but does NOT verify -> treat as NOT sent + surface tampering
+}
+
+private extension Data {
+    /// base64url (no padding, -/_ alphabet) -> Data. Used for ed25519 keys/signatures on the wire.
+    init?(base64URLEncoded s: String) {
+        var b = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while b.count % 4 != 0 { b += "=" }
+        guard let d = Data(base64Encoded: b) else { return nil }
+        self = d
+    }
+}
+
+public enum ReceiptStatus: String, Codable, Equatable, Sendable {
     case pendingConnectivity   // offline: NEVER represent as sent
     case posted                // success: resultingSequence is set
     case failed                // failureReason is set
