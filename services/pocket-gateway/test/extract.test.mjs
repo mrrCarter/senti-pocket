@@ -88,7 +88,7 @@ const CANNED_EXPORT = {
     { sequenceId: 230200, event: 'session_message', agent: { id: 'y' }, payload: { text: 'after window' }, ts: '2026-07-18T10:50:00Z' },
   ],
 };
-const CANNED_CKPT = { checkpointId: 'cp_954233b7_000012', sessionId: '954233b7-1822-42bc-9cfe-1eb95eb0357a', startSequence: 230100, endSequence: 230180 };
+const CANNED_CKPT = { checkpointId: 'cp_954233b7_000012', sessionId: '954233b7-1822-42bc-9cfe-1eb95eb0357a', startSequence: 230100, endSequence: 230180, summarySections: { window: { eventCount: 2 } } };
 
 test('buildRawCheckpoint slices to range, scrubs, and validates clean', () => {
   const { rawCheckpoint, redactionTotal } = buildRawCheckpoint(CANNED_CKPT, CANNED_EXPORT);
@@ -179,7 +179,7 @@ test('(P1 participants) export-only / out-of-range actor is never labeled a part
       { sequenceId: 110, event: 'm', agent: { id: 'outside-only' }, payload: { text: 'after' }, ts: '2026-07-18T11:00:00Z' },
     ],
   };
-  const { rawCheckpoint } = buildRawCheckpoint({ checkpointId: 'cp_p', sessionId: 's', startSequence: 95, endSequence: 105 }, exportData);
+  const { rawCheckpoint } = buildRawCheckpoint({ checkpointId: 'cp_p', sessionId: 's', startSequence: 95, endSequence: 105, summarySections: { window: { eventCount: 1 } } }, exportData);
   assert.deepEqual(rawCheckpoint.agents, ['inside']);
 });
 

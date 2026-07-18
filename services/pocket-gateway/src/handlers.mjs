@@ -7,7 +7,7 @@
 // (knownSessionIdsFor(humanId)) — a client can never name an arbitrary target session.
 // Token model (per Echo's AIdenID research): atk_ = workload/project token; the phone uses a human-bound,
 // audience/resource-scoped token minted via /v1/sessions/exchange (DPoP-bound). deps.verifyToken owns that check.
-import { executeAction } from './actions.mjs';
+import { executeAction, findLandedByContent } from './actions.mjs';
 import { withLock } from './store.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
@@ -17,6 +17,13 @@ const readBody = (body) => {
   return body;
 };
 const hasScope = (ctx, scope) => Array.isArray(ctx.scopes) && ctx.scopes.includes(scope);
+
+/**
+ * Durable-state key namespaced by the authenticated human. A NUL separator is injection-safe: it cannot appear in a
+ * humanId or a proposal.id, so ("a","bc") and ("ab","c") can never collide. Exported so callers/tests derive the
+ * exact key rather than hardcoding the separator.
+ */
+export const storeKey = (humanId, id) => `${String(humanId).length}:${humanId}:${id}`;
 
 /**
  * @param {{
@@ -57,29 +64,46 @@ export function createGateway(deps) {
     try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
 
     const id = proposal.id;
-    const lockRes = await withLock(deps.store, id, async () => {
-      const prior = await deps.store.get(id);
+    const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
+    // CROSS-HUMAN ISOLATION (Echo P0): namespace ALL durable state + the lock by the authenticated human, so two
+    // humans reusing the same proposal.id never collide (no cross-tenant idempotency read, no shared lock).
+    const key = storeKey(ctx.humanId, id);
+
+    const lockRes = await withLock(deps.store, key, async () => {
+      const rec = await deps.store.get(key);
+      if (rec && rec.status === 'posted') return rec; // idempotent replay of a terminal receipt
       const map = new Map();
-      if (prior) map.set(id, prior); // seed executeAction so a prior emitted-marker re-verifies (never re-posts)
+
+      if (rec && rec.__emitted) {
+        // A post already executed for this (human,id) last time; executeAction re-verifies, never re-posts.
+        map.set(id, rec);
+      } else if (rec && rec.state === 'in-flight') {
+        // CRASH RECOVERY (Echo P0): a prior attempt may have posted then crashed BEFORE persisting the emitted marker.
+        // Disambiguate by content read-back BEFORE any re-post: if our post is already in the room, seed an emitted
+        // marker so executeAction FINALIZES it (never re-posts); if not found, the crash was pre-post (safe to post).
+        const landed = findLandedByContent(proposal.targetSessionId, { proposal, run: deps.run, agent: deps.agent });
+        if (landed) map.set(id, { status: 'failed', proposalId: id, __emitted: { parsed: landed, executedAt: rec.reservedAt || now() } });
+      } else {
+        // First attempt: write a DURABLE in-flight reservation BEFORE the external post, so a crash-then-retry takes
+        // the recovery branch above instead of blindly re-posting. (Prod store: conditional put-if-absent.)
+        await deps.store.put(key, { state: 'in-flight', proposalId: id, reservedAt: now() });
+      }
+
       const receipt = executeAction(proposal, confirmation, {
-        store: map,
-        run: deps.run,
-        knownSessionIds: known,
-        signingKey: deps.signingKey,
-        signingKeyId: deps.signingKeyId,
-        agent: deps.agent,
-        now: typeof deps.now === 'function' ? deps.now() : undefined,
-        freshnessSeconds: deps.freshnessSeconds,
+        store: map, run: deps.run, knownSessionIds: known,
+        signingKey: deps.signingKey, signingKeyId: deps.signingKeyId,
+        agent: deps.agent, now: now(), freshnessSeconds: deps.freshnessSeconds,
       });
-      const persisted = map.get(id); // only posted/pending/emitted are stored by executeAction; validation-fails aren't
-      if (persisted) await deps.store.put(id, persisted);
+      const persisted = map.get(id); // posted / emitted marker (validation-fails store nothing)
+      if (persisted) await deps.store.put(key, persisted);
+      else if (receipt.status === 'failed') await deps.store.delete(key); // validation failure: no post -> clear reservation
       return receipt;
     });
 
     if (!lockRes.locked) {
-      // A concurrent request on another instance holds the lock. Idempotent read if already terminal; else retry.
-      const prior = await deps.store.get(id);
-      if (prior && prior.status === 'posted') return json(200, prior);
+      // Another instance holds the lock. Idempotent read if already terminal; else ask the caller to retry.
+      const rec = await deps.store.get(key);
+      if (rec && rec.status === 'posted') return json(200, rec);
       return json(409, { error: 'proposal execution in progress; retry' });
     }
     return json(200, lockRes.value);

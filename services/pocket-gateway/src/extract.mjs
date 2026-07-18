@@ -156,17 +156,22 @@ export function buildRawCheckpoint(checkpoint, exportData, opts = {}) {
 
   const session = exportData?.session || {};
   const exSession = session.id || session.sessionId || '';
-  // descriptor/session provenance: the durable checkpoint must belong to the exported session.
-  if (checkpoint.sessionId && exSession && String(checkpoint.sessionId) !== String(exSession)) {
+  // MANDATORY descriptor/session provenance (Echo P0): a durable checkpoint MUST carry an authoritative sessionId,
+  // and it MUST match the exported session. A descriptor without provenance is refused (never accepted "clean").
+  if (!checkpoint.sessionId) throw new Error('checkpoint descriptor has no sessionId (missing provenance) — retryable');
+  if (!exSession) throw new Error('export has no session id (cannot bind checkpoint provenance) — retryable');
+  if (String(checkpoint.sessionId) !== String(exSession)) {
     throw new Error(`checkpoint sessionId ${checkpoint.sessionId} does not match export session ${exSession} — retryable`);
   }
 
   const sliced = sliceEvents(exportData?.events, start, end); // throws on duplicate in-range id
   if (sliced.length > LIMITS.MAX_EVENTS) throw new Error(`sliced event count ${sliced.length} exceeds MAX_EVENTS ${LIMITS.MAX_EVENTS}`);
-  // COMPLETENESS (Echo P0): the descriptor's authoritative eventCount must EXACTLY match the accepted events. A
-  // contained range that is missing interior events (globally sparse ids => can't check contiguity) is caught here.
+  // MANDATORY COMPLETENESS (Echo P0): the descriptor's authoritative eventCount is REQUIRED and must EXACTLY match
+  // the accepted events. A contained range missing interior events (globally sparse ids => no contiguity check) is
+  // caught here; a descriptor lacking eventCount is refused rather than accepted as complete.
   const declared = declaredEventCount(checkpoint);
-  if (declared != null && sliced.length !== declared) {
+  if (declared == null) throw new Error('checkpoint descriptor has no authoritative eventCount (summarySections.window.eventCount) — retryable');
+  if (sliced.length !== declared) {
     throw new Error(`incomplete checkpoint: accepted ${sliced.length} events but descriptor declares ${declared} (partial/missing) — retryable`);
   }
 

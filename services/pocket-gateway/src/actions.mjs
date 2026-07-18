@@ -248,6 +248,36 @@ export function verifyActionLanded(sessionId, parsed, { run, agent = 'claude-poc
 }
 
 /**
+ * Crash-recovery read-back: after a durable "in-flight" reservation whose emitted actionId was LOST to a crash
+ * (post landed but the emitted marker was never persisted), find OUR already-landed action by CONTENT — an action
+ * event authored by us, threading under the exact target sequence, whose body equals the confirmed renderedPreview.
+ * Returns {actionId, targetSequenceId, targetCursor} or null. Lets the handler finalize (never re-post) an ambiguous
+ * post. NOTE: content-match is a heuristic disambiguator (proposal.id is single-use so at most one such post exists);
+ * the deterministic close is a server-side idempotency key on `sl session reply`, which the CLI does not expose.
+ */
+export function findLandedByContent(sessionId, { proposal, run, agent = 'claude-pocket-relay', attempts = 2 } = {}) {
+  if (!run || !proposal) return null;
+  const want = String(proposal.renderedPreview);
+  const wantSeq = proposal.targetSequence;
+  for (let i = 0; i < attempts; i++) {
+    try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
+    let j;
+    try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '50', '--agent', agent, '--json'])); } catch { continue; }
+    for (const e of (j.events || [])) {
+      if (!e || typeof e.eventId !== 'string' || !e.eventId.startsWith('session-action-')) continue;
+      const who = (e.agent && e.agent.id) || e.agentId;
+      const p = e.payload || {};
+      const tseq = p.targetSequenceId;
+      const body = p.text ?? p.body ?? p.renderedPreview ?? p.message;
+      if (who === agent && Number(tseq) === wantSeq && typeof body === 'string' && body === want) {
+        return { actionId: e.eventId.slice('session-action-'.length), targetSequenceId: Number(tseq), targetCursor: (typeof p.targetCursor === 'string' ? p.targetCursor : null) };
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Freeze a primitive snapshot of every authority-bearing proposal field in a SINGLE read each (a getter/Proxy
  * fires exactly once here). The value hashed+confirmed+posted MUST be identical, so nothing downstream re-reads
  * proposal.* (first-post content TOCTOU, Echo). createdAt is captured as an epoch-ms number.

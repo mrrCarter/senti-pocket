@@ -60,7 +60,7 @@ test('baseline schema label when senti provides no headline; sessionTitle prefer
   assert.equal(s.summaryBaselineSchema, SUMMARY_BASELINE_SCHEMA);
   assert.equal(s.headline, 'AIdenID-Live-Demo');
   // no title anywhere -> deterministic generated headline
-  const noTitle = buildRawCheckpoint({ checkpointId: 'cp_nt', sessionId: SID, startSequence: 100, endSequence: 103 }, { session: { id: SID }, events: EXPORT.events }).rawCheckpoint;
+  const noTitle = buildRawCheckpoint({ checkpointId: 'cp_nt', sessionId: SID, startSequence: 100, endSequence: 103, summarySections: { window: { eventCount: 4 } } }, { session: { id: SID }, events: EXPORT.events }).rawCheckpoint;
   assert.match(summarize(noTitle, {}).headline, /cp_nt: 4 events from 2 agents/);
 });
 

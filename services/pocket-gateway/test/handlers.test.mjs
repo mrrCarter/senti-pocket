@@ -2,7 +2,7 @@
 // Fully hermetic: injected verifyToken / sl runner / bundleStore / ttsBackend. NO live calls.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createGateway } from '../src/handlers.mjs';
+import { createGateway, storeKey } from '../src/handlers.mjs';
 import { createInMemoryStore } from '../src/store.mjs';
 import { computeProposalHash } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
@@ -91,7 +91,7 @@ test('exactly-once across instances: a concurrent lock holder gets 409, not a se
   const store = createInMemoryStore();
   const gw = createGateway(baseDeps({ store }));
   const p = makeProposal({ id: 'plock' });
-  await store.acquireLock('plock'); // simulate another instance mid-post
+  await store.acquireLock(storeKey('consumer-123', 'plock')); // simulate another instance mid-post (namespaced per-human key)
   const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
   assert.equal(r.status, 409);
 });
@@ -126,6 +126,55 @@ test('POST /tts proxies audio; the provider key never appears in the response', 
   assert.equal(r.headers['x-senti-audio-format'], 'pcm_s16le_24000');
   assert.ok(Buffer.isBuffer(r.body));
   assert.equal(sawKey, false);
+});
+
+test('cross-human isolation: same proposal.id from two humans does NOT share idempotency/lock state', async () => {
+  const store = createInMemoryStore();
+  const vt = async (h) => { const a = h && h.authorization; if (a === 'Bearer alice') return { humanId: 'alice', scopes: ['actions:execute'] }; if (a === 'Bearer bob') return { humanId: 'bob', scopes: ['actions:execute'] }; return null; };
+  const state = { replies: 0 };
+  const run = (args) => {
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_' + state.replies, agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160 } }] });
+    return '{}';
+  };
+  const gw = createGateway(baseDeps({ store, run, verifyToken: vt }));
+  const p = makeProposal({ id: 'shared' });
+  const body = { proposal: p, confirmation: makeConfirm(p) };
+  const ra = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer alice' }, body });
+  const rb = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer bob' }, body });
+  assert.equal(ra.body.status, 'posted');
+  assert.equal(rb.body.status, 'posted');
+  assert.equal(state.replies, 2, 'each human executes independently — no cross-tenant idempotency collapse');
+  assert.notEqual(ra.body.result.actionId, rb.body.result.actionId);
+});
+
+test('crash recovery: in-flight reservation + landed post => retry FINALIZES via content read-back, never re-posts', async () => {
+  const store = createInMemoryStore();
+  const POSTED = 'Approved.';
+  const state = { replies: 0 };
+  const run = (args) => {
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_crash', targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_crash', agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160, text: POSTED } }] });
+    return '{}';
+  };
+  const gw = createGateway(baseDeps({ store, run }));
+  const p = makeProposal({ id: 'pcrash', renderedPreview: POSTED });
+  await store.put(storeKey('consumer-123', 'pcrash'), { state: 'in-flight', proposalId: 'pcrash', reservedAt: '2026-07-18T12:02:00Z' }); // crashed after post
+  const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
+  assert.equal(r.body.status, 'posted', 'finalized the already-landed post');
+  assert.equal(r.body.result.actionId, 'act_crash');
+  assert.equal(state.replies, 0, 'crash recovery must NOT re-post');
+});
+
+test('crash recovery: in-flight reservation but post NOT found => safe to post (pre-post crash)', async () => {
+  const store = createInMemoryStore();
+  const state = { replies: 0, landed: true };
+  const gw = createGateway(baseDeps({ store, run: makeRun(state) })); // read events carry no matching content
+  const p = makeProposal({ id: 'pcrash2' });
+  await store.put(storeKey('consumer-123', 'pcrash2'), { state: 'in-flight', proposalId: 'pcrash2', reservedAt: '2026-07-18T12:02:00Z' });
+  const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
+  assert.equal(r.body.status, 'posted');
+  assert.equal(state.replies, 1, 'pre-post crash: re-posting once is correct (nothing landed to recover)');
 });
 
 test('POST /tts rejects oversized text and missing backend', async () => {
