@@ -78,6 +78,15 @@ final class ContractsCrossModuleTests: XCTestCase {
         // signature is NOT bound: changing it does not change the canonical.
         let other = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp1", sessionId: "s1", sequenceStart: 1, sequenceEnd: 2, summary: summary, evidence: [], createdAt: ts, signature: "DIFFERENT", signingKeyId: "k1")
         XCTAssertEqual(bundle.canonicalBundlePayload(), other.canonicalBundlePayload())
+
+        // POPULATED KAV — pins nested element serialization (evidence/claim/agent + populated arrays + present grade),
+        // so Relay's Node mirror is fully specified (the empty-array case above does not exercise these).
+        let ev1 = EvidenceRef(id: "ev1", sessionId: "s1", sequence: 11, agentId: "a1", snippet: "sn", ts: ts)
+        let ag = AgentSummary(agentId: "a1", summary: "sum", claims: [Claim(id: "c1", text: "t", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev1])
+        let sum2 = CheckpointSummary(checkpointId: "cp1", headline: "H", summaryBaselineSchema: "sch", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
+        let pop = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp1", sessionId: "s1", sequenceStart: 10, sequenceEnd: 20, summary: sum2, evidence: [ev1], createdAt: ts, signature: "X", signingKeyId: "k1")
+        XCTAssertEqual(pop.canonicalBundlePayload(),
+            "pocket.bundle.v1\n5:0.1.83:cp12:s12:102:203:cp11:H3:sch11:A1:12:a13:sum1:12:c11:t4:fact1:13:ev11:13:ev12:s12:112:a12:sn13:17528352000001:12:r11:12:b11:13:ev12:s12:112:a12:sn13:175283520000013:17528352000002:k1")
     }
 
     #if canImport(CryptoKit)
