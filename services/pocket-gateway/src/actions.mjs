@@ -2,8 +2,9 @@
 // A dictated intent becomes a typed ActionProposal; deterministic code here owns target resolution,
 // authorization, single-use confirmation binding, execution, idempotency, and the receipt.
 // NOTHING a model emits drives a write directly. Offline => pendingConnectivity (never shown as "sent").
-import { createHash } from 'node:crypto';
+import { createHash, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { stableStringify } from './bundle.mjs';
 
 /** Sunday scope: the only writes allowed. No destructive/deploy/free-form tool kinds. */
 export const ALLOWED_KINDS = new Set(['threadedReply', 'opinionRequest']);
@@ -17,11 +18,14 @@ export const ALLOWED_KINDS = new Set(['threadedReply', 'opinionRequest']);
 export const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * The EXACT canonical bytes the hash covers — MUST byte-match PocketContracts.swift v0.1.2:
- *   "pocket.actionproposal.v1\n{kind}\n{targetSessionId}\n{targetSequence}\n{renderedPreview}"
+ * The EXACT canonical bytes the hash covers — MUST byte-match PocketContracts.swift v0.1.3.
+ * INJECTION-PROOF length-prefixed encoding (Echo review): lp(s) = "<utf8ByteCount>:<s>", so a delimiter
+ * inside any field cannot shift field boundaries (the byte count is authoritative).
+ *   "pocket.actionproposal.v2\n" + lp(kind) + lp(targetSessionId) + lp(String(targetSequence)) + lp(renderedPreview)
  */
 export function canonicalPayload(kind, targetSessionId, targetSequence, renderedPreview) {
-  return `pocket.actionproposal.v1\n${kind}\n${targetSessionId}\n${targetSequence}\n${renderedPreview}`;
+  const lp = (s) => `${Buffer.byteLength(String(s), 'utf8')}:${s}`;
+  return 'pocket.actionproposal.v2\n' + lp(kind) + lp(targetSessionId) + lp(String(targetSequence)) + lp(renderedPreview);
 }
 
 /** proposalHash = base64url(SHA-256(UTF-8(canonicalPayload))), '=' stripped — matches Swift computeHash. */
@@ -65,7 +69,34 @@ function receipt(proposal, status, extra = {}) {
     confirmedByHumanAt: extra.confirmedByHumanAt ?? null,
     executedAt: extra.executedAt ?? null,
     failureReason: extra.failureReason ?? null,
+    signature: null,     // v0.1.3: set ONLY on a real .posted receipt (signReceipt); pending/failed stay unsigned
+    signingKeyId: null,
   };
+}
+
+/** Canonical receipt bytes for signing = the receipt minus its own `signature` field (signingKeyId IS bound). */
+export function canonicalReceiptBytes(r) {
+  const { signature, ...signed } = r;
+  return Buffer.from(stableStringify(signed), 'utf8');
+}
+
+/** Ed25519-sign a receipt with the gateway key. Only ever called on a real .posted receipt. */
+export function signReceipt(r, privateKey, signingKeyId) {
+  const key = typeof privateKey === 'string' ? createPrivateKey(privateKey) : privateKey;
+  const withId = { ...r, signingKeyId: signingKeyId ?? r.signingKeyId ?? null };
+  const sig = edSign(null, canonicalReceiptBytes(withId), key);
+  return { ...withId, signature: sig.toString('base64') };
+}
+
+/** Verify a .posted receipt's gateway signature. Returns false for unsigned (pending/failed) receipts. */
+export function verifyReceipt(r, publicKey) {
+  try {
+    if (!r || typeof r.signature !== 'string' || r.signature.length === 0) return false;
+    const key = typeof publicKey === 'string' ? createPublicKey(publicKey) : publicKey;
+    return edVerify(null, canonicalReceiptBytes(r), key, Buffer.from(r.signature, 'base64'));
+  } catch {
+    return false;
+  }
 }
 
 /** Best-effort parse of the resulting sequence from `sl session reply` output (JSON preferred). */
@@ -131,7 +162,8 @@ export function executeAction(proposal, confirmation, opts = {}) {
       // no verifiable sequence => do NOT claim posted; leave unstored so it can be retried
       return receipt(proposal, 'failed', { failureReason: 'post returned no verifiable resulting sequence', confirmedProposalHash: live, confirmedByHumanAt: confirmation.confirmedAt });
     }
-    const r = receipt(proposal, 'posted', { resultingSequence, confirmedProposalHash: live, executedAt: now, confirmedByHumanAt: confirmation.confirmedAt });
+    let r = receipt(proposal, 'posted', { resultingSequence, confirmedProposalHash: live, executedAt: now, confirmedByHumanAt: confirmation.confirmedAt });
+    if (opts.signingKey) r = signReceipt(r, opts.signingKey, opts.signingKeyId); // only .posted is gateway-signed
     store.set(proposal.id, r);
     return r;
   } catch (e) {
