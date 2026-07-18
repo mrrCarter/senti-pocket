@@ -79,13 +79,14 @@ test('POST /actions/execute posts once and returns a signed receipt', async () =
   assert.equal(state.replies, 1);
 });
 
-test('POST /actions/execute rejects a session the human does not belong to (server-derived authz)', async () => {
+test('POST /actions/execute rejects a session the human does not belong to => typed 422 error envelope (not a null-hash receipt)', async () => {
   const gw = createGateway(baseDeps({ knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
   const p = makeProposal();
   const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
-  assert.equal(r.status, 200);
-  assert.equal(r.body.status, 'failed');
-  assert.match(r.body.failureReason, /not a known session/);
+  assert.equal(r.status, 422);
+  assert.equal(r.body.error, 'proposal_rejected');
+  assert.match(r.body.reason, /not a known session/);
+  assert.equal(r.body.status, undefined, 'not a receipt — no null-hash receipt crosses');
 });
 
 test('exactly-once across instances: a concurrent lock holder gets 409, not a second post', async () => {

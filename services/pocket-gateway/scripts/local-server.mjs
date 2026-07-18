@@ -82,13 +82,9 @@ const server = http.createServer((req, res) => {
     const headers = {}; for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = v;
     headers['x-http-method'] = req.method; headers['x-http-url'] = 'http://x' + u.pathname; // trusted (this server sets it)
     const query = Object.fromEntries(u.searchParams.entries());
+    // The gateway itself returns a typed 422 error envelope for non-bindable inputs (warden contract ruling) — never
+    // a null-hash "receipt". We just forward its response.
     const out = await gateway.handle({ method: req.method, path: u.pathname, query, headers, body: req.method === 'POST' ? body : undefined });
-    // ERROR ENVELOPE: a pre-confirmation validation failure carries confirmedProposalHash:null and is NOT a
-    // frozen-Swift-decodable ActionReceipt. Return an explicit error instead of a malformed receipt (Echo #233114).
-    const b = out.body;
-    if (u.pathname === '/actions/execute' && b && typeof b === 'object' && b.status === 'failed' && b.confirmedProposalHash == null) {
-      return send(422, { error: 'proposal_rejected', reason: b.failureReason || 'invalid proposal' });
-    }
     send(out.status, out.body, out.headers);
   });
   req.on('error', () => { try { res.writeHead(400).end('{"error":"bad_request"}'); } catch { /* ignore */ } });

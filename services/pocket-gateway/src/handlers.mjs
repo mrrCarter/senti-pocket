@@ -11,6 +11,16 @@ import { executeAction, findLandedByProposal } from './actions.mjs';
 import { withLock } from './store.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
+
+/**
+ * Map an ActionReceipt to a response (warden contract ruling): a receipt whose confirmation binding was NEVER
+ * established (status failed AND confirmedProposalHash == null) is NOT a valid frozen ActionReceipt — return a TYPED
+ * ERROR ENVELOPE instead of a null-hash "receipt". A posted / pending / post-confirmation-failed receipt (which
+ * carries the verified non-null hash) is returned as-is.
+ */
+const receiptResponse = (r) => (r && r.status === 'failed' && r.confirmedProposalHash == null)
+  ? json(422, { error: 'proposal_rejected', reason: (r.failureReason || 'proposal could not be bound to a confirmation') })
+  : json(200, r);
 const readBody = (body) => {
   if (body == null) return {};
   if (typeof body === 'string') { try { return JSON.parse(body); } catch { return null; } }
@@ -107,7 +117,7 @@ export function createGateway(deps) {
       else if (receipt.ambiguous) { /* AMBIGUOUS send: PRESERVE the durable in-flight reservation (do NOT clear) so a
                                        retry reconciles via read-back instead of re-posting a possibly-committed write. */ }
       else if (receipt.status === 'failed') await deps.store.delete(key); // definitive pre-post failure -> clear reservation
-      return json(200, receipt);
+      return receiptResponse(receipt); // null-hash (non-bindable) failures -> typed 422 error envelope, never a receipt
     });
 
     if (!lockRes.locked) {
