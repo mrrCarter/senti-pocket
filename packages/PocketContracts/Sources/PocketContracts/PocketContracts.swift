@@ -297,8 +297,8 @@ public extension PocketBundle {
     static var capBlockers: Int { 100 }  // summary.blockers count
     // Round-5 total-work DoS budget across the whole graph — per-array caps don't bound the PRODUCT (agents × claims ×
     // evidence × string bytes). Both are comfortably above any real gateway bundle (gateway signs <= 512KB bodies).
-    static var maxTotalElements: Int { 5000 }
-    static var maxTotalBytes: Int { 2_000_000 }
+    static var maxTotalElements: Int { 20000 }
+    static var maxTotalBytes: Int { 1_048_576 }
 
     /// P1.4 — cheap, no-crypto: is this bundle's `signingKeyId` one the phone pins? The ingress rejects an unknown id
     /// with THIS before running the (bounded) semantic scan or any crypto.
