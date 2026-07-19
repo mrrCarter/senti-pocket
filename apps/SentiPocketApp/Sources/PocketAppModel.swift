@@ -42,18 +42,20 @@ final class PocketAppModel: NSObject, ObservableObject {
 
         switch intent {
         case .selectCheckpoint(let context):
-            guard matches(context, verifiedBundle: verifiedBundle) else {
+            guard matchesInboxCheckpoint(context, verifiedBundle: verifiedBundle) else {
                 failClosed("Checkpoint identity changed before it could be opened.")
                 return
             }
+            stopActiveSpeech(message: "Read-back stopped before navigation.")
             resetConversation()
             showIncoming(verifiedBundle)
 
         case .answer(let context), .callSenti(let context):
-            guard matches(context, verifiedBundle: verifiedBundle) else {
+            guard matchesIncomingCheckpoint(context, verifiedBundle: verifiedBundle) else {
                 failClosed("Checkpoint identity changed before the briefing began.")
                 return
             }
+            stopActiveSpeech(message: "Read-back stopped before the briefing began.")
             resetConversation()
             guard showConversation(verifiedBundle, includesCachedAnswer: false, voiceState: .speaking(segmentId: nil)) else {
                 return
@@ -61,7 +63,7 @@ final class PocketAppModel: NSObject, ObservableObject {
             speakBriefing()
 
         case .listenLater(let context):
-            guard matches(context, verifiedBundle: verifiedBundle) else {
+            guard matchesIncomingCheckpoint(context, verifiedBundle: verifiedBundle) else {
                 failClosed("Checkpoint identity changed before Listen Later was saved.")
                 return
             }
@@ -70,7 +72,7 @@ final class PocketAppModel: NSObject, ObservableObject {
             showInbox(verifiedBundle, attention: .listenLater)
 
         case .snooze(let context, let option):
-            guard matches(context, verifiedBundle: verifiedBundle) else {
+            guard matchesIncomingCheckpoint(context, verifiedBundle: verifiedBundle) else {
                 failClosed("Checkpoint identity changed before Snooze was saved.")
                 return
             }
@@ -136,12 +138,16 @@ final class PocketAppModel: NSObject, ObservableObject {
             speakBriefing()
 
         case .endConversation(let context):
-            guard matches(context, verifiedBundle: verifiedBundle) else { return }
+            guard matchesCurrentConversation(context, verifiedBundle: verifiedBundle) else { return }
             stopActiveSpeech(message: "Read-back stopped before completion.")
             resetConversation()
             showIncoming(verifiedBundle)
 
         case .openEvidence(let selection):
+            guard matchesCurrentEvidenceSelection(selection, verifiedBundle: verifiedBundle) else {
+                failClosed("Evidence no longer belongs to the active verified checkpoint.")
+                return
+            }
             state = PocketUIState(
                 destination: state.destination,
                 connectivity: state.connectivity,
@@ -223,6 +229,28 @@ final class PocketAppModel: NSObject, ObservableObject {
         context == CheckpointContext(bundle: verifiedBundle.bundle)
     }
 
+    private func matchesInboxCheckpoint(
+        _ context: CheckpointContext,
+        verifiedBundle: VerifiedBundle
+    ) -> Bool {
+        guard matches(context, verifiedBundle: verifiedBundle),
+              case .inbox(let inbox) = state.destination else { return false }
+        let expectedIntegrity = BundleIntegrityState(verifiedBundle: verifiedBundle)
+        return inbox.items.contains {
+            $0.bundle == verifiedBundle.bundle && $0.integrity == expectedIntegrity
+        }
+    }
+
+    private func matchesIncomingCheckpoint(
+        _ context: CheckpointContext,
+        verifiedBundle: VerifiedBundle
+    ) -> Bool {
+        guard matches(context, verifiedBundle: verifiedBundle),
+              case .incoming(let incoming) = state.destination else { return false }
+        return incoming.bundle == verifiedBundle.bundle
+            && incoming.integrity == BundleIntegrityState(verifiedBundle: verifiedBundle)
+    }
+
     private func matchesCurrentConversation(
         _ context: CheckpointContext,
         verifiedBundle: VerifiedBundle
@@ -230,6 +258,29 @@ final class PocketAppModel: NSObject, ObservableObject {
         guard matches(context, verifiedBundle: verifiedBundle),
               case .conversation(let conversation) = state.destination else { return false }
         return conversation.bundle == verifiedBundle.bundle && conversation.integrity.kind == .verified
+    }
+
+    private func matchesCurrentEvidenceSelection(
+        _ selection: PresentedEvidenceSelection,
+        verifiedBundle: VerifiedBundle
+    ) -> Bool {
+        guard case .conversation(let conversation) = state.destination,
+              conversation.bundle == verifiedBundle.bundle,
+              conversation.integrity == BundleIntegrityState(verifiedBundle: verifiedBundle) else {
+            return false
+        }
+
+        let citedEvidenceIDs = Set(
+            conversation.briefingPlan.segments.flatMap(\.evidenceIds)
+                + conversation.transcript.flatMap { entry in
+                    if case .questionAnswer(let answer) = entry { return answer.citations }
+                    return []
+                }
+        )
+        guard citedEvidenceIDs.contains(selection.evidenceId) else { return false }
+        return verifiedBundle.bundle.evidence.contains { evidence in
+            PresentedEvidenceSelection(evidence: evidence, verifiedBundle: verifiedBundle) == selection
+        }
     }
 
     private func showInbox(_ verifiedBundle: VerifiedBundle, attention: CheckpointAttention) {
@@ -267,7 +318,18 @@ final class PocketAppModel: NSObject, ObservableObject {
             failClosed("The verified checkpoint does not support the canonical offline demo flow.")
             return false
         }
-        state = PocketUIState(destination: .conversation(conversation), connectivity: offlineConnectivity)
+        let preservesConversationPresentation: Bool
+        if case .conversation = state.destination {
+            preservesConversationPresentation = true
+        } else {
+            preservesConversationPresentation = false
+        }
+        state = PocketUIState(
+            destination: .conversation(conversation),
+            connectivity: offlineConnectivity,
+            presentedEvidence: preservesConversationPresentation ? state.presentedEvidence : nil,
+            alertMessage: preservesConversationPresentation ? state.alertMessage : nil
+        )
         return true
     }
 
@@ -406,7 +468,7 @@ final class PocketAppModel: NSObject, ObservableObject {
     }
 }
 
-extension PocketAppModel: @preconcurrency AVSpeechSynthesizerDelegate {
+extension PocketAppModel: AVSpeechSynthesizerDelegate {
     nonisolated func speechSynthesizer(
         _ synthesizer: AVSpeechSynthesizer,
         didFinish utterance: AVSpeechUtterance
