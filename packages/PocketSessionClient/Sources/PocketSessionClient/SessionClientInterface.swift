@@ -16,8 +16,8 @@ import PocketContracts
 
 /// Opaque, single-path-segment session id. The initializer THROWS `AuthError.invalidResponse` on any grammar
 /// violation, before any transport/broker execution — so `/`, `..`, control, space, `%`, empty never reach a URL.
-public struct SessionID: Sendable, Equatable, Hashable {
-    public let value: String
+public struct SessionID: Sendable, Equatable {
+    let value: String                      // module-INTERNAL: the broker/transport read it to build the path; not part of the §4 public surface
     public init(_ raw: String) throws {
         guard Self.isValid(raw) else { throw AuthError.invalidResponse }
         self.value = raw
@@ -74,8 +74,11 @@ public struct RepositorySnapshot<Page: Sendable & Equatable>: Sendable, Equatabl
     public let completeness: Completeness
     public let serverWatermark: Watermark?
     public let lastSuccessfulSync: Date?
-    public init(page: Page, source: Source, authStatus: AuthStatus, completeness: Completeness,
-                serverWatermark: Watermark?, lastSuccessfulSync: Date?) {
+    // Deliberately NO public initializer — the compiler's memberwise init is module-INTERNAL, so ONLY the gated
+    // repository/fixture implementations mint a snapshot. External consumers READ the fields but cannot forge a
+    // .network/.live/.complete provenance (upholds the fixture-cannot-mint-network/current/green invariant).
+    init(page: Page, source: Source, authStatus: AuthStatus, completeness: Completeness,
+         serverWatermark: Watermark?, lastSuccessfulSync: Date?) {
         self.page = page; self.source = source; self.authStatus = authStatus
         self.completeness = completeness; self.serverWatermark = serverWatermark; self.lastSuccessfulSync = lastSuccessfulSync
     }
@@ -84,7 +87,11 @@ public struct RepositorySnapshot<Page: Sendable & Equatable>: Sendable, Equatabl
 // MARK: - Public protocols (the ONLY public surface; no arbitrary-request API)
 
 public protocol AuthProviding: Sendable {
-    func currentState() async -> AuthState
+    func currentState() async -> AuthState          // one-shot convenience read of the current state
+    /// REPLAY-ON-SUBSCRIBE — FROZEN behavioral contract: yields the CURRENT `AuthState` synchronously on
+    /// subscription, then every subsequent transition in order. Consumers drive UI from this stream ALONE —
+    /// no `currentState()` seed, no lost-update window between read and subscribe. A step-3 behavioral KAV
+    /// pins the on-subscribe replay + the transition ordering; implementations MUST NOT vary this.
     func stateUpdates() async -> AsyncStream<AuthState>
     @MainActor func signIn() async throws          // ONLY interactive entry; single UI flight
     func signOut() async throws                    // tombstone-gated; signedOut only after both wipes succeed
