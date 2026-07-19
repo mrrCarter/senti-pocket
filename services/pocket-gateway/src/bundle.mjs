@@ -7,8 +7,16 @@ import { scrubText } from './scrub.mjs';
 export const CONTRACTS_VERSION = '0.1.8';
 /** Max UTF-8 bytes for any single phone-visible evidence snippet (bounded egress). */
 export const MAX_EVIDENCE_SNIPPET_BYTES = 2048;
-/** Max UTF-8 bytes for the entire signed bundle body (defense against a pathological summary). */
+/** Max UTF-8 bytes for the entire signed bundle body (defense against a pathological summary). This is the AUTHORITATIVE
+ *  PRODUCE CEILING — the gateway NEVER signs a bundle whose canonical exceeds this. */
 export const MAX_BUNDLE_BYTES = 512 * 1024;
+/**
+ * SINGLE SOURCE OF TRUTH for the whole-graph consume budget (warden's parity ask): the phone's
+ * PocketBundle.maxTotalElements / maxTotalBytes MUST be pinned to EXACTLY these so any bundle this gateway signs is
+ * accepted by the consumer. Both comfortably exceed the 512KB produce ceiling (a real ≤512KB bundle of genuine
+ * evidence/claims — each element well over 26 bytes — carries far fewer than 20000 elements).
+ */
+export const BUNDLE_BUDGET = Object.freeze({ maxTotalElements: 20000, maxTotalBytes: 1024 * 1024 });
 
 // ---- pocket.bundle.v1 canonical — MUST byte-match PocketContracts.swift canonicalBundlePayload() (@b25347a) ----
 // Length+count-prefixed, presence-flagged grade, CHECKED epoch-millis dates, binds ALL fields except `signature`.
@@ -286,10 +294,10 @@ export function validateBundleIngress(bundle) {
   const b = bundle;
   if (!b || typeof b !== 'object') return { ok: false, errors: ['bundle: not an object'] };
   const SNIPPET_MAX = 8000; // frozen ingress max (egress is stricter at 2048)
-  // total-work budget (warden #2 DoS guard): bound the WHOLE graph, not just per-array. Element budget is PINNED to the
-  // phone's maxTotalElements (5000) so a bundle this gateway signs is NEVER over the consumer's budget (Pulse parity:
-  // egress ⊆ consume). bytes 2MB matches the phone (gateway bodies are already <=512KB via MAX_BUNDLE_BYTES).
-  const BUDGET = Object.freeze({ elements: 5000, bytes: 2 * 1024 * 1024 });
+  // total-work budget (warden #2 DoS guard) — the SINGLE SOURCE OF TRUTH BUNDLE_BUDGET, which the phone pins to exactly
+  // (warden parity ask). Both sides use the SAME numbers, and both comfortably exceed the 512KB produce ceiling, so any
+  // bundle this gateway signs is accepted by the consumer (egress ⊆ consume) — while a pathological graph fails fast.
+  const BUDGET = { elements: BUNDLE_BUDGET.maxTotalElements, bytes: BUNDLE_BUDGET.maxTotalBytes };
   let elems = 0, bytes = 0;
   const reqStr = (v, label, cap) => {
     if (typeof v !== 'string' || v.length === 0) push(`${label}: empty/non-string required field`);
