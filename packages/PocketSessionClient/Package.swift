@@ -2,7 +2,7 @@
 import PackageDescription
 
 // PocketSessionClient — Relay-owned client-side auth + session-READ transport for Senti Pocket.
-// Implements the ratified Pocket Auth + Session-Fetch security contract (docs/auth-fetch-contract.md @ a0a9114c).
+// Implements the ratified Pocket Auth + Session-Fetch security contract (docs/auth-fetch-contract.md @ 15c83561, V11).
 // Standalone until Atlas's step-2 shell consumes it. Depends on the merged wire DTOs in PocketContracts.
 let package = Package(
     name: "PocketSessionClient",

@@ -12,7 +12,7 @@ Xcode project/workspace is a conflict magnet — **only Atlas** edits `apps/Sent
 | `packages/PocketSyncClient` | **claude-pocket-relay** | checkpoint pull + bundle sync to phone, idempotency |
 | `packages/PocketActionsClient` | **claude-pocket-relay** | governed writeback via existing Senti MCP/API, receipts, offline pending intents |
 | `services/pocket-gateway` | **claude-pocket-relay** | checkpoint extract → summarizer → bundle → aidenid scope → receipts |
-| `packages/PocketSessionClient` | **claude-pocket-relay** | Client-side auth + session-READ transport per ratified docs/auth-fetch-contract.md (a0a9114c): CredentialBroker + AuthProviding + SessionTransport + SessionRepository + frozen §4 types (SessionID/RepositorySnapshot/…) + internal SessionRequestSpec + fixtures. Standalone until Atlas's shell consumes it. |
+| `packages/PocketSessionClient` | **claude-pocket-relay** | Client-side auth + session-READ transport per ratified docs/auth-fetch-contract.md (15c83561, V11): CredentialBroker + AuthProviding + SessionTransport + SessionRepository + frozen §4 types (SessionID/RepositorySnapshot/…) + internal SessionRequestSpec + fixtures. Standalone until Atlas's shell consumes it. |
 | `packages/PocketBriefing` + `packages/PocketStorage` | Atlas assigns exact owner at contract freeze | summary consumer + local SQLite/FTS retrieval |
 | `security/reviews` | **claude-warden** | audits, security scans, gate records |
 

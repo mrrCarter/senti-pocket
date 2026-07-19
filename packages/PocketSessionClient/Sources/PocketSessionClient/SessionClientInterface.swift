@@ -2,7 +2,7 @@ import Foundation
 import PocketContracts
 
 // Frozen interface for the ratified Pocket Auth + Session-Fetch security contract
-// (docs/auth-fetch-contract.md @ a0a9114c). STEP 1 of the fixture-first build: the exact §4 type surface as
+// (docs/auth-fetch-contract.md @ 15c83561, V11). STEP 1 of the fixture-first build: the exact §4 type surface as
 // compileable declarations. Implementations (fixture CredentialBroker/Transport/Repository) + KAVs land in
 // steps 2–3; warden source-gates the whole (compile + green + compile-NEGATIVE + N-vs-N+1). FIXTURE-ONLY:
 // no live sign-in/fetch until server-P1 (63446896) + Pocket client registration deploy under Carter's GO.
