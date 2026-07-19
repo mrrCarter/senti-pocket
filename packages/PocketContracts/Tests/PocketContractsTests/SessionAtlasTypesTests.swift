@@ -116,4 +116,21 @@ final class SessionAtlasTypesTests: XCTestCase {
         XCTAssertEqual(wrapped.createdAt.raw, "2026-07-18T10:40:00.250Z")
         XCTAssertNotNil(wrapped.createdAt.date)
     }
+
+    // MARK: Finder-list exact KAVs (#240136)
+
+    /// Item 3: two different wire strings for the SAME instant parse to the SAME Date (equivalent-instant), and raw
+    /// retention still holds.
+    func testTimestampEquivalentInstantEquality() {
+        XCTAssertEqual(ParsedSessionTimestamp("2026-07-18T10:36:34Z").date,
+                       ParsedSessionTimestamp("2026-07-18T06:36:34-04:00").date)
+        XCTAssertEqual(ParsedSessionTimestamp("2026-07-18T06:36:34-04:00").raw, "2026-07-18T06:36:34-04:00")
+    }
+
+    /// Item 4: the wrapper preserves the WHOLE DTO — `.checkpoint` is Equatable-identical to the original (true
+    /// losslessness, not a field-by-field spot check).
+    func testCheckpointWrapperWholeDTOEquality() throws {
+        let dto = try checkpoint()
+        XCTAssertEqual(MembershipAuthorizedCheckpoint(dto).checkpoint, dto)
+    }
 }

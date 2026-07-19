@@ -37,11 +37,13 @@ struct AppShell<Sessions: View, Activity: View>: View {
     }
 }
 
-// Default composition: empty Sessions/Activity until Pulse injects her screens. No Atlas presentation/copy.
-extension AppShell where Sessions == EmptyView, Activity == EmptyView {
-    init() { self.init(sessions: { EmptyView() }, activity: { EmptyView() }) }
-}
+// AppShell is INJECTION-ONLY: there is deliberately no zero-argument initializer. @main ships RootView() until Pulse
+// supplies real Sessions/Activity screens, at which point it composes `AppShell(sessions:{…}, activity:{…})`. This
+// keeps blank tabs from ever shipping (finder item 2) while the shell's composition is still exercised by the preview.
 
-#Preview("App shell (structure)") {
-    AppShell()
+#Preview("App shell (injection)") {
+    AppShell(
+        sessions: { List { Text("Session · room A"); Text("Session · room B") } },
+        activity: { List { Text("Activity · event 1"); Text("Activity · event 2") } }
+    )
 }
