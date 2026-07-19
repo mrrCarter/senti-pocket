@@ -1,8 +1,8 @@
-# Pocket Auth + Session-Fetch Security Contract (V10)
+# Pocket Auth + Session-Fetch Security Contract (V11)
 
 **Owner:** claude-pocket-relay · **Status:** DESIGN — precise-markdown (warden A/B=B). Awaiting fresh exact finder keys (Echo + Pulse) then warden ratification. **No implementation logic; compile-proof + compile-negative + N-vs-N+1 KAVs enforced at the IMPLEMENTATION code-gate.**
 **Base:** atlas/pocket-contracts-v0.1 `6f019594` (FF-ready). **Scope:** client-side auth + session-READ transport. Consumes merged wire DTOs (`SessionWire.swift`, **unchanged**). Does **not** import/touch `VerifiedBundle`/signed-briefing (PocketCall).
-Folds warden R1–R6', consolidated V6 P1-1..P2-5 + Pulse guards, both full A-E verdicts + V7 a–g, V8 residuals 1–5 (401 suppresses subject cache per warden R4', structured `wipeFailed`, exact query limits, `.unauthorized` removed, decode-no-cache), and V9 consistency fixes (stale SessionRepository 401 comment, normalized-status wording at every surface, literal query omissions, exact `/api/v1/auth/mcp-subject`). Server-P1 ratified `63446896`.
+Folds warden R1–R6', consolidated V6 P1-1..P2-5 + Pulse guards, both full A-E verdicts + V7 a–g, V8 residuals 1–5 (401 suppresses subject cache per warden R4', structured `wipeFailed`, exact query limits, `.unauthorized` removed, decode-no-cache), V9 consistency fixes (stale SessionRepository 401 comment, normalized-status wording at every surface, literal query omissions, exact `/api/v1/auth/mcp-subject`), and V11 precision amendment (§4c stale-generation terminal + §5a fixture A/B seams — NO redline change, completes two unspecified terminals). Server-P1 ratified `63446896`.
 
 ## 1. Deployed contract (live-verified; read-only ECS/AS evidence)
 Provenance distinct: **deployed prod `3ca7640`**; **origin/main `91a2c3fa`** is **+1 non-serializer commit ahead**.
@@ -62,7 +62,7 @@ enum SessionRequestSpec: Sendable {
 // .reauthenticationRequired; 403→TransportError.accessDenied; other→TransportError.server), returns ONLY Data. Credential + generation are
 // private actor state; neither they nor any HTTPURLResponse ever leave the actor.
 actor CredentialBroker {
-    func perform(_ spec: SessionRequestSpec) async throws -> Data     // throws AuthError.reauthenticationRequired when no unexpired credential; NEVER awaits UI; no replay
+    func perform(_ spec: SessionRequestSpec) async throws -> Data     // throws AuthError.reauthenticationRequired when no unexpired credential; NEVER awaits UI; no replay; stale-generation supersession terminal per §4c
 }
 
 public protocol AuthProviding: Sendable {                     // async, actor-safe; NO token accessor
@@ -113,6 +113,12 @@ Credential used for NETWORK only while unexpired minus **60s skew**; at/near/aft
 
 **Wipe:** `signOut` writes a `tombstone` FIRST → immediately blocks BOTH cache reads AND any broker credential/network use → deletes Keychain + filesystem. `signedOut` is impossible until BOTH complete. Per-half failure: `signOut` throws exactly one `AuthError.wipeFailed(keychain:, cache:)` with the failed halves flagged (both true ⇒ both deletions failed); AuthState stays `.wipePending` (credential unusable, reads disabled) until BOTH deletions succeed, retried before any later `perform`/`signIn`; neither half is ever readable. Clock: monotonic where available; wall-clock skew conservative (expire early, never late).
 
+## 4c. Stale-generation terminal (V11 precision amendment — no redline change)
+When a response returns for a request whose captured generation N no longer equals the broker's current generation (a concurrent sign-in or sign-out occurred mid-flight), the broker compares generations BEFORE any Data return / decode / cache read-or-write / status mutation, and terminates that caller by CAUSE:
+- **Superseded by a newer SIGNED-IN generation** (re-auth produced a valid N+1): throw `CancellationError()` — the request was semantically cancelled, not auth-failed; the caller may retry under N+1. (`reauthenticationRequired` would be untruthful while signed-in.)
+- **Superseded by SIGN-OUT** (tombstone / `.wipePending`; no valid current credential): throw `AuthError.reauthenticationRequired` via the R6' tombstone path — NOT a benign cancel; there is no N+1 to retry and reads+network are already blocked.
+Distinguishing signal = current auth state at classification (signedIn N+1 vs signedOut/`.wipePending`). Both branches, for BOTH a stale 2xx AND a stale 401: zero Data returned, zero decode, zero cache read-or-write, zero mutation of current-generation AuthState/credential/namespace/cache, no transparent replay; terminal to ONLY the stale caller. KAVs: superseded-by-N+1 → `CancellationError` + N+1 signed-in state untouched + caller may retry; superseded-by-sign-out → `reauthenticationRequired` + tombstone/`.wipePending` intact.
+
 ## 5. KAV matrix (exact query freeze with server-proven limits; compile-proof KAVs deferred to impl gate)
 **Query freeze (literal names + exact fixed values OR explicit omission — server-route-verified limits):**
 - `listSessions` → `include_archived=<bool>`, `cursor=<opaque next_cursor>` (OMIT when nil), `limit=50`. Omit `after`/`display_only`.
@@ -124,6 +130,12 @@ Negative `fromSequence`/`beforeSequence` rejected pre-execution (`AuthError.inva
 **Client (fixture-closable now):** single sign-in UI flight; state-mismatch/cancel fail closed; 401 invalidates generation + SUPPRESSES subject cache + throws reauthenticationRequired (never serves cache — may be revoked/invalid; AS has no revocation endpoint) + zero-replay + late gen N cannot commit after sign-out/N+1; ONLY client-detected pre-network expiry serves `.authExpired` cache; 403→accessDenied, no-retry, cache suppressed, renders nothing; fresh-2xx-decode-fail WITH cache→`.partial("decode-fallback")` `.live`, with NO cache→`TransportError.decoding`; each freshness row returns/throws EXACTLY its cell; offline-no-cache→offlineNoCache, expired-no-cache→reauthenticationRequired, expired+offline→expired; cached fallback never `.complete`; raw response/headers/token absent from DTO/error/log/crash/preview while a NORMALIZED status Int in `.server(status:)` IS permitted; broker returns only Data (no HTTPURLResponse escapes); fixture cannot mint network/current/write/green; no PocketCall import; provisional-credential never persisted before mcp-subject; stale-subject cannot commit; generation-gated cache r/w; freshness boundaries (±60s skew, 300s max-age); wipe (tombstone blocks reads+network immediately; `AuthError.wipeFailed(keychain:,cache:)` exact flags, `.wipePending` until both clear, nothing readable, retry before perform/signIn); SessionID init throws on grammar violation pre-execution; negative sequence rejected; no caller can name a URL/method/header (only SessionRequestSpec); usage-scope (read-only→403; read+usage→200 required `totalCostUsd`; missing key→decode-fail).
 **Deferred to IMPL code-gate (need real code):** compile-NEGATIVE (no external/same-module construction of a credential-bearing request; broker exposes no internal/fileprivate factory and no Data-less status) + N-vs-N+1 live-response binding + full compile/green/minimal-diff/Pulse review.
 **Live/server (need server-lane + probe + registration):** wrong/absent user+MCP issuer/audience rejected; scope/`scp` confusion terminal no-fallback; read-scoped cannot write (403); route-local A-cannot-read-B (403); required `iat`/`sub`, MCP nonempty `jti`; mcp-subject stable across reauth/two tokens + both cache headers + subject-only body; web-audience token rejected at mcp-subject.
+
+## 5a. Fixture seams (V11 precision amendment — no redline change)
+Two distinct seams, never conflated:
+- **(A) Deterministic executor (KAV-only):** a private `SessionExecuting` seam injected into the REAL broker/repository path. Test executors simulate every §4b/§4c response — HTTP status, races, decode failures, including simulated `.network`/`.live` — because they drive the REAL `perform` construction + classification + repository code under test. UNREACHABLE from any public/demo initializer.
+- **(B) Shipping `FixtureSessionRepository`:** the app/demo-consumed repository. It ALWAYS vends exactly `RepositorySnapshot(source: .fixture, authStatus: .offline, completeness: .unknown, serverWatermark: nil, lastSuccessfulSync: nil)` and NEVER `.network`/`.live`/`.complete` (upholds §5 fixture-cannot-mint). Replay fixtures may drive all `AuthState` cases for routing tests without claiming a live credential.
+- **Item 9:** (A) drives the same `perform` path as live; (B) cannot select (A) nor bypass into live provenance. Negative KAVs: no external/demo consumer can reach (A); (B) never emits `.network`/`.live`/`.complete`.
 
 ## 6. Separate live gates (all prod auth ⇒ two-key warden+finder + explicit @human-mrrcarter GO before deploy)
 - **Server-P1 (Echo; ratified design `63446896`):** per-path audience + token kind+scope preserve + route scope (incl. usage all-of) + iss/aud/sig/exp verify + fail-first/green KAVs. Implementation code-gate pending.
