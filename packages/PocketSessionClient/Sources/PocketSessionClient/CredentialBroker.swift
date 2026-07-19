@@ -55,7 +55,8 @@ actor CredentialBroker {
         let now = Date()
         guard !credential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !subjectId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !credential.contains(where: { $0 == "\r" || $0 == "\n" }),
+              credential.rangeOfCharacter(from: .controlCharacters) == nil,   // no CR/LF header-injection…
+              subjectId.rangeOfCharacter(from: .controlCharacters) == nil,    // …symmetric on subjectId (Forge flag)
               expiresAt.timeIntervalSince(now) > skew else { throw AuthError.invalidResponse }
         currentGeneration &+= 1
         authority = Authority(credential: credential, subjectId: subjectId,

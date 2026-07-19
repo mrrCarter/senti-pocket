@@ -28,14 +28,17 @@ public struct FixtureSessionRepository: SessionRepository {
     }
 
     public func sessions(includeArchived: Bool, cursor: String?) async throws -> RepositorySnapshot<SessionListPage> {
+        // Echo the requested include_archived (was hardcoded false) — query-truthful even in the fixture.
         snapshot(Self.decode(SessionListPage.self,
-            #"{"sessions":[],"count":0,"include_archived":false,"next_cursor":null,"has_more":false}"#))
+            #"{"sessions":[],"count":0,"include_archived":\#(includeArchived),"next_cursor":null,"has_more":false}"#))
     }
     public func events(sessionId: SessionID, fromSequence: Int64?) async throws -> RepositorySnapshot<SessionEventForwardPage> {
-        snapshot(Self.decode(SessionEventForwardPage.self, #"{"events":[]}"#))
+        if let seq = fromSequence, seq < 0 { throw AuthError.invalidResponse }   // §5: reject negative BEFORE returning
+        return snapshot(Self.decode(SessionEventForwardPage.self, #"{"events":[]}"#))
     }
     public func eventsBefore(sessionId: SessionID, beforeSequence: Int64) async throws -> RepositorySnapshot<SessionEventBeforePage> {
-        snapshot(Self.decode(SessionEventBeforePage.self,
+        guard beforeSequence >= 0 else { throw AuthError.invalidResponse }       // §5: reject negative BEFORE returning
+        return snapshot(Self.decode(SessionEventBeforePage.self,
             #"{"events":[],"count":0,"next_before_sequence":null,"has_more":false,"partial":false}"#))
     }
     public func actions(sessionId: SessionID) async throws -> RepositorySnapshot<SessionActionPage> {
