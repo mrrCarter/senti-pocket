@@ -14,13 +14,11 @@ let package = Package(
         .package(path: "../PocketContracts")
     ],
     targets: [
+        // Test target is added in step 2/3 alongside the fixture impl + KAVs (incl. the separate
+        // non-@testable negative-construction consumer target). Step 1 is the frozen interface only.
         .target(
             name: "PocketSessionClient",
             dependencies: [.product(name: "PocketContracts", package: "PocketContracts")]
-        ),
-        .testTarget(
-            name: "PocketSessionClientTests",
-            dependencies: ["PocketSessionClient"]
         )
     ]
 )
