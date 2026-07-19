@@ -40,13 +40,23 @@ actor CredentialBroker {
     /// only if broker state is UNCHANGED since it was issued — so a sign-in whose token-exchange straddled a
     /// sign-out or a newer sign-in cannot clobber that later state (P1-C).
     struct SignInAttempt: Sendable { fileprivate let base: UInt64 }
-    func beginSignIn() -> SignInAttempt { SignInAttempt(base: currentGeneration) }
+    func beginSignIn() throws -> SignInAttempt {
+        guard !tombstone else { throw AuthError.stateMismatch }   // no sign-in while a sign-out wipe is in flight
+        return SignInAttempt(base: currentGeneration)
+    }
 
     /// Atomic, GUARDED commit of {credential + subject namespace} at a NEW generation (§4a). Succeeds ONLY if no
     /// sign-out (tombstone) and no newer generation intervened since `attempt` was issued; otherwise the stale
     /// attempt is rejected (`.stateMismatch`) and the current state — e.g. a completed sign-out — stands.
     func commit(credential: String, subjectId: String, expiresAt: Date, attempt: SignInAttempt) throws {
         guard !tombstone, attempt.base == currentGeneration else { throw AuthError.stateMismatch }
+        // Input validation BEFORE any authority write (snapshot `now` once): reject a whitespace-only or
+        // header-injecting (CR/LF) credential/subject, and a credential already within the 60s skew of expiry.
+        let now = Date()
+        guard !credential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !subjectId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !credential.contains(where: { $0 == "\r" || $0 == "\n" }),
+              expiresAt.timeIntervalSince(now) > skew else { throw AuthError.invalidResponse }
         currentGeneration &+= 1
         authority = Authority(credential: credential, subjectId: subjectId,
                               generation: currentGeneration, expiresAt: expiresAt)
@@ -56,15 +66,25 @@ actor CredentialBroker {
     /// deletion — so any in-flight request under the old generation compares unequal at classification and
     /// returns no Data during the wipe window. (Keychain/filesystem deletion + `.wipePending` are the
     /// repository/keystore's concern; the broker's job is to make the credential immediately unusable.)
-    func beginSignOutTombstone() {
+    /// A sign-out capability owning the post-increment generation. `completeSignOut` accepts it only if that same
+    /// generation is still current — so a stale sign-out's completion can't clear a NEWER sign-out's tombstone.
+    struct SignOutAttempt: Sendable { fileprivate let base: UInt64 }
+
+    func beginSignOutTombstone() -> SignOutAttempt {
         tombstone = true
         currentGeneration &+= 1
         authority = nil
+        return SignOutAttempt(base: currentGeneration)
     }
 
-    /// Called after BOTH Keychain + filesystem deletions succeed: clears the tombstone to a clean signed-out
-    /// state so a fresh sign-in (new attempt) can proceed. Until this, the tombstone rejects any commit.
-    func completeSignOut() { tombstone = false }
+    /// Called after BOTH Keychain + filesystem deletions succeed. Clears the tombstone to a clean signed-out state
+    /// ONLY if still-current (no newer sign-out advanced the generation); otherwise throws `.stateMismatch` and
+    /// LEAVES the tombstone (a newer sign-out still governs). Until cleared, the tombstone rejects any commit and
+    /// any beginSignIn.
+    func completeSignOut(attempt: SignOutAttempt) throws {
+        guard tombstone, attempt.base == currentGeneration else { throw AuthError.stateMismatch }
+        tombstone = false
+    }
 
     // MARK: - perform (§4c: generation compare BEFORE any status/body observation)
 
