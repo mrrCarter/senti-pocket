@@ -47,6 +47,6 @@
     { "id": "ev_2", "sessionId": "954233b7-1822-42bc-9cfe-1eb95eb0357a", "sequence": 230160, "agentId": "claude-warden", "snippet": "entryPoint predicate is now exact-equality; positive-accept fixture present", "ts": "2026-07-18T10:36:34Z" }
   ],
   "createdAt": "2026-07-18T10:40:00Z",
-  "signature": "FIXTURE_UNSIGNED_v0.1_replace_with_gateway_ed25519_signature",
-  "signingKeyId": "pocket-gateway-fixture-key"
+  "signature": "ZdyelUEuYxRg0SpGaefRj8Qq2lK_r_SlDex5b4TqWZH1M_Yi2KUh5cT_tyiaHDM2HcoYjPZwgZIhKO5BmF-YBg",
+  "signingKeyId": "pocket-demo-app-fixture"
 }

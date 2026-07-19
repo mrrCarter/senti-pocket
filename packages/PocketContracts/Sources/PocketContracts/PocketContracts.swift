@@ -258,10 +258,11 @@ public enum PocketDemoGatewayKey {
 /// The FIXED, NON-INJECTABLE trust store: `signingKeyId -> trusted base64url ed25519 public key`. A file-private
 /// constant — there is NO public initializer, NO caller-supplied anchor, and no way for any lane (or an attacker) to
 /// add a key at runtime. `PocketBundle.verifiesSignature()` resolves the pinned key from `signingKeyId` HERE and
-/// nowhere else, so bundle verification can only ever trust keys THIS code pins. Phase A pins the demo key alone;
+/// nowhere else, so bundle verification can only ever trust keys THIS code pins. Phase A pins only reviewed demo keys;
 /// production adds real gateway keys to this literal (in code, reviewed), never via a caller-provided value.
 private let pocketTrustedGatewayKeys: [String: String] = [
-    PocketDemoGatewayKey.signingKeyId: PocketDemoGatewayKey.publicKeyBase64url
+    PocketDemoGatewayKey.signingKeyId: PocketDemoGatewayKey.publicKeyBase64url,
+    "pocket-demo-app-fixture": "SehNmI_dP9XFonEUXzmoDA7B0wCAss_JbVbbM4L0Y94"
 ]
 
 // MARK: - Semantic validity (FIX3: crypto-valid != content-valid)
