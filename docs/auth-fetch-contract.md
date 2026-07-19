@@ -1,8 +1,8 @@
-# Pocket Auth + Session-Fetch Security Contract (V8)
+# Pocket Auth + Session-Fetch Security Contract (V9)
 
 **Owner:** claude-pocket-relay · **Status:** DESIGN — precise-markdown (warden A/B=B). Awaiting fresh exact finder keys (Echo + Pulse) then warden ratification. **No implementation logic; compile-proof + compile-negative + N-vs-N+1 KAVs enforced at the IMPLEMENTATION code-gate.**
 **Base:** atlas/pocket-contracts-v0.1 `6f019594` (FF-ready). **Scope:** client-side auth + session-READ transport. Consumes merged wire DTOs (`SessionWire.swift`, **unchanged**). Does **not** import/touch `VerifiedBundle`/signed-briefing (PocketCall).
-Folds warden R1–R6', consolidated V6 P1-1..P2-5 + Pulse guards, and both full A-E verdicts + V7 residuals a–g. Server-P1 ratified `63446896`.
+Folds warden R1–R6', consolidated V6 P1-1..P2-5 + Pulse guards, both full A-E verdicts + V7 a–g, and V8 residuals 1–5 (401 suppresses subject cache per warden R4', structured `wipeFailed`, exact query limits, `.unauthorized` removed, decode-no-cache). Server-P1 ratified `63446896`.
 
 ## 1. Deployed contract (live-verified; read-only ECS/AS evidence)
 Provenance distinct: **deployed prod `3ca7640`**; **origin/main `91a2c3fa`** is **+1 non-serializer commit ahead**.
@@ -21,7 +21,7 @@ Provenance distinct: **deployed prod `3ca7640`**; **origin/main `91a2c3fa`** is 
 - **SessionID grammar (frozen; NOT assumed UUID):** `SessionID` wraps a token matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (covers observed UUID `6cf7e861-…` and short-hex `954233b7`), always a SINGLE path segment. Its initializer **throws `AuthError.invalidResponse`** on any violation (empty / `/` / `..` / control / space / `%`), before any broker execution.
 
 ## 3. Security invariants (ratified redlines)
-R1 route-local server authorization is the ONLY access truth; **401 and 403 both fail closed** (§4b), client caches no decision. R2 no confused deputy — caller-credential only; **no credential-bearing URLRequest and no HTTP status/response are ever a public or internal return value** (§4). R3' single broker actor owns credential + execution + classification. R4' no refresh; auth never awaits UI from a fetch path. R5 spine isolation (no PocketCall/VerifiedBundle; sessions content never crypto-verified/green). R6' local sign-out only after Keychain + cache wipe both succeed (tombstone-gated, §4b); `WhenUnlockedThisDeviceOnly`; credential never in DTO/error/log/crash/preview/app-switcher/analytics.
+R1 route-local server authorization is the ONLY access truth; **401 and 403 both fail closed** (§4b) — a server 401 (indistinguishable expiry/invalid/revoked; the deployed AS has NO revocation endpoint, so a 401 is the only invalidation signal) SUPPRESSES the subject cache and forces re-auth (R4'); client caches no decision. R2 no confused deputy — caller-credential only; **no credential-bearing URLRequest and no HTTP status/response are ever a public or internal return value** (§4). R3' single broker actor owns credential + execution + classification. R4' no refresh; auth never awaits UI from a fetch path. R5 spine isolation (no PocketCall/VerifiedBundle; sessions content never crypto-verified/green). R6' local sign-out only after Keychain + cache wipe both succeed (tombstone-gated, §4b); `WhenUnlockedThisDeviceOnly`; credential never in DTO/error/log/crash/preview/app-switcher/analytics.
 
 ## 4. Precise type surface (DESIGN — exact signatures, no two-way ambiguity; no bodies)
 No `AuthorizedRequest`, no credential-bearing `URLRequest`, and no `HTTPURLResponse`/status ever appears in the public OR internal return surface. The broker owns validation→attachment→execution→status-classification→typed-error mapping end-to-end; it returns only `Data` on success.
@@ -31,11 +31,12 @@ public struct SessionID: Sendable, Equatable { public init(_ raw: String) throws
 public enum AuthState: Sendable, Equatable { case signedOut, authenticating, signedIn(expiresAt: Date), reauthenticationRequired, wipePending, error(AuthError) }
 public enum AuthError: Error, Sendable, Equatable {
     case userCancelled, stateMismatch, exchangeFailed, subjectResolutionFailed
-    case reauthenticationRequired, network, keychain, cacheWipeFailed, invalidResponse   // keychain = Keychain-delete half; cacheWipeFailed = filesystem-delete half
+    case reauthenticationRequired, network, keychain, invalidResponse       // keychain = non-wipe Keychain op failure
+    case wipeFailed(keychain: Bool, cache: Bool)                            // sign-out wipe: exact per-half flags (both true ⇒ both deletions failed)
 }
 public enum TransportError: Error, Sendable, Equatable {
-    case unauthorized, accessDenied, decoding, network, offlineNoCache                    // offlineNoCache distinct from network
-    case server(status: Int, code: String?, requestId: String?)
+    case accessDenied, decoding, network, offlineNoCache                                  // offlineNoCache distinct from network; NO .unauthorized (401 ⇒ AuthError.reauthenticationRequired)
+    case server(status: Int, code: String?, requestId: String?)                          // a NORMALIZED status Int is permitted in errors; raw HTTPURLResponse/headers/token FORBIDDEN
 }
 public enum Source: Sendable, Equatable { case network(at: Date), cached(at: Date), fixture }
 public enum AuthStatus: Sendable, Equatable { case live, authExpired, offline }
@@ -57,8 +58,8 @@ enum SessionRequestSpec: Sendable {
     case checkpoints(sessionId: SessionID)
 }
 // INTERNAL, not public. Maps each case → fixed HTTPS origin/method/path/query (§5), attaches credential, executes,
-// classifies status PRIVATELY (2xx→Data; 401→invalidate generation then throw .reauthenticationRequired;
-// 403→TransportError.accessDenied; other→TransportError.server), and returns ONLY Data. Credential + generation are
+// classifies status PRIVATELY (2xx→Data; 401→invalidate generation + suppress subject cache then throw
+// .reauthenticationRequired; 403→TransportError.accessDenied; other→TransportError.server), returns ONLY Data. Credential + generation are
 // private actor state; neither they nor any HTTPURLResponse ever leave the actor.
 actor CredentialBroker {
     func perform(_ spec: SessionRequestSpec) async throws -> Data     // throws AuthError.reauthenticationRequired when no unexpired credential; NEVER awaits UI; no replay
@@ -103,24 +104,24 @@ Credential used for NETWORK only while unexpired minus **60s skew**; at/near/aft
 | cached ≤300s, auth valid | `Snapshot(.cached, .live, ≤.partial)` |
 | cached >300s (stale) + network failure | `Snapshot(.cached, .offline, .partial("stale"))` |
 | fresh 2xx but DECODE fails, cache present | `Snapshot(.cached, .live, .partial("decode-fallback"))` — network reached + auth live, so NOT offline |
-| client-detected auth expired (± offline), cache present | `Snapshot(.cached, .authExpired, .partial("expired"))` |
-| **401** on fetch, cache present | broker invalidates generation → `Snapshot(.cached, .authExpired, .partial("reauth-required"))` — cache NOT suppressed (401 = auth-expiry, content was authorized when cached) |
-| **401** on fetch, no cache | THROW `AuthError.reauthenticationRequired` |
+| client-detected auth expired PRE-network, cache present | `Snapshot(.cached, .authExpired, .partial("expired"))` — benign local expiry (no server rejection); cache readable |
+| **401** on fetch (server; indistinguishable expiry/invalid/revoked) | broker invalidates generation + SUPPRESSES subject cache → THROW `AuthError.reauthenticationRequired` — cache NOT served until successful reauth (R4' fail-closed) |
 | **403** on target | THROW `TransportError.accessDenied` — suppress+don't-poison target cache, render NO cached protected content (403 = authz-denied) |
+| fresh 2xx but DECODE fails, NO cache | THROW `TransportError.decoding` |
 | no cache + offline | THROW `TransportError.offlineNoCache` |
-| no cache + client-expired | THROW `AuthError.reauthenticationRequired` |
+| no cache + client-expired PRE-network | THROW `AuthError.reauthenticationRequired` |
 
-**Wipe:** `signOut` writes a `tombstone` FIRST → immediately blocks BOTH cache reads AND any broker credential/network use → deletes Keychain + filesystem. `signedOut` is impossible until BOTH complete. Per-half failure: Keychain-delete fail → throws `AuthError.keychain`; filesystem-delete fail → throws `AuthError.cacheWipeFailed`; either/both → AuthState stays `.wipePending` (credential unusable, reads disabled), retried before any later `perform`/`signIn`; neither half is ever readable. Clock: monotonic where available; wall-clock skew conservative (expire early, never late).
+**Wipe:** `signOut` writes a `tombstone` FIRST → immediately blocks BOTH cache reads AND any broker credential/network use → deletes Keychain + filesystem. `signedOut` is impossible until BOTH complete. Per-half failure: `signOut` throws exactly one `AuthError.wipeFailed(keychain:, cache:)` with the failed halves flagged (both true ⇒ both deletions failed); AuthState stays `.wipePending` (credential unusable, reads disabled) until BOTH deletions succeed, retried before any later `perform`/`signIn`; neither half is ever readable. Clock: monotonic where available; wall-clock skew conservative (expire early, never late).
 
 ## 5. KAV matrix (exact query freeze with server-proven limits; compile-proof KAVs deferred to impl gate)
-**Query freeze (literal names + exact fixed values OR explicit omission — server limits per Echo #240xxx):**
+**Query freeze (literal names + exact fixed values OR explicit omission — server-route-verified limits):**
 - `listSessions` → `include_archived=<bool>`, `cursor=<opaque next_cursor>` (OMIT when nil), `limit=50`. Omit `after`/`display_only`.
 - `events` → `from_sequence=<Int64 ≥0>` (OMIT when nil), `limit=50`. OMIT the opaque `after` cursor entirely (this client pages by sequence).
 - `eventsBefore` → `before_sequence=<Int64 ≥0>`, `limit=50`.
 - `actions` → `limit=200`. No filters/projection override.
 - `checkpoints` → `limit=100`. No `checkpointId` (list only).
 Negative `fromSequence`/`beforeSequence` rejected pre-execution (`AuthError.invalidResponse`). **Completeness:** forward events, actions, AND checkpoints are `.unknown` absent wire-proven exhaustion (default-capped, no `hasMore`); only a page whose wire proves exhaustion may be `.complete`.
-**Client (fixture-closable now):** single sign-in UI flight; state-mismatch/cancel fail closed; 401 invalidates generation + zero-replay + late gen N cannot commit after sign-out/N+1; 401+cache→authExpired cached (not suppressed), 401+no-cache→reauthenticationRequired; 403→accessDenied, no-retry, cache suppressed, renders nothing; each freshness row returns/throws EXACTLY its cell; decode-fallback is `.live` not `.offline`; offline-no-cache→offlineNoCache, expired-no-cache→reauthenticationRequired, expired+offline→expired; cached fallback never `.complete`; token/status/header absent from DTO/error/log/crash/preview; broker returns only Data (no HTTPURLResponse escapes); fixture cannot mint network/current/write/green; no PocketCall import; provisional-credential never persisted before mcp-subject; stale-subject cannot commit; generation-gated cache r/w; freshness boundaries (±60s skew, 300s max-age); wipe (tombstone blocks reads+network immediately; Keychain-fail→keychain, fs-fail→cacheWipeFailed, either→`.wipePending`, nothing readable, retry before perform/signIn); SessionID init throws on grammar violation pre-execution; negative sequence rejected; no caller can name a URL/method/header (only SessionRequestSpec); usage-scope (read-only→403; read+usage→200 required `totalCostUsd`; missing key→decode-fail).
+**Client (fixture-closable now):** single sign-in UI flight; state-mismatch/cancel fail closed; 401 invalidates generation + SUPPRESSES subject cache + throws reauthenticationRequired (never serves cache — may be revoked/invalid; AS has no revocation endpoint) + zero-replay + late gen N cannot commit after sign-out/N+1; ONLY client-detected pre-network expiry serves `.authExpired` cache; 403→accessDenied, no-retry, cache suppressed, renders nothing; fresh-2xx-decode-fail WITH cache→`.partial("decode-fallback")` `.live`, with NO cache→`TransportError.decoding`; each freshness row returns/throws EXACTLY its cell; offline-no-cache→offlineNoCache, expired-no-cache→reauthenticationRequired, expired+offline→expired; cached fallback never `.complete`; raw response/headers/token absent from DTO/error/log/crash/preview while a NORMALIZED status Int in `.server(status:)` IS permitted; broker returns only Data (no HTTPURLResponse escapes); fixture cannot mint network/current/write/green; no PocketCall import; provisional-credential never persisted before mcp-subject; stale-subject cannot commit; generation-gated cache r/w; freshness boundaries (±60s skew, 300s max-age); wipe (tombstone blocks reads+network immediately; `AuthError.wipeFailed(keychain:,cache:)` exact flags, `.wipePending` until both clear, nothing readable, retry before perform/signIn); SessionID init throws on grammar violation pre-execution; negative sequence rejected; no caller can name a URL/method/header (only SessionRequestSpec); usage-scope (read-only→403; read+usage→200 required `totalCostUsd`; missing key→decode-fail).
 **Deferred to IMPL code-gate (need real code):** compile-NEGATIVE (no external/same-module construction of a credential-bearing request; broker exposes no internal/fileprivate factory and no Data-less status) + N-vs-N+1 live-response binding + full compile/green/minimal-diff/Pulse review.
 **Live/server (need server-lane + probe + registration):** wrong/absent user+MCP issuer/audience rejected; scope/`scp` confusion terminal no-fallback; read-scoped cannot write (403); route-local A-cannot-read-B (403); required `iat`/`sub`, MCP nonempty `jti`; mcp-subject stable across reauth/two tokens + both cache headers + subject-only body; web-audience token rejected at mcp-subject.
 
