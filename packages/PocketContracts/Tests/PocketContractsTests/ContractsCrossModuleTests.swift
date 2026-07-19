@@ -301,19 +301,24 @@ final class ContractsCrossModuleTests: XCTestCase {
         d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
     }
     /// The signed pocket.bundle.v1 KAV loaded from the bundled test RESOURCE (P1.5) — no duplicated literals.
-    private func loadKAV() throws -> (canonical: String, signature: String, pubkey: String) {
-        let url = try XCTUnwrap(Bundle.module.url(forResource: "bundle_kav", withExtension: "json", subdirectory: "Fixtures"))
+    private func loadKAV(_ resource: String = "bundle_kav") throws -> (canonical: String, canonicalSha256Hex: String, signature: String, pubkey: String) {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: resource, withExtension: "json", subdirectory: "Fixtures"))
         let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
         let kav = obj["kav"] as! [String: Any]
         let demoKey = obj["demoKey"] as! [String: Any]
-        return (kav["canonicalBytesUtf8"] as! String, kav["signatureBase64url"] as! String, demoKey["publicKeyBase64url"] as! String)
+        return (
+            kav["canonicalBytesUtf8"] as! String,
+            kav["canonicalSha256Hex"] as! String,
+            kav["signatureBase64url"] as! String,
+            demoKey["publicKeyBase64url"] as! String
+        )
     }
     /// The canonical, semantically-valid demo bundle (matches the KAV fixture). Tamper params flip a signed field.
-    private func demoBundle(signature: String, headline: String = "demo briefing", snippet: String = "snippet", signingKeyId: String = "pocket-demo-phase-a") -> PocketBundle {
+    private func demoBundle(signature: String, headline: String = "demo briefing", snippet: String = "snippet", signingKeyId: String = "pocket-demo-phase-a", sequenceStart: Int = 100) -> PocketBundle {
         let ev = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: snippet, ts: ts)
         let ag = AgentSummary(agentId: "agent-a", summary: "did the thing", claims: [Claim(id: "c1", text: "a fact", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev])
         let sum = CheckpointSummary(checkpointId: "cp_demo_1", headline: headline, summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
-        return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: 100, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
+        return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: sequenceStart, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
     }
 
     /// FIX2 (P1.1 + P1.5) — load the committed KAV RESOURCE: the pinned pubkey equals the fixture's, the canonical bytes
@@ -326,6 +331,22 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertTrue(b.isSemanticallyValid())
         XCTAssertTrue(b.hasTrustedSigningKeyId())
         XCTAssertTrue(b.verifiesSignature())                                         // committed signature verifies under the pinned key
+    }
+
+    /// A valid signature cannot bypass semantic validation: the committed negative KAV has an inverted sequence range.
+    func testBundleRejectsCryptoValidButSemanticallyInvalidKAV() throws {
+        let kav = try loadKAV("bundle_kav_negative")
+        let b = demoBundle(signature: kav.signature, sequenceStart: 300)
+        let canonical = b.canonicalBundlePayload()
+
+        XCTAssertEqual(PocketDemoGatewayKey.publicKeyBase64url, kav.pubkey)
+        XCTAssertEqual(canonical, kav.canonical)
+        XCTAssertEqual(Data(canonical.utf8).count, 354)
+        XCTAssertEqual(SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined(), kav.canonicalSha256Hex)
+        XCTAssertEqual(kav.canonicalSha256Hex, "f6365cf012001d4e9eda366937178e14390aebfb0da29116539cae44e6cbbc86")
+        XCTAssertTrue(b.verifiesSignature())
+        XCTAssertTrue(b.semanticIssues().contains(.invertedSequenceRange))
+        XCTAssertFalse(b.isSemanticallyValid())
     }
 
     /// FIX1 — no committed private key is forgeable: an UNTRUSTED signingKeyId is rejected pre-crypto; a TRUSTED id signed
