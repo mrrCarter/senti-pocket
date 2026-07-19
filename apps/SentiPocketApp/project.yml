@@ -16,8 +16,6 @@ packages:
     path: ../../packages/PocketBriefing
   PocketUI:
     path: ../../packages/PocketUI
-  PocketInference:
-    path: ../../packages/PocketInference
   PocketVoice:
     path: ../../packages/PocketVoice
   # Relay's PocketSyncClient/PocketActionsClient are Phase-B (real gateway); not wired for the Phase-A fixture build.
@@ -34,7 +32,6 @@ targets:
       - package: PocketCall
       - package: PocketBriefing
       - package: PocketUI
-      - package: PocketInference
       - package: PocketVoice
     info:
       path: Sources/Info.plist
