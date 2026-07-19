@@ -1,8 +1,8 @@
-# Pocket Auth + Session-Fetch Security Contract (V9)
+# Pocket Auth + Session-Fetch Security Contract (V10)
 
 **Owner:** claude-pocket-relay · **Status:** DESIGN — precise-markdown (warden A/B=B). Awaiting fresh exact finder keys (Echo + Pulse) then warden ratification. **No implementation logic; compile-proof + compile-negative + N-vs-N+1 KAVs enforced at the IMPLEMENTATION code-gate.**
 **Base:** atlas/pocket-contracts-v0.1 `6f019594` (FF-ready). **Scope:** client-side auth + session-READ transport. Consumes merged wire DTOs (`SessionWire.swift`, **unchanged**). Does **not** import/touch `VerifiedBundle`/signed-briefing (PocketCall).
-Folds warden R1–R6', consolidated V6 P1-1..P2-5 + Pulse guards, both full A-E verdicts + V7 a–g, and V8 residuals 1–5 (401 suppresses subject cache per warden R4', structured `wipeFailed`, exact query limits, `.unauthorized` removed, decode-no-cache). Server-P1 ratified `63446896`.
+Folds warden R1–R6', consolidated V6 P1-1..P2-5 + Pulse guards, both full A-E verdicts + V7 a–g, V8 residuals 1–5 (401 suppresses subject cache per warden R4', structured `wipeFailed`, exact query limits, `.unauthorized` removed, decode-no-cache), and V9 consistency fixes (stale SessionRepository 401 comment, normalized-status wording at every surface, literal query omissions, exact `/api/v1/auth/mcp-subject`). Server-P1 ratified `63446896`.
 
 ## 1. Deployed contract (live-verified; read-only ECS/AS evidence)
 Provenance distinct: **deployed prod `3ca7640`**; **origin/main `91a2c3fa`** is **+1 non-serializer commit ahead**.
@@ -21,10 +21,10 @@ Provenance distinct: **deployed prod `3ca7640`**; **origin/main `91a2c3fa`** is 
 - **SessionID grammar (frozen; NOT assumed UUID):** `SessionID` wraps a token matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (covers observed UUID `6cf7e861-…` and short-hex `954233b7`), always a SINGLE path segment. Its initializer **throws `AuthError.invalidResponse`** on any violation (empty / `/` / `..` / control / space / `%`), before any broker execution.
 
 ## 3. Security invariants (ratified redlines)
-R1 route-local server authorization is the ONLY access truth; **401 and 403 both fail closed** (§4b) — a server 401 (indistinguishable expiry/invalid/revoked; the deployed AS has NO revocation endpoint, so a 401 is the only invalidation signal) SUPPRESSES the subject cache and forces re-auth (R4'); client caches no decision. R2 no confused deputy — caller-credential only; **no credential-bearing URLRequest and no HTTP status/response are ever a public or internal return value** (§4). R3' single broker actor owns credential + execution + classification. R4' no refresh; auth never awaits UI from a fetch path. R5 spine isolation (no PocketCall/VerifiedBundle; sessions content never crypto-verified/green). R6' local sign-out only after Keychain + cache wipe both succeed (tombstone-gated, §4b); `WhenUnlockedThisDeviceOnly`; credential never in DTO/error/log/crash/preview/app-switcher/analytics.
+R1 route-local server authorization is the ONLY access truth; **401 and 403 both fail closed** (§4b) — a server 401 (indistinguishable expiry/invalid/revoked; the deployed AS has NO revocation endpoint, so a 401 is the only invalidation signal) SUPPRESSES the subject cache and forces re-auth (R4'); client caches no decision. R2 no confused deputy — caller-credential only; **no credential-bearing URLRequest and no raw HTTP response/headers/status object are ever a return value** — a NORMALIZED status Int in `.server(status:)` is the only status form permitted (§4). R3' single broker actor owns credential + execution + classification. R4' no refresh; auth never awaits UI from a fetch path. R5 spine isolation (no PocketCall/VerifiedBundle; sessions content never crypto-verified/green). R6' local sign-out only after Keychain + cache wipe both succeed (tombstone-gated, §4b); `WhenUnlockedThisDeviceOnly`; credential never in DTO/error/log/crash/preview/app-switcher/analytics.
 
 ## 4. Precise type surface (DESIGN — exact signatures, no two-way ambiguity; no bodies)
-No `AuthorizedRequest`, no credential-bearing `URLRequest`, and no `HTTPURLResponse`/status ever appears in the public OR internal return surface. The broker owns validation→attachment→execution→status-classification→typed-error mapping end-to-end; it returns only `Data` on success.
+No `AuthorizedRequest`, no credential-bearing `URLRequest`, and no raw `HTTPURLResponse`/headers/status object ever appears in the public OR internal return surface (a NORMALIZED status Int in `.server(status:)` excepted). The broker owns validation→attachment→execution→status-classification→typed-error mapping end-to-end; it returns only `Data` on success.
 ```swift
 public struct SessionID: Sendable, Equatable { public init(_ raw: String) throws /* throws AuthError.invalidResponse on §2 grammar violation */ }
 
@@ -81,7 +81,7 @@ public protocol SessionTransport: Sendable {
     func checkpoints(sessionId: SessionID) async throws -> SessionCheckpointListPage
 }
 // ONE contract: async throws -> Snapshot with exact thrown cases (§4b). Subject-partitioned; owns cache; owns
-// 401→invalidate+authExpired-fallback and 403→suppress-and-render-nothing. Snapshot only when a page (network|cached) exists.
+// 401→invalidate+suppress-subject-cache+throw-reauthenticationRequired and 403→suppress-target-cache+throw-accessDenied. Snapshot only when a page (network|cached) exists.
 public protocol SessionRepository: Sendable {
     func sessions(includeArchived: Bool, cursor: String?) async throws -> RepositorySnapshot<SessionListPage>
     func events(sessionId: SessionID, fromSequence: Int64?) async throws -> RepositorySnapshot<SessionEventForwardPage>
@@ -93,7 +93,7 @@ public protocol SessionRepository: Sendable {
 - **Subject namespace:** unforgeable capability minted only after `mcp-subject` succeeds; on-disk cache key is a **deterministic keyed digest** of `subjectId` (raw `subjectId` NEVER in a path); Keychain-held; complete file protection + no iCloud backup; reads AND writes generation-gated. Client never security-trusts parsed JWT `iss`/`aud`/`sub`. Non-enumerating: forbidden/notMember/notFound → single `accessDenied`.
 
 ## 4a. signIn sequence (atomic)
-`@MainActor signIn()` → single `ASWebAuthenticationSession` (PKCE + `state`) → exact endpoint/callback/`state` match → **ephemeral** token exchange → `GET /auth/mcp-subject` → current-generation check → **ATOMIC commit {credential + subject namespace}** → `.signedIn`. Any failure: persist **neither**, wipe **both**; a stale generation N can never commit after sign-out or after N+1. Concurrent fetches during this throw `.reauthenticationRequired`.
+`@MainActor signIn()` → single `ASWebAuthenticationSession` (PKCE + `state`) → exact endpoint/callback/`state` match → **ephemeral** token exchange → `GET /api/v1/auth/mcp-subject` → current-generation check → **ATOMIC commit {credential + subject namespace}** → `.signedIn`. Any failure: persist **neither**, wipe **both**; a stale generation N can never commit after sign-out or after N+1. Concurrent fetches during this throw `.reauthenticationRequired`.
 
 ## 4b. Freshness + wipe (exact; one `async throws -> Snapshot` contract)
 Credential used for NETWORK only while unexpired minus **60s skew**; at/near/after expiry NEVER used for network. `max-age` = **300s**. Any cached fallback sets completeness away from `.complete`. Precedence when client-side conditions overlap: **auth-expired outranks offline**. A 401/403 is a server RESPONSE (implies online), so it never overlaps an offline row.
@@ -117,9 +117,9 @@ Credential used for NETWORK only while unexpired minus **60s skew**; at/near/aft
 **Query freeze (literal names + exact fixed values OR explicit omission — server-route-verified limits):**
 - `listSessions` → `include_archived=<bool>`, `cursor=<opaque next_cursor>` (OMIT when nil), `limit=50`. Omit `after`/`display_only`.
 - `events` → `from_sequence=<Int64 ≥0>` (OMIT when nil), `limit=50`. OMIT the opaque `after` cursor entirely (this client pages by sequence).
-- `eventsBefore` → `before_sequence=<Int64 ≥0>`, `limit=50`.
-- `actions` → `limit=200`. No filters/projection override.
-- `checkpoints` → `limit=100`. No `checkpointId` (list only).
+- `eventsBefore` → `before_sequence=<Int64 ≥0>`, `limit=50`. OMIT `display_only`/`displayOnly`.
+- `actions` → `limit=200`. OMIT `targetSequenceId`/`targetActionId` filters and any projection override.
+- `checkpoints` → `limit=100`. OMIT `checkpointId` (list only).
 Negative `fromSequence`/`beforeSequence` rejected pre-execution (`AuthError.invalidResponse`). **Completeness:** forward events, actions, AND checkpoints are `.unknown` absent wire-proven exhaustion (default-capped, no `hasMore`); only a page whose wire proves exhaustion may be `.complete`.
 **Client (fixture-closable now):** single sign-in UI flight; state-mismatch/cancel fail closed; 401 invalidates generation + SUPPRESSES subject cache + throws reauthenticationRequired (never serves cache — may be revoked/invalid; AS has no revocation endpoint) + zero-replay + late gen N cannot commit after sign-out/N+1; ONLY client-detected pre-network expiry serves `.authExpired` cache; 403→accessDenied, no-retry, cache suppressed, renders nothing; fresh-2xx-decode-fail WITH cache→`.partial("decode-fallback")` `.live`, with NO cache→`TransportError.decoding`; each freshness row returns/throws EXACTLY its cell; offline-no-cache→offlineNoCache, expired-no-cache→reauthenticationRequired, expired+offline→expired; cached fallback never `.complete`; raw response/headers/token absent from DTO/error/log/crash/preview while a NORMALIZED status Int in `.server(status:)` IS permitted; broker returns only Data (no HTTPURLResponse escapes); fixture cannot mint network/current/write/green; no PocketCall import; provisional-credential never persisted before mcp-subject; stale-subject cannot commit; generation-gated cache r/w; freshness boundaries (±60s skew, 300s max-age); wipe (tombstone blocks reads+network immediately; `AuthError.wipeFailed(keychain:,cache:)` exact flags, `.wipePending` until both clear, nothing readable, retry before perform/signIn); SessionID init throws on grammar violation pre-execution; negative sequence rejected; no caller can name a URL/method/header (only SessionRequestSpec); usage-scope (read-only→403; read+usage→200 required `totalCostUsd`; missing key→decode-fail).
 **Deferred to IMPL code-gate (need real code):** compile-NEGATIVE (no external/same-module construction of a credential-bearing request; broker exposes no internal/fileprivate factory and no Data-less status) + N-vs-N+1 live-response binding + full compile/green/minimal-diff/Pulse review.
