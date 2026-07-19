@@ -1,4 +1,28 @@
 // PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
+// v0.1.8++ (warden/bundle-kav-fix, P1 re-audit, round 5): bundle semantic caps are now the FROZEN PER-FIELD values
+//   mirroring the gateway (services/pocket-gateway SUMMARY_CAPS) + GroundedInferenceRequest (id 256 / evId 128 /
+//   str 512 / headline 4096 / summary+text 8192 / snippet 8000; perAgent 200 / evidence 256 / risks+blockers 100) so a
+//   gateway-signed bundle is never rejected; a total element+byte DoS budget fails fast; identity binding (unique
+//   agentIds, per-agent-scoped claim/nested-evidence dedup, citation-id dedup, per-agent-evidence bound to its agent,
+//   non-blank/trimmed ids) added. The wire SHAPES/fields stay additive at "0.1.8" (bound in
+//   canonicalBundlePayload — no field add/rename/remove). NOTE this is NOT purely additive at the API surface: the
+//   caller-supplied bundle-verify overloads (`verifiesSignature(gatewayPublicKeyBase64url:)` and the `trustAnchor:` forms)
+//   were REMOVED — a source-break for any external caller (here the only caller was internal PocketCall). That reduction
+//   is intentional (it closes the caller-key-injection bypass).
+//   FIX1 TRUST ANCHOR (non-injectable, non-forgeable): `PocketBundle.verifiesSignature()` takes NO key/anchor; it
+//     resolves the trusted ed25519 key INTERNALLY from `signingKeyId` against the FIXED, file-private
+//     `pocketTrustedGatewayKeys` store, REJECTS an unknown id, and verifies under the pinned key. No public trust-store
+//     initializer -> a caller cannot pin its own key. The demo key is now a REAL random keypair: only the PUBLIC key is
+//     committed; the private key was used once to sign the KAV and DISCARDED (the earlier public-seed-phrase design was
+//     publicly forgeable and is removed).
+//   FIX3 SEMANTIC VALIDITY (bounded ingress): `isSemanticallyValid()` rejects a bundle — EVEN A CORRECTLY-SIGNED ONE —
+//     with wrong version/schema, inverted OR negative sequence ranges, empty required fields, oversized strings/arrays,
+//     mismatched checkpoint/session ids, duplicate evidence/claim ids, foreign citations (resolved against TOP-LEVEL
+//     `bundle.evidence` ONLY — the set the UI consumes), per-agent evidence not byte-identical to top-level, uncited
+//     fact/inference, or unsane/sub-millisecond dates. Ingress rejects an UNTRUSTED signingKeyId (cheap
+//     `hasTrustedSigningKeyId()`) BEFORE the bounded scan.
+//   FIX2: a signed `pocket.bundle.v1` KAV wired as a test resource (Tests/.../Fixtures/bundle_kav.json), loaded by the
+//     test (no duplicated literals). `VerifiedBundle.verify(_:)` (PocketCall) requires trusted-id + semantic validity + the ed25519 pass.
 // v0.1.8+ (Pulse #231475 P0 / bundle-ingress): ADDITIVE, no wire/shape change -> NOT a version bump. Adds
 //   PocketBundle.canonicalBundlePayload() (`pocket.bundle.v1`, length+count-prefixed) + verifiesSignature();
 //   VerifiedBundle.verify now does REAL ed25519 over the pinned key (was fail-closed nil). The Phase-A fixture is
@@ -189,9 +213,11 @@ public extension PocketBundle {
     }
 
     #if canImport(CryptoKit)
-    /// True IFF `signature` is a valid ed25519 signature over `canonicalBundlePayload()` under the pinned key AND
-    /// the required fields are present + createdAt is sane. This is the ONLY path to a trusted bundle; fails closed.
-    func verifiesSignature(gatewayPublicKeyBase64url pk: String) -> Bool {
+    /// LOW-LEVEL ed25519 check: true IFF `signature` verifies over `canonicalBundlePayload()` under EXACTLY `pk`,
+    /// with required fields present + a sane createdAt. This is NOT a trust decision on its own — `pk` must already
+    /// be a PINNED trusted key. Private so no lane can accidentally verify under an arbitrary key; the trust gates
+    /// below are the only public paths.
+    private func verifiesSignatureRaw(underKeyBase64url pk: String) -> Bool {
         guard !checkpointId.isEmpty, !sessionId.isEmpty, !signingKeyId.isEmpty, !signature.isEmpty,
               ActionReceipt.safeEpochMillis(createdAt) != nil else { return false }
         guard let pkData = Data(base64URLEncoded: pk),
@@ -199,7 +225,198 @@ public extension PocketBundle {
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: pkData) else { return false }
         return key.isValidSignature(sigData, for: Data(canonicalBundlePayload().utf8))
     }
+
+    /// FIX1 (P1 re-audit) — the ONLY public bundle verify. Resolves the trusted key INTERNALLY from this bundle's
+    /// `signingKeyId` against the FIXED, file-private `pocketTrustedGatewayKeys` store, REJECTS an unknown id BEFORE any
+    /// crypto, then ed25519-verifies under the pinned key. There is NO caller-supplied key or anchor parameter, so an
+    /// attacker cannot pin its own key: the trusted key is chosen by code the attacker does not control — never by the
+    /// caller or by the (attacker-authored) bundle. A self-signed bundle either claims a trusted `signingKeyId` (and
+    /// then must verify under the REAL pinned key, which the attacker lacks) or an untrusted one (rejected pre-crypto).
+    func verifiesSignature() -> Bool {
+        guard let pinned = pocketTrustedGatewayKeys[signingKeyId] else { return false }
+        return verifiesSignatureRaw(underKeyBase64url: pinned)
+    }
     #endif
+}
+
+// MARK: - Trust anchor (FIX1: FIXED, non-injectable pinned bundle signing keys)
+
+/// PHASE-A DEMO signing identity — a REAL random ed25519 keypair for the offline demo, NEVER production. Only the
+/// PUBLIC key is committed here; the PRIVATE key was generated ONCE, used to sign the KAV fixture, and DISCARDED — it
+/// is NOT committed and NOT derivable from any committed value, so a forged bundle CANNOT be signed under this key.
+/// (The earlier design derived the private key from a PUBLIC seed phrase, which made it publicly forgeable — removed.)
+/// The real gateway uses a real, rotated key with its own `signingKeyId`, added to the FIXED trust store below the same
+/// way. Verify the committed signature under this public key: Tests/PocketContractsTests/Fixtures/bundle_kav.json.
+public enum PocketDemoGatewayKey {
+    /// The `signingKeyId` the DEMO gateway stamps on bundles.
+    public static let signingKeyId = "pocket-demo-phase-a"
+    /// PINNED base64url ed25519 PUBLIC key (public, not a secret). The matching private key is not committed anywhere.
+    /// (Re-generated once to also sign the negative KAV in the SAME ephemeral session, then discarded.)
+    public static let publicKeyBase64url = "tbiyPLuRcBXqYRHazuik4y5mVG_5B__8vO6ov48GhmE"
+}
+
+/// The FIXED, NON-INJECTABLE trust store: `signingKeyId -> trusted base64url ed25519 public key`. A file-private
+/// constant — there is NO public initializer, NO caller-supplied anchor, and no way for any lane (or an attacker) to
+/// add a key at runtime. `PocketBundle.verifiesSignature()` resolves the pinned key from `signingKeyId` HERE and
+/// nowhere else, so bundle verification can only ever trust keys THIS code pins. Phase A pins the demo key alone;
+/// production adds real gateway keys to this literal (in code, reviewed), never via a caller-provided value.
+private let pocketTrustedGatewayKeys: [String: String] = [
+    PocketDemoGatewayKey.signingKeyId: PocketDemoGatewayKey.publicKeyBase64url
+]
+
+// MARK: - Semantic validity (FIX3: crypto-valid != content-valid)
+
+/// Content-level rejection reasons — a bundle failing ANY of these must NEVER be narrated, even if its ed25519
+/// signature verifies under a trusted key (a trusted key signing malformed content still yields malformed content).
+public enum BundleSemanticIssue: String, Equatable, Sendable {
+    case wrongContractsVersion, wrongSummarySchema, invertedSequenceRange, checkpointIdMismatch
+    case evidenceSessionMismatch, evidenceSequenceOutOfRange, duplicateEvidenceId
+    case uncitedFactOrInference, foreignClaimCitation, unsaneDate, subMillisecondDate
+    // P1.3 bounded ingress + P1.2 per-agent cross-check:
+    case negativeSequence, emptyRequiredField, duplicateClaimId, oversizedField, perAgentEvidenceMismatch
+    case emptyEvidence   // a bundle must carry >= 1 top-level evidence item
+    // Round-5: total-work DoS budget + identity binding (mirrors the gateway's per-agent scoping).
+    case overBudget, duplicateAgentId, duplicateCitationId, perAgentEvidenceForeignAgent, malformedId
+}
+
+public extension PocketBundle {
+    /// The summary schema every Phase-A bundle must declare.
+    static var expectedSummarySchema: String { "checkpoint_summary_sections_v1" }
+    // FROZEN per-field caps (UTF-8 bytes) — MIRROR the gateway (services/pocket-gateway/src/bundle.mjs SUMMARY_CAPS)
+    // and GroundedInferenceRequest (PocketInference/InferenceTypes.swift) EXACTLY, so a bundle the gateway signs is
+    // NEVER rejected by the phone. The caps DIFFER per field (a single uniform cap wrongly rejected valid bundles).
+    static var capId: Int { 256 }        // checkpointId, sessionId, signingKeyId   (frozen checkpoint/session 1...256)
+    static var capEvId: Int { 128 }      // evidence.id, evidence.agentId, agent.agentId   (frozen 1...128)
+    static var capStr: Int { 512 }       // signature, summaryBaselineSchema, grade, each risk/blocker, claim.id
+    static var capHeadline: Int { 4096 } // summary.headline
+    static var capSummary: Int { 8192 }  // agent.summary, claim.text
+    static var capSnippet: Int { 8000 }  // evidence.snippet   (frozen ingress 1...8000)
+    static var capPerAgent: Int { 200 }  // summary.perAgent count
+    static var capEvidence: Int { 256 }  // top-level evidence count + claim.evidenceIds count
+    static var capRisks: Int { 100 }     // summary.risks count
+    static var capBlockers: Int { 100 }  // summary.blockers count
+    // Round-5 total-work DoS budget across the whole graph — per-array caps don't bound the PRODUCT (agents × claims ×
+    // evidence × string bytes). Both are comfortably above any real gateway bundle (gateway signs <= 512KB bodies).
+    static var maxTotalElements: Int { 5000 }
+    static var maxTotalBytes: Int { 2_000_000 }
+
+    /// P1.4 — cheap, no-crypto: is this bundle's `signingKeyId` one the phone pins? The ingress rejects an unknown id
+    /// with THIS before running the (bounded) semantic scan or any crypto.
+    func hasTrustedSigningKeyId() -> Bool { pocketTrustedGatewayKeys[signingKeyId] != nil }
+
+    /// All content-validity issues (deterministic order; empty == valid), independent of the signature. Numeric caps
+    /// and per-agent dedup scoping MIRROR the gateway's validateBundleIngress/validateBundleSemantics EXACTLY, so a
+    /// bundle the gateway signs is never rejected; the strict rules (positive/non-inverted range, non-empty evidence,
+    /// byte-identical per-agent evidence, citations resolve to top-level) still reject a signed-but-malformed bundle.
+    func semanticIssues() -> [BundleSemanticIssue] {
+        var issues: [BundleSemanticIssue] = []
+        func tooLong(_ s: String, _ cap: Int) -> Bool { s.utf8.count > cap }   // caps measured in UTF-8 BYTES
+        // An id must be non-blank AND already-trimmed — whitespace-only or untrimmed ids are invalid identities.
+        func malformed(_ id: String) -> Bool { let t = id.trimmingCharacters(in: .whitespacesAndNewlines); return t.isEmpty || t != id }
+
+        // Round-5 DoS: total element + total byte budget across the WHOLE graph, FAIL-FAST before the field scan and
+        // before signature canonicalization. (Per-array caps alone don't bound the product agents × claims × bytes.)
+        var totalElements = evidence.count + summary.perAgent.count + summary.risks.count + summary.blockers.count
+        var totalBytes = signature.utf8.count + checkpointId.utf8.count + sessionId.utf8.count + signingKeyId.utf8.count
+            + summary.headline.utf8.count + (summary.grade?.utf8.count ?? 0)
+        for r in summary.risks { totalBytes += r.utf8.count }
+        for bl in summary.blockers { totalBytes += bl.utf8.count }
+        for e in evidence { totalBytes += e.id.utf8.count + e.sessionId.utf8.count + e.agentId.utf8.count + e.snippet.utf8.count }
+        for agent in summary.perAgent {
+            totalElements += agent.evidence.count + agent.claims.count
+            totalBytes += agent.agentId.utf8.count + agent.summary.utf8.count
+            for e in agent.evidence { totalBytes += e.id.utf8.count + e.sessionId.utf8.count + e.agentId.utf8.count + e.snippet.utf8.count }
+            for c in agent.claims {
+                totalElements += c.evidenceIds.count
+                totalBytes += c.id.utf8.count + c.text.utf8.count
+                for cid in c.evidenceIds { totalBytes += cid.utf8.count }
+            }
+        }
+        if totalElements > PocketBundle.maxTotalElements || totalBytes > PocketBundle.maxTotalBytes { return [.overBudget] }
+
+        if contractsVersion != PocketContracts.version { issues.append(.wrongContractsVersion) }
+        if summary.summaryBaselineSchema != PocketBundle.expectedSummarySchema { issues.append(.wrongSummarySchema) }
+        if summary.checkpointId != checkpointId { issues.append(.checkpointIdMismatch) }
+
+        // Sequence range: strictly positive + non-inverted. Top-level evidence must be non-empty.
+        if sequenceStart > sequenceEnd { issues.append(.invertedSequenceRange) }
+        if sequenceStart <= 0 || sequenceEnd <= 0 { issues.append(.negativeSequence) }
+        if evidence.isEmpty { issues.append(.emptyEvidence) }
+
+        // Top-level scalar fields — per-field FROZEN caps; ids must be non-blank + trimmed.
+        if checkpointId.isEmpty || sessionId.isEmpty || signingKeyId.isEmpty { issues.append(.emptyRequiredField) }
+        if malformed(checkpointId) || malformed(sessionId) || malformed(signingKeyId) { issues.append(.malformedId) }
+        if tooLong(checkpointId, PocketBundle.capId) || tooLong(sessionId, PocketBundle.capId) || tooLong(signingKeyId, PocketBundle.capId)
+            || tooLong(signature, PocketBundle.capStr) || tooLong(summary.headline, PocketBundle.capHeadline)
+            || (summary.grade.map { tooLong($0, PocketBundle.capStr) } ?? false)
+            || evidence.count > PocketBundle.capEvidence || summary.perAgent.count > PocketBundle.capPerAgent
+            || summary.risks.count > PocketBundle.capRisks || summary.blockers.count > PocketBundle.capBlockers
+            || summary.risks.contains(where: { tooLong($0, PocketBundle.capStr) })
+            || summary.blockers.contains(where: { tooLong($0, PocketBundle.capStr) }) {
+            issues.append(.oversizedField)
+        }
+
+        // Top-level evidence — the authoritative UI resolution set: non-blank+trimmed ids, per-field caps, in-session,
+        // positive+in-range sequence, sane millisecond-exact dates, GLOBALLY-unique ids.
+        var topSeen = Set<String>()
+        var topById: [String: EvidenceRef] = [:]
+        for e in evidence {
+            if e.id.isEmpty || e.agentId.isEmpty || e.snippet.isEmpty { issues.append(.emptyRequiredField) }
+            if malformed(e.id) || malformed(e.agentId) { issues.append(.malformedId) }
+            if tooLong(e.id, PocketBundle.capEvId) || tooLong(e.agentId, PocketBundle.capEvId) || tooLong(e.snippet, PocketBundle.capSnippet) { issues.append(.oversizedField) }
+            if e.sessionId != sessionId { issues.append(.evidenceSessionMismatch) }
+            if e.sequence <= 0 { issues.append(.negativeSequence) }
+            if e.sequence < sequenceStart || e.sequence > sequenceEnd { issues.append(.evidenceSequenceOutOfRange) }
+            if !PocketBundle.dateIsSaneAndMillisExact(e.ts) { issues.append(ActionReceipt.safeEpochMillis(e.ts) == nil ? .unsaneDate : .subMillisecondDate) }
+            if !topSeen.insert(e.id).inserted { issues.append(.duplicateEvidenceId) }
+            topById[e.id] = e
+        }
+
+        // Per-agent: agentIds unique ACROSS agents. Per-agent evidence must be byte-identical to top-level, BOUND to
+        // its container (evidence.agentId == the agent), and unique WITHIN the agent's list. Claim ids unique WITHIN
+        // the agent; citation ids unique within a claim; fact/inference cited; citations resolve to top-level. (Dedup
+        // is per-agent — matching the gateway — so a gateway bundle is never rejected.)
+        var agentIdSeen = Set<String>()
+        for agent in summary.perAgent {
+            if agent.agentId.isEmpty { issues.append(.emptyRequiredField) }
+            if malformed(agent.agentId) { issues.append(.malformedId) }
+            if !agentIdSeen.insert(agent.agentId).inserted { issues.append(.duplicateAgentId) }
+            if tooLong(agent.agentId, PocketBundle.capEvId) || tooLong(agent.summary, PocketBundle.capSummary) { issues.append(.oversizedField) }
+            var nestedSeen = Set<String>()
+            for pe in agent.evidence {
+                if topById[pe.id] != pe { issues.append(.perAgentEvidenceMismatch) }
+                if pe.agentId != agent.agentId { issues.append(.perAgentEvidenceForeignAgent) }
+                if !nestedSeen.insert(pe.id).inserted { issues.append(.duplicateEvidenceId) }
+            }
+            var claimSeen = Set<String>()
+            for claim in agent.claims {
+                if claim.id.isEmpty || claim.text.isEmpty { issues.append(.emptyRequiredField) }
+                if malformed(claim.id) { issues.append(.malformedId) }
+                if tooLong(claim.id, PocketBundle.capStr) || tooLong(claim.text, PocketBundle.capSummary)
+                    || claim.evidenceIds.count > PocketBundle.capEvidence
+                    || claim.evidenceIds.contains(where: { tooLong($0, PocketBundle.capEvId) }) { issues.append(.oversizedField) }
+                if !claimSeen.insert(claim.id).inserted { issues.append(.duplicateClaimId) }
+                var citeSeen = Set<String>()
+                for cid in claim.evidenceIds where !citeSeen.insert(cid).inserted { issues.append(.duplicateCitationId) }
+                if (claim.kind == .fact || claim.kind == .inference) && claim.evidenceIds.isEmpty { issues.append(.uncitedFactOrInference) }
+                if !claim.evidenceIds.allSatisfy({ topSeen.contains($0) }) { issues.append(.foreignClaimCitation) }
+            }
+        }
+
+        if !PocketBundle.dateIsSaneAndMillisExact(createdAt) { issues.append(ActionReceipt.safeEpochMillis(createdAt) == nil ? .unsaneDate : .subMillisecondDate) }
+        return issues
+    }
+
+    /// FIX3: content-valid IFF there are no semantic issues. `VerifiedBundle.verify` requires this AND a pinned-key pass.
+    func isSemanticallyValid() -> Bool { semanticIssues().isEmpty }
+
+    /// A date is acceptable IFF finite/in-range (safeEpochMillis) AND exactly on a millisecond boundary — so nothing
+    /// sub-millisecond can diverge between the DISPLAYED date and the epoch-millis the signature actually covers.
+    static func dateIsSaneAndMillisExact(_ date: Date) -> Bool {
+        guard ActionReceipt.safeEpochMillis(date) != nil else { return false }
+        let m = date.timeIntervalSince1970 * 1000
+        return abs(m - m.rounded()) <= 1e-6
+    }
 }
 
 // MARK: - Briefing + Q&A (Echo/Pulse consume; local, offline-capable)

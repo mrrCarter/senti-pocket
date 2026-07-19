@@ -169,23 +169,26 @@ public enum PocketCall {
     }
 }
 
-/// Trust-boundary wrapper: a `PocketBundle` may drive the call ONLY after its gateway ed25519 signature verifies.
-/// `VerifiedBundle` has NO public memberwise init — it is mintable ONLY through `verify(_:gatewayPublicKeyBase64url:)`,
-/// so an unverified bundle cannot be wrapped in a `.bundleArrived` event as a matter of TYPE (not convention).
+/// Trust-boundary wrapper: a `PocketBundle` may drive the call ONLY after it is trusted + verified.
+/// `VerifiedBundle` has NO public memberwise init — it is mintable ONLY through `verify(_:)`, so an unverified bundle
+/// cannot be wrapped in a `.bundleArrived` event NOR held in any live PocketCallState (v0.4) as a matter of TYPE.
 ///
-/// The crypto body is completed against Relay's bundle-signing canonical KAV (services/pocket-gateway/src/bundle.mjs;
-/// Relay's narrow cross-language commit is pending — one ISO8601-ms date form, versioned domain separator, base64url
-/// signature, schema/key validation, frozen test-key KAV). Until that lands `verify` returns nil (fails closed),
-/// so in a release build NOTHING can start a call — the correct honest state while bundle verification is unfinished.
+/// Converged onto warden/bundle-kav-fix's NON-INJECTABLE trust model (P1 re-audit): there is NO caller-supplied key.
+/// `verify` resolves the pinned ed25519 key INTERNALLY from the bundle's `signingKeyId` (fixed, file-private trust
+/// store in PocketContracts), rejects an untrusted id BEFORE any crypto, requires SEMANTIC validity (a trusted key
+/// signing malformed content still yields malformed content), then verifies the ed25519 signature. Fails closed.
 public struct VerifiedBundle: Equatable, Sendable {
     public let bundle: PocketBundle
     private init(bundle: PocketBundle) { self.bundle = bundle }
 
-    public static func verify(_ bundle: PocketBundle, gatewayPublicKeyBase64url key: String) -> VerifiedBundle? {
-        // v0.1.9: real ed25519 verification over the `pocket.bundle.v1` canonical bytes under the PINNED key
-        // (PocketContracts.PocketBundle.verifiesSignature). Mints ONLY on a genuine pass; fails closed off-crypto.
+    /// The ONLY ingress mint — no caller-supplied key/anchor (closes the caller-key-injection bypass).
+    public static func verify(_ bundle: PocketBundle) -> VerifiedBundle? {
         #if canImport(CryptoKit)
-        return bundle.verifiesSignature(gatewayPublicKeyBase64url: key) ? VerifiedBundle(bundle: bundle) : nil
+        // cheap reject FIRST: an UNTRUSTED signingKeyId never reaches the bounded semantic scan or any crypto.
+        guard bundle.hasTrustedSigningKeyId(),
+              bundle.isSemanticallyValid(),
+              bundle.verifiesSignature() else { return nil }
+        return VerifiedBundle(bundle: bundle)
         #else
         return nil
         #endif
