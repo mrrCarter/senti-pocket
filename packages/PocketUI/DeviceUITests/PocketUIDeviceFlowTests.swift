@@ -81,7 +81,15 @@ final class PocketUIDeviceFlowTests: XCTestCase {
 
     func testAccessibilityXXXLKeepsCoreContentAndControlsReachable() {
         let scenarios = [
-            ("inbox", PocketAccessibilityID.inboxScreen, "pocket.inbox.item.cp_954233b7_000012", true),
+            (
+                "inbox",
+                PocketAccessibilityID.inboxScreen,
+                PocketAccessibilityID.inboxItem(
+                    sessionId: "954233b7-1822-42bc-9cfe-1eb95eb0357a",
+                    checkpointId: "cp_954233b7_000012"
+                ),
+                true
+            ),
             ("conversation", PocketAccessibilityID.conversationScreen, PocketAccessibilityID.pushToTalk, true),
             ("proposal", PocketAccessibilityID.proposalScreen, PocketAccessibilityID.proposalCancel, true),
             ("evidence", PocketAccessibilityID.evidenceScreen, PocketAccessibilityID.evidenceDone, true),
@@ -119,14 +127,20 @@ final class PocketUIDeviceFlowTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Ready to brief"].exists)
         XCTAssertTrue(app.staticTexts["Needs verification"].exists)
 
-        let blocked = app.buttons["pocket.inbox.item.cp_blocked_private"]
+        let blocked = app.buttons[PocketAccessibilityID.inboxItem(
+            sessionId: "blocked-session-private",
+            checkpointId: "cp_blocked_private"
+        )]
         XCTAssertTrue(blocked.exists)
         XCTAssertFalse(blocked.isEnabled)
         XCTAssertFalse(app.staticTexts["SECRET BLOCKED HEADLINE"].exists)
         XCTAssertFalse(app.staticTexts["blocked-session-private"].exists)
         XCTAssertFalse(app.staticTexts["Sequences 230200–230201"].exists)
 
-        let ready = app.buttons["pocket.inbox.item.cp_954233b7_000012"]
+        let ready = app.buttons[PocketAccessibilityID.inboxItem(
+            sessionId: "954233b7-1822-42bc-9cfe-1eb95eb0357a",
+            checkpointId: "cp_954233b7_000012"
+        )]
         XCTAssertTrue(ready.isHittable)
         ready.tap()
         XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))

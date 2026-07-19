@@ -28,6 +28,14 @@ final class SafetyPresentationStateTests: XCTestCase {
                 evidenceId: "evidence"
             )
         )
+        XCTAssertNotEqual(
+            PocketAccessibilityID.inboxItem(sessionId: "session-a", checkpointId: "checkpoint"),
+            PocketAccessibilityID.inboxItem(sessionId: "session-b", checkpointId: "checkpoint")
+        )
+        XCTAssertNotEqual(
+            PocketAccessibilityID.inboxItem(sessionId: "a", checkpointId: "bc"),
+            PocketAccessibilityID.inboxItem(sessionId: "ab", checkpointId: "c")
+        )
     }
 
     func testNarrationSegmentChangesDoNotChangeAccessibilityPhase() {
