@@ -98,7 +98,7 @@ final class SessionWireTests: XCTestCase {
         let json = """
         {"checkpoints":[{"checkpointId":"cp_954233b7_000012","sessionId":"954233b7","kind":"auto",
         "title":"AUTH-1C","summary":"canary cleared","startSequence":230100,"endSequence":230180,
-        "createdBy":"system","createdByAgentId":null,"tokenRange":{"start":0,"end":100},"eventSequence":230180,
+        "createdBy":"system","createdByAgentId":"","tokenRange":{"start":0,"end":100},"eventSequence":230180,
         "cursor":"cp1","createdAt":"2026-07-18T10:40:00Z","summarySections":{"headline":"h"},"grade":"A-",
         "gradeScore":91,"gradeVersion":"checkpoint_grade_v1",
         "gradeReasons":[{"code":"coverage","message":"broad","points":3}]}],"count":1}
@@ -110,6 +110,28 @@ final class SessionWireTests: XCTestCase {
         XCTAssertEqual(c.gradeReasons?.arrayValue?.first?["code"]?.stringValue, "coverage")
         XCTAssertEqual(c.gradeReasons?.arrayValue?.first?["points"]?.intValue, 3)
         XCTAssertEqual(c.title, "AUTH-1C")                        // membership-authorized content retained
+    }
+
+    /// The grade family is serializer-guaranteed non-null; a checkpoint missing it MUST fail decode (fail-closed).
+    func testCheckpointMissingGradeThrows() {
+        let json = """
+        {"checkpoints":[{"checkpointId":"cp_1","sessionId":"s1","kind":"auto","title":"t","summary":"s",
+        "createdBy":"system","createdByAgentId":"","eventSequence":10,"cursor":"c","createdAt":"2026-07-18T10:40:00Z",
+        "summarySections":{}}],"count":1}
+        """
+        XCTAssertThrowsError(try decode(SessionCheckpointListPage.self, json))
+    }
+
+    /// event.source key is always emitted but DB-nullable — an explicit null decodes to nil, never a throw.
+    func testEventNullSourceDecodesToNil() throws {
+        let json = """
+        {"events":[{"id":"ev_2","event":"session_action","agent":{},"agentId":"warden","agentModel":"",
+        "payload":{},"ts":"2026-07-18T10:36:34Z","timestamp":"2026-07-18T10:36:34Z","cursor":"c2",
+        "sequenceId":230160,"sessionId":"954233b7","source":null}]}
+        """
+        let e = try decode(SessionEventForwardPage.self, json).events[0]
+        XCTAssertNil(e.source)
+        XCTAssertEqual(e.agent, .object([:]))     // empty agent object still lossless, not nil
     }
 
     // MARK: - JSONValue numeric exactness + round-trip

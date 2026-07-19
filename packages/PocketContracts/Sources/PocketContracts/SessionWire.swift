@@ -73,7 +73,7 @@ public struct SessionEventDTO: Codable, Equatable, Sendable, Identifiable {
     public let cursor: String
     public let sequenceId: Int64
     public let sessionId: String
-    public let source: String            // always emitted (Echo: _event_from_db_row :3815)
+    public let source: String?           // key always emitted, but SessionEvent.source is DB-nullable (models/session.py:141)
     public let eventId: String?
     public let idempotencyToken: String?
 }
@@ -142,17 +142,20 @@ public struct SessionCheckpointDTO: Codable, Equatable, Sendable, Identifiable {
     public let summary: String
     public let startSequence: Int64?
     public let endSequence: Int64?
-    public let createdBy: String?
-    public let createdByAgentId: String?
     public let tokenRange: JSONValue?
-    public let eventSequence: Int64?
-    public let cursor: String?
-    public let createdAt: String?
-    public let summarySections: JSONValue?
-    public let grade: String?
-    public let gradeScore: Int?
-    public let gradeVersion: String?
-    public let gradeReasons: JSONValue?
+    // serializer-guaranteed non-null (createdBy/createdByAgentId normalized to strings; eventSequence/cursor/
+    // createdAt derived from the always-present event; summarySections synthesized; grade family from
+    // normalize_checkpoint_grade whose both return paths emit non-null values):
+    public let createdBy: String
+    public let createdByAgentId: String
+    public let eventSequence: Int64
+    public let cursor: String
+    public let createdAt: String
+    public let summarySections: JSONValue
+    public let grade: String
+    public let gradeScore: Int
+    public let gradeVersion: String
+    public let gradeReasons: JSONValue
 }
 
 /// GET /{session_id}/checkpoints -> { checkpoints, count } (list lacks a cursor).
