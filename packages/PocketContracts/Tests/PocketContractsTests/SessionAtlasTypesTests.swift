@@ -72,4 +72,48 @@ final class SessionAtlasTypesTests: XCTestCase {
         XCTAssertNotEqual(a, b)                                // distinct content
         XCTAssertEqual(a, MembershipAuthorizedCheckpoint(try checkpoint(title: "X")))
     }
+
+    // MARK: Completeness — timestamp byte-exactness across forms + FULL field losslessness
+
+    func testTimestampByteExactAcrossForms() {
+        // Every form the wire may emit round-trips its raw bytes exactly, whether or not `date` parses.
+        for raw in ["2026-07-18T10:36:34Z",
+                    "2026-07-18T10:36:34.123456+00:00",
+                    "2026-07-18T10:36:34+05:30",
+                    "2026-07-18T10:36:34.5-08:00",
+                    "2026-W29-6T10:35Z"] {          // unparseable → still byte-exact raw
+            XCTAssertEqual(ParsedSessionTimestamp(raw).raw, raw)
+        }
+        XCTAssertNotNil(ParsedSessionTimestamp("2026-07-18T10:36:34+05:30").date)   // non-UTC offset parses
+    }
+
+    /// Complete losslessness: EVERY SessionCheckpointDTO field is reachable through the wrapper — the wrapper drops
+    /// nothing (this is the guarantee the prior lossful CheckpointContent broke).
+    func testCheckpointPreservesEveryField() throws {
+        let dto = try checkpoint(createdAt: "2026-07-18T10:40:00.250Z")
+        let c = MembershipAuthorizedCheckpoint(dto).checkpoint
+        XCTAssertEqual(c.checkpointId, "cp_1")
+        XCTAssertEqual(c.sessionId, "s1")
+        XCTAssertEqual(c.kind, "auto")
+        XCTAssertEqual(c.title, "AUTH-1C")
+        XCTAssertEqual(c.summary, "canary cleared")
+        XCTAssertEqual(c.startSequence, 230100)
+        XCTAssertEqual(c.endSequence, 230180)
+        XCTAssertEqual(c.tokenRange?["start"]?.intValue, 0)
+        XCTAssertEqual(c.tokenRange?["end"]?.intValue, 100)
+        XCTAssertEqual(c.createdBy, "system")
+        XCTAssertEqual(c.createdByAgentId, "")               // real empty-string emit preserved
+        XCTAssertEqual(c.eventSequence, 230180)
+        XCTAssertEqual(c.cursor, "c")
+        XCTAssertEqual(c.createdAt, "2026-07-18T10:40:00.250Z")
+        XCTAssertEqual(c.summarySections["headline"]?.stringValue, "h")
+        XCTAssertEqual(c.grade, "A-")
+        XCTAssertEqual(c.gradeScore, 91)
+        XCTAssertEqual(c.gradeVersion, "checkpoint_grade_v1")
+        XCTAssertEqual(c.gradeReasons.arrayValue?.first?["points"]?.intValue, 3)
+        // and the wrapper's createdAt projection is raw-exact + parses the fractional form
+        let wrapped = MembershipAuthorizedCheckpoint(dto)
+        XCTAssertEqual(wrapped.createdAt.raw, "2026-07-18T10:40:00.250Z")
+        XCTAssertNotNil(wrapped.createdAt.date)
+    }
 }
