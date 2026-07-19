@@ -1,7 +1,7 @@
 # PocketUI
 
-Pulse-owned SwiftUI product surfaces for Senti Pocket. The package consumes `PocketContracts` v0.1.8 at
-`7e1cfbe` and
+Pulse-owned SwiftUI product surfaces for Senti Pocket. The package consumes `PocketContracts` v0.1.8 at the
+signed Atlas convergence head `365294c` and
 contains no voice, model, sync, credential, MCP, or writeback client.
 
 ## Integration boundary
@@ -63,11 +63,12 @@ durable queue record exists.
 ## Evidence and fixture
 
 The package depends on both `PocketContracts` and PocketCall's non-forgeable `VerifiedBundle`. The unit test decodes
-`../PocketContracts/Fixtures/canonical_checkpoint.json` directly with ISO-8601 dates;
-the fixture is not copied. The fixture's `FIXTURE_UNSIGNED` signature must be injected as `.unverified`, never
-`.verified`; `.unverified` is fail-closed for opening, displaying, narrating, and answering checkpoint content.
-The unsigned canonical previews therefore exercise the integrity-blocked UI until Atlas supplies a genuinely
-verified bundle through the v0.1.8 ingest seam. Bundle and evidence previews decode that JSON. Atlas's typed `PocketFixtures` supplies separate
+`../PocketContracts/Fixtures/canonical_checkpoint.json` directly with ISO-8601 dates and proves it is byte-identical
+to the app resource; the fixture is not copied. Successful canonical previews decode that JSON and require
+`VerifiedBundle.verify` under the fixed `pocket-demo-app-fixture` trust anchor before any content renders. Separate
+incoming/conversation invalid-state previews and unverified/invalid badge states remain fail-closed for opening,
+displaying, narrating, and answering checkpoint content. The canonical unit test, not a preview, carries the
+semantically valid signed-field tamper vector. Atlas's typed `PocketFixtures` supplies separate
 briefing, Q&A, proposal, pending-receipt, and placeholder-posted-receipt scenarios; Pulse does not assume those
 typed scenarios are value-identical to the canonical bundle.
 
@@ -78,7 +79,7 @@ caller-supplied replacement content dismisses/fails closed.
 
 ## Draft integration holds
 
-This package is a reviewable UI draft, not merge-ready write authority. The v0.1.8 contracts at `7e1cfbe` still
+This package is a reviewable UI draft, not merge-ready write authority. The v0.1.8 contracts at `365294c` still
 leave the confirmation capability publicly constructible, make single-use a coordinator convention, reduce
 `createdAt` identity to epoch milliseconds, and do not bind a receipt's result kind/action target to the confirmed
 proposal in `PocketCall.receiptBinds`. PocketUI's ledger, full-`Date` comparison, and receipt validation are
@@ -93,8 +94,9 @@ by the full-auth design. Do not expose its opaque `ConsumerSession` cookie to Po
 agent/service exchange as human authority. Native login, server-derived human subject, key binding, refresh/reuse
 detection, revocation, and redirect/state/nonce KAVs remain a separate fail-closed prerequisite.
 
-Bundle content also remains fail-closed until Relay and Atlas provide a key-ID-matched verified bundle under the
-pinned gateway keyring. A Mac compile/test pass, app-host wiring, simulator/device UI tests, VoiceOver audit, and
+The canonical demo bundle now has a key-ID-matched signature under the pinned gateway keyring; all other bundle
+content still fails closed unless PocketCall mints a matching `VerifiedBundle`. A Mac compile/test pass, app-host
+wiring, simulator/device UI tests, VoiceOver audit, and
 signed-receipt end-to-end run remain required before merge.
 
 ## Validation

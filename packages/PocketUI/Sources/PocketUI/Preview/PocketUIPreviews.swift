@@ -2,9 +2,10 @@
 import Foundation
 import SwiftUI
 import PocketContracts
+import PocketCall
 
 private enum CanonicalPreviewFixture {
-    static let bundle: PocketBundle? = {
+    static let verifiedBundle: VerifiedBundle? = {
         let bundles = [Bundle.main] + Bundle.allBundles
         guard let url = bundles.compactMap({
             $0.url(forResource: "canonical_checkpoint", withExtension: "json")
@@ -21,11 +22,11 @@ private enum CanonicalPreviewFixture {
               decoded.checkpointId == "cp_954233b7_000012" else {
             return nil
         }
-        return decoded
+        return VerifiedBundle.verify(decoded)
     }()
 
     static let unverified = BundleIntegrityState.unverified(
-        reason: "Canonical fixture is explicitly unsigned."
+        reason: "No trusted signature was supplied."
     )
 
     static func readyGate() -> ProposalConfirmationGate {
@@ -53,21 +54,21 @@ private enum CanonicalPreviewFixture {
     }
 }
 
-private struct CanonicalBundlePreview<Content: View>: View {
-    private let content: (PocketBundle) -> Content
+private struct CanonicalVerifiedBundlePreview<Content: View>: View {
+    private let content: (VerifiedBundle) -> Content
 
-    init(@ViewBuilder content: @escaping (PocketBundle) -> Content) {
+    init(@ViewBuilder content: @escaping (VerifiedBundle) -> Content) {
         self.content = content
     }
 
     var body: some View {
-        if let bundle = CanonicalPreviewFixture.bundle {
-            content(bundle)
+        if let verifiedBundle = CanonicalPreviewFixture.verifiedBundle {
+            content(verifiedBundle)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: "doc.badge.ellipsis")
                     .font(.largeTitle)
-                Text("Canonical v0.1.8 preview fixture unavailable")
+                Text("Canonical v0.1.8 preview fixture unavailable or unverified")
                     .font(.headline)
                 Text("The host must bundle the v0.1.8 cp_954233b7_000012 canonical_checkpoint.json fixture.")
                     .multilineTextAlignment(.center)
@@ -80,15 +81,14 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Inbox — canonical checkpoint") {
-    CanonicalBundlePreview { bundle in
+    CanonicalVerifiedBundlePreview { verifiedBundle in
         NavigationStack {
             CheckpointInboxView(
                 state: CheckpointInboxState(items: [
                     CheckpointInboxItem(
-                        bundle: bundle,
+                        verifiedBundle: verifiedBundle,
                         attention: .unheard,
-                        cachedForOffline: true,
-                        integrity: CanonicalPreviewFixture.unverified
+                        cachedForOffline: true
                     )
                 ]),
                 connectivity: .online,
@@ -100,15 +100,14 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Root — canonical inbox") {
-    CanonicalBundlePreview { bundle in
+    CanonicalVerifiedBundlePreview { verifiedBundle in
         PocketRootView(
             state: PocketUIState(
                 destination: .inbox(CheckpointInboxState(items: [
                     CheckpointInboxItem(
-                        bundle: bundle,
+                        verifiedBundle: verifiedBundle,
                         attention: .unheard,
-                        cachedForOffline: true,
-                        integrity: CanonicalPreviewFixture.unverified
+                        cachedForOffline: true
                     )
                 ])),
                 connectivity: .online
@@ -120,13 +119,12 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Incoming call — canonical checkpoint") {
-    CanonicalBundlePreview { bundle in
+    CanonicalVerifiedBundlePreview { verifiedBundle in
         NavigationStack {
             IncomingBriefingView(
                 state: IncomingBriefingState(
-                    bundle: bundle,
-                    sessionDisplayName: "Senti Pocket build room",
-                    integrity: CanonicalPreviewFixture.unverified
+                    verifiedBundle: verifiedBundle,
+                    sessionDisplayName: "Senti Pocket build room"
                 ),
                 connectivity: .online,
                 send: { _ in }
@@ -137,7 +135,8 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Incoming call — integrity blocked") {
-    CanonicalBundlePreview { bundle in
+    CanonicalVerifiedBundlePreview { verifiedBundle in
+        let bundle = verifiedBundle.bundle
         NavigationStack {
             IncomingBriefingView(
                 state: IncomingBriefingState(
@@ -153,20 +152,19 @@ private struct CanonicalBundlePreview<Content: View>: View {
 }
 
 @available(iOS 17.0, macOS 14.0, *)
-#Preview("Conversation — unsigned fixture blocked") {
-    CanonicalBundlePreview { bundle in
+#Preview("Conversation — verified cached fixture") {
+    CanonicalVerifiedBundlePreview { verifiedBundle in
         NavigationStack {
             ConversationView(
                 state: ConversationState(
-                    bundle: bundle,
-                    integrity: CanonicalPreviewFixture.unverified,
+                    verifiedBundle: verifiedBundle,
                     briefingPlan: PocketFixtures.briefingPlan,
                     transcript: PocketFixtures.briefingPlan.segments.map(ConversationEntry.briefing)
                         + [.questionAnswer(PocketFixtures.questionAnswer)],
                     voiceState: .speaking(segmentId: "b2"),
                     isPushToTalkActive: false
                 ),
-                connectivity: .offline(cachedAt: bundle.createdAt),
+                connectivity: .offline(cachedAt: verifiedBundle.bundle.createdAt),
                 send: { _ in }
             )
         }
@@ -175,7 +173,8 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Conversation — integrity blocked") {
-    CanonicalBundlePreview { bundle in
+    CanonicalVerifiedBundlePreview { verifiedBundle in
+        let bundle = verifiedBundle.bundle
         NavigationStack {
             ConversationView(
                 state: ConversationState(
@@ -195,7 +194,8 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Evidence — bounded cached reference") {
-    CanonicalBundlePreview { bundle in
+    CanonicalVerifiedBundlePreview { verifiedBundle in
+        let bundle = verifiedBundle.bundle
         if let evidence = bundle.evidence.first {
             EvidenceDetailView(evidence: evidence)
         }
@@ -263,7 +263,8 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Component — evidence card") {
-    CanonicalBundlePreview { bundle in
+    CanonicalVerifiedBundlePreview { verifiedBundle in
+        let bundle = verifiedBundle.bundle
         if let evidence = bundle.evidence.first {
             EvidenceCard(evidence: evidence, onOpen: { _ in })
                 .padding()
@@ -281,14 +282,17 @@ private struct CanonicalBundlePreview<Content: View>: View {
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Component — integrity states") {
-    VStack(spacing: 12) {
-        IntegrityBadge(integrity: CanonicalPreviewFixture.unverified)
-        IntegrityBadge(integrity: .invalid(reason: "Signature mismatch"))
-        ClaimBadge(kind: .fact)
-        ClaimBadge(kind: .inference)
-        ClaimBadge(kind: .recommendation)
+    CanonicalVerifiedBundlePreview { verifiedBundle in
+        VStack(spacing: 12) {
+            IntegrityBadge(integrity: BundleIntegrityState(verifiedBundle: verifiedBundle))
+            IntegrityBadge(integrity: CanonicalPreviewFixture.unverified)
+            IntegrityBadge(integrity: .invalid(reason: "Signature mismatch"))
+            ClaimBadge(kind: .fact)
+            ClaimBadge(kind: .inference)
+            ClaimBadge(kind: .recommendation)
+        }
+        .padding()
+        .background(PocketPalette.canvas)
     }
-    .padding()
-    .background(PocketPalette.canvas)
 }
 #endif
