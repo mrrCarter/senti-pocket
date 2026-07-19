@@ -19,6 +19,8 @@ actor PCM16StreamPlayer {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let format: AVAudioFormat
+    private let audioSessionLeases: DuplexAudioSessionLeaseManager
+    private var audioSessionLease: DuplexAudioSessionLease?
     private var attached = false
     private var pendingBuffers = 0
     private var scheduledFrames: Int64 = 0
@@ -26,7 +28,10 @@ actor PCM16StreamPlayer {
     private var finishContinuation: CheckedContinuation<Void, Error>?
     private var finishTimeoutTask: Task<Void, Never>?
 
-    init?(sampleRate: Double) {
+    init?(
+        sampleRate: Double,
+        audioSessionLeases: DuplexAudioSessionLeaseManager = .shared
+    ) {
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: sampleRate,
@@ -34,22 +39,27 @@ actor PCM16StreamPlayer {
             interleaved: false
         ) else { return nil }
         self.format = format
+        self.audioSessionLeases = audioSessionLeases
     }
 
     func prepare() throws {
-        #if os(iOS)
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(
-                .playAndRecord,
-                mode: .voiceChat,
-                options: [.defaultToSpeaker, .allowBluetooth]
-            )
-            try session.setActive(true)
-        } catch {
-            throw VoiceError.audioSessionFailed(error.localizedDescription)
+        try Task.checkCancellation()
+        if audioSessionLease == nil {
+            let lease = try audioSessionLeases.acquire()
+            do {
+                try Task.checkCancellation()
+            } catch {
+                let cleanupError = audioSessionLeases.release(lease).error
+                if let cleanupError {
+                    throw Self.audioSessionFailure(
+                        "playback preparation cancelled",
+                        cleanupError: cleanupError
+                    )
+                }
+                throw error
+            }
+            audioSessionLease = lease
         }
-        #endif
 
         if !attached {
             engine.attach(player)
@@ -58,16 +68,23 @@ actor PCM16StreamPlayer {
         }
         if !engine.isRunning {
             engine.prepare()
+            try checkCancellationAndStop()
             do {
                 try engine.start()
             } catch {
-                throw VoiceError.audioSessionFailed(error.localizedDescription)
+                let cleanupError = releaseAudioSession()
+                throw Self.audioSessionFailure(
+                    error.localizedDescription,
+                    cleanupError: cleanupError
+                )
             }
         }
+        try checkCancellationAndStop()
         if !player.isPlaying { player.play() }
     }
 
     func enqueue(_ data: Data) throws {
+        try Task.checkCancellation()
         guard !data.isEmpty, data.count.isMultiple(of: 2) else {
             throw VoiceError.malformedPCMStream
         }
@@ -90,6 +107,7 @@ actor PCM16StreamPlayer {
             }
         }
 
+        try Task.checkCancellation()
         pendingBuffers += 1
         scheduledFrames += Int64(frameCount)
         let generation = playbackGeneration
@@ -99,6 +117,7 @@ actor PCM16StreamPlayer {
     }
 
     func finish() async throws {
+        try checkCancellationAndStop()
         if pendingBuffers > 0 {
             let playbackSeconds = Double(scheduledFrames) / format.sampleRate
             let timeoutSeconds = min(max(playbackSeconds + 10, 15), 600)
@@ -118,16 +137,20 @@ actor PCM16StreamPlayer {
                 Task { await self.stop() }
             }
         }
-        try Task.checkCancellation()
+        try checkCancellationAndStop()
         finishTimeoutTask?.cancel()
         finishTimeoutTask = nil
         playbackGeneration &+= 1
         player.stop()
         engine.stop()
         scheduledFrames = 0
+        if let cleanupError = releaseAudioSession() {
+            throw cleanupError
+        }
     }
 
-    func stop() {
+    @discardableResult
+    func stop() -> VoiceError? {
         playbackGeneration &+= 1
         player.stop()
         engine.stop()
@@ -135,8 +158,19 @@ actor PCM16StreamPlayer {
         scheduledFrames = 0
         finishTimeoutTask?.cancel()
         finishTimeoutTask = nil
-        finishContinuation?.resume(throwing: VoiceError.cancelled)
+        let cleanupError = releaseAudioSession()
+        if let cleanupError {
+            finishContinuation?.resume(
+                throwing: Self.audioSessionFailure(
+                    "playback cancelled",
+                    cleanupError: cleanupError
+                )
+            )
+        } else {
+            finishContinuation?.resume(throwing: VoiceError.cancelled)
+        }
         finishContinuation = nil
+        return cleanupError
     }
 
     private func bufferCompleted(generation: UInt64) {
@@ -157,7 +191,39 @@ actor PCM16StreamPlayer {
         pendingBuffers = 0
         scheduledFrames = 0
         finishTimeoutTask = nil
-        finishContinuation?.resume(throwing: VoiceError.audioSessionFailed("PCM playback did not drain before its deadline"))
+        let cleanupError = releaseAudioSession()
+        finishContinuation?.resume(
+            throwing: Self.audioSessionFailure(
+                "PCM playback did not drain before its deadline",
+                cleanupError: cleanupError
+            )
+        )
         finishContinuation = nil
+    }
+
+    private func releaseAudioSession() -> VoiceError? {
+        guard let audioSessionLease else { return nil }
+        self.audioSessionLease = nil
+        return audioSessionLeases.release(audioSessionLease).error
+    }
+
+    private func checkCancellationAndStop() throws {
+        do {
+            try Task.checkCancellation()
+        } catch {
+            let cleanupError = stop()
+            if let cleanupError {
+                throw Self.audioSessionFailure("playback cancelled", cleanupError: cleanupError)
+            }
+            throw error
+        }
+    }
+
+    private static func audioSessionFailure(
+        _ reason: String,
+        cleanupError: VoiceError?
+    ) -> VoiceError {
+        guard let cleanupError else { return .audioSessionFailed(reason) }
+        return .audioSessionFailed("\(reason); \(cleanupError.localizedDescription)")
     }
 }

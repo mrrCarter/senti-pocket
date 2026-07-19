@@ -6,6 +6,8 @@ public actor MicrophoneCapture {
 
     private var engine: AVAudioEngine?
     private let frameSink = CaptureFrameSink()
+    private let audioSessionLeases = DuplexAudioSessionLeaseManager.shared
+    private var audioSessionLease: DuplexAudioSessionLease?
     private var tapInstalled = false
     private var notificationTokens: [NSObjectProtocol] = []
     private var generations = CaptureGenerationGate()
@@ -33,17 +35,15 @@ public actor MicrophoneCapture {
         guard AVAudioSession.sharedInstance().recordPermission == .granted else {
             throw VoiceError.microphonePermissionDenied
         }
+        #endif
+
+        let audioSessionLease = try audioSessionLeases.acquire()
+        #if os(iOS)
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(
-                .playAndRecord,
-                mode: .voiceChat,
-                options: [.defaultToSpeaker, .allowBluetooth]
-            )
-            try session.setPreferredIOBufferDuration(0.01)
-            try session.setActive(true)
+            try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(0.01)
         } catch {
-            throw VoiceError.audioSessionFailed(error.localizedDescription)
+            let cleanupError = audioSessionLeases.release(audioSessionLease).error
+            throw Self.audioSessionFailure(error.localizedDescription, cleanupError: cleanupError)
         }
         #endif
 
@@ -57,7 +57,9 @@ public actor MicrophoneCapture {
                 channels: 1,
                 interleaved: false
               ) else {
-            throw VoiceError.audioSessionFailed("no valid microphone input format")
+            let reason = "no valid microphone input format"
+            let cleanupError = audioSessionLeases.release(audioSessionLease).error
+            throw Self.audioSessionFailure(reason, cleanupError: cleanupError)
         }
 
         let streamPair = AsyncThrowingStream<MicrophoneFrame, Error>.makeStream(
@@ -72,14 +74,30 @@ public actor MicrophoneCapture {
 
         let frameSink = self.frameSink
         let captureSampleRate = captureFormat.sampleRate
-        input.installTap(onBus: 0, bufferSize: 1_024, format: captureFormat) { buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 1_024, format: captureFormat) { [weak self] buffer, _ in
             guard let channel = buffer.floatChannelData?.pointee else { return }
             let samples = Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
             guard let frame = try? MicrophoneFrame(samples: samples, sampleRate: captureSampleRate) else {
                 return
             }
-            // Overflow finishes the stream; onTermination owns actor-isolated engine teardown.
-            _ = frameSink.yield(frame, captureID: captureID)
+            switch frameSink.yield(frame, captureID: captureID) {
+            case .overflow:
+                Task {
+                    await self?.failActiveCapture(
+                        "microphone frame buffer overflow",
+                        captureID: captureID
+                    )
+                }
+            case .unknown:
+                Task {
+                    await self?.failActiveCapture(
+                        "unknown microphone frame delivery state",
+                        captureID: captureID
+                    )
+                }
+            case .accepted, .stale, .terminated, .terminalPending:
+                break
+            }
         }
         tapInstalled = true
 
@@ -87,17 +105,23 @@ public actor MicrophoneCapture {
             engine.prepare()
             try engine.start()
             self.engine = engine
+            self.audioSessionLease = audioSessionLease
             installAudioSessionObservers(captureID: captureID)
             return stream
         } catch {
+            let cleanupError = audioSessionLeases.release(audioSessionLease).error
+            let failure = Self.audioSessionFailure(
+                error.localizedDescription,
+                cleanupError: cleanupError
+            )
             input.removeTap(onBus: 0)
             tapInstalled = false
             _ = generations.end(captureID)
             frameSink.finish(
                 captureID: captureID,
-                throwing: VoiceError.audioSessionFailed(error.localizedDescription)
+                throwing: failure
             )
-            throw VoiceError.audioSessionFailed(error.localizedDescription)
+            throw failure
         }
     }
 
@@ -106,7 +130,7 @@ public actor MicrophoneCapture {
         await stop(captureID: captureID)
     }
 
-    private func stop(captureID: UUID) async {
+    private func stop(captureID: UUID, failureReason: String? = nil) async {
         guard generations.end(captureID) else { return }
         removeAudioSessionObservers()
         if tapInstalled, let engine {
@@ -115,11 +139,17 @@ public actor MicrophoneCapture {
         tapInstalled = false
         engine?.stop()
         engine = nil
-        frameSink.finish(captureID: captureID)
-
-        #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        #endif
+        let effectiveFailureReason = frameSink.pendingTerminalReason(captureID: captureID)
+            ?? failureReason
+        var cleanupError: VoiceError?
+        if let audioSessionLease {
+            self.audioSessionLease = nil
+            cleanupError = audioSessionLeases.release(audioSessionLease).error
+        }
+        let completionError = effectiveFailureReason.map {
+            Self.audioSessionFailure($0, cleanupError: cleanupError)
+        } ?? cleanupError
+        frameSink.finish(captureID: captureID, throwing: completionError)
     }
 
     private func installAudioSessionObservers(captureID: UUID) {
@@ -186,8 +216,15 @@ public actor MicrophoneCapture {
 
     private func failActiveCapture(_ reason: String, captureID: UUID) async {
         guard generations.accepts(captureID) else { return }
-        frameSink.finish(captureID: captureID, throwing: VoiceError.audioSessionFailed(reason))
-        await stop(captureID: captureID)
+        await stop(captureID: captureID, failureReason: reason)
+    }
+
+    private static func audioSessionFailure(
+        _ reason: String,
+        cleanupError: VoiceError?
+    ) -> VoiceError {
+        guard let cleanupError else { return .audioSessionFailed(reason) }
+        return .audioSessionFailed("\(reason); \(cleanupError.localizedDescription)")
     }
 }
 
@@ -195,7 +232,9 @@ enum CaptureFrameDelivery: Equatable {
     case accepted
     case stale
     case terminated
+    case terminalPending
     case overflow
+    case unknown
 }
 
 final class CaptureFrameSink: @unchecked Sendable {
@@ -203,11 +242,15 @@ final class CaptureFrameSink: @unchecked Sendable {
 
     private let lock = NSLock()
     private var activeCaptureID: UUID?
+    private var terminalCaptureID: UUID?
+    private var terminalReason: String?
     private var continuation: Continuation?
 
     func begin(captureID: UUID, continuation: Continuation) {
         lock.lock()
         activeCaptureID = captureID
+        terminalCaptureID = nil
+        terminalReason = nil
         self.continuation = continuation
         lock.unlock()
     }
@@ -218,6 +261,10 @@ final class CaptureFrameSink: @unchecked Sendable {
             lock.unlock()
             return .stale
         }
+        guard terminalCaptureID != captureID else {
+            lock.unlock()
+            return .terminalPending
+        }
 
         switch continuation.yield(frame) {
         case .enqueued(_):
@@ -225,26 +272,29 @@ final class CaptureFrameSink: @unchecked Sendable {
             return .accepted
         case .terminated:
             activeCaptureID = nil
+            terminalCaptureID = nil
+            terminalReason = nil
             self.continuation = nil
             lock.unlock()
             return .terminated
         case .dropped(_):
-            activeCaptureID = nil
-            self.continuation = nil
+            terminalCaptureID = captureID
+            terminalReason = "microphone frame buffer overflow"
             lock.unlock()
-            continuation.finish(
-                throwing: VoiceError.audioSessionFailed("microphone frame buffer overflow")
-            )
             return .overflow
         @unknown default:
-            activeCaptureID = nil
-            self.continuation = nil
+            terminalCaptureID = captureID
+            terminalReason = "unknown microphone frame delivery state"
             lock.unlock()
-            continuation.finish(
-                throwing: VoiceError.audioSessionFailed("unknown microphone frame delivery state")
-            )
-            return .terminated
+            return .unknown
         }
+    }
+
+    func pendingTerminalReason(captureID: UUID) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeCaptureID == captureID, terminalCaptureID == captureID else { return nil }
+        return terminalReason
     }
 
     func finish(captureID: UUID, throwing error: Error? = nil) {
@@ -254,6 +304,8 @@ final class CaptureFrameSink: @unchecked Sendable {
             return
         }
         activeCaptureID = nil
+        terminalCaptureID = nil
+        terminalReason = nil
         self.continuation = nil
         lock.unlock()
 

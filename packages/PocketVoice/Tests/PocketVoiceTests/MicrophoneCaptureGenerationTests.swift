@@ -36,7 +36,7 @@ final class MicrophoneCaptureGenerationTests: XCTestCase {
         XCTAssertNil(try await iterator.next())
     }
 
-    func testFrameSinkFailsLoudlyWhenItsBoundedBufferOverflows() async throws {
+    func testFrameSinkPreservesTerminalContinuationUntilActorCleanup() async throws {
         let pair = AsyncThrowingStream<MicrophoneFrame, Error>.makeStream(
             bufferingPolicy: .bufferingOldest(MicrophoneCapture.frameBufferCapacity)
         )
@@ -51,7 +51,21 @@ final class MicrophoneCaptureGenerationTests: XCTestCase {
             sink.yield(try frame(Float(MicrophoneCapture.frameBufferCapacity)), captureID: captureID),
             .overflow
         )
-        XCTAssertEqual(sink.yield(try frame(99), captureID: captureID), .stale)
+        XCTAssertEqual(sink.yield(try frame(99), captureID: captureID), .terminalPending)
+        XCTAssertEqual(
+            sink.pendingTerminalReason(captureID: captureID),
+            "microphone frame buffer overflow"
+        )
+
+        let terminalError = VoiceError.audioSessionFailed(
+            "microphone frame buffer overflow; "
+                + "Audio session failed: audio-session deactivation failed: synthetic"
+        )
+        sink.finish(captureID: captureID, throwing: terminalError)
+        sink.finish(
+            captureID: captureID,
+            throwing: VoiceError.audioSessionFailed("must not replace the terminal error")
+        )
 
         var iterator = pair.stream.makeAsyncIterator()
         var deliveredFrameCount = 0
@@ -62,10 +76,7 @@ final class MicrophoneCaptureGenerationTests: XCTestCase {
             XCTFail("overflow must terminate the stream with an explicit error")
         } catch {
             XCTAssertEqual(deliveredFrameCount, MicrophoneCapture.frameBufferCapacity)
-            XCTAssertEqual(
-                error as? VoiceError,
-                .audioSessionFailed("microphone frame buffer overflow")
-            )
+            XCTAssertEqual(error as? VoiceError, terminalError)
         }
     }
 
