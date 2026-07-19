@@ -144,7 +144,7 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertTrue(p.isValidForConfirmation())
         // v0.1.8 KAV HASH: base64url(SHA-256(v3 canonical)) for (id p1, threadedReply, s1, 100, "post X", ts, nil).
         XCTAssertEqual(p.proposalHash, "Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY")
-        let swapped = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post EVIL", createdAt: ts, sourceQuestionId: nil, proposalHash: p.proposalHash)
+        let swapped = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post EVIL", requiresConfirmation: true, createdAt: ts, sourceQuestionId: nil, proposalHash: p.proposalHash)
         XCTAssertFalse(swapped.isValidForConfirmation())
         let noConfirm = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", requiresConfirmation: false, createdAt: ts, sourceQuestionId: nil, proposalHash: p.proposalHash)
         XCTAssertFalse(noConfirm.isValidForConfirmation())
@@ -246,9 +246,10 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertTrue(semBundle(evId: " ev1 ").semanticIssues().contains(.malformedId))                          // untrimmed evidence id
         XCTAssertTrue(semBundle(signingKeyId: "   ").semanticIssues().contains(.malformedId))                    // whitespace-only id
 
-        // Round-5 total-work DoS budget (fail-fast; per-array caps don't bound the product): over-element + over-byte.
-        XCTAssertEqual(semBundle(claims: (0..<5001).map { Claim(id: "c\($0)", text: "x", kind: .recommendation, evidenceIds: []) }).semanticIssues(), [.overBudget])
-        XCTAssertEqual(semBundle(agentSummaryText: String(repeating: "x", count: 2_000_001)).semanticIssues(), [.overBudget])
+        // Round-5 total-work DoS budget (fail-fast; per-array caps don't bound the product): over-element (>20000) + over-byte (>1_048_576).
+        // NOTE: values track PocketBundle.maxTotalElements/maxTotalBytes — bump BOTH here whenever those caps change (this test IS an enforcing surface).
+        XCTAssertEqual(semBundle(claims: (0..<20001).map { Claim(id: "c\($0)", text: "x", kind: .recommendation, evidenceIds: []) }).semanticIssues(), [.overBudget])
+        XCTAssertEqual(semBundle(agentSummaryText: String(repeating: "x", count: 1_048_577)).semanticIssues(), [.overBudget])
     }
 
     /// Round-5 CONSUMER PARITY — a gateway-shaped bundle whose fields sit AT the FROZEN per-field caps (which the old
