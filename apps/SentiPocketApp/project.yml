@@ -43,6 +43,9 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        # Required or iOS SIGABRTs on the first permission request (on-device Speech STT + mic barge-in/PTT).
+        NSMicrophoneUsageDescription: "Senti Pocket uses the microphone so you can barge in and answer the briefing by voice."
+        NSSpeechRecognitionUsageDescription: "Senti Pocket transcribes your speech on-device to let you interrupt and confirm actions by voice."
     settings:
       base:
         GENERATE_INFOPLIST_FILE: false
