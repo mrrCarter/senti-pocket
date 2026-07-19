@@ -9,7 +9,7 @@ import PocketCall   // VerifiedBundle — the ONLY trusted way to hold a bundle
 struct SentiPocketApp: App {
     var body: some Scene {
         WindowGroup {
-            RootView()
+            AppShell()   // TabView shell (Sessions · Pocket · Activity · You); Pocket = the verified briefing
         }
     }
 }
