@@ -18,15 +18,23 @@ public struct CheckpointInboxView: View {
     }
 
     public var body: some View {
-        Group {
-            if state.isLoading && state.items.isEmpty {
-                loadingView
-            } else if let errorMessage = state.errorMessage, state.items.isEmpty {
-                errorView(errorMessage)
-            } else if state.items.isEmpty {
-                emptyView
-            } else {
-                inboxList
+        VStack(spacing: 0) {
+            if connectivity != .online {
+                ConnectivityBanner(connectivity: connectivity)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+            }
+
+            Group {
+                if state.isLoading && state.items.isEmpty {
+                    loadingView
+                } else if let errorMessage = state.errorMessage, state.items.isEmpty {
+                    errorView(errorMessage)
+                } else if state.items.isEmpty {
+                    emptyView
+                } else {
+                    inboxList
+                }
             }
         }
         .navigationTitle("Checkpoints")
@@ -36,12 +44,6 @@ public struct CheckpointInboxView: View {
 
     private var inboxList: some View {
         List {
-            Section {
-                ConnectivityBanner(connectivity: connectivity)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Color.clear)
-            }
-
             if let errorMessage = state.errorMessage {
                 Section {
                     Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
@@ -51,29 +53,51 @@ public struct CheckpointInboxView: View {
                 .listRowBackground(PocketPalette.raised)
             }
 
-            Section("Ready to brief") {
-                ForEach(state.items) { item in
-                    Button {
-                        send(.selectCheckpoint(CheckpointContext(bundle: item.bundle)))
-                    } label: {
-                        CheckpointInboxRow(item: item)
+            if !readyItems.isEmpty {
+                Section("Ready to brief") {
+                    ForEach(readyItems) { item in
+                        checkpointRow(item)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier(PocketAccessibilityID.inboxItem(
-                        sessionId: item.bundle.sessionId,
-                        checkpointId: item.bundle.checkpointId
-                    ))
-                    .accessibilityHint(
-                        item.integrity.allowsBriefing
-                            ? "Opens this checkpoint briefing"
-                            : "Unavailable until checkpoint integrity verification succeeds"
-                    )
-                    .disabled(!item.integrity.allowsBriefing)
-                    .listRowBackground(PocketPalette.raised)
+                }
+            }
+
+            if !blockedItems.isEmpty {
+                Section("Needs verification") {
+                    ForEach(blockedItems) { item in
+                        checkpointRow(item)
+                    }
                 }
             }
         }
         .scrollContentBackground(.hidden)
+    }
+
+    private var readyItems: [CheckpointInboxItem] {
+        state.items.filter { $0.integrity.allowsBriefing }
+    }
+
+    private var blockedItems: [CheckpointInboxItem] {
+        state.items.filter { !$0.integrity.allowsBriefing }
+    }
+
+    private func checkpointRow(_ item: CheckpointInboxItem) -> some View {
+        Button {
+            send(.selectCheckpoint(CheckpointContext(bundle: item.bundle)))
+        } label: {
+            CheckpointInboxRow(item: item)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier(PocketAccessibilityID.inboxItem(
+            sessionId: item.bundle.sessionId,
+            checkpointId: item.bundle.checkpointId
+        ))
+        .accessibilityHint(
+            item.integrity.allowsBriefing
+                ? "Opens this checkpoint briefing"
+                : "Unavailable until checkpoint integrity verification succeeds"
+        )
+        .disabled(!item.integrity.allowsBriefing)
+        .listRowBackground(PocketPalette.raised)
     }
 
     private var loadingView: some View {
@@ -98,7 +122,7 @@ public struct CheckpointInboxView: View {
                 .accessibilityHidden(true)
             Text("No checkpoints yet")
                 .font(.title2.weight(.bold))
-            Text("When your agents reach a checkpoint, Senti will call with a bounded briefing.")
+            Text("When your agents reach a checkpoint, signed briefings appear here.")
                 .font(.body)
                 .foregroundStyle(PocketPalette.textSecondary)
                 .multilineTextAlignment(.center)
@@ -144,7 +168,7 @@ private struct CheckpointInboxRow: View {
                 attentionLabel
                 Spacer(minLength: 8)
                 if item.cachedForOffline {
-                    Label("Cached", systemImage: "iphone.and.arrow.forward")
+                    Label("Available offline", systemImage: "arrow.down.circle.fill")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(PocketPalette.accent)
                 }
@@ -158,7 +182,14 @@ private struct CheckpointInboxRow: View {
 
                 Text("Sequences \(item.bundle.sequenceStart)–\(item.bundle.sequenceEnd)")
                     .font(.caption)
+                    .monospacedDigit()
                     .foregroundStyle(PocketPalette.textSecondary)
+
+                Text(verbatim: item.bundle.sessionId)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(PocketPalette.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             } else {
                 Text("Checkpoint content hidden")
                     .font(.headline)
@@ -185,15 +216,19 @@ private struct CheckpointInboxRow: View {
         switch item.attention {
         case .unheard:
             Label("New briefing", systemImage: "circle.fill")
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(PocketPalette.accent)
         case .heard:
             Label("Heard", systemImage: "checkmark.circle")
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(PocketPalette.textSecondary)
         case .listenLater:
             Label("Listen later", systemImage: "bookmark.fill")
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(PocketPalette.listening)
         case .snoozed(let until):
             Label("Snoozed until \(until.formatted(date: .omitted, time: .shortened))", systemImage: "alarm.fill")
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(PocketPalette.warning)
         }
     }

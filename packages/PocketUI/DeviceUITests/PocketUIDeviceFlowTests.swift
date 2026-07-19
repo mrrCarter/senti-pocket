@@ -120,6 +120,32 @@ final class PocketUIDeviceFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons[PocketAccessibilityID.proposalCancel].isHittable)
     }
 
+    func testMixedInboxSeparatesAndProtectsUnverifiedCheckpoint() {
+        launch(scenario: "mixed-inbox")
+
+        XCTAssertTrue(element(PocketAccessibilityID.inboxScreen).waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Ready to brief"].exists)
+        XCTAssertTrue(app.staticTexts["Needs verification"].exists)
+
+        let blocked = app.buttons[PocketAccessibilityID.inboxItem(
+            sessionId: "blocked-session-private",
+            checkpointId: "cp_blocked_private"
+        )]
+        XCTAssertTrue(blocked.exists)
+        XCTAssertFalse(blocked.isEnabled)
+        XCTAssertFalse(app.staticTexts["SECRET BLOCKED HEADLINE"].exists)
+        XCTAssertFalse(app.staticTexts["blocked-session-private"].exists)
+        XCTAssertFalse(app.staticTexts["Sequences 230200–230201"].exists)
+
+        let ready = app.buttons[PocketAccessibilityID.inboxItem(
+            sessionId: "954233b7-1822-42bc-9cfe-1eb95eb0357a",
+            checkpointId: "cp_954233b7_000012"
+        )]
+        XCTAssertTrue(ready.isHittable)
+        ready.tap()
+        XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))
+    }
+
     func testLongFailureTextRemainsScrollableAtAccessibilityXXXL() {
         let arguments = [
             "-UIPreferredContentSizeCategoryName",
@@ -224,6 +250,7 @@ final class PocketUIDeviceFlowTests: XCTestCase {
             "long-invalid-conversation",
             "invalid-receipt",
             "reconnecting-proposal",
+            "mixed-inbox",
             "expiring-proposal"
         ] {
             launch(scenario: scenario)
