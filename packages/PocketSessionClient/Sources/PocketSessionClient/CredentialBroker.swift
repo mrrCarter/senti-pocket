@@ -30,11 +30,18 @@ actor CredentialBroker {
 
     // MARK: - Lifecycle (signIn commits atomically; signOut tombstones + advances generation before wipe)
 
-    /// Atomic commit of {credential + subject namespace} at a NEW generation (§4a). Called only after a
-    /// successful token exchange + mcp-subject resolution; on any earlier failure this is never reached.
-    func commit(credential: String, subjectId: String, expiresAt: Date) {
+    /// A provisional sign-in capability, issued by the actor at the START of a sign-in flow. `commit` accepts it
+    /// only if broker state is UNCHANGED since it was issued — so a sign-in whose token-exchange straddled a
+    /// sign-out or a newer sign-in cannot clobber that later state (P1-C).
+    struct SignInAttempt: Sendable { fileprivate let base: UInt64 }
+    func beginSignIn() -> SignInAttempt { SignInAttempt(base: currentGeneration) }
+
+    /// Atomic, GUARDED commit of {credential + subject namespace} at a NEW generation (§4a). Succeeds ONLY if no
+    /// sign-out (tombstone) and no newer generation intervened since `attempt` was issued; otherwise the stale
+    /// attempt is rejected (`.stateMismatch`) and the current state — e.g. a completed sign-out — stands.
+    func commit(credential: String, subjectId: String, expiresAt: Date, attempt: SignInAttempt) throws {
+        guard !tombstone, attempt.base == currentGeneration else { throw AuthError.stateMismatch }
         currentGeneration &+= 1
-        tombstone = false
         authority = Authority(credential: credential, subjectId: subjectId,
                               generation: currentGeneration, expiresAt: expiresAt)
     }
@@ -49,6 +56,10 @@ actor CredentialBroker {
         authority = nil
     }
 
+    /// Called after BOTH Keychain + filesystem deletions succeed: clears the tombstone to a clean signed-out
+    /// state so a fresh sign-in (new attempt) can proceed. Until this, the tombstone rejects any commit.
+    func completeSignOut() { tombstone = false }
+
     // MARK: - perform (§4c: generation compare BEFORE any status/body observation)
 
     func perform(_ spec: SessionRequestSpec) async throws -> Data {
@@ -60,10 +71,11 @@ actor CredentialBroker {
         let captured = start.generation
         // 2. Build the credential-bearing request from the typed spec (fixed origin/path/query; §2/§5).
         let request = try Self.buildRequest(spec, credential: start.credential)
-        // 3. Execute; the raw response returns to the broker only.
-        let (data, response) = try await executor.execute(request)
-        // 4. §4c: compare captured generation against the PRIVATE authority BEFORE observing/classifying the
-        //    response status OR body. On mismatch: ZERO status/body observation (a stale 401 is never classified).
+        // 3. Execute; the SEALED response returns to the broker only — status/body unobservable until open().
+        let sealed = try await executor.execute(request)
+        // 4. §4c: compare captured generation against the PRIVATE authority BEFORE opening the envelope. On
+        //    mismatch the sealed response is DISCARDED UNOPENED — structural zero status/body observation (a stale
+        //    401 is never classified and can never invalidate/suppress the current generation).
         if tombstone || authority?.generation != captured {
             if let live = authority, !tombstone, live.isUsable(now: Date(), skew: skew) {
                 throw CancellationError()               // superseded by a valid newer committed pair — retryable
@@ -71,8 +83,9 @@ actor CredentialBroker {
                 throw AuthError.reauthenticationRequired  // superseded by sign-out (tombstone / no committed pair)
             }
         }
-        // 5. Generation EQUAL ⇒ only now may status/body be observed and classified (§4b).
-        switch response.statusCode {
+        // 5. Generation EQUAL ⇒ only NOW open the envelope and classify (§4b).
+        let (status, data, requestId) = sealed.open()
+        switch status {
         case 200..<300:
             return data
         case 401:
@@ -84,8 +97,7 @@ actor CredentialBroker {
         case 403:
             throw TransportError.accessDenied           // authz denied; repository suppresses the target cache
         default:
-            throw TransportError.server(status: response.statusCode, code: nil,
-                                        requestId: response.value(forHTTPHeaderField: "x-request-id"))
+            throw TransportError.server(status: status, code: nil, requestId: requestId)
         }
     }
 
@@ -93,7 +105,7 @@ actor CredentialBroker {
 
     private static let origin = URL(string: "https://api.sentinelayer.com")!   // scheme+host+443, no userinfo
 
-    static func buildRequest(_ spec: SessionRequestSpec, credential: String) throws -> URLRequest {
+    private static func buildRequest(_ spec: SessionRequestSpec, credential: String) throws -> URLRequest {
         var comps = URLComponents(url: origin, resolvingAgainstBaseURL: false)!
         var query: [URLQueryItem] = []
         switch spec {
