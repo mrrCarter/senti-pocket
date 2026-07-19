@@ -38,6 +38,67 @@ final class HybridSpeechSynthesizerTests: XCTestCase {
         XCTAssertEqual(offlineCalls, 1)
     }
 
+    func testPremiumAudioSessionFailureDoesNotFallBackOffline() async throws {
+        let cleanupError = VoiceError.audioSessionFailed("deactivation failed")
+        let premium = FakeSynthesizer(result: .failure(cleanupError))
+        let offline = FakeSynthesizer(result: .success(metrics(.avSpeechOffline)))
+        let hybrid = HybridSpeechSynthesizer(
+            premium: premium,
+            offline: offline,
+            connectivity: FixedConnectivity(online: true)
+        )
+
+        do {
+            _ = try await hybrid.speak(try SpeechSynthesisRequest(text: "Checkpoint ready"))
+            XCTFail("an audio-session cleanup failure must not fall back to offline success")
+        } catch {
+            XCTAssertEqual(error as? VoiceError, cleanupError)
+        }
+
+        let premiumCalls = await premium.callCount()
+        let offlineCalls = await offline.callCount()
+        XCTAssertEqual(premiumCalls, 1)
+        XCTAssertEqual(offlineCalls, 0)
+    }
+
+    func testSupersededOfflineAudioSessionFailureRemainsObservable() async throws {
+        let oldRequest = try SpeechSynthesisRequest(text: "old offline request")
+        let newRequest = try SpeechSynthesisRequest(text: "new offline request")
+        let oldRequestStarted = HybridAsyncLatch()
+        let cleanupError = VoiceError.audioSessionFailed("offline deactivation failed")
+        let premium = FakeSynthesizer(result: .failure(.synthesisFailed("must not run")))
+        let offline = SupersedingOfflineCleanupSynthesizer(
+            failingRequestID: oldRequest.id,
+            oldRequestStarted: oldRequestStarted,
+            cleanupError: cleanupError,
+            nextMetrics: metrics(.avSpeechOffline)
+        )
+        let hybrid = HybridSpeechSynthesizer(
+            premium: premium,
+            offline: offline,
+            connectivity: FixedConnectivity(online: false)
+        )
+
+        let oldTask = Task { () -> VoiceError? in
+            do {
+                _ = try await hybrid.speak(oldRequest)
+                return nil
+            } catch {
+                return error as? VoiceError
+            }
+        }
+        try await oldRequestStarted.waitUntilStarted()
+
+        let newTask = Task { try await hybrid.speak(newRequest) }
+        let oldError = await oldTask.value
+        let newMetrics = try await newTask.value
+        let offlineCalls = await offline.callCount()
+
+        XCTAssertEqual(oldError, cleanupError)
+        XCTAssertEqual(newMetrics.backend, .avSpeechOffline)
+        XCTAssertEqual(offlineCalls, 2)
+    }
+
     func testSameRequestIDSupersessionDoesNotReviveOldOfflinePlayback() async throws {
         let oldRequestStarted = HybridAsyncLatch()
         let newRequestStarted = HybridAsyncLatch()
@@ -195,6 +256,43 @@ private actor FakeSynthesizer: SpeechSynthesizer {
 private enum FakeSynthesisResult: Sendable {
     case success(SpeechPlaybackMetrics)
     case failure(VoiceError)
+}
+
+private actor SupersedingOfflineCleanupSynthesizer: SpeechSynthesizer {
+    private let failingRequestID: UUID
+    private let oldRequestStarted: HybridAsyncLatch
+    private let cleanupError: VoiceError
+    private let nextMetrics: SpeechPlaybackMetrics
+    private var activeFailingRequest = false
+    private var calls = 0
+
+    init(
+        failingRequestID: UUID,
+        oldRequestStarted: HybridAsyncLatch,
+        cleanupError: VoiceError,
+        nextMetrics: SpeechPlaybackMetrics
+    ) {
+        self.failingRequestID = failingRequestID
+        self.oldRequestStarted = oldRequestStarted
+        self.cleanupError = cleanupError
+        self.nextMetrics = nextMetrics
+    }
+
+    func speak(_ request: SpeechSynthesisRequest) async throws -> SpeechPlaybackMetrics {
+        calls += 1
+        guard request.id == failingRequestID else { return nextMetrics }
+        activeFailingRequest = true
+        await oldRequestStarted.suspend()
+        activeFailingRequest = false
+        throw cleanupError
+    }
+
+    func stop() async {
+        guard activeFailingRequest else { return }
+        await oldRequestStarted.release()
+    }
+
+    func callCount() -> Int { calls }
 }
 
 private actor SupersedingPremiumSynthesizer: SpeechSynthesizer {
