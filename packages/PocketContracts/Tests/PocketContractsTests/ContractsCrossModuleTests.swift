@@ -176,14 +176,14 @@ final class ContractsCrossModuleTests: XCTestCase {
                            agentId: String = "agent-a", agentSummaryText: String = "s",
                            evId: String = "ev1", evAgent: String = "agent-a", evSnippet: String = "sn", evSession: String = "sess_demo_1", evSeq: Int = 150,
                            secondEvidence: EvidenceRef? = nil, perAgentEvidence: [EvidenceRef]? = nil,
-                           claims: [Claim]? = nil, date: Date? = nil) -> PocketBundle {
+                           claims: [Claim]? = nil, perAgentOverride: [AgentSummary]? = nil, date: Date? = nil) -> PocketBundle {
         let t = date ?? ts
         let ev = EvidenceRef(id: evId, sessionId: evSession, sequence: evSeq, agentId: evAgent, snippet: evSnippet, ts: t)
         var top = [ev]
         if let s = secondEvidence { top.append(s) }
         let claimList = claims ?? [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: [evId])]
         let ag = AgentSummary(agentId: agentId, summary: agentSummaryText, claims: claimList, evidence: perAgentEvidence ?? [ev])
-        let sum = CheckpointSummary(checkpointId: cpSummary, headline: headline, summaryBaselineSchema: schema, grade: grade, perAgent: [ag], risks: risks, blockers: blockers)
+        let sum = CheckpointSummary(checkpointId: cpSummary, headline: headline, summaryBaselineSchema: schema, grade: grade, perAgent: perAgentOverride ?? [ag], risks: risks, blockers: blockers)
         return PocketBundle(contractsVersion: version, checkpointId: cpBundle, sessionId: sessionId, sequenceStart: seqStart, sequenceEnd: seqEnd, summary: sum, evidence: top, createdAt: t, signature: signature, signingKeyId: signingKeyId)
     }
 
@@ -215,18 +215,69 @@ final class ContractsCrossModuleTests: XCTestCase {
         let ev1 = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)
         XCTAssertTrue(semBundle(perAgentEvidence: [ev1, ev1]).semanticIssues().contains(.duplicateEvidenceId))  // dup within a per-agent list
 
-        // Newly-bounded fields (frozen caps id<=128, string<=8000 UTF-8 bytes).
-        let longS = String(repeating: "x", count: 8001)
-        let longId = String(repeating: "i", count: 129)
-        XCTAssertTrue(semBundle(signature: longS).semanticIssues().contains(.oversizedField))
-        XCTAssertTrue(semBundle(grade: longS).semanticIssues().contains(.oversizedField))
-        XCTAssertTrue(semBundle(risks: [longS]).semanticIssues().contains(.oversizedField))
-        XCTAssertTrue(semBundle(blockers: [longS]).semanticIssues().contains(.oversizedField))
-        XCTAssertTrue(semBundle(agentId: longId).semanticIssues().contains(.oversizedField))
-        XCTAssertTrue(semBundle(agentSummaryText: longS).semanticIssues().contains(.oversizedField))
-        XCTAssertTrue(semBundle(evAgent: longId).semanticIssues().contains(.oversizedField))
-        // UTF-8 BYTE count (not grapheme): 4001 × "é" = 8002 bytes > 8000, though String.count is only 4001.
+        // FROZEN per-field caps (UTF-8 bytes): str<=512, agentId/evId<=128, id<=256, summary/text<=8192, snippet<=8000.
+        let over512 = String(repeating: "x", count: 513)
+        let over8192 = String(repeating: "x", count: 8193)
+        let over128 = String(repeating: "i", count: 129)
+        let over256 = String(repeating: "c", count: 257)
+        XCTAssertTrue(semBundle(signature: over512).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(grade: over512).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(risks: [over512]).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(blockers: [over512]).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(agentId: over128).semanticIssues().contains(.oversizedField))            // agent.agentId <= 128
+        XCTAssertTrue(semBundle(agentSummaryText: over8192).semanticIssues().contains(.oversizedField))   // agent.summary <= 8192
+        XCTAssertTrue(semBundle(evAgent: over128).semanticIssues().contains(.oversizedField))             // evidence.agentId <= 128
+        XCTAssertTrue(semBundle(cpBundle: over256, cpSummary: over256).semanticIssues().contains(.oversizedField)) // checkpointId <= 256
+        XCTAssertTrue(semBundle(claims: [Claim(id: over512, text: "x", kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.oversizedField))   // claim.id <= 512
+        XCTAssertTrue(semBundle(claims: [Claim(id: "c1", text: over8192, kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.oversizedField)) // claim.text <= 8192
+        // PARITY (the demo-blocking fix): fields the OLD uniform 128/8000 caps wrongly rejected are NOW accepted.
+        XCTAssertFalse(semBundle(cpBundle: String(repeating: "c", count: 200), cpSummary: String(repeating: "c", count: 200)).semanticIssues().contains(.oversizedField))         // 200-byte checkpointId
+        XCTAssertFalse(semBundle(claims: [Claim(id: "c1", text: String(repeating: "t", count: 8100), kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.oversizedField)) // 8100-byte claim.text
+        // UTF-8 BYTE count (not grapheme): 4001 × "é" = 8002 bytes > 8000 snippet cap, though String.count is only 4001.
         XCTAssertTrue(semBundle(evSnippet: String(repeating: "é", count: 4001)).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(evSnippet: String(repeating: "x", count: 8001)).semanticIssues().contains(.oversizedField)) // snippet <= 8000
+
+        // Round-5 identity binding.
+        let evA = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)
+        let agA = AgentSummary(agentId: "agent-a", summary: "s", claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: ["ev1"])], evidence: [evA])
+        XCTAssertTrue(semBundle(perAgentOverride: [agA, agA]).semanticIssues().contains(.duplicateAgentId))      // two agents, same agentId
+        XCTAssertTrue(semBundle(claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: ["ev1", "ev1"])]).semanticIssues().contains(.duplicateCitationId))  // repeated citation id
+        XCTAssertTrue(semBundle(agentId: "agent-b", perAgentEvidence: [evA]).semanticIssues().contains(.perAgentEvidenceForeignAgent))  // nested ev bound to its container agent
+        XCTAssertTrue(semBundle(evId: " ev1 ").semanticIssues().contains(.malformedId))                          // untrimmed evidence id
+        XCTAssertTrue(semBundle(signingKeyId: "   ").semanticIssues().contains(.malformedId))                    // whitespace-only id
+
+        // Round-5 total-work DoS budget (fail-fast; per-array caps don't bound the product): over-element + over-byte.
+        XCTAssertEqual(semBundle(claims: (0..<5001).map { Claim(id: "c\($0)", text: "x", kind: .recommendation, evidenceIds: []) }).semanticIssues(), [.overBudget])
+        XCTAssertEqual(semBundle(agentSummaryText: String(repeating: "x", count: 2_000_001)).semanticIssues(), [.overBudget])
+    }
+
+    /// Round-5 CONSUMER PARITY — a gateway-shaped bundle whose fields sit AT the FROZEN per-field caps (which the old
+    /// uniform 128/8000 wrongly rejected) is ACCEPTED by the phone's semantic gate, and its evidence also satisfies the
+    /// GroundedInferenceRequest frozen caps (PocketInference/InferenceTypes.swift: checkpoint/session<=256, evidence
+    /// id/agent<=128, snippet<=8000, evidence count<=32). NOTE: literal GroundedInferenceRequest construction lives in
+    /// PocketInference (out of this branch's file scope) — parity is proven by matching its exact frozen numeric caps.
+    func testConsumerParityGatewayBoundaryBundleAccepted() {
+        let id256 = String(repeating: "a", count: 256)
+        let id128 = String(repeating: "e", count: 128)
+        let str512 = String(repeating: "s", count: 512)
+        let text8192 = String(repeating: "t", count: 8192)
+        let snippet8000 = String(repeating: "n", count: 8000)
+        let head4096 = String(repeating: "h", count: 4096)
+        let ev = EvidenceRef(id: id128, sessionId: id256, sequence: 150, agentId: id128, snippet: snippet8000, ts: ts)
+        let agent = AgentSummary(agentId: id128, summary: text8192, claims: [Claim(id: str512, text: text8192, kind: .fact, evidenceIds: [id128])], evidence: [ev])
+        let sum = CheckpointSummary(checkpointId: id256, headline: head4096, summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: str512, perAgent: [agent], risks: [str512], blockers: [str512])
+        let bundle = PocketBundle(contractsVersion: "0.1.8", checkpointId: id256, sessionId: id256, sequenceStart: 100, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: str512, signingKeyId: "pocket-demo-phase-a")
+        XCTAssertEqual(bundle.semanticIssues(), [])                 // ACCEPTED (was wrongly rejected under uniform 128/8000)
+        XCTAssertTrue(bundle.isSemanticallyValid())
+        // Evidence also within GroundedInferenceRequest frozen caps (the other consumer):
+        XCTAssertLessThanOrEqual(bundle.checkpointId.utf8.count, 256)
+        XCTAssertLessThanOrEqual(bundle.sessionId.utf8.count, 256)
+        for e in bundle.evidence {
+            XCTAssertLessThanOrEqual(e.id.utf8.count, 128)
+            XCTAssertLessThanOrEqual(e.agentId.utf8.count, 128)
+            XCTAssertLessThanOrEqual(e.snippet.utf8.count, 8000)
+        }
+        XCTAssertLessThanOrEqual(bundle.evidence.count, 32)
     }
 
     /// P1.2 adversary A — a claim citing evidence present ONLY in per-agent evidence (NOT top-level) is a foreign citation.

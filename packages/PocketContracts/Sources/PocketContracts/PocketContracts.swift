@@ -1,5 +1,10 @@
 // PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
-// v0.1.8++ (warden/bundle-kav-fix, P1 re-audit x3): the contract SHAPES/wire fields stay additive at "0.1.8" (bound in
+// v0.1.8++ (warden/bundle-kav-fix, P1 re-audit, round 5): bundle semantic caps are now the FROZEN PER-FIELD values
+//   mirroring the gateway (services/pocket-gateway SUMMARY_CAPS) + GroundedInferenceRequest (id 256 / evId 128 /
+//   str 512 / headline 4096 / summary+text 8192 / snippet 8000; perAgent 200 / evidence 256 / risks+blockers 100) so a
+//   gateway-signed bundle is never rejected; a total element+byte DoS budget fails fast; identity binding (unique
+//   agentIds, per-agent-scoped claim/nested-evidence dedup, citation-id dedup, per-agent-evidence bound to its agent,
+//   non-blank/trimmed ids) added. The wire SHAPES/fields stay additive at "0.1.8" (bound in
 //   canonicalBundlePayload — no field add/rename/remove). NOTE this is NOT purely additive at the API surface: the
 //   caller-supplied bundle-verify overloads (`verifiesSignature(gatewayPublicKeyBase64url:)` and the `trustAnchor:` forms)
 //   were REMOVED — a source-break for any external caller (here the only caller was internal PocketCall). That reduction
@@ -270,58 +275,95 @@ public enum BundleSemanticIssue: String, Equatable, Sendable {
     // P1.3 bounded ingress + P1.2 per-agent cross-check:
     case negativeSequence, emptyRequiredField, duplicateClaimId, oversizedField, perAgentEvidenceMismatch
     case emptyEvidence   // a bundle must carry >= 1 top-level evidence item
+    // Round-5: total-work DoS budget + identity binding (mirrors the gateway's per-agent scoping).
+    case overBudget, duplicateAgentId, duplicateCitationId, perAgentEvidenceForeignAgent, malformedId
 }
 
 public extension PocketBundle {
     /// The summary schema every Phase-A bundle must declare.
     static var expectedSummarySchema: String { "checkpoint_summary_sections_v1" }
-    // P1.3 bounded-ingress caps — FROZEN field minima, applied CONSISTENTLY everywhere a string/id/array is bounded.
-    static var maxIdLength: Int { 128 }        // ids: evidence id, claim id, agentId, checkpointId, sessionId, signingKeyId
-    static var maxStringLength: Int { 8000 }   // content: snippet, summary, headline, grade, risk, blocker, signature, text
-    static var maxArrayCount: Int { 2048 }     // arrays: evidence, perAgent, claims, risks, blockers, evidenceIds
+    // FROZEN per-field caps (UTF-8 bytes) — MIRROR the gateway (services/pocket-gateway/src/bundle.mjs SUMMARY_CAPS)
+    // and GroundedInferenceRequest (PocketInference/InferenceTypes.swift) EXACTLY, so a bundle the gateway signs is
+    // NEVER rejected by the phone. The caps DIFFER per field (a single uniform cap wrongly rejected valid bundles).
+    static var capId: Int { 256 }        // checkpointId, sessionId, signingKeyId   (frozen checkpoint/session 1...256)
+    static var capEvId: Int { 128 }      // evidence.id, evidence.agentId, agent.agentId   (frozen 1...128)
+    static var capStr: Int { 512 }       // signature, summaryBaselineSchema, grade, each risk/blocker, claim.id
+    static var capHeadline: Int { 4096 } // summary.headline
+    static var capSummary: Int { 8192 }  // agent.summary, claim.text
+    static var capSnippet: Int { 8000 }  // evidence.snippet   (frozen ingress 1...8000)
+    static var capPerAgent: Int { 200 }  // summary.perAgent count
+    static var capEvidence: Int { 256 }  // top-level evidence count + claim.evidenceIds count
+    static var capRisks: Int { 100 }     // summary.risks count
+    static var capBlockers: Int { 100 }  // summary.blockers count
+    // Round-5 total-work DoS budget across the whole graph — per-array caps don't bound the PRODUCT (agents × claims ×
+    // evidence × string bytes). Both are comfortably above any real gateway bundle (gateway signs <= 512KB bodies).
+    static var maxTotalElements: Int { 5000 }
+    static var maxTotalBytes: Int { 2_000_000 }
 
     /// P1.4 — cheap, no-crypto: is this bundle's `signingKeyId` one the phone pins? The ingress rejects an unknown id
     /// with THIS before running the (bounded) semantic scan or any crypto.
     func hasTrustedSigningKeyId() -> Bool { pocketTrustedGatewayKeys[signingKeyId] != nil }
 
-    /// FIX3 + P1.2/P1.3: all content-validity issues (deterministic order; empty == valid). Independent of the signature.
+    /// All content-validity issues (deterministic order; empty == valid), independent of the signature. Numeric caps
+    /// and per-agent dedup scoping MIRROR the gateway's validateBundleIngress/validateBundleSemantics EXACTLY, so a
+    /// bundle the gateway signs is never rejected; the strict rules (positive/non-inverted range, non-empty evidence,
+    /// byte-identical per-agent evidence, citations resolve to top-level) still reject a signed-but-malformed bundle.
     func semanticIssues() -> [BundleSemanticIssue] {
         var issues: [BundleSemanticIssue] = []
-        // Bounds are measured in UTF-8 BYTES (not grapheme clusters) so multibyte content cannot bypass a cap.
-        func tooLong(_ s: String, _ cap: Int) -> Bool { s.utf8.count > cap }
+        func tooLong(_ s: String, _ cap: Int) -> Bool { s.utf8.count > cap }   // caps measured in UTF-8 BYTES
+        // An id must be non-blank AND already-trimmed — whitespace-only or untrimmed ids are invalid identities.
+        func malformed(_ id: String) -> Bool { let t = id.trimmingCharacters(in: .whitespacesAndNewlines); return t.isEmpty || t != id }
+
+        // Round-5 DoS: total element + total byte budget across the WHOLE graph, FAIL-FAST before the field scan and
+        // before signature canonicalization. (Per-array caps alone don't bound the product agents × claims × bytes.)
+        var totalElements = evidence.count + summary.perAgent.count + summary.risks.count + summary.blockers.count
+        var totalBytes = signature.utf8.count + checkpointId.utf8.count + sessionId.utf8.count + signingKeyId.utf8.count
+            + summary.headline.utf8.count + (summary.grade?.utf8.count ?? 0)
+        for r in summary.risks { totalBytes += r.utf8.count }
+        for bl in summary.blockers { totalBytes += bl.utf8.count }
+        for e in evidence { totalBytes += e.id.utf8.count + e.sessionId.utf8.count + e.agentId.utf8.count + e.snippet.utf8.count }
+        for agent in summary.perAgent {
+            totalElements += agent.evidence.count + agent.claims.count
+            totalBytes += agent.agentId.utf8.count + agent.summary.utf8.count
+            for e in agent.evidence { totalBytes += e.id.utf8.count + e.sessionId.utf8.count + e.agentId.utf8.count + e.snippet.utf8.count }
+            for c in agent.claims {
+                totalElements += c.evidenceIds.count
+                totalBytes += c.id.utf8.count + c.text.utf8.count
+                for cid in c.evidenceIds { totalBytes += cid.utf8.count }
+            }
+        }
+        if totalElements > PocketBundle.maxTotalElements || totalBytes > PocketBundle.maxTotalBytes { return [.overBudget] }
 
         if contractsVersion != PocketContracts.version { issues.append(.wrongContractsVersion) }
         if summary.summaryBaselineSchema != PocketBundle.expectedSummarySchema { issues.append(.wrongSummarySchema) }
         if summary.checkpointId != checkpointId { issues.append(.checkpointIdMismatch) }
 
-        // P1.3 sequence-range bounds: STRICTLY POSITIVE and start <= end (reject 0…0, negatives, and inverted).
+        // Sequence range: strictly positive + non-inverted. Top-level evidence must be non-empty.
         if sequenceStart > sequenceEnd { issues.append(.invertedSequenceRange) }
         if sequenceStart <= 0 || sequenceEnd <= 0 { issues.append(.negativeSequence) }
-        // A bundle must carry >= 1 top-level evidence item (the UI's resolution set cannot be empty).
         if evidence.isEmpty { issues.append(.emptyEvidence) }
 
-        // P1.3 required non-empty top-level fields + oversized caps — bound EVERY string/id/array (ids, headline, grade,
-        // signature, each risk/blocker string, and all array counts).
+        // Top-level scalar fields — per-field FROZEN caps; ids must be non-blank + trimmed.
         if checkpointId.isEmpty || sessionId.isEmpty || signingKeyId.isEmpty { issues.append(.emptyRequiredField) }
-        if tooLong(checkpointId, PocketBundle.maxIdLength) || tooLong(sessionId, PocketBundle.maxIdLength)
-            || tooLong(signingKeyId, PocketBundle.maxIdLength) || tooLong(signature, PocketBundle.maxStringLength)
-            || tooLong(summary.headline, PocketBundle.maxStringLength)
-            || (summary.grade.map { tooLong($0, PocketBundle.maxStringLength) } ?? false)
-            || evidence.count > PocketBundle.maxArrayCount || summary.perAgent.count > PocketBundle.maxArrayCount
-            || summary.risks.count > PocketBundle.maxArrayCount || summary.blockers.count > PocketBundle.maxArrayCount
-            || summary.risks.contains(where: { tooLong($0, PocketBundle.maxStringLength) })
-            || summary.blockers.contains(where: { tooLong($0, PocketBundle.maxStringLength) }) {
+        if malformed(checkpointId) || malformed(sessionId) || malformed(signingKeyId) { issues.append(.malformedId) }
+        if tooLong(checkpointId, PocketBundle.capId) || tooLong(sessionId, PocketBundle.capId) || tooLong(signingKeyId, PocketBundle.capId)
+            || tooLong(signature, PocketBundle.capStr) || tooLong(summary.headline, PocketBundle.capHeadline)
+            || (summary.grade.map { tooLong($0, PocketBundle.capStr) } ?? false)
+            || evidence.count > PocketBundle.capEvidence || summary.perAgent.count > PocketBundle.capPerAgent
+            || summary.risks.count > PocketBundle.capRisks || summary.blockers.count > PocketBundle.capBlockers
+            || summary.risks.contains(where: { tooLong($0, PocketBundle.capStr) })
+            || summary.blockers.contains(where: { tooLong($0, PocketBundle.capStr) }) {
             issues.append(.oversizedField)
         }
 
-        // Top-level `bundle.evidence` — the EXACT set the UI resolves links against (ConversationView /
-        // EvidenceResolution): required non-empty fields, bounded, in-session, non-negative + in-range sequence, sane
-        // millisecond-exact dates, unique ids. This is the authoritative resolution + duplicate set.
+        // Top-level evidence — the authoritative UI resolution set: non-blank+trimmed ids, per-field caps, in-session,
+        // positive+in-range sequence, sane millisecond-exact dates, GLOBALLY-unique ids.
         var topSeen = Set<String>()
         var topById: [String: EvidenceRef] = [:]
         for e in evidence {
             if e.id.isEmpty || e.agentId.isEmpty || e.snippet.isEmpty { issues.append(.emptyRequiredField) }
-            if tooLong(e.id, PocketBundle.maxIdLength) || tooLong(e.agentId, PocketBundle.maxIdLength) || tooLong(e.snippet, PocketBundle.maxStringLength) { issues.append(.oversizedField) }
+            if malformed(e.id) || malformed(e.agentId) { issues.append(.malformedId) }
+            if tooLong(e.id, PocketBundle.capEvId) || tooLong(e.agentId, PocketBundle.capEvId) || tooLong(e.snippet, PocketBundle.capSnippet) { issues.append(.oversizedField) }
             if e.sessionId != sessionId { issues.append(.evidenceSessionMismatch) }
             if e.sequence <= 0 { issues.append(.negativeSequence) }
             if e.sequence < sequenceStart || e.sequence > sequenceEnd { issues.append(.evidenceSequenceOutOfRange) }
@@ -330,37 +372,37 @@ public extension PocketBundle {
             topById[e.id] = e
         }
 
-        // P1.2 per-agent cross-check: every `AgentSummary.evidence` item MUST be PRESENT in top-level `bundle.evidence`
-        // AND byte-identical (same id + every field). Absent, or present-but-differing (foreign session/sequence/snippet),
-        // is rejected — otherwise per-agent evidence could carry content the UI never resolves against.
-        var perAgentEvSeen = Set<String>()
+        // Per-agent: agentIds unique ACROSS agents. Per-agent evidence must be byte-identical to top-level, BOUND to
+        // its container (evidence.agentId == the agent), and unique WITHIN the agent's list. Claim ids unique WITHIN
+        // the agent; citation ids unique within a claim; fact/inference cited; citations resolve to top-level. (Dedup
+        // is per-agent — matching the gateway — so a gateway bundle is never rejected.)
+        var agentIdSeen = Set<String>()
         for agent in summary.perAgent {
             if agent.agentId.isEmpty { issues.append(.emptyRequiredField) }
-            if tooLong(agent.agentId, PocketBundle.maxIdLength) || tooLong(agent.summary, PocketBundle.maxStringLength)
-                || agent.evidence.count > PocketBundle.maxArrayCount || agent.claims.count > PocketBundle.maxArrayCount { issues.append(.oversizedField) }
+            if malformed(agent.agentId) { issues.append(.malformedId) }
+            if !agentIdSeen.insert(agent.agentId).inserted { issues.append(.duplicateAgentId) }
+            if tooLong(agent.agentId, PocketBundle.capEvId) || tooLong(agent.summary, PocketBundle.capSummary) { issues.append(.oversizedField) }
+            var nestedSeen = Set<String>()
             for pe in agent.evidence {
-                if topById[pe.id] != pe { issues.append(.perAgentEvidenceMismatch) }               // must be byte-identical to top-level
-                if !perAgentEvSeen.insert(pe.id).inserted { issues.append(.duplicateEvidenceId) }   // no dup id within a list or across agents
+                if topById[pe.id] != pe { issues.append(.perAgentEvidenceMismatch) }
+                if pe.agentId != agent.agentId { issues.append(.perAgentEvidenceForeignAgent) }
+                if !nestedSeen.insert(pe.id).inserted { issues.append(.duplicateEvidenceId) }
             }
-        }
-
-        // Claims: bounded, non-empty id/text, unique ids across the bundle, fact/inference MUST cite, and every cited id
-        // resolves to a TOP-LEVEL evidence id (no foreign citation).
-        let knownIds = Set(evidence.map { $0.id })
-        var claimSeen = Set<String>()
-        for agent in summary.perAgent {
+            var claimSeen = Set<String>()
             for claim in agent.claims {
                 if claim.id.isEmpty || claim.text.isEmpty { issues.append(.emptyRequiredField) }
-                if tooLong(claim.id, PocketBundle.maxIdLength) || tooLong(claim.text, PocketBundle.maxStringLength)
-                    || claim.evidenceIds.count > PocketBundle.maxArrayCount
-                    || claim.evidenceIds.contains(where: { tooLong($0, PocketBundle.maxIdLength) }) { issues.append(.oversizedField) }
+                if malformed(claim.id) { issues.append(.malformedId) }
+                if tooLong(claim.id, PocketBundle.capStr) || tooLong(claim.text, PocketBundle.capSummary)
+                    || claim.evidenceIds.count > PocketBundle.capEvidence
+                    || claim.evidenceIds.contains(where: { tooLong($0, PocketBundle.capEvId) }) { issues.append(.oversizedField) }
                 if !claimSeen.insert(claim.id).inserted { issues.append(.duplicateClaimId) }
+                var citeSeen = Set<String>()
+                for cid in claim.evidenceIds where !citeSeen.insert(cid).inserted { issues.append(.duplicateCitationId) }
                 if (claim.kind == .fact || claim.kind == .inference) && claim.evidenceIds.isEmpty { issues.append(.uncitedFactOrInference) }
-                if !claim.evidenceIds.allSatisfy({ knownIds.contains($0) }) { issues.append(.foreignClaimCitation) }
+                if !claim.evidenceIds.allSatisfy({ topSeen.contains($0) }) { issues.append(.foreignClaimCitation) }
             }
         }
 
-        // createdAt is bound as epoch-millis in the canonical -> it must be sane + millisecond-exact.
         if !PocketBundle.dateIsSaneAndMillisExact(createdAt) { issues.append(ActionReceipt.safeEpochMillis(createdAt) == nil ? .unsaneDate : .subMillisecondDate) }
         return issues
     }
