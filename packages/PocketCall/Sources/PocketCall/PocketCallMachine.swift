@@ -23,12 +23,16 @@ import PocketContracts
 ///                          pinned gateway key.
 public enum PocketCallState: Equatable, Sendable {
     case idle
-    case incoming(PocketBundle)                                       // "Senti is calling"
-    case briefing(PocketBundle, BriefingPlan)                        // narrating (Echo speaks; barge-in interrupts)
-    case conversing(PocketBundle, answers: [QuestionAnswer])          // barge-in Q&A over cached evidence
-    case awaitingConfirmation(PocketBundle, ActionProposal, challenge: String)  // preview + read-back; awaiting confirm
-    case executing(PocketBundle, ActionProposal)                     // governed writeback in flight
-    case completed(ActionReceipt)                                    // receipt (posted / pendingConnectivity / failed)
+    // v0.4 (Pulse/Echo #235653 demo-blocker #1): every LIVE state holds a `VerifiedBundle`, NOT a raw PocketBundle.
+    // A `VerifiedBundle` is mintable ONLY via VerifiedBundle.verify (real ed25519) — so a live call state is
+    // UNCONSTRUCTABLE from an unverified bundle even by a misbehaving caller. This closes the "public raw state is
+    // an authority transition" bypass at the TYPE level (was: `.conversing(rawBundle,[])` could reach `.executing`).
+    case incoming(VerifiedBundle)                                            // "Senti is calling"
+    case briefing(VerifiedBundle, BriefingPlan)                             // narrating (Echo speaks; barge-in interrupts)
+    case conversing(VerifiedBundle, answers: [QuestionAnswer])              // barge-in Q&A over cached evidence
+    case awaitingConfirmation(VerifiedBundle, ActionProposal, challenge: String)  // preview + read-back; awaiting confirm
+    case executing(VerifiedBundle, ActionProposal)                         // governed writeback in flight
+    case completed(ActionReceipt)                                          // receipt (posted / pendingConnectivity / failed)
     case dismissed
 }
 
@@ -80,31 +84,31 @@ public enum PocketCall {
 
         switch (state, event) {
         case let (.idle, .bundleArrived(verified)):
-            return .incoming(verified.bundle)
+            return .incoming(verified)   // carry the VerifiedBundle through every live state
 
-        case let (.incoming(bundle), .answered(plan)):
-            return plan.checkpointId == bundle.checkpointId
-                ? .briefing(bundle, plan)
-                : .incoming(bundle)   // provenance mismatch: refuse
+        case let (.incoming(vb), .answered(plan)):
+            return plan.checkpointId == vb.bundle.checkpointId
+                ? .briefing(vb, plan)
+                : .incoming(vb)   // provenance mismatch: refuse
 
-        case let (.briefing(bundle, _), .interrupted),
-             let (.briefing(bundle, _), .briefingCompleted):
-            return .conversing(bundle, answers: [])
+        case let (.briefing(vb, _), .interrupted),
+             let (.briefing(vb, _), .briefingCompleted):
+            return .conversing(vb, answers: [])
 
-        case let (.conversing(bundle, answers), .questionAnswered(qa)):
-            guard qa.checkpointId == bundle.checkpointId,
-                  Self.citationsWithinBundle(qa.citations, bundle) else { return state }
-            return .conversing(bundle, answers: answers + [qa])
+        case let (.conversing(vb, answers), .questionAnswered(qa)):
+            guard qa.checkpointId == vb.bundle.checkpointId,
+                  Self.citationsWithinBundle(qa.citations, vb.bundle) else { return state }
+            return .conversing(vb, answers: answers + [qa])
 
         // Arm confirmation ONLY for a proposal that targets THIS bundle's session AND with a real episode nonce.
-        case let (.conversing(bundle, _), .proposalDrafted(proposal, challenge)):
-            return (proposal.targetSessionId == bundle.sessionId && !challenge.isEmpty)
-                ? .awaitingConfirmation(bundle, proposal, challenge: challenge)
-                : .conversing(bundle, answers: [])
+        case let (.conversing(vb, _), .proposalDrafted(proposal, challenge)):
+            return (proposal.targetSessionId == vb.bundle.sessionId && !challenge.isEmpty)
+                ? .awaitingConfirmation(vb, proposal, challenge: challenge)
+                : .conversing(vb, answers: [])
 
         // SAFETY-CRITICAL: confirm -> execute ONLY when the capability echoes the EXACT awaiting proposal's full
         // identity + this episode's challenge, the proposal is valid-for-confirmation, and target == bundle.session.
-        case let (.awaitingConfirmation(bundle, proposal, challenge), .confirmed(cap)):
+        case let (.awaitingConfirmation(vb, proposal, challenge), .confirmed(cap)):
             let boundToReadback =
                 cap.proposalId == proposal.id
                 && cap.proposalHash == proposal.proposalHash
@@ -113,17 +117,17 @@ public enum PocketCall {
                 && cap.challenge == challenge
             let ok = boundToReadback
                 && proposal.isValidForConfirmation()
-                && proposal.targetSessionId == bundle.sessionId
-            return ok ? .executing(bundle, proposal)
-                      : .awaitingConfirmation(bundle, proposal, challenge: challenge)   // refuse (fail-safe)
+                && proposal.targetSessionId == vb.bundle.sessionId
+            return ok ? .executing(vb, proposal)
+                      : .awaitingConfirmation(vb, proposal, challenge: challenge)   // refuse (fail-safe)
 
-        case let (.awaitingConfirmation(bundle, _, _), .cancelled):
-            return .conversing(bundle, answers: [])
+        case let (.awaitingConfirmation(vb, _, _), .cancelled):
+            return .conversing(vb, answers: [])
 
-        case let (.executing(bundle, proposal), .executed(receipt)):
-            return Self.receiptBinds(receipt, to: proposal, bundle: bundle, gatewayKey: gatewayKey)
+        case let (.executing(vb, proposal), .executed(receipt)):
+            return Self.receiptBinds(receipt, to: proposal, bundle: vb.bundle, gatewayKey: gatewayKey)
                 ? .completed(receipt)
-                : .executing(bundle, proposal)   // unbound/unverified receipt: stay in-flight, do not complete
+                : .executing(vb, proposal)   // unbound/unverified receipt: stay in-flight, do not complete
 
         default:
             return state   // no-op: undefined transition (incl. any attempt to skip confirmation)

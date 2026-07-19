@@ -54,7 +54,7 @@ final class PocketCallMachineTests: XCTestCase {
     /// SAFETY: confirming an INVALID proposal does NOT advance, even with a correctly-bound capability + challenge.
     func testInvalidProposalConfirmDoesNotExecute() {
         let bad = invalidProposal()
-        let awaiting = PocketCallState.awaitingConfirmation(bundle(), bad, challenge: challenge)
+        let awaiting = PocketCallState.awaitingConfirmation(vb(), bad, challenge: challenge)
         let cap = ConfirmationCapability.forReadBack(of: bad, challenge: challenge)   // binds identity + challenge
         let after = PocketCall.reduce(awaiting, .confirmed(cap), gatewayKey: key)
         if case .executing = after { XCTFail("invalid proposal must NOT execute") }
@@ -63,7 +63,7 @@ final class PocketCallMachineTests: XCTestCase {
 
     /// SAFETY (Echo #4): a correctly-shaped proposal for a DIFFERENT Senti session must NOT arm confirmation.
     func testWrongSessionProposalRefused() {
-        let conversing = PocketCallState.conversing(bundle(session: "s1"), answers: [])
+        let conversing = PocketCallState.conversing(vb(session: "s1"), answers: [])
         let foreign = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "OTHER-ROOM", targetSequence: 10, renderedPreview: "x", requiresConfirmation: true, createdAt: ts, sourceQuestionId: nil, proposalHash: "H")
         let after = PocketCall.reduce(conversing, .proposalDrafted(foreign, challenge: challenge), gatewayKey: key)
         if case .awaitingConfirmation = after { XCTFail("wrong-session proposal must NOT arm confirmation") }
@@ -72,7 +72,7 @@ final class PocketCallMachineTests: XCTestCase {
 
     /// SAFETY: arming confirmation requires a non-empty per-episode challenge nonce.
     func testEmptyChallengeDoesNotArm() {
-        let conversing = PocketCallState.conversing(bundle(), answers: [])
+        let conversing = PocketCallState.conversing(vb(), answers: [])
         if case .awaitingConfirmation = PocketCall.reduce(conversing, .proposalDrafted(invalidProposal(), challenge: ""), gatewayKey: key) {
             XCTFail("empty challenge must NOT arm confirmation")
         }
@@ -85,7 +85,7 @@ final class PocketCallMachineTests: XCTestCase {
         let displayedB = ActionProposal(id: "pB", kind: .threadedReply, targetSessionId: "s1", targetSequence: 10, renderedPreview: "rotate token", createdAt: ts, sourceQuestionId: nil)
         let proposalA = ActionProposal(id: "pA", kind: .threadedReply, targetSessionId: "s1", targetSequence: 10, renderedPreview: "rotate token", createdAt: ts, sourceQuestionId: nil)
         XCTAssertNotEqual(displayedB.proposalHash, proposalA.proposalHash)   // identical content, different id -> different hash
-        let awaiting = PocketCallState.awaitingConfirmation(bundle(), displayedB, challenge: challenge)
+        let awaiting = PocketCallState.awaitingConfirmation(vb(), displayedB, challenge: challenge)
         // stale capability for A must NOT confirm displayed B
         let capA = ConfirmationCapability.forReadBack(of: proposalA, challenge: challenge)
         guard case .awaitingConfirmation = PocketCall.reduce(awaiting, .confirmed(capA), gatewayKey: key) else { return XCTFail("A's cap must not confirm B") }
@@ -100,7 +100,7 @@ final class PocketCallMachineTests: XCTestCase {
 
     /// SAFETY (Echo #2): a briefing plan for a different checkpoint must not start the briefing.
     func testPlanProvenanceMismatchRefused() {
-        let incoming = PocketCallState.incoming(bundle(checkpoint: "cp1"))
+        let incoming = PocketCallState.incoming(vb(checkpoint: "cp1"))
         let after = PocketCall.reduce(incoming, .answered(plan(checkpoint: "OTHER-CP")), gatewayKey: key)
         guard case .incoming = after else { return XCTFail("cross-checkpoint plan must be refused") }
     }
@@ -108,7 +108,7 @@ final class PocketCallMachineTests: XCTestCase {
     /// SAFETY (Echo #3): Q&A for a wrong checkpoint, or citing evidence absent from the bundle, is dropped.
     func testQAProvenanceAndCitationsEnforced() {
         let ev = EvidenceRef(id: "ev_1", sessionId: "s1", sequence: 1, agentId: "a", snippet: "x", ts: ts)
-        let conversing = PocketCallState.conversing(bundle(evidence: [ev]), answers: [])
+        let conversing = PocketCallState.conversing(vb(evidence: [ev]), answers: [])
         XCTAssertEqual(PocketCall.reduce(conversing, .questionAnswered(qa(checkpoint: "OTHER-CP")), gatewayKey: key), conversing)
         XCTAssertEqual(PocketCall.reduce(conversing, .questionAnswered(qa(citations: ["ev_UNKNOWN"])), gatewayKey: key), conversing)
         guard case let .conversing(_, answers) = PocketCall.reduce(conversing, .questionAnswered(qa(citations: ["ev_1"])), gatewayKey: key), answers.count == 1 else {
@@ -117,13 +117,13 @@ final class PocketCallMachineTests: XCTestCase {
     }
 
     func testCancelReturnsToConversing() {
-        let awaiting = PocketCallState.awaitingConfirmation(bundle(), invalidProposal(), challenge: challenge)
+        let awaiting = PocketCallState.awaitingConfirmation(vb(), invalidProposal(), challenge: challenge)
         guard case .conversing = PocketCall.reduce(awaiting, .cancelled, gatewayKey: key) else { return XCTFail("cancel -> conversing") }
     }
 
     func testDismissFromAnywhereExceptCompleted() {
-        guard case .dismissed = PocketCall.reduce(.incoming(bundle()), .dismiss, gatewayKey: key) else { return XCTFail() }
-        guard case .dismissed = PocketCall.reduce(.awaitingConfirmation(bundle(), invalidProposal(), challenge: challenge), .dismiss, gatewayKey: key) else { return XCTFail() }
+        guard case .dismissed = PocketCall.reduce(.incoming(vb()), .dismiss, gatewayKey: key) else { return XCTFail() }
+        guard case .dismissed = PocketCall.reduce(.awaitingConfirmation(vb(), invalidProposal(), challenge: challenge), .dismiss, gatewayKey: key) else { return XCTFail() }
         let done = PocketCallState.completed(receipt())
         guard case .completed = PocketCall.reduce(done, .dismiss, gatewayKey: key) else { return XCTFail("completed is terminal") }
     }
