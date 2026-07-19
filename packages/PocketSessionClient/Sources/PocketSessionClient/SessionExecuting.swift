@@ -19,15 +19,18 @@ protocol SessionExecuting: Sendable {
 
 /// Opaque sealed HTTP result. Exposes NO status/body until `open()`; the broker opens it ONLY after
 /// generation-equality (§4c). `open()` yields a NORMALIZED status Int (never a raw HTTPURLResponse) + Data +
-/// requestId — nothing else escapes. Its initializer is fileprivate, so only an executor in THIS file mints one.
+/// requestId — nothing else escapes.
 struct SealedResponse {
     private let statusCode: Int
     private let data: Data
     private let requestId: String?
-    fileprivate init(data: Data, response: HTTPURLResponse) {
-        self.statusCode = response.statusCode
+    /// Normalized init (a status Int, never a raw HTTPURLResponse) — INTERNAL so BOTH the live executor and the
+    /// deterministic KAV executor can mint a sealed response. Security lives in `open()`'s broker-only grant, NOT
+    /// the init: any executor may MINT a seal, but ONLY the broker can READ it (and only post generation-equality).
+    init(data: Data, status: Int, requestId: String?) {
+        self.statusCode = status
         self.data = data
-        self.requestId = response.value(forHTTPHeaderField: "x-request-id")
+        self.requestId = requestId
     }
     /// Broker-only classification surface, called post generation-equality. Requires an `ExecutionGrant` that
     /// ONLY CredentialBroker can mint (its init is broker-file-private), so NO other current-or-future
@@ -53,7 +56,9 @@ struct LiveSessionExecutor: SessionExecuting {
         catch is CancellationError { throw CancellationError() }   // structured cancellation propagates verbatim
         catch { throw TransportError.network }
         guard let http = response as? HTTPURLResponse else { throw TransportError.network }
-        return SealedResponse(data: data, response: http)          // sealed; broker opens post-equality
+        // Normalize to a status Int HERE — no HTTPURLResponse ever leaves the seam. Broker opens post-equality.
+        return SealedResponse(data: data, status: http.statusCode,
+                              requestId: http.value(forHTTPHeaderField: "x-request-id"))
     }
 }
 
