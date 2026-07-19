@@ -5,7 +5,7 @@
 Folds warden R1/R2/R3'/R4'/R5/R6', Echo's 8 exact corrections (#239660), Pulse's ownership/state/evidence redlines, and the live-verified deployed contract.
 
 ## 1. Deployed contract (live-verified, read-only ECS/AS evidence — no secrets)
-sentinelayer-api deployed `3ca7640` == origin/main `91a2c3fa`.
+Provenance (kept distinct): **deployed prod = `3ca7640`**; **origin/main = `91a2c3fa`**, which is **one commit AHEAD** of deploy (`Persist MCP OAuth write consent in deploys`). Server-lane work targets a clean worktree on `origin/main 91a2c3fa`; the values below were read from the deployed build.
 - **AS** `https://api.sentinelayer.com`: **Authorization-Code + PKCE S256 only**, public client (`token_endpoint_auth_methods: none`), RS256.
 - `grant_types = [authorization_code, token-exchange]` **but the deployed token endpoint REJECTS token-exchange** ⇒ the ONLY evidenced re-issuance is an explicit foreground Auth-Code+PKCE `signIn`. **No `refresh_token`. No revocation endpoint.**
 - Exact values: **issuer `https://api.sentinelayer.com`**, **resource/audience `https://mcp.sentinelayer.com`**, **access-token TTL 900s**. `JWT_ISSUER`/`JWT_AUDIENCE` env **absent** (server does not verify iss/aud today — a server-lane hardening item).
@@ -35,11 +35,19 @@ public protocol AuthProviding: Sendable {              // STATE only; async, act
 }
 
 // Broker module: the credential is a PRIVATE nested type; not nameable/constructible outside.
+// AuthorizedRequest is an OPAQUE handle (the request + an unforgeable broker-private generation).
+// Non-public initializer -> only the broker mints one; callers cannot fabricate or read the generation,
+// and it is NOT a token. This makes the generation race a real, testable API, not prose.
+public struct AuthorizedRequest: Sendable {
+    public let request: URLRequest
+    // internal let generation: Generation   // broker-private, non-token, unforgeable
+}
 actor CredentialBroker {
     // authorize() NEVER awaits UI. Missing/near-expired -> throw .reauthenticationRequired (no network, no replay).
-    // Each authorized request carries an opaque broker-private GENERATION. A late 401 for generation N invalidates/
-    // cancels ONLY N, never N+1. A 403 never invalidates and never retries.
-    func authorize(_ request: URLRequest) async throws -> URLRequest
+    func authorize(_ request: URLRequest) async throws -> AuthorizedRequest   // mints request + CURRENT generation
+    func handle401(_ authorized: AuthorizedRequest) async                     // invalidates ONLY that generation; a late 401 for gen N never touches N+1; a subsequent signIn() bumps generation
+    // Allowed alternative: the broker OWNS network execution + response classification (no handle exposed).
+    // A 403 never invalidates and never retries.
 }
 
 public protocol SessionTransport: Sendable {           // NETWORK-ONLY; returns merged wire pages; no cache, no fake success
