@@ -15,6 +15,7 @@ final class PocketAppModel: NSObject, ObservableObject {
 
     private enum SpeechPurpose {
         case briefing
+        case answer
         case proposal(ProposalReadBackAttempt)
     }
 
@@ -25,7 +26,12 @@ final class PocketAppModel: NSObject, ObservableObject {
 
     private let ledger = ProposalConfirmationLedger()
     private let synthesizer = AVSpeechSynthesizer()
+    private let speechRecognizer = OnDeviceSpeechRecognizer()
     private var activeSpeech: ActiveSpeech?
+    private var speechStartTask: Task<Void, Error>?
+    private var speechFinishTask: Task<Void, Never>?
+    private var activeRecognitionID: UUID?
+    private var recognizedQuestionAnswer: QuestionAnswer?
     private var pushToTalkIsActive = false
     private var completedPushToTalkCycles = 0
 
@@ -97,22 +103,47 @@ final class PocketAppModel: NSObject, ObservableObject {
                   !pushToTalkIsActive else { return }
             stopActiveSpeech(message: "Read-back interrupted before completion.")
             pushToTalkIsActive = true
+            let recognitionID = UUID()
+            activeRecognitionID = recognitionID
             _ = showConversation(
                 verifiedBundle,
                 includesCachedAnswer: completedPushToTalkCycles > 0,
                 voiceState: .listening,
                 isPushToTalkActive: true
             )
+            let startTask = Task { @MainActor [speechRecognizer] in
+                try await speechRecognizer.start()
+            }
+            speechStartTask = startTask
+            Task { @MainActor [weak self] in
+                do {
+                    try await startTask.value
+                } catch {
+                    self?.handleRecognitionFailure(error, recognitionID: recognitionID)
+                }
+            }
 
         case .pushToTalkEnded(let context):
             guard matchesCurrentConversation(context, verifiedBundle: verifiedBundle),
-                  pushToTalkIsActive else { return }
+                  pushToTalkIsActive,
+                  let recognitionID = activeRecognitionID else { return }
             pushToTalkIsActive = false
-            completedPushToTalkCycles += 1
-            if completedPushToTalkCycles == 1 {
-                _ = showConversation(verifiedBundle, includesCachedAnswer: true, voiceState: .idle)
-            } else {
-                showProposal(verifiedBundle)
+            _ = showConversation(
+                verifiedBundle,
+                includesCachedAnswer: completedPushToTalkCycles > 0,
+                voiceState: .thinking
+            )
+            let startTask = speechStartTask
+            speechFinishTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await startTask?.value
+                    guard self.activeRecognitionID == recognitionID else { return }
+                    let transcript = try await self.speechRecognizer.stop()
+                    self.completeRecognition(transcript, recognitionID: recognitionID)
+                } catch {
+                    self.handleRecognitionFailure(error, recognitionID: recognitionID)
+                }
             }
 
         case .stopNarration(let context):
@@ -309,15 +340,28 @@ final class PocketAppModel: NSObject, ObservableObject {
         voiceState: VoiceConversationState,
         isPushToTalkActive: Bool = false
     ) -> Bool {
-        guard let conversation = PocketUIDemoFixtures.conversationState(
+        guard let canonicalConversation = PocketUIDemoFixtures.conversationState(
             verifiedBundle: verifiedBundle,
-            includesCachedAnswer: includesCachedAnswer,
-            voiceState: voiceState,
-            isPushToTalkActive: isPushToTalkActive
+            includesCachedAnswer: false
         ) else {
             failClosed("The verified checkpoint does not support the canonical offline demo flow.")
             return false
         }
+        var transcript = canonicalConversation.briefingPlan.segments.map(ConversationEntry.briefing)
+        transcript.append(.notice(ConversationNotice(
+            id: "on-device-speech-cached-answer",
+            text: "Microphone transcription runs on this device. Answers are matched against cached evidence; no live Gemma or network model is running."
+        )))
+        if includesCachedAnswer, let recognizedQuestionAnswer {
+            transcript.append(.questionAnswer(recognizedQuestionAnswer))
+        }
+        let conversation = ConversationState(
+            verifiedBundle: verifiedBundle,
+            briefingPlan: canonicalConversation.briefingPlan,
+            transcript: transcript,
+            voiceState: voiceState,
+            isPushToTalkActive: isPushToTalkActive
+        )
         let preservesConversationPresentation: Bool
         if case .conversation = state.destination {
             preservesConversationPresentation = true
@@ -383,6 +427,15 @@ final class PocketAppModel: NSObject, ObservableObject {
         synthesizer.speak(utterance)
     }
 
+    private func speakAnswer(_ answer: String) {
+        let utterance = AVSpeechUtterance(string: answer)
+        activeSpeech = ActiveSpeech(
+            utteranceID: ObjectIdentifier(utterance),
+            purpose: .answer
+        )
+        synthesizer.speak(utterance)
+    }
+
     private func stopActiveSpeech(message: String) {
         guard let activeSpeech else { return }
         if case .proposal(let attempt) = activeSpeech.purpose,
@@ -399,11 +452,14 @@ final class PocketAppModel: NSObject, ObservableObject {
     }
 
     private func resetConversation() {
+        cancelRecognition()
         pushToTalkIsActive = false
         completedPushToTalkCycles = 0
+        recognizedQuestionAnswer = nil
     }
 
     private func failClosed(_ message: String) {
+        cancelRecognition()
         stopActiveSpeech(message: message)
         guard let verifiedBundle else {
             state = Self.initialState(nil)
@@ -427,6 +483,15 @@ final class PocketAppModel: NSObject, ObservableObject {
             _ = showConversation(
                 verifiedBundle,
                 includesCachedAnswer: completedPushToTalkCycles > 0,
+                voiceState: .idle
+            )
+
+        case .answer:
+            guard let verifiedBundle,
+                  case .conversation = state.destination else { return }
+            _ = showConversation(
+                verifiedBundle,
+                includesCachedAnswer: true,
                 voiceState: .idle
             )
 
@@ -456,6 +521,14 @@ final class PocketAppModel: NSObject, ObservableObject {
                 includesCachedAnswer: completedPushToTalkCycles > 0,
                 voiceState: .interrupted
             )
+        case .answer:
+            guard let verifiedBundle,
+                  case .conversation = state.destination else { return }
+            _ = showConversation(
+                verifiedBundle,
+                includesCachedAnswer: true,
+                voiceState: .interrupted
+            )
         case .proposal(let attempt):
             guard case .proposal(let proposalState) = state.destination else { return }
             var gate = proposalState.confirmationGate
@@ -465,6 +538,101 @@ final class PocketAppModel: NSObject, ObservableObject {
                 connectivity: offlineConnectivity
             )
         }
+    }
+
+    private func completeRecognition(_ transcript: String, recognitionID: UUID) {
+        guard activeRecognitionID == recognitionID,
+              let verifiedBundle,
+              case .conversation = state.destination else { return }
+        activeRecognitionID = nil
+        speechStartTask = nil
+        speechFinishTask = nil
+
+        if completedPushToTalkCycles == 0 {
+            let answer = cachedAnswer(for: transcript, verifiedBundle: verifiedBundle)
+            recognizedQuestionAnswer = answer
+            completedPushToTalkCycles = 1
+            guard showConversation(
+                verifiedBundle,
+                includesCachedAnswer: true,
+                voiceState: .speaking(segmentId: nil)
+            ) else { return }
+            speakAnswer(answer.answer)
+            return
+        }
+
+        guard matchesCanonicalDecision(transcript) else {
+            _ = showConversation(
+                verifiedBundle,
+                includesCachedAnswer: true,
+                voiceState: .error(
+                    message: "Decision heard, but it did not match ‘rotate the token and do not deploy.’ No proposal was created."
+                )
+            )
+            return
+        }
+
+        completedPushToTalkCycles = 2
+        showProposal(verifiedBundle)
+    }
+
+    private func handleRecognitionFailure(_ error: Error, recognitionID: UUID) {
+        guard activeRecognitionID == recognitionID else { return }
+        activeRecognitionID = nil
+        pushToTalkIsActive = false
+        speechStartTask?.cancel()
+        speechStartTask = nil
+        speechFinishTask?.cancel()
+        speechFinishTask = nil
+        speechRecognizer.cancel()
+
+        guard let verifiedBundle,
+              case .conversation = state.destination else { return }
+        _ = showConversation(
+            verifiedBundle,
+            includesCachedAnswer: completedPushToTalkCycles > 0,
+            voiceState: .error(message: error.localizedDescription)
+        )
+    }
+
+    private func cancelRecognition() {
+        activeRecognitionID = nil
+        speechStartTask?.cancel()
+        speechStartTask = nil
+        speechFinishTask?.cancel()
+        speechFinishTask = nil
+        speechRecognizer.cancel()
+    }
+
+    private func cachedAnswer(
+        for question: String,
+        verifiedBundle: VerifiedBundle
+    ) -> QuestionAnswer {
+        let normalized = question.lowercased()
+        let isCanonicalQuestion = normalized.contains("token")
+            && (normalized.contains("parser") || normalized.contains("fixed"))
+        return QuestionAnswer(
+            id: "speech-question-1",
+            checkpointId: verifiedBundle.bundle.checkpointId,
+            question: question,
+            answer: isCanonicalQuestion
+                ? PocketFixtures.questionAnswer.answer
+                : "I do not have cached evidence that answers that question.",
+            citations: isCanonicalQuestion ? PocketFixtures.questionAnswer.citations : [],
+            answeredOffline: true,
+            createdAt: Date()
+        )
+    }
+
+    private func matchesCanonicalDecision(_ transcript: String) -> Bool {
+        let normalized = transcript
+            .lowercased()
+            .replacingOccurrences(of: "’", with: "'")
+        let requestsRotation = normalized.contains("rotate") && normalized.contains("token")
+        let blocksDeployment = normalized.contains("do not deploy")
+            || normalized.contains("don't deploy")
+            || normalized.contains("no deploy")
+        return requestsRotation && blocksDeployment
     }
 }
 
