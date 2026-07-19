@@ -30,11 +30,11 @@ struct RootView: View {
             if let vb = verified {
                 briefing(vb.bundle)
             } else if decoded == nil {
-                ContentUnavailableView("No bundle", systemImage: "bolt.slash",
-                    description: Text("canonical_checkpoint.json failed to load — check Resources bundling."))
+                StatusView(title: "No bundle", systemImage: "bolt.slash",
+                    message: "canonical_checkpoint.json failed to load — check Resources bundling.")
             } else {
-                ContentUnavailableView("Bundle not verified", systemImage: "lock.trianglebadge.exclamationmark",
-                    description: Text("The cached checkpoint is unsigned or signed by an untrusted key. Senti Pocket refuses to display, narrate, or answer from an unverified bundle — fail-closed. Sign the fixture under a trusted key (pocket-demo-app-fixture) to enable the demo."))
+                StatusView(title: "Bundle not verified", systemImage: "lock.trianglebadge.exclamationmark",
+                    message: "The cached checkpoint is unsigned or signed by an untrusted key. Senti Pocket refuses to display, narrate, or answer from an unverified bundle — fail-closed. Sign the fixture under a trusted key (pocket-demo-app-fixture) to enable the demo.")
                     .navigationTitle("Fail-closed")
             }
         }
@@ -73,6 +73,23 @@ struct RootView: View {
         case .inference: return "[INFER]"
         case .recommendation: return "[REC]"
         }
+    }
+}
+
+/// iOS 16-compatible empty/error state (ContentUnavailableView is iOS 17+, but the app target is pinned to iOS 16
+/// per the baseline — forge #238084 caught the mismatch on the real Mac). Pure VStack/Image/Text = iOS 16-safe.
+private struct StatusView: View {
+    let title: String
+    let systemImage: String
+    let message: String
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: systemImage).font(.largeTitle).foregroundStyle(.secondary)
+            Text(title).font(.headline)
+            Text(message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
