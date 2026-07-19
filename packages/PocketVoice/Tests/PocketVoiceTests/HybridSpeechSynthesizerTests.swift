@@ -38,17 +38,22 @@ final class HybridSpeechSynthesizerTests: XCTestCase {
         XCTAssertEqual(offlineCalls, 1)
     }
 
-    func testSupersededPremiumFailureDoesNotReviveOldOfflinePlayback() async throws {
+    func testSameRequestIDSupersessionDoesNotReviveOldOfflinePlayback() async throws {
         let oldRequestStarted = HybridAsyncLatch()
-        let premium = SupersedingPremiumSynthesizer(oldRequestStarted: oldRequestStarted)
+        let newRequestStarted = HybridAsyncLatch()
+        let premium = SupersedingPremiumSynthesizer(
+            oldRequestStarted: oldRequestStarted,
+            newRequestStarted: newRequestStarted
+        )
         let offline = FakeSynthesizer(result: .success(metrics(.avSpeechOffline)))
         let hybrid = HybridSpeechSynthesizer(
             premium: premium,
             offline: offline,
             connectivity: FixedConnectivity(online: true)
         )
-        let oldRequest = try SpeechSynthesisRequest(text: "old request")
-        let newRequest = try SpeechSynthesisRequest(text: "new request")
+        let sharedRequestID = UUID()
+        let oldRequest = try SpeechSynthesisRequest(id: sharedRequestID, text: "old request")
+        let newRequest = try SpeechSynthesisRequest(id: sharedRequestID, text: "new request")
 
         let oldTask = Task { () -> VoiceError? in
             do {
@@ -58,16 +63,23 @@ final class HybridSpeechSynthesizerTests: XCTestCase {
                 return error as? VoiceError
             }
         }
-        await oldRequestStarted.waitUntilStarted()
+        try await oldRequestStarted.waitUntilStarted()
 
-        let newestMetrics = try await hybrid.speak(newRequest)
+        let newTask = Task { try await hybrid.speak(newRequest) }
+        try await newRequestStarted.waitUntilStarted()
         await oldRequestStarted.release()
+
         let oldError = await oldTask.value
         let offlineCalls = await offline.callCount()
+        let newRequestStillActive = await hybrid.hasActiveRequest(sharedRequestID)
+
+        await newRequestStarted.release()
+        let newestMetrics = try await newTask.value
 
         XCTAssertEqual(newestMetrics.backend, .elevenLabsGateway)
         XCTAssertEqual(oldError, .cancelled)
         XCTAssertEqual(offlineCalls, 0)
+        XCTAssertTrue(newRequestStillActive)
     }
 
     func testOlderStopCannotCrossIntoNewerPlaybackGeneration() async throws {
@@ -90,7 +102,7 @@ final class HybridSpeechSynthesizerTests: XCTestCase {
                 return error as? VoiceError
             }
         }
-        await firstStop.waitUntilStarted()
+        try await firstStop.waitUntilStarted()
 
         let newTask = Task { try await hybrid.speak(newRequest) }
         var newRequestBecameActive = false
@@ -111,6 +123,39 @@ final class HybridSpeechSynthesizerTests: XCTestCase {
         XCTAssertEqual(oldError, .cancelled)
         XCTAssertEqual(newMetrics.backend, .elevenLabsGateway)
         XCTAssertEqual(spoken, ["new request"])
+    }
+
+    func testCancellationDuringBackendQuiescenceClearsLifecycle() async throws {
+        let firstStop = HybridAsyncLatch()
+        let premium = BlockingFirstStopSynthesizer(firstStop: firstStop)
+        let offline = FakeSynthesizer(result: .success(metrics(.avSpeechOffline)))
+        let hybrid = HybridSpeechSynthesizer(
+            premium: premium,
+            offline: offline,
+            connectivity: FixedConnectivity(online: true)
+        )
+        let request = try SpeechSynthesisRequest(text: "cancel while stopping")
+
+        let task = Task { () -> VoiceError? in
+            do {
+                _ = try await hybrid.speak(request)
+                return nil
+            } catch {
+                return error as? VoiceError
+            }
+        }
+        try await firstStop.waitUntilStarted()
+
+        task.cancel()
+        await firstStop.release()
+
+        let error = await task.value
+        let remainsActive = await hybrid.hasActiveRequest(request.id)
+        let spoken = await premium.spokenTexts()
+
+        XCTAssertEqual(error, .cancelled)
+        XCTAssertFalse(remainsActive)
+        XCTAssertTrue(spoken.isEmpty)
     }
 
     private func metrics(_ backend: SpeechSynthesisBackend) -> SpeechPlaybackMetrics {
@@ -154,9 +199,11 @@ private enum FakeSynthesisResult: Sendable {
 
 private actor SupersedingPremiumSynthesizer: SpeechSynthesizer {
     private let oldRequestStarted: HybridAsyncLatch
+    private let newRequestStarted: HybridAsyncLatch
 
-    init(oldRequestStarted: HybridAsyncLatch) {
+    init(oldRequestStarted: HybridAsyncLatch, newRequestStarted: HybridAsyncLatch) {
         self.oldRequestStarted = oldRequestStarted
+        self.newRequestStarted = newRequestStarted
     }
 
     func speak(_ request: SpeechSynthesisRequest) async throws -> SpeechPlaybackMetrics {
@@ -164,6 +211,7 @@ private actor SupersedingPremiumSynthesizer: SpeechSynthesizer {
             await oldRequestStarted.suspend()
             throw VoiceError.gatewayRejected(503)
         }
+        await newRequestStarted.suspend()
         return SpeechPlaybackMetrics(
             backend: .elevenLabsGateway,
             firstAudioMeasurement: .pcmFirstBufferScheduled,
@@ -209,23 +257,40 @@ private actor BlockingFirstStopSynthesizer: SpeechSynthesizer {
 }
 
 private actor HybridAsyncLatch {
+    enum WaitError: Error {
+        case didNotStart
+    }
+
     private var started = false
-    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
     private var releaseContinuation: CheckedContinuation<Void, Never>?
 
     func suspend() async {
         started = true
-        startWaiters.forEach { $0.resume() }
-        startWaiters.removeAll()
-        await withCheckedContinuation { releaseContinuation = $0 }
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if released {
+                    continuation.resume()
+                } else {
+                    releaseContinuation = continuation
+                }
+            }
+        }, onCancel: {
+            Task { await self.release() }
+        })
     }
 
-    func waitUntilStarted() async {
-        if started { return }
-        await withCheckedContinuation { startWaiters.append($0) }
+    func waitUntilStarted() async throws {
+        for _ in 0..<100_000 {
+            if started { return }
+            await Task.yield()
+        }
+        release()
+        throw WaitError.didNotStart
     }
 
     func release() {
+        released = true
         releaseContinuation?.resume()
         releaseContinuation = nil
     }
