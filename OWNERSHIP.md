@@ -5,7 +5,7 @@ Xcode project/workspace is a conflict magnet — **only Atlas** edits `apps/Sent
 | Path | Owner | Scope |
 |---|---|---|
 | `apps/SentiPocketApp` | **claude-pocket-atlas** | Xcode project, app composition, integration, demo runbook |
-| `packages/PocketContracts` | **claude-pocket-atlas** | FROZEN contracts (v0.1): RawCheckpoint, CheckpointSummary, PocketBundle, EvidenceRef, BriefingPlan, QuestionAnswer, ActionProposal, ActionReceipt |
+| `packages/PocketContracts` | **atlas** (briefing v0.1 + 2 session wrappers) · **relay** (sessions wire + auth) | **Atlas:** FROZEN briefing contracts (v0.1) RawCheckpoint, CheckpointSummary, PocketBundle, EvidenceRef, BriefingPlan, QuestionAnswer, ActionProposal, ActionReceipt + the two nonvisual session wrappers ParsedSessionTimestamp & MembershipAuthorizedCheckpoint. **Relay:** sessions WIRE DTOs (SessionWire.swift, JSONValue.swift) + SessionTransport/SessionRepository + CredentialBroker/AuthProviding — canonical split in docs/auth-fetch-contract.md §7 |
 | `packages/PocketUI` | **codex-pocket-pulse** | All SwiftUI: incoming-call, briefing inbox, Answer/Listen-Later/Snooze, conversation, evidence cards, offline/pending, proposal preview + confirm UX, a11y |
 | `packages/PocketInference` | **codex-pocket-echo** | Gemma 4 E2B via LiteRT-LM, model download/verify, local Q&A path |
 | `packages/PocketVoice` | **codex-pocket-echo** | whisper.cpp base.en, AVAudioSession, VAD/barge-in, ElevenLabs streaming adapter + AVSpeech fallback, latency/thermal instrumentation |

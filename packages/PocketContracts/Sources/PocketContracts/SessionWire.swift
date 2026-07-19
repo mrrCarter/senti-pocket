@@ -1,9 +1,12 @@
 import Foundation
 
-// Lossless Senti Sessions WIRE DTOs — source-bound to sentinelayer-api
-// (deployed 3ca7640 == origin/main 91a2c3fa; serializers session_relay_service.py + routes/sessions.py
-// + session_checkpoint_grading.py, verified against tests/test_sessions.py). Relay owns the wire layer;
-// ATLAS projects typed domain values atop these reviewed DTOs.
+// Lossless Senti Sessions WIRE DTOs — source-bound to sentinelayer-api serializers
+// (session_relay_service.py + routes/sessions.py + session_checkpoint_grading.py, verified against
+// tests/test_sessions.py; serializers identical at deployed 3ca7640 and origin/main 91a2c3fa, which is
+// +1 non-serializer commit ahead — the two SHAs are NOT equal, only serializer-identical). OWNERSHIP
+// (canonical, per docs/auth-fetch-contract.md §7): RELAY owns this wire layer + transport/repository/
+// broker; ATLAS owns ONLY the two nonvisual session wrappers (ParsedSessionTimestamp,
+// MembershipAuthorizedCheckpoint) + the bare app shell; PULSE owns all presentation.
 //
 // Rules matched EXACTLY to the wire:
 //  - ITEM objects use camelCase keys (default Codable). PAGE ENVELOPES mix snake_case -> CodingKeys.

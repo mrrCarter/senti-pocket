@@ -2,7 +2,8 @@ import XCTest
 @testable import PocketContracts
 
 /// Decode KAVs for the Relay-owned Senti sessions wire DTOs — pinned to the exact camelCase/snake-envelope
-/// shapes the deployed API emits (3ca7640 == origin/main 91a2c3fa). Proves lossless decode + that malformed
+/// shapes the deployed API emits (serializers identical at deployed 3ca7640 and origin/main 91a2c3fa —
+/// main is +1 non-serializer commit ahead; the SHAs are serializer-identical, not equal). Proves lossless decode + that malformed
 /// wire FAILS rather than silently minting ambiguous domain state.
 final class SessionWireTests: XCTestCase {
 
