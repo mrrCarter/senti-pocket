@@ -181,6 +181,14 @@ test('validateBundleIngress: accepts a clean bundle; rejects empty/oversized/dup
   assert.match(validateBundleIngress(emptyAgent).errors.join(), /agent\.agentId: empty/);
 });
 
+test('validateBundleIngress: bounds all remaining label/prose/signature fields (completeness — Echo ced1a57 #1)', () => {
+  const good = buildBundle(RAW, SUMMARY, { signingKeyId: 'k1', createdAt: '2026-07-18T10:40:00Z' });
+  assert.match(validateBundleIngress({ ...good, signature: 'x'.repeat(600) }).errors.join(), /signature: exceeds/);
+  assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, grade: 'x'.repeat(600) } }).errors.join(), /grade: exceeds/);
+  assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, risks: ['x'.repeat(600)] } }).errors.join(), /risks\[\]: exceeds/);
+  assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, headline: 'x'.repeat(5000) } }).errors.join(), /headline: exceeds/);
+});
+
 // ---- Pulse's two exact counterexamples on the sign path (must fail CLOSED, never sign what the phone rejects) ----
 test('buildSignedBundle FAILS CLOSED: cannot sign a bundle its own ingress gate rejects (evidence=[])', () => {
   const { privateKey } = generateSigningKeypair();

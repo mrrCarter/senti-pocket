@@ -291,6 +291,7 @@ export function validateBundleIngress(bundle) {
     else if (b8(v) > cap) push(`${label}: exceeds ${cap} bytes`);
   };
   const arrOf = (v, label) => { if (v == null) return []; if (!Array.isArray(v)) { push(`${label}: must be an array`); return []; } return v; };
+  const optStr = (v, label, cap) => { if (v == null) return; if (typeof v !== 'string') push(`${label}: must be a string`); else if (b8(v) > cap) push(`${label}: exceeds ${cap} bytes`); };
   reqStr(b.checkpointId, 'checkpointId', SUMMARY_CAPS.id);
   reqStr(b.sessionId, 'sessionId', SUMMARY_CAPS.id);
   reqStr(b.signingKeyId, 'signingKeyId', SUMMARY_CAPS.id); // not in the inference type; bounded defensively
@@ -304,6 +305,13 @@ export function validateBundleIngress(bundle) {
   if (arrOf(sum.perAgent, 'summary.perAgent').length > SUMMARY_CAPS.perAgent) push(`perAgent: exceeds ${SUMMARY_CAPS.perAgent}`);
   if (arrOf(sum.risks, 'summary.risks').length > SUMMARY_CAPS.risks) push(`risks: exceeds ${SUMMARY_CAPS.risks}`);
   if (arrOf(sum.blockers, 'summary.blockers').length > SUMMARY_CAPS.blockers) push(`blockers: exceeds ${SUMMARY_CAPS.blockers}`);
+  // completeness (Echo/warden ced1a57 #1): bound the remaining label/prose/signature fields + every risk/blocker string.
+  optStr(b.signature, 'signature', 512);
+  optStr(sum.headline, 'summary.headline', SUMMARY_CAPS.headline);
+  optStr(sum.summaryBaselineSchema, 'summary.summaryBaselineSchema', SUMMARY_CAPS.str);
+  optStr(sum.grade, 'summary.grade', SUMMARY_CAPS.str);
+  for (const r of arrOf(sum.risks, 'summary.risks')) optStr(r, 'summary.risks[]', SUMMARY_CAPS.str);
+  for (const bl of arrOf(sum.blockers, 'summary.blockers')) optStr(bl, 'summary.blockers[]', SUMMARY_CAPS.str);
   const chkEv = (e, where) => {
     reqStr(e && e.id, `${where}.id`, SUMMARY_CAPS.evId);
     reqStr(e && e.agentId, `${where}.agentId`, SUMMARY_CAPS.evId);
@@ -315,6 +323,7 @@ export function validateBundleIngress(bundle) {
   for (const e of topEv) chkEv(e, `evidence ${e && e.id}`);
   for (const a of arrOf(sum.perAgent, 'summary.perAgent')) {
     reqStr(a && a.agentId, 'agent.agentId', SUMMARY_CAPS.evId);
+    optStr(a && a.summary, 'agent.summary', SUMMARY_CAPS.summary);
     const nestedIds = new Set();
     for (const e of arrOf(a && a.evidence, 'agent.evidence')) {
       chkEv(e, `agent ${a && a.agentId} evidence ${e && e.id}`);
