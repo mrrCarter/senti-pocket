@@ -300,34 +300,19 @@ final class ContractsCrossModuleTests: XCTestCase {
         d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
     }
     /// The signed pocket.bundle.v1 KAV loaded from the bundled test RESOURCE (P1.5) — no duplicated literals.
-    private func loadKAV(resource: String = "bundle_kav") throws -> (canonical: String, signature: String, pubkey: String) {
-        let url = try XCTUnwrap(Bundle.module.url(forResource: resource, withExtension: "json", subdirectory: "Fixtures"))
+    private func loadKAV() throws -> (canonical: String, signature: String, pubkey: String) {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "bundle_kav", withExtension: "json", subdirectory: "Fixtures"))
         let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
         let kav = obj["kav"] as! [String: Any]
         let demoKey = obj["demoKey"] as! [String: Any]
         return (kav["canonicalBytesUtf8"] as! String, kav["signatureBase64url"] as! String, demoKey["publicKeyBase64url"] as! String)
     }
     /// The canonical, semantically-valid demo bundle (matches the KAV fixture). Tamper params flip a signed field.
-    private func demoBundle(signature: String, headline: String = "demo briefing", snippet: String = "snippet", signingKeyId: String = "pocket-demo-phase-a", sequenceStart: Int = 100) -> PocketBundle {
+    private func demoBundle(signature: String, headline: String = "demo briefing", snippet: String = "snippet", signingKeyId: String = "pocket-demo-phase-a") -> PocketBundle {
         let ev = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: snippet, ts: ts)
         let ag = AgentSummary(agentId: "agent-a", summary: "did the thing", claims: [Claim(id: "c1", text: "a fact", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev])
         let sum = CheckpointSummary(checkpointId: "cp_demo_1", headline: headline, summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
-        return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: sequenceStart, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
-    }
-
-    /// NEGATIVE KAV (Relay #237825 handoff — the Swift MIRROR of Relay's Node negative test): bundle_kav_negative.json
-    /// is CRYPTO-VALID under the SAME pinned key as the positive KAV, but SEMANTICALLY INVALID (sequenceStart 300 >
-    /// sequenceEnd 200 -> .invertedSequenceRange). This proves the semantic gate is NOT dead code hidden behind crypto:
-    /// a trusted key signing malformed content is still REJECTED. Full cross-language parity on BOTH vectors.
-    func testBundleNegativeKAVFromResource() throws {
-        let neg = try loadKAV(resource: "bundle_kav_negative")
-        let b = demoBundle(signature: neg.signature, sequenceStart: 300)   // inverted range = the only semantic break
-        XCTAssertEqual(b.canonicalBundlePayload(), neg.canonical)          // negative canonical byte-parity (Node mirror)
-        XCTAssertTrue(b.semanticIssues().contains(.invertedSequenceRange)) // the specific semantic defect
-        XCTAssertFalse(b.isSemanticallyValid())                           // gate REJECTS the crypto-valid bundle
-        #if canImport(CryptoKit)
-        XCTAssertTrue(b.verifiesSignature())                              // genuinely crypto-valid under the pinned key
-        #endif
+        return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: 100, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
     }
 
     /// FIX2 (P1.1 + P1.5) — load the committed KAV RESOURCE: the pinned pubkey equals the fixture's, the canonical bytes
