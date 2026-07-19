@@ -21,13 +21,18 @@ public struct IncomingBriefingView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(spacing: 24) {
+            VStack(spacing: 20) {
                 ConnectivityBanner(connectivity: connectivity)
 
-                Spacer(minLength: 8)
+                Spacer(minLength: 12)
                 callMark
 
-                VStack(spacing: 8) {
+                VStack(spacing: 7) {
+                    Text("INCOMING CHECKPOINT")
+                        .font(.caption.weight(.semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(PocketPalette.textSecondary)
+
                     Text("Senti is calling")
                         .font(.largeTitle.weight(.bold))
                         .multilineTextAlignment(.center)
@@ -39,27 +44,7 @@ public struct IncomingBriefingView: View {
                         .multilineTextAlignment(.center)
                 }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    IntegrityBadge(integrity: state.integrity)
-                    if state.integrity.allowsBriefing {
-                        Text(verbatim: state.bundle.summary.headline)
-                            .font(.title3.weight(.semibold))
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text("Session \(state.bundle.sessionId) · sequences \(state.bundle.sequenceStart)–\(state.bundle.sequenceEnd)")
-                            .font(.caption)
-                            .foregroundStyle(PocketPalette.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Text("Checkpoint content hidden")
-                            .font(.title3.weight(.semibold))
-                        Text("Senti will not display or narrate content until integrity verification succeeds.")
-                            .font(.body)
-                            .foregroundStyle(PocketPalette.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .pocketCard()
+                briefingPreview
 
                 if let failureReason = state.integrity.failureReason {
                     Label(
@@ -95,7 +80,7 @@ public struct IncomingBriefingView: View {
         ZStack {
             Circle()
                 .stroke(PocketPalette.accent.opacity(0.22), lineWidth: 2)
-                .frame(width: 164, height: 164)
+                .frame(width: 152, height: 152)
                 .scaleEffect(pulse ? 1.18 : 0.94)
                 .opacity(reduceMotion ? 0.6 : (pulse ? 0.08 : 0.55))
                 .animation(
@@ -103,13 +88,62 @@ public struct IncomingBriefingView: View {
                     value: pulse
                 )
             Circle()
-                .fill(PocketPalette.accent.opacity(0.14))
-                .frame(width: 128, height: 128)
+                .fill(PocketPalette.accent)
+                .frame(width: 116, height: 116)
             Image(systemName: "waveform.and.mic")
-                .font(.system(size: 50, weight: .semibold))
-                .foregroundStyle(PocketPalette.accent)
+                .font(.system(size: 44, weight: .semibold))
+                .foregroundStyle(Color.white)
         }
         .accessibilityHidden(true)
+    }
+
+    private var briefingPreview: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            IntegrityBadge(integrity: state.integrity)
+
+            if state.integrity.allowsBriefing {
+                Text(verbatim: state.bundle.summary.headline)
+                    .font(.title2.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) {
+                        briefingSessionLabel
+                        Text("·")
+                            .accessibilityHidden(true)
+                        briefingSequenceLabel
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        briefingSessionLabel
+                        briefingSequenceLabel
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(PocketPalette.textSecondary)
+            } else {
+                Text("Checkpoint content hidden")
+                    .font(.title3.weight(.semibold))
+                Text("Senti will not display or narrate content until integrity verification succeeds.")
+                    .font(.body)
+                    .foregroundStyle(PocketPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .pocketCard()
+    }
+
+    private var briefingSessionLabel: some View {
+        HStack(spacing: 4) {
+            Text("Session")
+            Text(verbatim: state.bundle.sessionId)
+                .font(.caption.monospaced())
+        }
+    }
+
+    private var briefingSequenceLabel: some View {
+        Text("Sequences \(state.bundle.sequenceStart)–\(state.bundle.sequenceEnd)")
+            .monospacedDigit()
     }
 
     private var callActions: some View {
@@ -118,13 +152,12 @@ public struct IncomingBriefingView: View {
             Button {
                 send(.answer(context))
             } label: {
-                Label("Answer briefing", systemImage: "phone.fill")
+                Label("Answer", systemImage: "phone.fill")
                     .font(.title3.weight(.bold))
                     .frame(maxWidth: .infinity, minHeight: 58)
             }
             .buttonStyle(.borderedProminent)
             .tint(PocketPalette.accent)
-            .foregroundStyle(Color.black.opacity(0.82))
             .accessibilityIdentifier(PocketAccessibilityID.answer)
             .accessibilityHint(
                 state.integrity.allowsBriefing

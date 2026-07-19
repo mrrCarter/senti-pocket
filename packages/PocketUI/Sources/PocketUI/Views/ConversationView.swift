@@ -64,7 +64,7 @@ public struct ConversationView: View {
                 .frame(maxWidth: .infinity)
             }
 
-            Divider().overlay(Color.white.opacity(0.1))
+            Divider().overlay(PocketPalette.separator)
             controlDock(context: context)
         }
     }
@@ -113,8 +113,10 @@ public struct ConversationView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: voiceIcon)
-                    .font(.title2.weight(.semibold))
+                    .font(.title3.weight(.semibold))
                     .foregroundStyle(voiceColor)
+                    .frame(width: 38, height: 38)
+                    .background(voiceColor.opacity(0.13), in: Circle())
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(voiceTitle)
@@ -141,7 +143,12 @@ public struct ConversationView: View {
                 .accessibilityHint("Immediately pauses narration so you can ask a question")
             }
         }
-        .pocketCard()
+        .padding(16)
+        .background(PocketPalette.raised, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(PocketPalette.separator.opacity(0.72), lineWidth: 0.5)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityFocused($voiceStatusFocused)
     }
@@ -174,7 +181,10 @@ public struct ConversationView: View {
                         .padding(.vertical, 4)
                     }
                 }
-                .pocketCard()
+                .padding(.vertical, 6)
+
+                Divider()
+                    .overlay(PocketPalette.separator)
             }
         }
     }
@@ -202,7 +212,7 @@ public struct ConversationView: View {
             }
         }
         .padding(14)
-        .background(PocketPalette.canvas)
+        .background(.regularMaterial)
     }
 
     @ViewBuilder
@@ -342,7 +352,7 @@ private struct ConversationEntryView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
-                .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 14))
+                .background(PocketPalette.inset, in: RoundedRectangle(cornerRadius: 14))
         }
     }
 }

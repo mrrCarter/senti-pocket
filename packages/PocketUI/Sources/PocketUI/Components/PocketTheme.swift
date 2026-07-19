@@ -55,6 +55,7 @@ enum PocketPalette {
     static let verified = Color.green
     static let warning = Color.orange
     static let danger = Color.red
+    static let recording = Color(red: 0.72, green: 0.08, blue: 0.10)
 
     // Epistemic categories are not trust verdicts.
     static let fact = Color.secondary
