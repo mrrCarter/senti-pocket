@@ -55,19 +55,24 @@ export function summarize(rawCheckpoint, descriptor = {}) {
     const evs = byAgent.get(agentId);
     const first = evs[0], last = evs[evs.length - 1];
     const span = first.sequenceId === last.sequenceId ? `seq ${first.sequenceId}` : `seq ${first.sequenceId}..${last.sequenceId}`;
-    // grounded, factual prose: counts + exact span. No claim is made that isn't backed by the cited evidence.
-    const summary = clamp(`${agentId}: ${evs.length} message${evs.length === 1 ? '' : 's'} (${span}).`, LIMITS.SUMMARY_BYTES);
     // bounded citations: first, last, and evenly-spread interior events (deterministic).
     const picks = pickSpread(evs, LIMITS.EVIDENCE_PER_AGENT);
     const evidence = picks.map((e) => evidenceFrom(rc, e));
-    // one GROUNDED fact claim per agent: a count/span statement DIRECTLY supported by the cited evidence (kind=fact).
-    // The LLM-enriched summarizer adds inference/recommendation claims later, reusing the same evidence ids.
-    const claims = [{
-      id: `claim_${rc.checkpointId}_${agentId}`,
-      text: clamp(`${agentId} contributed ${evs.length} message${evs.length === 1 ? '' : 's'} (${span}).`, LIMITS.SUMMARY_BYTES),
-      kind: 'fact',
-      evidenceIds: evidence.map((e) => e.id),
-    }];
+    // GROUNDED CONTENT prose: quote the agent's ACTUAL messages (bounded) so the briefing conveys WHAT was said, not
+    // just how many. Every quote is a real cited event — nothing is paraphrased or invented. (The LLM-enriched
+    // summarizer later refines phrasing + adds inference/recommendation claims, reusing these same evidence ids.)
+    const quotes = evidence.map((e) => e.snippet).filter(Boolean);
+    const summary = clamp(
+      quotes.length
+        ? `${agentId} (${evs.length} msg${evs.length === 1 ? '' : 's'}, ${span}): ${quotes.join('  |  ')}`
+        : `${agentId}: ${evs.length} message${evs.length === 1 ? '' : 's'} (${span}).`,
+      LIMITS.SUMMARY_BYTES,
+    );
+    // one GROUNDED fact claim per cited message — each claim IS the real message content, cited 1:1 to its source event
+    // (empty-snippet events yield no claim). Directly supported by the cited evidence; kind=fact.
+    const claims = evidence
+      .filter((e) => e.snippet)
+      .map((e) => ({ id: `claim_${rc.checkpointId}_${e.sequence}`, text: clamp(e.snippet, LIMITS.SUMMARY_BYTES), kind: 'fact', evidenceIds: [e.id] }));
     return { agentId, summary, claims, evidence };
   });
 

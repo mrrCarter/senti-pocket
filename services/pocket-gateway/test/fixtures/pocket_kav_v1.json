@@ -25,11 +25,11 @@
       "perAgent": [
         {
           "agentId": "agent-a",
-          "summary": "agent-a: 1 message (seq 1).",
+          "summary": "agent-a (1 msg, seq 1): kav event one",
           "claims": [
             {
-              "id": "claim_cp_kav_agent-a",
-              "text": "agent-a contributed 1 message (seq 1).",
+              "id": "claim_cp_kav_1",
+              "text": "kav event one",
               "kind": "fact",
               "evidenceIds": [
                 "ev_cp_kav_1"
@@ -49,11 +49,11 @@
         },
         {
           "agentId": "agent-b",
-          "summary": "agent-b: 1 message (seq 2).",
+          "summary": "agent-b (1 msg, seq 2): kav event two",
           "claims": [
             {
-              "id": "claim_cp_kav_agent-b",
-              "text": "agent-b contributed 1 message (seq 2).",
+              "id": "claim_cp_kav_2",
+              "text": "kav event two",
               "kind": "fact",
               "evidenceIds": [
                 "ev_cp_kav_2"
@@ -94,7 +94,7 @@
       }
     ],
     "createdAt": "2026-07-18T00:03:00Z",
-    "signature": "pcIWqQBC2wLMmHcr9naGxfiA+M72Jd18XmbqrEa6Xjfd9SZSQGYKgzb5zkmR7nNM6rXyqJIhJKZcUytDds5jAw==",
+    "signature": "PRfyYP+VouVEtSj9Ffv3Qz4h7tfR64lDzkkQdTooNuICSGJJ4j2tQ6VcZDfOwtvj79931dac5nWxjoUhLE56DA==",
     "signingKeyId": "kav-key"
   },
   "receipt": {
