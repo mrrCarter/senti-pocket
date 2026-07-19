@@ -164,6 +164,128 @@ final class PocketCallMachineTests: XCTestCase {
         guard case .executing = PocketCall.reduce(executing, .executed(signed), gatewayKey: wrong) else { return XCTFail("wrong key must NOT complete") }
     }
 
+    private struct BundleKAV: Decodable {
+        struct KnownAnswer: Decodable {
+            let canonicalBytesUtf8: String
+            let canonicalSha256Hex: String
+            let signatureBase64url: String
+        }
+
+        let kav: KnownAnswer
+    }
+
+    private func demoKAVBundle(
+        signature: String,
+        signingKeyId: String = "pocket-demo-phase-a",
+        invertRange: Bool = false
+    ) -> PocketBundle {
+        let evidence = EvidenceRef(
+            id: "ev1",
+            sessionId: "sess_demo_1",
+            sequence: 150,
+            agentId: "agent-a",
+            snippet: "snippet",
+            ts: ts
+        )
+        let agent = AgentSummary(
+            agentId: "agent-a",
+            summary: "did the thing",
+            claims: [Claim(id: "c1", text: "a fact", kind: .fact, evidenceIds: ["ev1"])],
+            evidence: [evidence]
+        )
+        let summary = CheckpointSummary(
+            checkpointId: "cp_demo_1",
+            headline: "demo briefing",
+            summaryBaselineSchema: "checkpoint_summary_sections_v1",
+            grade: "A",
+            perAgent: [agent],
+            risks: ["r1"],
+            blockers: ["b1"]
+        )
+        return PocketBundle(
+            contractsVersion: "0.1.8",
+            checkpointId: "cp_demo_1",
+            sessionId: "sess_demo_1",
+            sequenceStart: invertRange ? 300 : 100,
+            sequenceEnd: 200,
+            summary: summary,
+            evidence: [evidence],
+            createdAt: ts,
+            signature: signature,
+            signingKeyId: signingKeyId
+        )
+    }
+
+    private func signedKAVBundle(
+        with signer: Curve25519.Signing.PrivateKey,
+        signingKeyId: String = "pocket-demo-phase-a",
+        invertRange: Bool = false
+    ) throws -> PocketBundle {
+        let unsigned = demoKAVBundle(
+            signature: "",
+            signingKeyId: signingKeyId,
+            invertRange: invertRange
+        )
+        let signature = try signer.signature(for: Data(unsigned.canonicalBundlePayload().utf8))
+        return demoKAVBundle(
+            signature: b64url(signature),
+            signingKeyId: signingKeyId,
+            invertRange: invertRange
+        )
+    }
+
+    private func loadBundleKAV(_ file: String = "bundle_kav.json") throws -> BundleKAV.KnownAnswer {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("../../../PocketContracts/Tests/PocketContractsTests/Fixtures/\(file)")
+            .standardizedFileURL
+        return try JSONDecoder().decode(BundleKAV.self, from: Data(contentsOf: url)).kav
+    }
+
+    private func sha256Hex(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func testVerifiedBundleMintsOnlyFromPinnedKAV() throws {
+        let kav = try loadBundleKAV()
+        let candidate = demoKAVBundle(signature: kav.signatureBase64url)
+        let canonical = candidate.canonicalBundlePayload()
+
+        XCTAssertEqual(canonical, kav.canonicalBytesUtf8)
+        XCTAssertEqual(Data(canonical.utf8).count, 354)
+        XCTAssertEqual(sha256Hex(canonical), kav.canonicalSha256Hex)
+        XCTAssertEqual(kav.canonicalSha256Hex, "be4c9e360624c1bab4f2ad13afeda10c87e2f680ada48e2aa020f0afb069e9e3")
+        XCTAssertTrue(candidate.verifiesSignature())
+        XCTAssertNotNil(VerifiedBundle.verify(candidate))
+    }
+
+    func testVerifiedBundleRejectsUntrustedIdWrongKeyAndSemanticInvalid() throws {
+        let kav = try loadBundleKAV()
+        XCTAssertNil(VerifiedBundle.verify(demoKAVBundle(
+            signature: kav.signatureBase64url,
+            signingKeyId: "not-a-trusted-key"
+        )))
+        XCTAssertNil(VerifiedBundle.verify(try signedKAVBundle(with: Curve25519.Signing.PrivateKey())))
+
+        let invalid = try signedKAVBundle(with: Curve25519.Signing.PrivateKey(), invertRange: true)
+        XCTAssertFalse(invalid.isSemanticallyValid())
+        XCTAssertNil(VerifiedBundle.verify(invalid))
+    }
+
+    func testVerifiedBundleRejectsCryptoValidButSemanticallyInvalidKAV() throws {
+        let kav = try loadBundleKAV("bundle_kav_negative.json")
+        let candidate = demoKAVBundle(signature: kav.signatureBase64url, invertRange: true)
+        let canonical = candidate.canonicalBundlePayload()
+
+        XCTAssertEqual(canonical, kav.canonicalBytesUtf8)
+        XCTAssertEqual(Data(canonical.utf8).count, 354)
+        XCTAssertEqual(sha256Hex(canonical), kav.canonicalSha256Hex)
+        XCTAssertEqual(kav.canonicalSha256Hex, "f6365cf012001d4e9eda366937178e14390aebfb0da29116539cae44e6cbbc86")
+        XCTAssertTrue(candidate.verifiesSignature())
+        XCTAssertFalse(candidate.isSemanticallyValid())
+        XCTAssertNil(VerifiedBundle.verify(candidate))
+    }
+
     private func b64url(_ d: Data) -> String {
         d.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
