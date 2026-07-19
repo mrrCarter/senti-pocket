@@ -24,6 +24,9 @@ public struct ActionReceiptView: View {
                     receiptField("Proposal", value: state.receipt.proposalId)
                     receiptField("Target session", value: state.receipt.targetSessionId)
                     receiptField("Confirmed proposal hash", value: state.receipt.confirmedProposalHash)
+                    if let signingKeyId = state.presentation.verifiedSigningKeyId {
+                        receiptField("Signing key", value: signingKeyId)
+                    }
                     if let result = state.presentation.verifiedResult {
                         verifiedResultFields(result)
                     }
@@ -37,7 +40,6 @@ public struct ActionReceiptView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(PocketPalette.accent)
-                .foregroundStyle(Color.black.opacity(0.82))
                 .accessibilityIdentifier(PocketAccessibilityID.receiptDone)
             }
             .padding(20)
@@ -60,7 +62,8 @@ public struct ActionReceiptView: View {
             receiptField(
                 "Result type",
                 value: "Thread action",
-                accessibilityId: PocketAccessibilityID.receiptResultKind
+                accessibilityId: PocketAccessibilityID.receiptResultKind,
+                monospaced: false
             )
             receiptField(
                 "Action ID",
@@ -84,7 +87,8 @@ public struct ActionReceiptView: View {
             receiptField(
                 "Result type",
                 value: "Sequence",
-                accessibilityId: PocketAccessibilityID.receiptResultKind
+                accessibilityId: PocketAccessibilityID.receiptResultKind,
+                monospaced: false
             )
             receiptField(
                 "Resulting sequence",
@@ -97,14 +101,15 @@ public struct ActionReceiptView: View {
     private func receiptField(
         _ label: String,
         value: String,
-        accessibilityId: String? = nil
+        accessibilityId: String? = nil,
+        monospaced: Bool = true
     ) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(label.uppercased())
                 .font(.caption2.weight(.bold))
                 .foregroundStyle(PocketPalette.textSecondary)
             Text(verbatim: value)
-                .font(.body.monospaced())
+                .font(monospaced ? .body.monospaced() : .body)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -162,7 +167,7 @@ struct ReceiptStatusCard: View {
     private var color: Color {
         switch presentation.status {
         case .pendingConnectivity: return PocketPalette.warning
-        case .posted: return PocketPalette.accent
+        case .posted: return PocketPalette.verified
         case .failed, .invalid: return PocketPalette.danger
         }
     }

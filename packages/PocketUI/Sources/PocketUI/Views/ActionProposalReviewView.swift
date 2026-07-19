@@ -87,7 +87,7 @@ public struct ActionProposalReviewView: View {
 
     private var safetyHeader: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Review the exact action", systemImage: "checkmark.shield.fill")
+            Label("Review the exact action", systemImage: "lock.shield.fill")
                 .font(.title2.weight(.bold))
                 .foregroundStyle(PocketPalette.accent)
             Text("Nothing is sent until the full target and message are read back and you explicitly confirm.")
@@ -142,7 +142,8 @@ public struct ActionProposalReviewView: View {
             exactField(
                 label: "Action kind",
                 value: proposal.kind.rawValue,
-                accessibilityId: PocketAccessibilityID.proposalKind
+                accessibilityId: PocketAccessibilityID.proposalKind,
+                monospaced: false
             )
             exactField(
                 label: "Target session",
@@ -163,12 +164,16 @@ public struct ActionProposalReviewView: View {
             Text("Full message text")
                 .font(.headline)
             Text(verbatim: proposal.renderedPreview)
-                .font(.body.monospaced())
+                .font(.body)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(14)
-                .background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 12))
+                .background(PocketPalette.inset, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(PocketPalette.separator.opacity(0.72), lineWidth: 0.5)
+                }
                 .accessibilityIdentifier(PocketAccessibilityID.proposalMessage)
                 .accessibilityLabel("Full message text")
                 .accessibilityValue(proposal.renderedPreview)
@@ -225,14 +230,13 @@ public struct ActionProposalReviewView: View {
                     confirmButtonTitle,
                     systemImage: connectivity.requiresQueuedWrite
                         ? "tray.and.arrow.down.fill"
-                        : "checkmark.shield.fill"
+                        : "paperplane.fill"
                 )
                     .font(.headline)
                     .frame(maxWidth: .infinity, minHeight: 56)
             }
             .buttonStyle(.borderedProminent)
             .tint(PocketPalette.accent)
-            .foregroundStyle(Color.black.opacity(0.82))
             .disabled(
                 !gate.canConfirm(currentProposal: gate.proposal, at: currentDate)
                     || locallyConsumedProposalKey == proposalKey(gate.proposal)
@@ -262,13 +266,18 @@ public struct ActionProposalReviewView: View {
         }
     }
 
-    private func exactField(label: String, value: String, accessibilityId: String) -> some View {
+    private func exactField(
+        label: String,
+        value: String,
+        accessibilityId: String,
+        monospaced: Bool = true
+    ) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(label.uppercased())
                 .font(.caption2.weight(.bold))
                 .foregroundStyle(PocketPalette.textSecondary)
             Text(verbatim: value)
-                .font(.body.monospaced())
+                .font(monospaced ? .body.monospaced() : .body)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }
