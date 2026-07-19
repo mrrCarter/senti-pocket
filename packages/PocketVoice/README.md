@@ -13,13 +13,13 @@ Offline speech recognition, duplex capture, deterministic barge-in, and pluggabl
 
 ## Voice Loop
 
-1. `MicrophoneCapture` configures duplex voice-chat audio and emits bounded Float32 mono frames. The audio callback writes directly to one locked continuation, preserving callback order without spawning a task per frame. If the eight-frame buffer overflows, capture terminates with an explicit error instead of silently producing a corrupted transcript.
+1. `MicrophoneCapture` configures duplex voice-chat audio and emits bounded Float32 mono frames. Microphone, offline narration, and gateway PCM playback share reference-counted audio-session leases, so overlapping barge-in cannot deactivate another active owner and the last owner attempts process-session deactivation. Deactivation failures are surfaced through the active speech, playback, or microphone-stream operation instead of being silently discarded. The audio callback writes directly to one locked continuation, preserving callback order without spawning a task per frame. If the eight-frame buffer overflows, capture terminates with an explicit error instead of silently producing a corrupted transcript.
 2. `EnergyVoiceActivityDetector` applies fixed RMS hysteresis plus attack/release durations.
 3. A `speechStarted` transition calls `DeterministicBargeInController`, which moves out of the armed state before concurrently stopping speech and inference. Duplicate events are idempotent.
 4. `CapturedAudioAccumulator` and `PCMResampler` produce the 16 kHz request consumed by whisper.cpp.
 5. `HybridSpeechSynthesizer` uses the gateway premium path only when online and falls back to `AVSpeechSynthesizer` otherwise.
 
-Audio interruptions, media-service resets, and loss of the active input route terminate capture with an explicit error. They do not leave the app in a false listening state.
+Audio interruptions, media-service resets, and loss of the active input route terminate capture with an explicit error. A failed start releases its audio-session lease before returning the error. Duplicate or stale releases cannot deactivate a newer capture or playback generation. These failures do not leave the app in a false listening state.
 
 ## Premium TTS Gateway
 
@@ -42,6 +42,8 @@ X-Senti-Audio-Format: pcm_s16le_24000
 ```
 
 The stream is capped at 24 MB. PocketContracts' `BriefingTone` is the single constrained vocabulary used by the bundle, phone, and gateway; checkpoint text is never forwarded as a provider-control prompt.
+
+Gateway speech failures include any last-owner audio-session deactivation failure instead of discarding it during cleanup. The `SpeechSynthesizer` contract makes `stop()` nonthrowing, so that path retains its first cleanup failure for `pendingAudioSessionError()` and the next throwing `speak()` consumes and reports it before starting another request.
 
 ## Measurement Contract
 
