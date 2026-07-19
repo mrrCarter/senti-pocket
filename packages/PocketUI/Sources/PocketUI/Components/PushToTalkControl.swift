@@ -83,20 +83,24 @@ public struct PushToTalkControl: View {
         } label: {
             VStack(spacing: 8) {
                 Image(systemName: isActive ? "waveform.circle.fill" : "mic.circle.fill")
-                    .font(.system(size: 54, weight: .semibold))
+                    .font(.system(size: 48, weight: .semibold))
                     .accessibilityHidden(true)
                 Text(isActive ? "Release to ask" : "Hold to ask")
                     .font(.headline)
-                Text(isActive ? "Listening on this iPhone" : "VoiceOver: double-tap to start")
+                Text(isActive ? "Listening on this iPhone" : "Hold, then release")
                     .font(.caption)
-                    .foregroundStyle(PocketPalette.textSecondary)
+                    .foregroundStyle(Color.white)
             }
-            .frame(maxWidth: .infinity, minHeight: 112)
-            .foregroundStyle(PocketPalette.textPrimary)
+            .frame(maxWidth: .infinity, minHeight: 104)
+            .foregroundStyle(Color.white)
             .background(
-                (isActive ? PocketPalette.danger : PocketPalette.listening),
-                in: RoundedRectangle(cornerRadius: 24, style: .continuous)
+                (isActive ? PocketPalette.recording : PocketPalette.accent),
+                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
             )
+            .overlay {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 0.5)
+            }
             .scaleEffect(touchIsDown ? 0.97 : 1)
             .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: touchIsDown)
         }

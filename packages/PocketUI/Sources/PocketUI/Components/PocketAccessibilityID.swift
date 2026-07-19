@@ -4,6 +4,11 @@ public enum PocketAccessibilityID {
     public static let inboxError = "pocket.inbox.error"
     public static let inboxErrorEnd = "pocket.inbox.error.end"
 
+    /// Session-bound and delimiter-safe so rows from different rooms cannot collapse into one accessibility node.
+    public static func inboxItem(sessionId: String, checkpointId: String) -> String {
+        "pocket.inbox.item.s\(sessionId.utf8.count):\(sessionId)c\(checkpointId.utf8.count):\(checkpointId)"
+    }
+
     public static let incomingScreen = "pocket.incoming.screen"
     public static let answer = "pocket.incoming.answer"
     public static let listenLater = "pocket.incoming.listenLater"

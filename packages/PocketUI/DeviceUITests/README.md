@@ -6,7 +6,8 @@ During integration, Atlas should:
 1. Add `PocketUIDeviceFlowTests.swift` to an iOS UI-testing target that depends on `PocketUI`.
 2. Map `-PocketUITestScenario` to deterministic states named `inbox`, `incoming`, `conversation`, `proposal`,
    `evidence`, `offline-pending`, `verified-action-receipt`, `invalid-checkpoint`, `invalid-conversation`,
-   `invalid-receipt`, `reconnecting-proposal`, `long-inbox-error`, and `long-invalid-conversation`. The two long
+   `invalid-receipt`, `reconnecting-proposal`, `expiring-proposal`, `long-inbox-error`, and
+   `long-invalid-conversation`. The two long
    failure scenarios must supply multi-paragraph error/reason text. The invalid conversation scenarios must carry invalid bundle
    integrity even if its transcript and voice state are populated, proving the UI does not expose them. Successful
    checkpoint scenarios must use a genuinely verified deterministic test bundle, not relabel the unsigned fixture.
@@ -14,6 +15,9 @@ During integration, Atlas should:
    contract: the current production `ReceiptTrustStore` is intentionally empty/fail-closed. Once that contract lands,
    sign the canonical receipt with a deterministic test key, inject only its pinned public test anchor, and expose
    action ID `action-device-1` targeting sequence `230180`; a placeholder signature is not acceptable.
+   `expiring-proposal` must start with an exact completed read-back and an authorization valid for ten seconds after
+   screen creation, so
+   the on-screen timer—not a relaunch—disables confirmation and exposes the expiry status.
 3. Make the proposal scenario synchronously reduce the read-back intent to an exact completed read-back;
    it must not call a real Senti write.
 4. Bundle `PocketContracts/Fixtures/canonical_checkpoint.json` into the app target so package previews and

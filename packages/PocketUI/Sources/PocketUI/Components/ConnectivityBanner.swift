@@ -16,7 +16,7 @@ public struct ConnectivityBanner: View {
         case .offline(let cachedAt):
             statusBanner(
                 icon: "wifi.slash",
-                title: "Offline — cached evidence only",
+                title: "Offline · Cached evidence",
                 detail: offlineDetail(cachedAt: cachedAt),
                 color: PocketPalette.warning
             )
@@ -35,10 +35,10 @@ public struct ConnectivityBanner: View {
 
     private func offlineDetail(cachedAt: Date?) -> String {
         guard let cachedAt else {
-            return "Briefing and Q&A stay local. Confirmed actions queue as pending, never sent."
+            return "Briefing and Q&A stay available. Confirmed actions queue as pending — not sent."
         }
         return "Cached \(cachedAt.formatted(date: .abbreviated, time: .shortened)). "
-            + "Confirmed actions queue as pending, never sent."
+            + "Confirmed actions queue as pending — not sent."
     }
 
     private func statusBanner(
@@ -66,7 +66,7 @@ public struct ConnectivityBanner: View {
         .background(color.opacity(0.13), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(color.opacity(0.4), lineWidth: 1)
+                .stroke(color.opacity(0.32), lineWidth: 0.5)
         }
         .accessibilityElement(children: .combine)
     }

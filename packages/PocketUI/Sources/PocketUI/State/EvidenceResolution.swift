@@ -11,7 +11,25 @@ public struct EvidenceResolution: Equatable, Sendable {
     }
 
     public static func resolve(ids: [String], in evidence: [EvidenceRef]) -> Self {
-        let evidenceById = Dictionary(evidence.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        EvidenceIndex(evidence: evidence).resolve(ids: ids)
+    }
+}
+
+/// A bundle-scoped lookup reused by every visible claim and transcript row. Building this once per
+/// `ConversationView` render avoids rebuilding the full evidence dictionary for each citation group.
+struct EvidenceIndex: Equatable, Sendable {
+    private let evidenceById: [String: EvidenceRef]
+
+    init(evidence: [EvidenceRef]) {
+        var index: [String: EvidenceRef] = [:]
+        index.reserveCapacity(evidence.count)
+        for reference in evidence where index[reference.id] == nil {
+            index[reference.id] = reference
+        }
+        self.evidenceById = index
+    }
+
+    func resolve(ids: [String]) -> EvidenceResolution {
         var seen = Set<String>()
         var resolved: [EvidenceRef] = []
         var missing: [String] = []

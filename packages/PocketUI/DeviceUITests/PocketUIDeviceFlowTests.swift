@@ -37,6 +37,15 @@ final class PocketUIDeviceFlowTests: XCTestCase {
         let targetSequence = element(PocketAccessibilityID.proposalTargetSequence)
         XCTAssertEqual(targetSequence.label, "Target message sequence")
         XCTAssertEqual(targetSequence.value as? String, "230180")
+        let actionKind = element(PocketAccessibilityID.proposalKind)
+        XCTAssertEqual(actionKind.label, "Action kind")
+        XCTAssertEqual(actionKind.value as? String, "threadedReply")
+        let fullMessage = element(PocketAccessibilityID.proposalMessage)
+        XCTAssertEqual(fullMessage.label, "Full message text")
+        XCTAssertEqual(
+            fullMessage.value as? String,
+            "Rotate the token but do not deploy until Omar Gate is green."
+        )
 
         let confirm = app.buttons[PocketAccessibilityID.proposalConfirm]
         XCTAssertFalse(confirm.isEnabled)
@@ -45,6 +54,19 @@ final class PocketUIDeviceFlowTests: XCTestCase {
         XCTAssertTrue(confirm.isEnabled)
         confirm.tap()
         XCTAssertFalse(confirm.isEnabled, "single-use confirmation must disable synchronously")
+    }
+
+    func testCompletedReadBackExpiresWhileProposalRemainsVisible() {
+        launch(scenario: "expiring-proposal")
+
+        let confirm = app.buttons[PocketAccessibilityID.proposalConfirm]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+        XCTAssertTrue(confirm.isEnabled)
+
+        let expiry = element(PocketAccessibilityID.proposalValidationError)
+        XCTAssertTrue(expiry.waitForExistence(timeout: 15))
+        XCTAssertTrue(expiry.label.localizedCaseInsensitiveContains("confirmation expired"))
+        XCTAssertFalse(confirm.isEnabled)
     }
 
     func testOfflineConfirmationRendersPendingConnectivityNotSent() {
@@ -59,7 +81,15 @@ final class PocketUIDeviceFlowTests: XCTestCase {
 
     func testAccessibilityXXXLKeepsCoreContentAndControlsReachable() {
         let scenarios = [
-            ("inbox", PocketAccessibilityID.inboxScreen, "pocket.inbox.item.cp_954233b7_000012", true),
+            (
+                "inbox",
+                PocketAccessibilityID.inboxScreen,
+                PocketAccessibilityID.inboxItem(
+                    sessionId: "954233b7-1822-42bc-9cfe-1eb95eb0357a",
+                    checkpointId: "cp_954233b7_000012"
+                ),
+                true
+            ),
             ("conversation", PocketAccessibilityID.conversationScreen, PocketAccessibilityID.pushToTalk, true),
             ("proposal", PocketAccessibilityID.proposalScreen, PocketAccessibilityID.proposalCancel, true),
             ("evidence", PocketAccessibilityID.evidenceScreen, PocketAccessibilityID.evidenceDone, true),
@@ -193,7 +223,8 @@ final class PocketUIDeviceFlowTests: XCTestCase {
             "long-inbox-error",
             "long-invalid-conversation",
             "invalid-receipt",
-            "reconnecting-proposal"
+            "reconnecting-proposal",
+            "expiring-proposal"
         ] {
             launch(scenario: scenario)
             try app.performAccessibilityAudit()

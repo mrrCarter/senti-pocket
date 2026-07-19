@@ -6,7 +6,21 @@ import PocketCall
 /// resolved again from the current verified conversation before presentation, so navigation or integrity changes
 /// dismiss stale evidence rather than retaining caller-supplied content.
 public struct PresentedEvidenceSelection: Equatable, Identifiable, Sendable {
-    public var id: String { "\(checkpointId).\(evidenceId)" }
+    public struct ID: Hashable, Sendable {
+        public let sessionId: String
+        public let checkpointId: String
+        public let evidenceId: String
+
+        public init(sessionId: String, checkpointId: String, evidenceId: String) {
+            self.sessionId = sessionId
+            self.checkpointId = checkpointId
+            self.evidenceId = evidenceId
+        }
+    }
+
+    public var id: ID {
+        ID(sessionId: sessionId, checkpointId: checkpointId, evidenceId: evidenceId)
+    }
 
     public let checkpointId: String
     public let sessionId: String
@@ -197,7 +211,19 @@ public struct BundleIntegrityState: Equatable, Sendable {
 }
 
 public struct CheckpointInboxItem: Equatable, Identifiable, Sendable {
-    public var id: String { bundle.checkpointId }
+    public struct ID: Hashable, Sendable {
+        public let sessionId: String
+        public let checkpointId: String
+
+        public init(sessionId: String, checkpointId: String) {
+            self.sessionId = sessionId
+            self.checkpointId = checkpointId
+        }
+    }
+
+    public var id: ID {
+        ID(sessionId: bundle.sessionId, checkpointId: bundle.checkpointId)
+    }
 
     public let bundle: PocketBundle
     public let attention: CheckpointAttention
@@ -280,6 +306,28 @@ public enum VoiceConversationState: Equatable, Sendable {
     case listening
     case thinking
     case error(message: String)
+
+    /// Accessibility focus follows meaningful voice phases, not narration segment identifiers.
+    /// This prevents normal `.speaking` segment churn from stealing focus from transcript controls.
+    var accessibilityPhase: VoiceAccessibilityPhase {
+        switch self {
+        case .idle: return .idle
+        case .speaking: return .speaking
+        case .interrupted: return .interrupted
+        case .listening: return .listening
+        case .thinking: return .thinking
+        case .error: return .error
+        }
+    }
+}
+
+enum VoiceAccessibilityPhase: Equatable, Sendable {
+    case idle
+    case speaking
+    case interrupted
+    case listening
+    case thinking
+    case error
 }
 
 public struct ConversationNotice: Equatable, Identifiable, Sendable {
