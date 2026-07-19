@@ -20,9 +20,11 @@ public struct FixtureSessionRepository: SessionRepository {
                            completeness: .unknown, serverWatermark: nil, lastSuccessfulSync: nil)
     }
 
-    private static func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
-        // Malformed fixture JSON (e.g. after a future wire Codable change) maps to a caught TransportError.decoding
-        // — NEVER a process kill from a public repository path. A step-3 KAV exercises every constant.
+    // INTERNAL (not private) as the §5a decode SEAM: a `@testable import` KAV drives malformed JSON through this
+    // exact path and asserts it maps to `TransportError.decoding` — NEVER a process kill from a public repository
+    // path. `@testable` reaches `internal`, not `private`, so widening the visibility is the minimal seam; behavior
+    // is unchanged (the canned callers below still use it). A step-3 KAV exercises every constant + the error path.
+    static func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
         do { return try JSONDecoder().decode(type, from: Data(json.utf8)) }
         catch { throw TransportError.decoding }
     }

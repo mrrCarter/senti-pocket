@@ -11,6 +11,22 @@ import PocketContracts
 /// compile) = STRUCTURAL §4c broker-only observation (P1-B DiD), not reliance on the current call graph.
 struct ExecutionGrant: Sendable { fileprivate init() {} }
 
+/// Injected time source for the broker. `wallNow` interprets the server's ABSOLUTE `expiresAt`; `monotonicNow` is
+/// a CONTINUOUS monotonic instant that advances through device sleep (ContinuousClock) — deliberately NOT
+/// SuspendingClock/uptime, which pause during sleep and would extend bearer validity past its true lifetime. The
+/// broker pairs ONE wall + ONE monotonic sample at commit and at every usability check so a backward wall-clock
+/// jump can never resurrect an expired credential (§4b; Echo/Pulse ruling). Injectable so a KAV drives both clocks
+/// deterministically (a fake anchors a base ContinuousClock instant and advances it under test control).
+protocol BrokerClock: Sendable {
+    func wallNow() -> Date
+    func monotonicNow() -> ContinuousClock.Instant
+}
+
+struct SystemClock: BrokerClock {
+    func wallNow() -> Date { Date() }
+    func monotonicNow() -> ContinuousClock.Instant { ContinuousClock().now }
+}
+
 actor CredentialBroker {
 
     // MARK: - Private atomic authority (§4c distinguishing signal)
@@ -22,8 +38,15 @@ actor CredentialBroker {
         let credential: String            // opaque bearer; never logged / never returned
         let subjectId: String             // resolved via /auth/mcp-subject; keys the cache namespace (digest elsewhere)
         let generation: UInt64
-        let expiresAt: Date
-        func isUsable(now: Date, skew: TimeInterval) -> Bool { expiresAt.addingTimeInterval(-skew) > now }
+        let wallDeadline: Date                          // expiresAt - skew: absolute wall bound (§4b conservative)
+        let monotonicDeadline: ContinuousClock.Instant  // M0 + (expiresAt - W0 - skew): elapsed bound immune to wall jumps
+        /// Usable ONLY if BOTH bounds hold: the wall clock is before the absolute deadline AND the CONTINUOUS
+        /// monotonic clock is before the elapsed deadline anchored at commit. Requiring both means a BACKWARD
+        /// wall-clock jump can't resurrect an expired credential (monotonic keeps advancing); a forward-then-back
+        /// jump can't either, because the caller terminally invalidates on the first failure (§4b).
+        func isUsable(wallNow: Date, monotonicNow: ContinuousClock.Instant) -> Bool {
+            wallNow < wallDeadline && monotonicNow < monotonicDeadline
+        }
     }
 
     private var authority: Authority?     // nil ⇒ signed out
@@ -31,8 +54,12 @@ actor CredentialBroker {
     private var tombstone = false         // set FIRST during sign-out (with a generation advance) before wipe awaits
     private let skew: TimeInterval = 60   // §4b: never use a credential within 60s of expiry for network
     private let executor: SessionExecuting
+    private let clock: BrokerClock
 
-    init(executor: SessionExecuting) { self.executor = executor }
+    init(executor: SessionExecuting, clock: BrokerClock = SystemClock()) {
+        self.executor = executor
+        self.clock = clock
+    }
 
     // MARK: - Lifecycle (signIn commits atomically; signOut tombstones + advances generation before wipe)
 
@@ -50,17 +77,25 @@ actor CredentialBroker {
     /// attempt is rejected (`.stateMismatch`) and the current state — e.g. a completed sign-out — stands.
     func commit(credential: String, subjectId: String, expiresAt: Date, attempt: SignInAttempt) throws {
         guard !tombstone, attempt.base == currentGeneration else { throw AuthError.stateMismatch }
-        // Input validation BEFORE any authority write (snapshot `now` once): reject a whitespace-only or
-        // header-injecting (CR/LF) credential/subject, and a credential already within the 60s skew of expiry.
-        let now = Date()
+        // Pair ONE wall + ONE monotonic sample at commit (§4b), then validate BEFORE any authority write: reject a
+        // whitespace-only or header-injecting (CR/LF) credential/subject, and a credential already within the 60s
+        // skew of expiry. The wall sample interprets the server's absolute expiry; the monotonic (ContinuousClock)
+        // sample anchors an elapsed deadline immune to later wall jumps.
+        let w0 = clock.wallNow()
+        let m0 = clock.monotonicNow()
+        let lifetime = expiresAt.timeIntervalSince(w0)     // seconds of validity remaining per our wall clock at commit
         guard !credential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !subjectId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               credential.rangeOfCharacter(from: .controlCharacters) == nil,   // no CR/LF header-injection…
               subjectId.rangeOfCharacter(from: .controlCharacters) == nil,    // …symmetric on subjectId (Forge flag)
-              expiresAt.timeIntervalSince(now) > skew else { throw AuthError.invalidResponse }
+              lifetime > skew else { throw AuthError.invalidResponse }
+        // usableDuration = lifetime - skew (> 0 by the guard), floored to whole ms = conservative (expire early,
+        // never late); monotonicDeadline is that far past the commit monotonic instant M0.
+        let usableMillis = Int((lifetime - skew) * 1000)
         currentGeneration &+= 1
-        authority = Authority(credential: credential, subjectId: subjectId,
-                              generation: currentGeneration, expiresAt: expiresAt)
+        authority = Authority(credential: credential, subjectId: subjectId, generation: currentGeneration,
+                              wallDeadline: expiresAt.addingTimeInterval(-skew),
+                              monotonicDeadline: m0.advanced(by: .milliseconds(usableMillis)))
     }
 
     /// §4b/R6' sign-out: write the tombstone AND advance the generation FIRST — both before awaiting either
@@ -90,9 +125,18 @@ actor CredentialBroker {
     // MARK: - perform (§4c: generation compare BEFORE any status/body observation)
 
     func perform(_ spec: SessionRequestSpec) async throws -> Data {
-        let now = Date()
-        // 1. Snapshot the private authority at request start. No usable pair ⇒ fail closed.
-        guard let start = authority, !tombstone, start.isUsable(now: now, skew: skew) else {
+        // Pair one wall + one monotonic sample for the request-start usability check.
+        let wnow = clock.wallNow()
+        let mnow = clock.monotonicNow()
+        // 1. Snapshot the private authority at request start. No pair or a tombstone ⇒ fail closed. If a pair
+        //    exists but EITHER bound has passed, terminally invalidate (advance generation + clear authority)
+        //    before failing closed, so no later wall jump can resurrect it (§4b terminal invalidation).
+        guard let start = authority, !tombstone else {
+            throw AuthError.reauthenticationRequired
+        }
+        guard start.isUsable(wallNow: wnow, monotonicNow: mnow) else {
+            currentGeneration &+= 1
+            authority = nil
             throw AuthError.reauthenticationRequired
         }
         let captured = start.generation
@@ -104,10 +148,19 @@ actor CredentialBroker {
         //    mismatch the sealed response is DISCARDED UNOPENED — structural zero status/body observation (a stale
         //    401 is never classified and can never invalidate/suppress the current generation).
         if tombstone || authority?.generation != captured {
-            if let live = authority, !tombstone, live.isUsable(now: Date(), skew: skew) {
+            // Re-sample both clocks and classify the CURRENT (newer) authority under the SAME both-bounds rule.
+            let wr = clock.wallNow()
+            let mr = clock.monotonicNow()
+            if let live = authority, !tombstone, live.isUsable(wallNow: wr, monotonicNow: mr) {
                 throw CancellationError()               // superseded by a valid newer committed pair — retryable
             } else {
-                throw AuthError.reauthenticationRequired  // superseded by sign-out (tombstone / no committed pair)
+                // Superseded by sign-out (authority already nil) OR by a newer authority that is itself expired —
+                // terminally invalidate that dead newer authority before failing closed (§4b terminal invalidation).
+                if authority != nil {
+                    currentGeneration &+= 1
+                    authority = nil
+                }
+                throw AuthError.reauthenticationRequired
             }
         }
         // 5. Generation EQUAL ⇒ only NOW open the envelope and classify (§4b).

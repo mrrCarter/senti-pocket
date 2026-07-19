@@ -24,18 +24,27 @@ struct SealedResponse: Sendable {   // crosses the broker actor boundary; all fi
     private let statusCode: Int
     private let data: Data
     private let requestId: String?
+    /// Test-only observation hook, invoked EXACTLY when the broker opens this seal (post §4c generation-equality),
+    /// receiving the normalized status. Default nil ⇒ the live path is byte-for-byte untouched. A KAV installs one
+    /// to PROVE a superseded request's seal opens ZERO times (a stale 401 is never observed) while an
+    /// equal-generation seal opens exactly once. Never carries credential/body — only the status the broker classifies.
+    private let openWitness: (@Sendable (Int) -> Void)?
     /// Normalized init (a status Int, never a raw HTTPURLResponse) — INTERNAL so BOTH the live executor and the
     /// deterministic KAV executor can mint a sealed response. Security lives in `open()`'s broker-only grant, NOT
     /// the init: any executor may MINT a seal, but ONLY the broker can READ it (and only post generation-equality).
-    init(data: Data, status: Int, requestId: String?) {
+    init(data: Data, status: Int, requestId: String?, openWitness: (@Sendable (Int) -> Void)? = nil) {
         self.statusCode = status
         self.data = data
         self.requestId = requestId
+        self.openWitness = openWitness
     }
     /// Broker-only classification surface, called post generation-equality. Requires an `ExecutionGrant` that
     /// ONLY CredentialBroker can mint (its init is broker-file-private), so NO other current-or-future
     /// PocketSessionClient file can open a sealed response — structural, not current-call-graph-only (P1-B DiD).
-    func open(_ grant: ExecutionGrant) -> (status: Int, data: Data, requestId: String?) { (statusCode, data, requestId) }
+    func open(_ grant: ExecutionGrant) -> (status: Int, data: Data, requestId: String?) {
+        openWitness?(statusCode)           // test-only observation; nil (no-op) on the live path
+        return (statusCode, data, requestId)
+    }
 }
 
 /// Real network executor: an ephemeral `URLSession` (no cookies/cache/credential store), redirects refused so a
