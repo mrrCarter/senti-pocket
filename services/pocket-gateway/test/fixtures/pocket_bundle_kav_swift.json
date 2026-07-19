@@ -6,7 +6,7 @@
     "signingKeyId": "pocket-demo-phase-a",
     "privateKeyCommitted": false,
     "note": "Real random ed25519 public key. The matching private key is NOT committed and NOT derivable from any committed value; a forged bundle cannot be signed under this key.",
-    "publicKeyBase64url": "jyn3Qxg5YZ94RlyHf635kgT4Fh_M6gdrtiWMlx-hvds"
+    "publicKeyBase64url": "tbiyPLuRcBXqYRHazuik4y5mVG_5B__8vO6ov48GhmE"
   },
   "bundle": {
     "contractsVersion": "0.1.8",
@@ -37,7 +37,7 @@
   "kav": {
     "canonicalBytesUtf8": "pocket.bundle.v1\n5:0.1.89:cp_demo_111:sess_demo_13:1003:2009:cp_demo_113:demo briefing30:checkpoint_summary_sections_v111:A1:17:agent-a13:did the thing1:12:c16:a fact4:fact1:13:ev11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:17528352000001:12:r11:12:b11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:175283520000013:175283520000019:pocket-demo-phase-a",
     "canonicalSha256Hex": "be4c9e360624c1bab4f2ad13afeda10c87e2f680ada48e2aa020f0afb069e9e3",
-    "signatureBase64url": "zbwO9VPxqC0Hl82m_DQA9YRBCNDc4NpBkzuNm0GAIQb8Kvl4W_4r5NE9fTX19dAKimC-yFeMQcIzepspRSUVCg",
+    "signatureBase64url": "Enb3m9ANY6w9QEBAL6rvIYteBbISD5b8TLaZVSOJuGLMnSf6ktOK7pMwkmjfRaJwRdKZK5IWn-3VpzkSNAZHBA",
     "verifiesUnderPinnedKey": true
   },
   "tamperVectors": {
