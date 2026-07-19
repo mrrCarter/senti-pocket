@@ -179,10 +179,10 @@ final class PocketCallMachineTests: XCTestCase {
         let canonical = demoBundle(signature: "", signingKeyId: signingKeyId, invertRange: invertRange).canonicalBundlePayload()
         return demoBundle(signature: b64url(try signer.signature(for: Data(canonical.utf8))), signingKeyId: signingKeyId, invertRange: invertRange)
     }
-    /// The COMMITTED real-key signature, loaded from the PocketContracts KAV fixture (monorepo path; no literal dup, no private key).
-    private func kavSignature() throws -> String {
+    /// The COMMITTED real-key signature, loaded from a PocketContracts KAV fixture (monorepo path; no literal dup, no private key).
+    private func kavSignature(_ file: String = "bundle_kav.json") throws -> String {
         let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-            .appendingPathComponent("../../../PocketContracts/Tests/PocketContractsTests/Fixtures/bundle_kav.json").standardizedFileURL
+            .appendingPathComponent("../../../PocketContracts/Tests/PocketContractsTests/Fixtures/" + file).standardizedFileURL
         let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
         return (obj["kav"] as! [String: Any])["signatureBase64url"] as! String
     }
@@ -200,6 +200,15 @@ final class PocketCallMachineTests: XCTestCase {
         let invalid = try signed(with: Curve25519.Signing.PrivateKey(), invertRange: true)
         XCTAssertFalse(invalid.isSemanticallyValid())               // inverted range -> semantically invalid
         XCTAssertNil(VerifiedBundle.verify(invalid))                // rejected (semantic + crypto)
+    }
+
+    /// SECOND NEGATIVE KAV — the semantic gate is NOT dead code behind crypto: this bundle's committed signature
+    /// VERIFIES under the pinned key (crypto-valid), but its sequence range is inverted, so verify() still REJECTS it.
+    func testVerifiedBundleRejectsCryptoValidButSemanticallyInvalidKAV() throws {
+        let neg = demoBundle(signature: try kavSignature("bundle_kav_negative.json"), invertRange: true)
+        XCTAssertTrue(neg.verifiesSignature())        // committed signature verifies under the PINNED key
+        XCTAssertFalse(neg.isSemanticallyValid())     // but the sequence range is inverted (semantically invalid)
+        XCTAssertNil(VerifiedBundle.verify(neg))       // so verify() rejects it -> the semantic check is live
     }
 
     private func b64url(_ d: Data) -> String {

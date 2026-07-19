@@ -171,7 +171,9 @@ final class ContractsCrossModuleTests: XCTestCase {
     /// A semantically-VALID demo bundle; each param flips exactly one rule for the rejection tests below.
     private func semBundle(version: String = "0.1.8", schema: String = "checkpoint_summary_sections_v1",
                            seqStart: Int = 100, seqEnd: Int = 200, cpBundle: String = "cp_demo_1", cpSummary: String = "cp_demo_1",
-                           sessionId: String = "sess_demo_1", signingKeyId: String = "pocket-demo-phase-a",
+                           sessionId: String = "sess_demo_1", signingKeyId: String = "pocket-demo-phase-a", signature: String = "sig",
+                           headline: String = "h", grade: String? = "A", risks: [String] = [], blockers: [String] = [],
+                           agentId: String = "agent-a", agentSummaryText: String = "s",
                            evId: String = "ev1", evAgent: String = "agent-a", evSnippet: String = "sn", evSession: String = "sess_demo_1", evSeq: Int = 150,
                            secondEvidence: EvidenceRef? = nil, perAgentEvidence: [EvidenceRef]? = nil,
                            claims: [Claim]? = nil, date: Date? = nil) -> PocketBundle {
@@ -180,9 +182,9 @@ final class ContractsCrossModuleTests: XCTestCase {
         var top = [ev]
         if let s = secondEvidence { top.append(s) }
         let claimList = claims ?? [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: [evId])]
-        let ag = AgentSummary(agentId: "agent-a", summary: "s", claims: claimList, evidence: perAgentEvidence ?? [ev])
-        let sum = CheckpointSummary(checkpointId: cpSummary, headline: "h", summaryBaselineSchema: schema, grade: "A", perAgent: [ag], risks: [], blockers: [])
-        return PocketBundle(contractsVersion: version, checkpointId: cpBundle, sessionId: sessionId, sequenceStart: seqStart, sequenceEnd: seqEnd, summary: sum, evidence: top, createdAt: t, signature: "sig", signingKeyId: signingKeyId)
+        let ag = AgentSummary(agentId: agentId, summary: agentSummaryText, claims: claimList, evidence: perAgentEvidence ?? [ev])
+        let sum = CheckpointSummary(checkpointId: cpSummary, headline: headline, summaryBaselineSchema: schema, grade: grade, perAgent: [ag], risks: risks, blockers: blockers)
+        return PocketBundle(contractsVersion: version, checkpointId: cpBundle, sessionId: sessionId, sequenceStart: seqStart, sequenceEnd: seqEnd, summary: sum, evidence: top, createdAt: t, signature: signature, signingKeyId: signingKeyId)
     }
 
     /// FIX3 + P1.3 bounded ingress — a bundle failing ANY content rule is rejected (independent of the signature).
@@ -205,6 +207,26 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertTrue(semBundle(date: Date(timeIntervalSince1970: 1e18)).semanticIssues().contains(.unsaneDate))
         XCTAssertTrue(semBundle(date: Date(timeIntervalSince1970: 1_752_835_200.0005)).semanticIssues().contains(.subMillisecondDate))
         XCTAssertFalse(semBundle(claims: [Claim(id: "c1", text: "x", kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.uncitedFactOrInference))  // recommendation may be uncited
+
+        // P1 re-audit#3 — strictly-positive sequences (0…0 rejected), non-empty top-level evidence, duplicate per-agent evidence.
+        XCTAssertTrue(semBundle(seqStart: 0, seqEnd: 0).semanticIssues().contains(.negativeSequence))
+        let emptyEvidence = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: 100, sequenceEnd: 200, summary: CheckpointSummary(checkpointId: "cp_demo_1", headline: "h", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [], risks: [], blockers: []), evidence: [], createdAt: ts, signature: "sig", signingKeyId: "pocket-demo-phase-a")
+        XCTAssertTrue(emptyEvidence.semanticIssues().contains(.emptyEvidence))
+        let ev1 = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)
+        XCTAssertTrue(semBundle(perAgentEvidence: [ev1, ev1]).semanticIssues().contains(.duplicateEvidenceId))  // dup within a per-agent list
+
+        // Newly-bounded fields (frozen caps id<=128, string<=8000 UTF-8 bytes).
+        let longS = String(repeating: "x", count: 8001)
+        let longId = String(repeating: "i", count: 129)
+        XCTAssertTrue(semBundle(signature: longS).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(grade: longS).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(risks: [longS]).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(blockers: [longS]).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(agentId: longId).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(agentSummaryText: longS).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(evAgent: longId).semanticIssues().contains(.oversizedField))
+        // UTF-8 BYTE count (not grapheme): 4001 × "é" = 8002 bytes > 8000, though String.count is only 4001.
+        XCTAssertTrue(semBundle(evSnippet: String(repeating: "é", count: 4001)).semanticIssues().contains(.oversizedField))
     }
 
     /// P1.2 adversary A — a claim citing evidence present ONLY in per-agent evidence (NOT top-level) is a foreign citation.

@@ -12,9 +12,10 @@ let package = Package(
         .testTarget(
             name: "PocketContractsTests",
             dependencies: ["PocketContracts"],
-            // P1.5: the signed pocket.bundle.v1 KAV is a bundled test RESOURCE (loaded via Bundle.module),
+            // P1.5: the signed pocket.bundle.v1 KAVs are bundled test RESOURCES (loaded via Bundle.module),
             // so the test verifies the committed signature/pubkey/canonical instead of duplicating literals.
-            resources: [.copy("Fixtures/bundle_kav.json")]
+            // Copy the DIRECTORY (not the file) so `Bundle.module.url(..., subdirectory: "Fixtures")` resolves.
+            resources: [.copy("Fixtures")]
         )
     ]
 )

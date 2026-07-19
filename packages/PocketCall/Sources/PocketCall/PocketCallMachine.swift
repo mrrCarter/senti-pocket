@@ -165,14 +165,12 @@ public enum PocketCall {
     }
 }
 
-/// Trust-boundary wrapper: a `PocketBundle` may drive the call ONLY after its gateway ed25519 signature verifies.
-/// `VerifiedBundle` has NO public memberwise init — it is mintable ONLY through `verify(_:gatewayPublicKeyBase64url:)`,
-/// so an unverified bundle cannot be wrapped in a `.bundleArrived` event as a matter of TYPE (not convention).
-///
-/// The crypto body is completed against Relay's bundle-signing canonical KAV (services/pocket-gateway/src/bundle.mjs;
-/// Relay's narrow cross-language commit is pending — one ISO8601-ms date form, versioned domain separator, base64url
-/// signature, schema/key validation, frozen test-key KAV). Until that lands `verify` returns nil (fails closed),
-/// so in a release build NOTHING can start a call — the correct honest state while bundle verification is unfinished.
+/// Trust-boundary wrapper: a `PocketBundle` may drive the call ONLY after it passes ingress. `VerifiedBundle` has NO
+/// public memberwise init — it is mintable ONLY through `verify(_:)`, which (a) rejects an untrusted `signingKeyId`,
+/// (b) requires full semantic validity, and (c) verifies the ed25519 signature under the PINNED key resolved
+/// internally from `signingKeyId` (no caller-supplied key/anchor). So an unverified bundle cannot be wrapped in a
+/// `.bundleArrived` event as a matter of TYPE (not convention). Off-CryptoKit hosts fail closed (`verify` returns nil).
+/// The `pocket.bundle.v1` canonical is mirrored by Relay's Node gateway (services/pocket-gateway) to sign real bundles.
 public struct VerifiedBundle: Equatable, Sendable {
     public let bundle: PocketBundle
     private init(bundle: PocketBundle) { self.bundle = bundle }

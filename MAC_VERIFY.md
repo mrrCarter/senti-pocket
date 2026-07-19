@@ -9,22 +9,19 @@ exactly what cannot run on Windows.
 ## Prereqs
 - macOS with Xcode or the Command Line Tools (`xcode-select --install`). Check: `swift --version`.
 
-## Pin the exact commit — ABORTS on any SHA mismatch (never verifies a moved tip)
-Pass the exact **40-char** SHA from the warden's handoff as `EXPECTED_SHA`. The script fetches, checks out that
-EXACT commit **detached**, and aborts unless `HEAD` equals it — so a branch tip that moved after the handoff can
-never be silently verified. With no `EXPECTED_SHA`, it defaults to the current origin tip and prints an UNPINNED warning.
+## Pin the exact commit — FAILS CLOSED (aborts before anything runs without an exact SHA)
+You MUST pass the exact **40-char** `EXPECTED_SHA` from the warden's handoff. If it is unset/empty the script
+**aborts before any clone/fetch/build/test** — there is NO default-to-tip and NO warning-and-continue, so a moved
+branch tip can never be verified. It then checks out that EXACT commit **detached** and aborts unless `HEAD` equals it.
 ```bash
 set -euo pipefail
+# FAIL CLOSED: refuse to do ANYTHING without an explicit full-40-char EXPECTED_SHA (no default-to-tip).
+: "${EXPECTED_SHA:?ABORT: set EXPECTED_SHA=<full 40-char SHA from the handoff>. This runbook refuses to verify a movable branch tip.}"
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ABORT: EXPECTED_SHA must be a full 40-char commit SHA (got '$EXPECTED_SHA')." >&2; exit 1; }
+
 git clone https://github.com/mrrCarter/senti-pocket.git 2>/dev/null || true
 cd senti-pocket
 git fetch --all --prune
-
-if [ -z "${EXPECTED_SHA:-}" ]; then
-  EXPECTED_SHA="$(git rev-parse origin/warden/bundle-kav-fix)"
-  echo "WARNING: EXPECTED_SHA not set -> defaulting to current origin tip $EXPECTED_SHA (UNPINNED). Pass EXPECTED_SHA=<40-char> from the handoff to pin." >&2
-fi
-[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ABORT: EXPECTED_SHA must be a full 40-char commit SHA (got '$EXPECTED_SHA')." >&2; exit 1; }
-
 git checkout --detach "$EXPECTED_SHA"
 ACTUAL="$(git rev-parse HEAD)"
 [ "$ACTUAL" = "$EXPECTED_SHA" ] || { echo "ABORT: HEAD $ACTUAL != EXPECTED_SHA $EXPECTED_SHA." >&2; exit 1; }
