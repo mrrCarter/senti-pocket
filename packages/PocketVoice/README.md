@@ -19,7 +19,7 @@ Offline speech recognition, duplex capture, deterministic barge-in, and pluggabl
 4. `CapturedAudioAccumulator` and `PCMResampler` produce the 16 kHz request consumed by whisper.cpp.
 5. `HybridSpeechSynthesizer` uses the gateway premium path only when online and falls back to `AVSpeechSynthesizer` otherwise.
 
-Audio interruptions, media-service resets, and loss of the active input route terminate capture with an explicit error. They do not leave the app in a false listening state.
+Audio interruptions, media-service resets, and loss of the active input route terminate capture with an explicit error. A failed start after iOS audio-session activation deactivates that session before returning the error. These failures do not leave the app in a false listening state.
 
 ## Premium TTS Gateway
 

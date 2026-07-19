@@ -57,6 +57,9 @@ public actor MicrophoneCapture {
                 channels: 1,
                 interleaved: false
               ) else {
+            #if os(iOS)
+            Self.deactivateAudioSession()
+            #endif
             throw VoiceError.audioSessionFailed("no valid microphone input format")
         }
 
@@ -97,6 +100,9 @@ public actor MicrophoneCapture {
                 captureID: captureID,
                 throwing: VoiceError.audioSessionFailed(error.localizedDescription)
             )
+            #if os(iOS)
+            Self.deactivateAudioSession()
+            #endif
             throw VoiceError.audioSessionFailed(error.localizedDescription)
         }
     }
@@ -118,9 +124,15 @@ public actor MicrophoneCapture {
         frameSink.finish(captureID: captureID)
 
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        Self.deactivateAudioSession()
         #endif
     }
+
+    #if os(iOS)
+    private static func deactivateAudioSession() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+    #endif
 
     private func installAudioSessionObservers(captureID: UUID) {
         #if os(iOS)
