@@ -30,10 +30,15 @@ final class MicrophoneCaptureGenerationTests: XCTestCase {
         sink.finish(captureID: captureID)
 
         var iterator = pair.stream.makeAsyncIterator()
-        XCTAssertEqual(try await iterator.next()?.samples, [0.1])
-        XCTAssertEqual(try await iterator.next()?.samples, [0.2])
-        XCTAssertEqual(try await iterator.next()?.samples, [0.3])
-        XCTAssertNil(try await iterator.next())
+        let first = try await iterator.next()
+        let second = try await iterator.next()
+        let third = try await iterator.next()
+        let terminal = try await iterator.next()
+
+        XCTAssertEqual(first?.samples, [0.1])
+        XCTAssertEqual(second?.samples, [0.2])
+        XCTAssertEqual(third?.samples, [0.3])
+        XCTAssertNil(terminal)
     }
 
     func testFrameSinkPreservesTerminalContinuationUntilActorCleanup() async throws {
