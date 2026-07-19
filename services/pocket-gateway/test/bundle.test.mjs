@@ -189,6 +189,38 @@ test('validateBundleIngress: bounds all remaining label/prose/signature fields (
   assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, headline: 'x'.repeat(5000) } }).errors.join(), /headline: exceeds/);
 });
 
+test('validateBundleIngress: identity integrity (Echo/warden a459b33 #3)', () => {
+  const good = buildBundle(RAW, SUMMARY, { signingKeyId: 'k1', createdAt: '2026-07-18T10:40:00Z' });
+  const dupAgent = { ...good, summary: { ...good.summary, perAgent: [
+    { agentId: 'x', summary: 's', claims: [], evidence: [] }, { agentId: 'x', summary: 's', claims: [], evidence: [] }] } };
+  assert.match(validateBundleIngress(dupAgent).errors.join(), /duplicate agent id x/);
+  const misbound = { ...good, summary: { ...good.summary, perAgent: [
+    { agentId: 'x', summary: 's', claims: [], evidence: [{ ...good.evidence[0], agentId: 'y' }] }] } };
+  assert.match(validateBundleIngress(misbound).errors.join(), /agentId != containing agent x/);
+  const dupCite = { ...good, summary: { ...good.summary, perAgent: [
+    { agentId: 'x', summary: 's', evidence: [good.evidence[0]],
+      claims: [{ id: 'c', text: 't', kind: 'fact', evidenceIds: [good.evidence[0].id, good.evidence[0].id] }] }] } };
+  assert.match(validateBundleIngress(dupCite).errors.join(), /duplicate citation id/);
+  assert.match(validateBundleIngress({ ...good, checkpointId: '   ' }).errors.join(), /blank\/whitespace-only id/);
+});
+
+test('validateBundleIngress: total-work budget rejects a pathological graph product (warden a459b33 #2 DoS guard)', () => {
+  const good = buildBundle(RAW, SUMMARY, { signingKeyId: 'k1', createdAt: '2026-07-18T10:40:00Z' });
+  const perAgent = Array.from({ length: 300 }, (_, i) => ({ agentId: 'agent-' + i, summary: 'x'.repeat(8000), claims: [], evidence: [] }));
+  assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, perAgent } }).errors.join(), /total bytes .* exceed budget/);
+});
+
+test('consumer parity: a gateway-produced bundle stays within the FROZEN per-field caps (accepted by VerifiedBundle + inference)', () => {
+  const signed = buildSignedBundle(RAW, SUMMARY, generateSigningKeypair().privateKey, { signingKeyId: 'gw' });
+  assert.ok(Buffer.byteLength(signed.checkpointId, 'utf8') <= 256 && Buffer.byteLength(signed.sessionId, 'utf8') <= 256);
+  for (const e of signed.evidence) {
+    assert.ok(Buffer.byteLength(e.id, 'utf8') <= 128, 'evidence id <= 128');
+    assert.ok(Buffer.byteLength(e.agentId, 'utf8') <= 128, 'evidence agentId <= 128');
+    assert.ok(Buffer.byteLength(e.snippet, 'utf8') <= 8000, 'snippet <= 8000');
+  }
+  assert.deepEqual(validateBundleIngress(signed).errors, [], 'gateway bundle passes the Node consumer gate');
+});
+
 // ---- Pulse's two exact counterexamples on the sign path (must fail CLOSED, never sign what the phone rejects) ----
 test('buildSignedBundle FAILS CLOSED: cannot sign a bundle its own ingress gate rejects (evidence=[])', () => {
   const { privateKey } = generateSigningKeypair();

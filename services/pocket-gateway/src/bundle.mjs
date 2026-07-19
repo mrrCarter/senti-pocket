@@ -286,15 +286,25 @@ export function validateBundleIngress(bundle) {
   const b = bundle;
   if (!b || typeof b !== 'object') return { ok: false, errors: ['bundle: not an object'] };
   const SNIPPET_MAX = 8000; // frozen ingress max (egress is stricter at 2048)
+  // total-work budget (warden #2 DoS guard): bound the WHOLE graph, not just per-array, so a pathological product
+  // (e.g. 2048 agents x 2048 claims x 8000 bytes) fails fast. Demo-generous; far above any real checkpoint bundle.
+  const BUDGET = Object.freeze({ elements: 20000, bytes: 2 * 1024 * 1024 });
+  let elems = 0, bytes = 0;
   const reqStr = (v, label, cap) => {
     if (typeof v !== 'string' || v.length === 0) push(`${label}: empty/non-string required field`);
     else if (b8(v) > cap) push(`${label}: exceeds ${cap} bytes`);
   };
+  // ids are trimmed + non-blank (the frozen contract trims via .whitespacesAndNewlines then requires non-empty) — warden #3.
+  const reqId = (v, label, cap) => {
+    reqStr(v, label, cap);
+    if (typeof v === 'string' && v.length > 0 && v.trim().length === 0) push(`${label}: blank/whitespace-only id`);
+  };
   const arrOf = (v, label) => { if (v == null) return []; if (!Array.isArray(v)) { push(`${label}: must be an array`); return []; } return v; };
   const optStr = (v, label, cap) => { if (v == null) return; if (typeof v !== 'string') push(`${label}: must be a string`); else if (b8(v) > cap) push(`${label}: exceeds ${cap} bytes`); };
-  reqStr(b.checkpointId, 'checkpointId', SUMMARY_CAPS.id);
-  reqStr(b.sessionId, 'sessionId', SUMMARY_CAPS.id);
-  reqStr(b.signingKeyId, 'signingKeyId', SUMMARY_CAPS.id); // not in the inference type; bounded defensively
+  const acct = (v) => { if (typeof v === 'string') bytes += b8(v); elems += 1; };
+  reqId(b.checkpointId, 'checkpointId', SUMMARY_CAPS.id);
+  reqId(b.sessionId, 'sessionId', SUMMARY_CAPS.id);
+  reqId(b.signingKeyId, 'signingKeyId', SUMMARY_CAPS.id); // not in the inference type; bounded defensively
   const s0 = b.sequenceStart, s1 = b.sequenceEnd;
   const rangeOk = Number.isSafeInteger(s0) && Number.isSafeInteger(s1) && s0 > 0 && s1 >= s0;
   if (!rangeOk) push('sequence: range must be positive and non-inverted (start>0, end>=start)');
@@ -310,33 +320,47 @@ export function validateBundleIngress(bundle) {
   optStr(sum.headline, 'summary.headline', SUMMARY_CAPS.headline);
   optStr(sum.summaryBaselineSchema, 'summary.summaryBaselineSchema', SUMMARY_CAPS.str);
   optStr(sum.grade, 'summary.grade', SUMMARY_CAPS.str);
-  for (const r of arrOf(sum.risks, 'summary.risks')) optStr(r, 'summary.risks[]', SUMMARY_CAPS.str);
-  for (const bl of arrOf(sum.blockers, 'summary.blockers')) optStr(bl, 'summary.blockers[]', SUMMARY_CAPS.str);
-  const chkEv = (e, where) => {
-    reqStr(e && e.id, `${where}.id`, SUMMARY_CAPS.evId);
-    reqStr(e && e.agentId, `${where}.agentId`, SUMMARY_CAPS.evId);
+  for (const r of arrOf(sum.risks, 'summary.risks')) { optStr(r, 'summary.risks[]', SUMMARY_CAPS.str); acct(r); }
+  for (const bl of arrOf(sum.blockers, 'summary.blockers')) { optStr(bl, 'summary.blockers[]', SUMMARY_CAPS.str); acct(bl); }
+  const chkEv = (e, where, ownerAgentId) => {
+    reqId(e && e.id, `${where}.id`, SUMMARY_CAPS.evId);
+    reqId(e && e.agentId, `${where}.agentId`, SUMMARY_CAPS.evId);
     reqStr(e && e.snippet, `${where}.snippet`, SNIPPET_MAX);
     if (!e || !Number.isSafeInteger(e.sequence) || e.sequence <= 0) push(`${where}.sequence: not a positive integer`);
     else if (rangeOk && (e.sequence < s0 || e.sequence > s1)) push(`${where}.sequence ${e.sequence} outside checkpoint range [${s0},${s1}]`);
     if (e && b.sessionId && e.sessionId !== b.sessionId) push(`${where}: sessionId != bundle sessionId`);
+    // nested evidence must belong to its containing agent (warden #3 identity)
+    if (e && ownerAgentId != null && e.agentId !== ownerAgentId) push(`${where}: agentId != containing agent ${ownerAgentId}`);
+    if (e) { acct(e.id); acct(e.agentId); acct(e.snippet); }
   };
   for (const e of topEv) chkEv(e, `evidence ${e && e.id}`);
+  const agentIds = new Set();
   for (const a of arrOf(sum.perAgent, 'summary.perAgent')) {
-    reqStr(a && a.agentId, 'agent.agentId', SUMMARY_CAPS.evId);
+    reqId(a && a.agentId, 'agent.agentId', SUMMARY_CAPS.evId);
     optStr(a && a.summary, 'agent.summary', SUMMARY_CAPS.summary);
+    if (a && a.agentId) { if (agentIds.has(a.agentId)) push(`duplicate agent id ${a.agentId}`); agentIds.add(a.agentId); }
+    acct(a && a.agentId); acct(a && a.summary);
     const nestedIds = new Set();
     for (const e of arrOf(a && a.evidence, 'agent.evidence')) {
-      chkEv(e, `agent ${a && a.agentId} evidence ${e && e.id}`);
+      chkEv(e, `agent ${a && a.agentId} evidence ${e && e.id}`, a && a.agentId);
       if (e && e.id) { if (nestedIds.has(e.id)) push(`agent ${a.agentId}: duplicate nested evidence id ${e.id}`); nestedIds.add(e.id); }
     }
+    const claims = arrOf(a && a.claims, 'agent.claims');
+    if (claims.length > SUMMARY_CAPS.evidence) push(`agent ${a && a.agentId}: claims exceeds ${SUMMARY_CAPS.evidence}`);
     const claimIds = new Set();
-    for (const c of arrOf(a && a.claims, 'agent.claims')) {
-      reqStr(c && c.id, 'claim.id', SUMMARY_CAPS.str);
+    for (const c of claims) {
+      reqId(c && c.id, 'claim.id', SUMMARY_CAPS.str);
       reqStr(c && c.text, 'claim.text', SUMMARY_CAPS.summary);
-      if (arrOf(c && c.evidenceIds, 'claim.evidenceIds').length > SUMMARY_CAPS.evidence) push(`claim ${c.id}: evidenceIds exceeds ${SUMMARY_CAPS.evidence}`);
+      const cites = arrOf(c && c.evidenceIds, 'claim.evidenceIds');
+      if (cites.length > SUMMARY_CAPS.evidence) push(`claim ${c && c.id}: evidenceIds exceeds ${SUMMARY_CAPS.evidence}`);
+      const citeSet = new Set(); // unique citation ids per claim (warden #3)
+      for (const id of cites) { if (citeSet.has(id)) push(`claim ${c && c.id}: duplicate citation id ${id}`); citeSet.add(id); acct(id); }
       if (c && c.id) { if (claimIds.has(c.id)) push(`agent ${a.agentId}: duplicate claim id ${c.id}`); claimIds.add(c.id); }
+      acct(c && c.id); acct(c && c.text);
     }
   }
+  if (elems > BUDGET.elements) push(`total elements ${elems} exceed budget ${BUDGET.elements}`);
+  if (bytes > BUDGET.bytes) push(`total bytes ${bytes} exceed budget ${BUDGET.bytes}`);
   for (const e of validateBundleSemantics(b).errors) push(e); // then the semantic-graph checks (ranges/ids/citations/dates)
   return { ok: errors.length === 0, errors };
 }
