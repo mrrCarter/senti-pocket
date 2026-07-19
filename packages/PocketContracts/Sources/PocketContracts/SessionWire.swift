@@ -60,7 +60,8 @@ public struct SessionListPage: Codable, Equatable, Sendable {
 
 /// _event_from_db_row (:3806-3821) always emits id/event/payload/agentId/agentModel/ts/timestamp/cursor/
 /// sequenceId/sessionId, plus a nested `agent` presentation object (role/displayName/provider/clientKind).
-/// `agent` is JSONValue for losslessness; eventId/idempotencyToken/source are conditional.
+/// `agent` is JSONValue for losslessness; eventId/idempotencyToken are conditional; `source` key is
+/// always emitted but its value is DB-nullable (models/session.py:141).
 public struct SessionEventDTO: Codable, Equatable, Sendable, Identifiable {
     public let id: String
     public let event: String
@@ -131,8 +132,9 @@ public struct SessionActionPage: Codable, Equatable, Sendable {
 // MARK: - Checkpoints (generic session_checkpoint resource; membership-authorized, NOT verify-gated)
 
 /// Full-content checkpoint DTO (renamed from Ref — it carries title/summary/grade family, not just a ref).
-/// kind/title/summary are present before the service returns a row; the grade family is nullable
-/// (session_checkpoint_grading.py:144-146/202-204).
+/// kind/title/summary are present before the service returns a row; the grade family is
+/// serializer-guaranteed non-null (both normalize_checkpoint_grade return paths emit all four —
+/// build_checkpoint_grade uses _grade_letter, which always yields a letter).
 public struct SessionCheckpointDTO: Codable, Equatable, Sendable, Identifiable {
     public var id: String { checkpointId }
     public let checkpointId: String

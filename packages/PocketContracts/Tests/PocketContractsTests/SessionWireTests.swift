@@ -107,8 +107,8 @@ final class SessionWireTests: XCTestCase {
         let c = page.checkpoints[0]
         XCTAssertEqual(c.gradeScore, 91)
         XCTAssertEqual(c.gradeVersion, "checkpoint_grade_v1")
-        XCTAssertEqual(c.gradeReasons?.arrayValue?.first?["code"]?.stringValue, "coverage")
-        XCTAssertEqual(c.gradeReasons?.arrayValue?.first?["points"]?.intValue, 3)
+        XCTAssertEqual(c.gradeReasons.arrayValue?.first?["code"]?.stringValue, "coverage")
+        XCTAssertEqual(c.gradeReasons.arrayValue?.first?["points"]?.intValue, 3)
         XCTAssertEqual(c.title, "AUTH-1C")                        // membership-authorized content retained
     }
 
@@ -132,6 +132,20 @@ final class SessionWireTests: XCTestCase {
         let e = try decode(SessionEventForwardPage.self, json).events[0]
         XCTAssertNil(e.source)
         XCTAssertEqual(e.agent, .object([:]))     // empty agent object still lossless, not nil
+    }
+
+    /// Timestamps are raw ISO String -> byte-for-byte preserved across fractional/+00:00/Z forms (tolerant
+    /// parse is the projection's job). An unknown event kind survives raw (projection maps open enums).
+    func testRawTimestampAndUnknownEventKindPreserved() throws {
+        let json = """
+        {"events":[{"id":"ev_3","event":"future_unknown_kind_v9","agent":{},"agentId":"a","agentModel":"",
+        "payload":{},"ts":"2026-07-18T10:35:00.123456+00:00","timestamp":"2026-07-18T10:35:00Z",
+        "cursor":"c3","sequenceId":230161,"sessionId":"954233b7","source":"relay"}]}
+        """
+        let e = try decode(SessionEventForwardPage.self, json).events[0]
+        XCTAssertEqual(e.event, "future_unknown_kind_v9")            // unknown kind survives raw
+        XCTAssertEqual(e.ts, "2026-07-18T10:35:00.123456+00:00")     // fractional + offset byte-exact
+        XCTAssertEqual(e.timestamp, "2026-07-18T10:35:00Z")          // Z form byte-exact
     }
 
     // MARK: - JSONValue numeric exactness + round-trip
