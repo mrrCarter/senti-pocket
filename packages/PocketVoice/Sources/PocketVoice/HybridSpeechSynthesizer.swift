@@ -55,6 +55,9 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
         } catch is CancellationError {
             throw VoiceError.cancelled
         } catch {
+            if let audioSessionFailure = Self.audioSessionFailure(from: error) {
+                throw audioSessionFailure
+            }
             try ensureActive(invocation)
             return try await finishOffline(request, invocation: invocation)
         }
@@ -75,12 +78,21 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
             try ensureActive(invocation)
             return metrics
         } catch {
+            if let audioSessionFailure = Self.audioSessionFailure(from: error) {
+                throw audioSessionFailure
+            }
             let wasCurrent = activeInvocation == invocation
             if !wasCurrent || error is CancellationError || error as? VoiceError == .cancelled {
                 throw VoiceError.cancelled
             }
             throw error
         }
+    }
+
+    private static func audioSessionFailure(from error: Error) -> VoiceError? {
+        guard let voiceError = error as? VoiceError,
+              case .audioSessionFailed = voiceError else { return nil }
+        return voiceError
     }
 
     private func ensureActive(_ invocation: ActiveInvocation) throws {
