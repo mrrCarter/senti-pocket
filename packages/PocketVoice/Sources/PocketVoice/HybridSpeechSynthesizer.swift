@@ -6,10 +6,16 @@ public protocol ConnectivityProviding: Sendable {
 }
 
 public actor HybridSpeechSynthesizer: SpeechSynthesizer {
+    private struct ActiveInvocation: Equatable {
+        let requestID: UUID
+        let generation: UInt64
+    }
+
     private let premium: any SpeechSynthesizer
     private let offline: any SpeechSynthesizer
     private let connectivity: any ConnectivityProviding
-    private var activeRequestID: UUID?
+    private var lifecycleGeneration: UInt64 = 0
+    private var activeInvocation: ActiveInvocation?
     private var stopTail: Task<Void, Never>?
     private var stopTailID: UUID?
 
@@ -24,46 +30,52 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
     }
 
     public func speak(_ request: SpeechSynthesisRequest) async throws -> SpeechPlaybackMetrics {
-        activeRequestID = request.id
+        lifecycleGeneration += 1
+        let invocation = ActiveInvocation(
+            requestID: request.id,
+            generation: lifecycleGeneration
+        )
+        activeInvocation = invocation
+        defer { clearIfCurrent(invocation) }
+
         await quiesceBackends()
-        try ensureActive(request.id)
+        try ensureActive(invocation)
 
         guard await connectivity.isOnline() else {
-            try ensureActive(request.id)
-            return try await finishOffline(request)
+            try ensureActive(invocation)
+            return try await finishOffline(request, invocation: invocation)
         }
 
         do {
             let metrics = try await premium.speak(request)
-            try ensureActive(request.id)
-            activeRequestID = nil
+            try ensureActive(invocation)
             return metrics
         } catch VoiceError.cancelled {
-            clearIfCurrent(request.id)
             throw VoiceError.cancelled
         } catch is CancellationError {
-            clearIfCurrent(request.id)
             throw VoiceError.cancelled
         } catch {
-            try ensureActive(request.id)
-            return try await finishOffline(request)
+            try ensureActive(invocation)
+            return try await finishOffline(request, invocation: invocation)
         }
     }
 
     public func stop() async {
-        activeRequestID = nil
+        lifecycleGeneration += 1
+        activeInvocation = nil
         await quiesceBackends()
     }
 
-    private func finishOffline(_ request: SpeechSynthesisRequest) async throws -> SpeechPlaybackMetrics {
+    private func finishOffline(
+        _ request: SpeechSynthesisRequest,
+        invocation: ActiveInvocation
+    ) async throws -> SpeechPlaybackMetrics {
         do {
             let metrics = try await offline.speak(request)
-            try ensureActive(request.id)
-            activeRequestID = nil
+            try ensureActive(invocation)
             return metrics
         } catch {
-            let wasCurrent = activeRequestID == request.id
-            clearIfCurrent(request.id)
+            let wasCurrent = activeInvocation == invocation
             if !wasCurrent || error is CancellationError || error as? VoiceError == .cancelled {
                 throw VoiceError.cancelled
             }
@@ -71,18 +83,18 @@ public actor HybridSpeechSynthesizer: SpeechSynthesizer {
         }
     }
 
-    private func ensureActive(_ requestID: UUID) throws {
-        guard activeRequestID == requestID, !Task.isCancelled else {
+    private func ensureActive(_ invocation: ActiveInvocation) throws {
+        guard activeInvocation == invocation, !Task.isCancelled else {
             throw VoiceError.cancelled
         }
     }
 
-    private func clearIfCurrent(_ requestID: UUID) {
-        if activeRequestID == requestID { activeRequestID = nil }
+    private func clearIfCurrent(_ invocation: ActiveInvocation) {
+        if activeInvocation == invocation { activeInvocation = nil }
     }
 
     func hasActiveRequest(_ requestID: UUID) -> Bool {
-        activeRequestID == requestID
+        activeInvocation?.requestID == requestID
     }
 
     /// Serialize stop operations across actor reentrancy. A newer request cannot start playback until every stop

@@ -243,27 +243,42 @@ private final class AVSpeechDriver: NSObject, AVSpeechDriving, AVSpeechSynthesiz
         finish(.failure(VoiceError.cancelled))
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        guard active?.utterance === utterance else { return }
-        if active?.firstAudioAt == nil { active?.firstAudioAt = .now }
+    nonisolated func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        didStart utterance: AVSpeechUtterance
+    ) {
+        MainActor.assumeIsolated {
+            guard active?.utterance === utterance else { return }
+            if active?.firstAudioAt == nil { active?.firstAudioAt = .now }
+        }
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        guard let active, active.utterance === utterance else { return }
-        let firstAudioAt = active.firstAudioAt ?? ContinuousClock.now
-        finish(
-            .success(
-                AVSpeechTiming(
-                    firstAudioMilliseconds: active.started.duration(to: firstAudioAt).voiceMilliseconds,
-                    totalMilliseconds: active.started.duration(to: .now).voiceMilliseconds
+    nonisolated func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        didFinish utterance: AVSpeechUtterance
+    ) {
+        MainActor.assumeIsolated {
+            guard let active, active.utterance === utterance else { return }
+            let firstAudioAt = active.firstAudioAt ?? ContinuousClock.now
+            finish(
+                .success(
+                    AVSpeechTiming(
+                        firstAudioMilliseconds: active.started.duration(to: firstAudioAt).voiceMilliseconds,
+                        totalMilliseconds: active.started.duration(to: .now).voiceMilliseconds
+                    )
                 )
             )
-        )
+        }
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        guard active?.utterance === utterance else { return }
-        finish(.failure(VoiceError.cancelled))
+    nonisolated func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        didCancel utterance: AVSpeechUtterance
+    ) {
+        MainActor.assumeIsolated {
+            guard active?.utterance === utterance else { return }
+            finish(.failure(VoiceError.cancelled))
+        }
     }
 
     private func finish(_ result: Result<AVSpeechTiming, Error>) {

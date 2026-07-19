@@ -818,9 +818,7 @@ private final class BlockingDuplexAudioSessionSystem: DuplexAudioSessionSystem, 
 
     func waitForActivation() async throws {
         for _ in 0..<100_000 {
-            condition.lock()
-            let started = activationStarted
-            condition.unlock()
+            let started = condition.withLock { activationStarted }
             if started { return }
             await Task.yield()
         }
