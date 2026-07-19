@@ -5,6 +5,12 @@ import PocketContracts
 // The INTERNAL broker: sole owner of the credential + generation + execution + status classification.
 // Neither the credential/generation nor any HTTPURLResponse ever leaves the actor (R1/R2). `perform` returns
 // only Data. Not public; only the module's transport/repository call it.
+/// Broker-only capability. Its initializer is fileprivate to THIS file (which contains only CredentialBroker),
+/// so ONLY the broker can mint one — and `SealedResponse.open(_:)` requires it, so ONLY the broker can open a
+/// sealed response. A non-broker / future PocketSessionClient file cannot construct an ExecutionGrant (won't
+/// compile) = STRUCTURAL §4c broker-only observation (P1-B DiD), not reliance on the current call graph.
+struct ExecutionGrant: Sendable { fileprivate init() {} }
+
 actor CredentialBroker {
 
     // MARK: - Private atomic authority (§4c distinguishing signal)
@@ -84,7 +90,7 @@ actor CredentialBroker {
             }
         }
         // 5. Generation EQUAL ⇒ only NOW open the envelope and classify (§4b).
-        let (status, data, requestId) = sealed.open()
+        let (status, data, requestId) = sealed.open(ExecutionGrant())
         switch status {
         case 200..<300:
             return data

@@ -29,8 +29,10 @@ struct SealedResponse {
         self.data = data
         self.requestId = response.value(forHTTPHeaderField: "x-request-id")
     }
-    /// Broker-only classification surface, called post generation-equality.
-    func open() -> (status: Int, data: Data, requestId: String?) { (statusCode, data, requestId) }
+    /// Broker-only classification surface, called post generation-equality. Requires an `ExecutionGrant` that
+    /// ONLY CredentialBroker can mint (its init is broker-file-private), so NO other current-or-future
+    /// PocketSessionClient file can open a sealed response — structural, not current-call-graph-only (P1-B DiD).
+    func open(_ grant: ExecutionGrant) -> (status: Int, data: Data, requestId: String?) { (statusCode, data, requestId) }
 }
 
 /// Real network executor: an ephemeral `URLSession` (no cookies/cache/credential store), redirects refused so a
