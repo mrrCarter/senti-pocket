@@ -59,7 +59,7 @@ public struct CheckpointInboxView: View {
                         CheckpointInboxRow(item: item)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityIdentifier("pocket.inbox.item.\(item.id)")
+                    .accessibilityIdentifier("pocket.inbox.item.\(item.bundle.checkpointId)")
                     .accessibilityHint(
                         item.integrity.allowsBriefing
                             ? "Opens this checkpoint briefing"

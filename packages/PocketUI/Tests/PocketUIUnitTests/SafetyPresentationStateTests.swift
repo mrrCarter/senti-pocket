@@ -11,6 +11,36 @@ final class SafetyPresentationStateTests: XCTestCase {
         XCTAssertTrue(PocketConnectivity.reconnecting.requiresQueuedWrite)
     }
 
+    func testCrossSessionPresentationIdentifiersCannotCollide() {
+        XCTAssertNotEqual(
+            CheckpointInboxItem.ID(sessionId: "session-a", checkpointId: "checkpoint"),
+            CheckpointInboxItem.ID(sessionId: "session-b", checkpointId: "checkpoint")
+        )
+        XCTAssertNotEqual(
+            PresentedEvidenceSelection.ID(
+                sessionId: "session-a",
+                checkpointId: "checkpoint",
+                evidenceId: "evidence"
+            ),
+            PresentedEvidenceSelection.ID(
+                sessionId: "session-b",
+                checkpointId: "checkpoint",
+                evidenceId: "evidence"
+            )
+        )
+    }
+
+    func testNarrationSegmentChangesDoNotChangeAccessibilityPhase() {
+        XCTAssertEqual(
+            VoiceConversationState.speaking(segmentId: "segment-1").accessibilityPhase,
+            VoiceConversationState.speaking(segmentId: "segment-2").accessibilityPhase
+        )
+        XCTAssertNotEqual(
+            VoiceConversationState.speaking(segmentId: "segment-2").accessibilityPhase,
+            VoiceConversationState.listening.accessibilityPhase
+        )
+    }
+
     func testInvalidCheckpointFailsClosedForBriefing() {
         XCTAssertFalse(BundleIntegrityState.unverified(reason: "fixture only").allowsBriefing)
         XCTAssertFalse(BundleIntegrityState.invalid(reason: "signature mismatch").allowsBriefing)
@@ -24,9 +54,18 @@ final class SafetyPresentationStateTests: XCTestCase {
         let bundle = try canonicalBundle()
         let verifiedBundle = VerifiedBundle.makeUnverifiedForTesting(bundle)
         let trusted = BundleIntegrityState(verifiedBundle: verifiedBundle)
+        let inboxItem = CheckpointInboxItem(
+            verifiedBundle: verifiedBundle,
+            attention: .unheard,
+            cachedForOffline: true
+        )
 
         XCTAssertTrue(trusted.allowsBriefing)
         XCTAssertEqual(trusted.signingKeyId, bundle.signingKeyId)
+        XCTAssertEqual(
+            inboxItem.id,
+            CheckpointInboxItem.ID(sessionId: bundle.sessionId, checkpointId: bundle.checkpointId)
+        )
 
         let otherBundle = try canonicalBundle(replacingCheckpointIdWith: "cp_other")
         let mismatched = IncomingBriefingState(bundle: otherBundle, integrity: trusted)
@@ -42,6 +81,14 @@ final class SafetyPresentationStateTests: XCTestCase {
             evidence: evidence,
             verifiedBundle: verifiedBundle
         ))
+        XCTAssertEqual(
+            selection.id,
+            PresentedEvidenceSelection.ID(
+                sessionId: bundle.sessionId,
+                checkpointId: bundle.checkpointId,
+                evidenceId: evidence.id
+            )
+        )
         let verifiedConversation = ConversationState(
             verifiedBundle: verifiedBundle,
             briefingPlan: PocketFixtures.briefingPlan,

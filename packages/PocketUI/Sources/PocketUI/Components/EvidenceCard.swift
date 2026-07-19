@@ -64,12 +64,12 @@ public struct EvidenceCard: View {
 
 struct EvidenceLinksView: View {
     let ids: [String]
-    let evidence: [EvidenceRef]
+    let evidenceIndex: EvidenceIndex
     let emptyLabel: String
     let onOpen: (EvidenceRef) -> Void
 
     var body: some View {
-        let resolution = EvidenceResolution.resolve(ids: ids, in: evidence)
+        let resolution = evidenceIndex.resolve(ids: ids)
         VStack(alignment: .leading, spacing: 8) {
             if ids.isEmpty {
                 Label(emptyLabel, systemImage: "exclamationmark.magnifyingglass")

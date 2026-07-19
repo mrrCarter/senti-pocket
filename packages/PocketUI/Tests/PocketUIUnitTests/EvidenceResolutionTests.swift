@@ -1,4 +1,5 @@
 import XCTest
+import PocketContracts
 @testable import PocketUI
 
 final class EvidenceResolutionTests: XCTestCase {
@@ -19,5 +20,22 @@ final class EvidenceResolutionTests: XCTestCase {
         let resolution = EvidenceResolution.resolve(ids: [], in: [PocketUITestFactory.evidence()])
         XCTAssertTrue(resolution.resolved.isEmpty)
         XCTAssertTrue(resolution.missingIds.isEmpty)
+    }
+
+    func testReusableIndexPreservesFirstDuplicateAndSupportsMultipleCitationGroups() {
+        let first = PocketUITestFactory.evidence(id: "ev_1")
+        let duplicate = EvidenceRef(
+            id: first.id,
+            sessionId: first.sessionId,
+            sequence: first.sequence,
+            agentId: first.agentId,
+            snippet: "duplicate must not replace the first reference",
+            ts: first.ts
+        )
+        let second = PocketUITestFactory.evidence(id: "ev_2")
+        let index = EvidenceIndex(evidence: [first, duplicate, second])
+
+        XCTAssertEqual(index.resolve(ids: ["ev_2"]).resolved, [second])
+        XCTAssertEqual(index.resolve(ids: ["ev_1"]).resolved, [first])
     }
 }

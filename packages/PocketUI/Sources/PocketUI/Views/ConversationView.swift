@@ -29,20 +29,42 @@ public struct ConversationView: View {
         .navigationTitle("Briefing")
         .accessibilityIdentifier(PocketAccessibilityID.conversationScreen)
         .pocketCanvas()
-        .onChange(of: state.voiceState) { _ in
+        .onChange(of: state.voiceState.accessibilityPhase) { _ in
             voiceStatusFocused = true
         }
     }
 
     private var conversationContent: some View {
         let context = CheckpointContext(bundle: state.bundle)
+        let evidenceIndex = EvidenceIndex(evidence: state.bundle.evidence)
 
         return VStack(spacing: 0) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     ConnectivityBanner(connectivity: connectivity)
                     conversationHeader(context: context)
-                    groundedClaims
+                    Text("Grounded briefing")
+                        .font(.title2.weight(.bold))
+                        .accessibilityAddTraits(.isHeader)
+
+                    ForEach(state.bundle.summary.perAgent, id: \.agentId) { agent in
+                        Section {
+                            ForEach(agent.claims) { claim in
+                                GroundedClaimRow(
+                                    claim: claim,
+                                    evidenceIndex: evidenceIndex,
+                                    onOpenEvidence: openEvidence
+                                )
+                            }
+                        } header: {
+                            Text(verbatim: agent.agentId)
+                                .font(.headline)
+                                .padding(.top, 6)
+                        }
+
+                        Divider()
+                            .overlay(PocketPalette.separator)
+                    }
 
                     VStack(alignment: .leading, spacing: 14) {
                         Text("Conversation")
@@ -52,7 +74,7 @@ public struct ConversationView: View {
                         ForEach(displayEntries) { entry in
                             ConversationEntryView(
                                 entry: entry,
-                                evidence: state.bundle.evidence,
+                                evidenceIndex: evidenceIndex,
                                 onOpenEvidence: openEvidence
                             )
                         }
@@ -153,42 +175,6 @@ public struct ConversationView: View {
         .accessibilityFocused($voiceStatusFocused)
     }
 
-    private var groundedClaims: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Grounded briefing")
-                .font(.title2.weight(.bold))
-                .accessibilityAddTraits(.isHeader)
-
-            ForEach(state.bundle.summary.perAgent, id: \.agentId) { agent in
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(verbatim: agent.agentId)
-                        .font(.headline)
-                    ForEach(agent.claims) { claim in
-                        VStack(alignment: .leading, spacing: 8) {
-                            ClaimBadge(kind: claim.kind)
-                            Text(verbatim: claim.text)
-                                .font(.body)
-                                .fixedSize(horizontal: false, vertical: true)
-                            EvidenceLinksView(
-                                ids: claim.evidenceIds,
-                                evidence: state.bundle.evidence,
-                                emptyLabel: claim.kind == .recommendation
-                                    ? "Recommendation is not evidence-backed"
-                                    : "No supporting evidence",
-                                onOpen: openEvidence
-                            )
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-                .padding(.vertical, 6)
-
-                Divider()
-                    .overlay(PocketPalette.separator)
-            }
-        }
-    }
-
     private func openEvidence(_ evidence: EvidenceRef) {
         guard let selection = state.evidenceSelection(for: evidence) else { return }
         send(.openEvidence(selection))
@@ -287,7 +273,7 @@ public struct ConversationView: View {
 
 private struct ConversationEntryView: View {
     let entry: ConversationEntry
-    let evidence: [EvidenceRef]
+    let evidenceIndex: EvidenceIndex
     let onOpenEvidence: (EvidenceRef) -> Void
 
     var body: some View {
@@ -301,7 +287,7 @@ private struct ConversationEntryView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 EvidenceLinksView(
                     ids: segment.evidenceIds,
-                    evidence: evidence,
+                    evidenceIndex: evidenceIndex,
                     emptyLabel: "No supporting evidence",
                     onOpen: onOpenEvidence
                 )
@@ -337,7 +323,7 @@ private struct ConversationEntryView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     EvidenceLinksView(
                         ids: answer.citations,
-                        evidence: evidence,
+                        evidenceIndex: evidenceIndex,
                         emptyLabel: "No supporting evidence",
                         onOpen: onOpenEvidence
                     )
@@ -354,6 +340,30 @@ private struct ConversationEntryView: View {
                 .padding(12)
                 .background(PocketPalette.inset, in: RoundedRectangle(cornerRadius: 14))
         }
+    }
+}
+
+private struct GroundedClaimRow: View {
+    let claim: Claim
+    let evidenceIndex: EvidenceIndex
+    let onOpenEvidence: (EvidenceRef) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ClaimBadge(kind: claim.kind)
+            Text(verbatim: claim.text)
+                .font(.body)
+                .fixedSize(horizontal: false, vertical: true)
+            EvidenceLinksView(
+                ids: claim.evidenceIds,
+                evidenceIndex: evidenceIndex,
+                emptyLabel: claim.kind == .recommendation
+                    ? "Recommendation is not evidence-backed"
+                    : "No supporting evidence",
+                onOpen: onOpenEvidence
+            )
+        }
+        .padding(.vertical, 4)
     }
 }
 #endif
