@@ -6,13 +6,20 @@ struct ClaimBadge: View {
     let kind: ClaimKind
 
     var body: some View {
-        Text(label)
-            .font(.caption2.weight(.heavy))
-            .foregroundStyle(color)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.14), in: Capsule())
-            .accessibilityLabel(accessibilityLabel)
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 5, height: 5)
+                .accessibilityHidden(true)
+            Text(label)
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(PocketPalette.textPrimary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(color.opacity(0.14), in: Capsule())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private var label: String {
@@ -33,9 +40,9 @@ struct ClaimBadge: View {
 
     private var color: Color {
         switch kind {
-        case .fact: return PocketPalette.accent
-        case .inference: return PocketPalette.listening
-        case .recommendation: return PocketPalette.warning
+        case .fact: return PocketPalette.fact
+        case .inference: return PocketPalette.inference
+        case .recommendation: return PocketPalette.recommendation
         }
     }
 }

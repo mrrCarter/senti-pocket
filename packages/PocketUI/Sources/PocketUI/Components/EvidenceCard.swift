@@ -16,20 +16,29 @@ public struct EvidenceCard: View {
             onOpen(evidence)
         } label: {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "link.circle.fill")
-                    .font(.title2)
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.title3.weight(.semibold))
                     .foregroundStyle(PocketPalette.accent)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 6) {
+                    Text("EVIDENCE")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(PocketPalette.textSecondary)
                     Text(verbatim: evidence.snippet)
                         .font(.subheadline)
                         .foregroundStyle(PocketPalette.textPrimary)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("\(evidence.agentId) · sequence \(evidence.sequence)")
-                        .font(.caption)
-                        .foregroundStyle(PocketPalette.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Text(verbatim: evidence.agentId)
+                        Text("·")
+                            .accessibilityHidden(true)
+                        Text("Sequence \(evidence.sequence)")
+                            .monospacedDigit()
+                    }
+                    .font(.caption)
+                    .foregroundStyle(PocketPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right")
@@ -39,7 +48,11 @@ public struct EvidenceCard: View {
             }
             .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
             .padding(12)
-            .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(PocketPalette.inset, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(PocketPalette.separator.opacity(0.72), lineWidth: 0.5)
+            }
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(PocketAccessibilityID.evidenceCard(evidence.id))

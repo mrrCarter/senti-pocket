@@ -7,11 +7,12 @@ struct IntegrityBadge: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
+                .foregroundStyle(color)
                 .accessibilityHidden(true)
             Text(label)
         }
         .font(.caption.weight(.semibold))
-        .foregroundStyle(color)
+        .foregroundStyle(PocketPalette.textPrimary)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(color.opacity(0.13), in: Capsule())
@@ -36,7 +37,7 @@ struct IntegrityBadge: View {
 
     private var color: Color {
         switch integrity.kind {
-        case .verified: return PocketPalette.accent
+        case .verified: return PocketPalette.verified
         case .unverified: return PocketPalette.warning
         case .invalid: return PocketPalette.danger
         }
