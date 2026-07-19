@@ -50,13 +50,14 @@ final class MicrophoneCaptureGenerationTests: XCTestCase {
         sink.begin(captureID: captureID, continuation: pair.continuation)
 
         for index in 0..<MicrophoneCapture.frameBufferCapacity {
-            XCTAssertEqual(sink.yield(try frame(Float(index)), captureID: captureID), .accepted)
+            let sample = Float(index) / Float(MicrophoneCapture.frameBufferCapacity)
+            XCTAssertEqual(sink.yield(try frame(sample), captureID: captureID), .accepted)
         }
         XCTAssertEqual(
-            sink.yield(try frame(Float(MicrophoneCapture.frameBufferCapacity)), captureID: captureID),
+            sink.yield(try frame(1), captureID: captureID),
             .overflow
         )
-        XCTAssertEqual(sink.yield(try frame(99), captureID: captureID), .terminalPending)
+        XCTAssertEqual(sink.yield(try frame(-1), captureID: captureID), .terminalPending)
         XCTAssertEqual(
             sink.pendingTerminalReason(captureID: captureID),
             "microphone frame buffer overflow"
