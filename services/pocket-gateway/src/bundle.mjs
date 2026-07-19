@@ -286,9 +286,10 @@ export function validateBundleIngress(bundle) {
   const b = bundle;
   if (!b || typeof b !== 'object') return { ok: false, errors: ['bundle: not an object'] };
   const SNIPPET_MAX = 8000; // frozen ingress max (egress is stricter at 2048)
-  // total-work budget (warden #2 DoS guard): bound the WHOLE graph, not just per-array, so a pathological product
-  // (e.g. 2048 agents x 2048 claims x 8000 bytes) fails fast. Demo-generous; far above any real checkpoint bundle.
-  const BUDGET = Object.freeze({ elements: 20000, bytes: 2 * 1024 * 1024 });
+  // total-work budget (warden #2 DoS guard): bound the WHOLE graph, not just per-array. Element budget is PINNED to the
+  // phone's maxTotalElements (5000) so a bundle this gateway signs is NEVER over the consumer's budget (Pulse parity:
+  // egress ⊆ consume). bytes 2MB matches the phone (gateway bodies are already <=512KB via MAX_BUNDLE_BYTES).
+  const BUDGET = Object.freeze({ elements: 5000, bytes: 2 * 1024 * 1024 });
   let elems = 0, bytes = 0;
   const reqStr = (v, label, cap) => {
     if (typeof v !== 'string' || v.length === 0) push(`${label}: empty/non-string required field`);
@@ -322,6 +323,20 @@ export function validateBundleIngress(bundle) {
   optStr(sum.grade, 'summary.grade', SUMMARY_CAPS.str);
   for (const r of arrOf(sum.risks, 'summary.risks')) { optStr(r, 'summary.risks[]', SUMMARY_CAPS.str); acct(r); }
   for (const bl of arrOf(sum.blockers, 'summary.blockers')) { optStr(bl, 'summary.blockers[]', SUMMARY_CAPS.str); acct(bl); }
+  // account the top-level + summary SCALAR fields too (conservative superset — so my element count is never LESS than
+  // the consumer's, keeping my sign-path budget at-least-as-strict as the phone's => produce ⊆ consume at the boundary).
+  for (const v of [b.contractsVersion, b.checkpointId, b.sessionId, b.signingKeyId, b.signature, sum.checkpointId, sum.headline, sum.summaryBaselineSchema, sum.grade]) acct(v);
+  // FAIL-FAST pre-pass (Pulse #3): a cheap element estimate from array LENGTHS ONLY (no per-field byte work); reject a
+  // grossly over-budget graph BEFORE the deep walk/canonicalization. (Transport bytes are already capped pre-parse in handlers.)
+  {
+    let est = topEv.length + (Array.isArray(sum.risks) ? sum.risks.length : 0) + (Array.isArray(sum.blockers) ? sum.blockers.length : 0);
+    if (Array.isArray(sum.perAgent)) for (const a of sum.perAgent) {
+      est += 1 + (Array.isArray(a && a.evidence) ? a.evidence.length : 0);
+      if (Array.isArray(a && a.claims)) for (const c of a.claims) est += 1 + (Array.isArray(c && c.evidenceIds) ? c.evidenceIds.length : 0);
+      if (est > BUDGET.elements) break;
+    }
+    if (est > BUDGET.elements) return { ok: false, errors: [`total elements ~${est} exceed budget ${BUDGET.elements} (fail-fast)`] };
+  }
   const chkEv = (e, where, ownerAgentId) => {
     reqId(e && e.id, `${where}.id`, SUMMARY_CAPS.evId);
     reqId(e && e.agentId, `${where}.agentId`, SUMMARY_CAPS.evId);

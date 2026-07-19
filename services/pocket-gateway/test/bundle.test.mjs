@@ -204,10 +204,15 @@ test('validateBundleIngress: identity integrity (Echo/warden a459b33 #3)', () =>
   assert.match(validateBundleIngress({ ...good, checkpointId: '   ' }).errors.join(), /blank\/whitespace-only id/);
 });
 
-test('validateBundleIngress: total-work budget rejects a pathological graph product (warden a459b33 #2 DoS guard)', () => {
+test('validateBundleIngress: total-work budget rejects a pathological graph — element (5000, fail-fast) + byte (warden #2 DoS)', () => {
   const good = buildBundle(RAW, SUMMARY, { signingKeyId: 'k1', createdAt: '2026-07-18T10:40:00Z' });
-  const perAgent = Array.from({ length: 300 }, (_, i) => ({ agentId: 'agent-' + i, summary: 'x'.repeat(8000), claims: [], evidence: [] }));
-  assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, perAgent } }).errors.join(), /total bytes .* exceed budget/);
+  // ELEMENT budget pinned to the phone's 5000 (produce ⊆ consume): 200 agents x 26 claims ~= 5400 > 5000, caught fail-fast
+  const manyClaims = Array.from({ length: 200 }, (_, i) => ({ agentId: 'ag' + i, summary: 's', evidence: [],
+    claims: Array.from({ length: 26 }, (_, j) => ({ id: `c${i}-${j}`, text: 't', kind: 'recommendation', evidenceIds: [] })) }));
+  assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, perAgent: manyClaims } }).errors.join(), /exceed budget 5000/);
+  // BYTE budget: 300 agents x 8000-byte summaries ~= 2.4MB > 2MB
+  const bigBytes = Array.from({ length: 300 }, (_, i) => ({ agentId: 'agent-' + i, summary: 'x'.repeat(8000), claims: [], evidence: [] }));
+  assert.match(validateBundleIngress({ ...good, summary: { ...good.summary, perAgent: bigBytes } }).errors.join(), /total bytes .* exceed budget/);
 });
 
 test('consumer parity: a gateway-produced bundle stays within the FROZEN per-field caps (accepted by VerifiedBundle + inference)', () => {
