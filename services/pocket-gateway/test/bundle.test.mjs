@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canonicalBundlePayload, dedupEvidence, canonicalEpochMs, validateBundleSemantics, validateBundleIngress,
-  buildBundle, verifyBundle, buildSignedBundle, generateSigningKeypair, CONTRACTS_VERSION, projectEvidenceRef,
+  buildBundle, verifyBundle, buildSignedBundle, signBundle, generateSigningKeypair, CONTRACTS_VERSION, projectEvidenceRef,
 } from '../src/bundle.mjs';
 
 const RAW = {
@@ -224,6 +224,21 @@ test('consumer parity: a gateway-produced bundle stays within the FROZEN per-fie
     assert.ok(Buffer.byteLength(e.snippet, 'utf8') <= 8000, 'snippet <= 8000');
   }
   assert.deepEqual(validateBundleIngress(signed).errors, [], 'gateway bundle passes the Node consumer gate');
+});
+
+test('signBundle FAILS CLOSED at the 512KiB ceiling on the DIRECT fixture-signer path — egress ⊆ phone (warden F2)', () => {
+  const { privateKey } = generateSigningKeypair();
+  // hand-built draft like sign-app-fixture.mjs (bypasses buildBundle): passes ingress (<20000 elems, <1MiB Node-bytes)
+  // but its canonical > 512KiB. Node byte-accounting omits repeated evidence.sessionId that Swift counts, so a >512KiB
+  // bundle could exceed the phone's 1MiB budget — the signBundle ceiling stops it BEFORE crypto, so it never reaches the phone.
+  const perAgent = Array.from({ length: 100 }, (_, i) => ({ agentId: 'ag' + i, summary: 'x'.repeat(6000), claims: [], evidence: [] }));
+  const draft = {
+    contractsVersion: CONTRACTS_VERSION, checkpointId: 'cp', sessionId: 's', sequenceStart: 1, sequenceEnd: 2,
+    summary: { checkpointId: 'cp', headline: 'h', summaryBaselineSchema: 'v1', grade: null, perAgent, risks: [], blockers: [] },
+    evidence: [{ id: 'e1', sessionId: 's', sequence: 1, agentId: 'ag0', snippet: 'x', ts: '2026-07-18T10:00:00Z' }],
+    createdAt: '2026-07-18T10:40:00Z', signingKeyId: 'k', signature: '',
+  };
+  assert.throws(() => signBundle(draft, privateKey, 'k'), /MAX_BUNDLE_BYTES/);
 });
 
 // ---- Pulse's two exact counterexamples on the sign path (must fail CLOSED, never sign what the phone rejects) ----

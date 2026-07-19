@@ -182,7 +182,13 @@ export function signBundle(draft, privateKey, signingKeyId) {
   // FAIL-CLOSED: never crypto-sign a bundle the consume gate / phone would reject (Pulse: gateway must not sign what
   // its own ingress validator rejects). This runs the FULL ingress (bounds + semantics) over the exact bytes to sign.
   assertBundleIngress(toSign);
-  const sig = edSign(null, canonicalBundleBytes(toSign), key); // Ed25519 => algorithm is null
+  // 512KiB PRODUCER CEILING enforced HERE — the shared signing chokepoint — so EVERY sign entry point is covered, not
+  // just buildBundle (warden F2 (b)): the combined path AND direct callers (e.g. sign-app-fixture.mjs). 512KiB << the
+  // 1MiB phone budget, so the Node/Swift byte-accounting divergence is absorbed by the 2x margin => egress ⊆ phone
+  // acceptance BY CONSTRUCTION, not by hoping the two byte formulas match. buildBundle's own check is now redundant-safe.
+  const bytes = canonicalBundleBytes(toSign);
+  if (bytes.length > MAX_BUNDLE_BYTES) throw new Error(`bundle exceeds MAX_BUNDLE_BYTES (${bytes.length} > ${MAX_BUNDLE_BYTES})`);
+  const sig = edSign(null, bytes, key); // Ed25519 => algorithm is null
   return { ...toSign, signature: sig.toString('base64') };
 }
 
@@ -357,6 +363,9 @@ export function validateBundleIngress(bundle) {
     if (e) { acct(e.id); acct(e.agentId); acct(e.snippet); }
   };
   for (const e of topEv) chkEv(e, `evidence ${e && e.id}`);
+  // BYTE fail-fast (Echo residual / warden #236142): stop the deep walk the moment the byte budget is exceeded, like
+  // the element pre-pass — don't b8() every remaining nested string just to report an overage we already know.
+  if (bytes > BUDGET.bytes) { push(`total bytes ${bytes} exceed budget ${BUDGET.bytes} (fail-fast)`); return { ok: false, errors }; }
   const agentIds = new Set();
   for (const a of arrOf(sum.perAgent, 'summary.perAgent')) {
     reqId(a && a.agentId, 'agent.agentId', SUMMARY_CAPS.evId);
@@ -381,6 +390,7 @@ export function validateBundleIngress(bundle) {
       if (c && c.id) { if (claimIds.has(c.id)) push(`agent ${a.agentId}: duplicate claim id ${c.id}`); claimIds.add(c.id); }
       acct(c && c.id); acct(c && c.text);
     }
+    if (bytes > BUDGET.bytes) break; // byte fail-fast: stop walking further agents once over budget
   }
   if (elems > BUDGET.elements) push(`total elements ${elems} exceed budget ${BUDGET.elements}`);
   if (bytes > BUDGET.bytes) push(`total bytes ${bytes} exceed budget ${BUDGET.bytes}`);
