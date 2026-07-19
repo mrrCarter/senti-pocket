@@ -20,32 +20,32 @@ public struct FixtureSessionRepository: SessionRepository {
                            completeness: .unknown, serverWatermark: nil, lastSuccessfulSync: nil)
     }
 
-    private static func decode<T: Decodable>(_ type: T.Type, _ json: String) -> T {
-        // Fixture JSON is a compile-time constant authored to the wire contract; a decode failure is a build-time
-        // bug, not a runtime condition — hence the fatalError guard is unreachable in shipped fixtures.
+    private static func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
+        // Malformed fixture JSON (e.g. after a future wire Codable change) maps to a caught TransportError.decoding
+        // — NEVER a process kill from a public repository path. A step-3 KAV exercises every constant.
         do { return try JSONDecoder().decode(type, from: Data(json.utf8)) }
-        catch { fatalError("FixtureSessionRepository: malformed fixture JSON for \(type): \(error)") }
+        catch { throw TransportError.decoding }
     }
 
     public func sessions(includeArchived: Bool, cursor: String?) async throws -> RepositorySnapshot<SessionListPage> {
         // Echo the requested include_archived (was hardcoded false) — query-truthful even in the fixture.
-        snapshot(Self.decode(SessionListPage.self,
+        snapshot(try Self.decode(SessionListPage.self,
             #"{"sessions":[],"count":0,"include_archived":\#(includeArchived),"next_cursor":null,"has_more":false}"#))
     }
     public func events(sessionId: SessionID, fromSequence: Int64?) async throws -> RepositorySnapshot<SessionEventForwardPage> {
         if let seq = fromSequence, seq < 0 { throw AuthError.invalidResponse }   // §5: reject negative BEFORE returning
-        return snapshot(Self.decode(SessionEventForwardPage.self, #"{"events":[]}"#))
+        return snapshot(try Self.decode(SessionEventForwardPage.self, #"{"events":[]}"#))
     }
     public func eventsBefore(sessionId: SessionID, beforeSequence: Int64) async throws -> RepositorySnapshot<SessionEventBeforePage> {
         guard beforeSequence >= 0 else { throw AuthError.invalidResponse }       // §5: reject negative BEFORE returning
-        return snapshot(Self.decode(SessionEventBeforePage.self,
+        return snapshot(try Self.decode(SessionEventBeforePage.self,
             #"{"events":[],"count":0,"next_before_sequence":null,"has_more":false,"partial":false}"#))
     }
     public func actions(sessionId: SessionID) async throws -> RepositorySnapshot<SessionActionPage> {
-        snapshot(Self.decode(SessionActionPage.self,
+        snapshot(try Self.decode(SessionActionPage.self,
             #"{"sessionId":"\#(sessionId.value)","actions":[],"count":0,"projection":{}}"#))
     }
     public func checkpoints(sessionId: SessionID) async throws -> RepositorySnapshot<SessionCheckpointListPage> {
-        snapshot(Self.decode(SessionCheckpointListPage.self, #"{"checkpoints":[],"count":0}"#))
+        snapshot(try Self.decode(SessionCheckpointListPage.self, #"{"checkpoints":[],"count":0}"#))
     }
 }

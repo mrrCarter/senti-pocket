@@ -20,7 +20,7 @@ protocol SessionExecuting: Sendable {
 /// Opaque sealed HTTP result. Exposes NO status/body until `open()`; the broker opens it ONLY after
 /// generation-equality (§4c). `open()` yields a NORMALIZED status Int (never a raw HTTPURLResponse) + Data +
 /// requestId — nothing else escapes.
-struct SealedResponse {
+struct SealedResponse: Sendable {   // crosses the broker actor boundary; all fields are Sendable (Swift-6 strict-concurrency)
     private let statusCode: Int
     private let data: Data
     private let requestId: String?
