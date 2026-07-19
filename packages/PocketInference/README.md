@@ -29,12 +29,15 @@ let engine = LiteRTLMInferenceEngine(
     cacheDirectory: cacheDirectory
 )
 let loadMetrics = try await engine.prepareModel(artifact)
+guard let verifiedBundle = VerifiedBundle.verify(bundle) else {
+    throw IntegrationError.unverifiedBundle
+}
 let result = try await engine.answer(
-    GroundedInferenceRequest(bundle: bundle, question: question)
+    GroundedInferenceRequest(verifiedBundle: verifiedBundle, question: question)
 )
 ```
 
-`GroundedPromptBuilder` caps the encoded prompt at 7,000 UTF-8 bytes by default and reports the exact evidence IDs admitted after truncation. `GroundedAnswerDecoder` accepts only an `answer` plus known, unique IDs from that admitted set. An uncited answer must equal `I do not have evidence for that.` exactly. Any extra model output field is rejected. The default 8,192-token engine budget reserves at least 1,024 tokens beyond the byte-bounded prompt.
+The public request path accepts only `PocketCall.VerifiedBundle`; raw unsigned bundles cannot reach local inference. When callers do not provide an explicit evidence subset, the request deterministically selects the most recent 32 entries using sequence, timestamp, agent ID, and evidence ID as stable ordering keys. `GroundedPromptBuilder` caps the encoded prompt at 7,000 UTF-8 bytes by default and reports the exact evidence IDs admitted after truncation. `GroundedAnswerDecoder` accepts only an `answer` plus known, unique IDs from that admitted set. An uncited answer must equal `I do not have evidence for that.` exactly. Any extra model output field is rejected. The default 8,192-token engine budget reserves at least 1,024 tokens beyond the byte-bounded prompt.
 
 ## Measurement Contract
 

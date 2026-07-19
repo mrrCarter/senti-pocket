@@ -13,7 +13,7 @@ Offline speech recognition, duplex capture, deterministic barge-in, and pluggabl
 
 ## Voice Loop
 
-1. `MicrophoneCapture` configures duplex voice-chat audio and emits bounded Float32 mono frames.
+1. `MicrophoneCapture` configures duplex voice-chat audio and emits bounded Float32 mono frames. The audio callback writes directly to one locked continuation, preserving callback order without spawning a task per frame. If the eight-frame buffer overflows, capture terminates with an explicit error instead of silently producing a corrupted transcript.
 2. `EnergyVoiceActivityDetector` applies fixed RMS hysteresis plus attack/release durations.
 3. A `speechStarted` transition calls `DeterministicBargeInController`, which moves out of the armed state before concurrently stopping speech and inference. Duplicate events are idempotent.
 4. `CapturedAudioAccumulator` and `PCMResampler` produce the 16 kHz request consumed by whisper.cpp.

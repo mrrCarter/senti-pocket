@@ -1,4 +1,5 @@
 import Foundation
+import PocketCall
 import PocketContracts
 
 public protocol LocalInferenceEngine: Sendable {
@@ -9,6 +10,8 @@ public protocol LocalInferenceEngine: Sendable {
 }
 
 public struct GroundedInferenceRequest: Sendable {
+    public static let maximumEvidenceCount = 32
+
     public let checkpointId: String
     public let sessionId: String
     public let sequenceStart: Int
@@ -16,8 +19,12 @@ public struct GroundedInferenceRequest: Sendable {
     public let question: String
     public let evidence: [EvidenceRef]
 
-    public init(bundle: PocketBundle, question: String, evidence: [EvidenceRef]? = nil) throws {
-        let selectedEvidence = evidence ?? bundle.evidence
+    public init(verifiedBundle: VerifiedBundle, question: String, evidence: [EvidenceRef]? = nil) throws {
+        try self.init(bundle: verifiedBundle.bundle, question: question, evidence: evidence)
+    }
+
+    init(bundle: PocketBundle, question: String, evidence: [EvidenceRef]? = nil) throws {
+        let selectedEvidence = evidence ?? Self.defaultEvidenceSelection(from: bundle.evidence)
         guard selectedEvidence.allSatisfy(bundle.evidence.contains) else {
             throw InferenceError.invalidRequest("evidence must be an exact subset of the supplied bundle")
         }
@@ -54,8 +61,8 @@ public struct GroundedInferenceRequest: Sendable {
         guard !trimmedQuestion.isEmpty, trimmedQuestion.utf8.count <= 2_000 else {
             throw InferenceError.invalidRequest("question must contain 1...2000 UTF-8 bytes")
         }
-        guard !evidence.isEmpty, evidence.count <= 32 else {
-            throw InferenceError.invalidRequest("evidence must contain 1...32 entries")
+        guard !evidence.isEmpty, evidence.count <= Self.maximumEvidenceCount else {
+            throw InferenceError.invalidRequest("evidence must contain 1...\(Self.maximumEvidenceCount) entries")
         }
 
         var evidenceIds = Set<String>()
@@ -82,6 +89,16 @@ public struct GroundedInferenceRequest: Sendable {
         self.sequenceEnd = sequenceEnd
         self.question = trimmedQuestion
         self.evidence = evidence
+    }
+
+    private static func defaultEvidenceSelection(from evidence: [EvidenceRef]) -> [EvidenceRef] {
+        let ordered = evidence.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+            if lhs.ts != rhs.ts { return lhs.ts < rhs.ts }
+            if lhs.agentId != rhs.agentId { return lhs.agentId < rhs.agentId }
+            return lhs.id < rhs.id
+        }
+        return Array(ordered.suffix(Self.maximumEvidenceCount))
     }
 }
 

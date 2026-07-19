@@ -2,8 +2,10 @@ import AVFoundation
 import Foundation
 
 public actor MicrophoneCapture {
+    static let frameBufferCapacity = 8
+
     private var engine: AVAudioEngine?
-    private var continuation: AsyncThrowingStream<MicrophoneFrame, Error>.Continuation?
+    private let frameSink = CaptureFrameSink()
     private var tapInstalled = false
     private var notificationTokens: [NSObjectProtocol] = []
     private var generations = CaptureGenerationGate()
@@ -59,22 +61,25 @@ public actor MicrophoneCapture {
         }
 
         let streamPair = AsyncThrowingStream<MicrophoneFrame, Error>.makeStream(
-            bufferingPolicy: .bufferingNewest(8)
+            bufferingPolicy: .bufferingOldest(Self.frameBufferCapacity)
         )
         let captureID = generations.begin()
         let stream = streamPair.stream
-        continuation = streamPair.continuation
+        frameSink.begin(captureID: captureID, continuation: streamPair.continuation)
         streamPair.continuation.onTermination = { @Sendable _ in
             Task { await self.stop(captureID: captureID) }
         }
 
-        input.installTap(onBus: 0, bufferSize: 1_024, format: captureFormat) { [weak self] buffer, _ in
+        let frameSink = self.frameSink
+        let captureSampleRate = captureFormat.sampleRate
+        input.installTap(onBus: 0, bufferSize: 1_024, format: captureFormat) { buffer, _ in
             guard let channel = buffer.floatChannelData?.pointee else { return }
             let samples = Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
-            guard let frame = try? MicrophoneFrame(samples: samples, sampleRate: captureFormat.sampleRate) else {
+            guard let frame = try? MicrophoneFrame(samples: samples, sampleRate: captureSampleRate) else {
                 return
             }
-            Task { await self?.yield(frame, captureID: captureID) }
+            // Overflow finishes the stream; onTermination owns actor-isolated engine teardown.
+            _ = frameSink.yield(frame, captureID: captureID)
         }
         tapInstalled = true
 
@@ -88,8 +93,10 @@ public actor MicrophoneCapture {
             input.removeTap(onBus: 0)
             tapInstalled = false
             _ = generations.end(captureID)
-            continuation?.finish(throwing: VoiceError.audioSessionFailed(error.localizedDescription))
-            continuation = nil
+            frameSink.finish(
+                captureID: captureID,
+                throwing: VoiceError.audioSessionFailed(error.localizedDescription)
+            )
             throw VoiceError.audioSessionFailed(error.localizedDescription)
         }
     }
@@ -108,17 +115,11 @@ public actor MicrophoneCapture {
         tapInstalled = false
         engine?.stop()
         engine = nil
-        continuation?.finish()
-        continuation = nil
+        frameSink.finish(captureID: captureID)
 
         #if os(iOS)
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         #endif
-    }
-
-    private func yield(_ frame: MicrophoneFrame, captureID: UUID) {
-        guard generations.accepts(captureID) else { return }
-        continuation?.yield(frame)
     }
 
     private func installAudioSessionObservers(captureID: UUID) {
@@ -185,9 +186,82 @@ public actor MicrophoneCapture {
 
     private func failActiveCapture(_ reason: String, captureID: UUID) async {
         guard generations.accepts(captureID) else { return }
-        continuation?.finish(throwing: VoiceError.audioSessionFailed(reason))
-        continuation = nil
+        frameSink.finish(captureID: captureID, throwing: VoiceError.audioSessionFailed(reason))
         await stop(captureID: captureID)
+    }
+}
+
+enum CaptureFrameDelivery: Equatable {
+    case accepted
+    case stale
+    case terminated
+    case overflow
+}
+
+final class CaptureFrameSink: @unchecked Sendable {
+    typealias Continuation = AsyncThrowingStream<MicrophoneFrame, Error>.Continuation
+
+    private let lock = NSLock()
+    private var activeCaptureID: UUID?
+    private var continuation: Continuation?
+
+    func begin(captureID: UUID, continuation: Continuation) {
+        lock.lock()
+        activeCaptureID = captureID
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func yield(_ frame: MicrophoneFrame, captureID: UUID) -> CaptureFrameDelivery {
+        lock.lock()
+        guard activeCaptureID == captureID, let continuation else {
+            lock.unlock()
+            return .stale
+        }
+
+        switch continuation.yield(frame) {
+        case .enqueued(_):
+            lock.unlock()
+            return .accepted
+        case .terminated:
+            activeCaptureID = nil
+            self.continuation = nil
+            lock.unlock()
+            return .terminated
+        case .dropped(_):
+            activeCaptureID = nil
+            self.continuation = nil
+            lock.unlock()
+            continuation.finish(
+                throwing: VoiceError.audioSessionFailed("microphone frame buffer overflow")
+            )
+            return .overflow
+        @unknown default:
+            activeCaptureID = nil
+            self.continuation = nil
+            lock.unlock()
+            continuation.finish(
+                throwing: VoiceError.audioSessionFailed("unknown microphone frame delivery state")
+            )
+            return .terminated
+        }
+    }
+
+    func finish(captureID: UUID, throwing error: Error? = nil) {
+        lock.lock()
+        guard activeCaptureID == captureID, let continuation else {
+            lock.unlock()
+            return
+        }
+        activeCaptureID = nil
+        self.continuation = nil
+        lock.unlock()
+
+        if let error {
+            continuation.finish(throwing: error)
+        } else {
+            continuation.finish()
+        }
     }
 }
 
