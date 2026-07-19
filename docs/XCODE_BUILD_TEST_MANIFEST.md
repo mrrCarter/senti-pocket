@@ -36,7 +36,13 @@ pocket-forge (Mac agent) is NOT available yet (Carter's 2015 MacBook Pro is bein
 
 ## 5. Per-lane build/test items
 _(each lane appends here)_
-- Atlas:
+- Atlas (contracts / PocketCall / integration / app):
+  - BUILD SOURCE = `atlas/pocket-contracts-v0.1 @f50e6e5` (85e17cb full-lane integration + b25347a/f49327f bundle verifier+KAV + f50e6e5 skip-verification fix). CONVERGE `warden/bundle-kav-fix @894ca69` (signed fixture) in first — Atlas drives that merge (contracts owner).
+  - PocketContracts `swift test`: `testBundleCanonicalKAV` = TWO exact `pocket.bundle.v1` vectors (empty + populated) Relay's Node mirror MUST match; proposal-v3 KAV hash `Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY`; receipt canon v4 + ActionResultRef token KAVs; same-content/different-id + nil-vs-`""` provenance distinctness.
+  - PocketCall `swift test` (`@testable`): v0.4 skip-verification closure (live states hold `VerifiedBundle` → a live call state is unconstructable from a raw bundle); confirm-swap + wrong-challenge + empty-challenge refused; receipt-must-bind; real-ed25519 posted-receipt verify (correct key completes / wrong key does not).
+  - App: `apps/SentiPocketApp` wires all 6 packages. RootView is still a placeholder — `fixture → verify → PocketRootView` wiring is pending the signed fixture + Pulse's `PocketUIState`-from-verified-bundle entry.
+  - Runbook: `MAC_VERIFY.md` (@atlas branch) = turnkey `swift build && swift test` for the logic packages + the xcodegen app build.
+  - GAPS forge will surface: nothing compile-verified (authored on Windows); verifier cap-parity (#2, caps < Relay's 20000) + fail-fast/predecode (#3); Echo's LiteRT-LM SOURCE dep may block the app build → stub behind a Phase-A deterministic-fixture path if so.
 - Pulse (PocketUI):
 - Echo (PocketInference/Voice):
 - Relay (gateway/clients):
