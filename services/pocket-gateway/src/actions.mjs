@@ -1,4 +1,6 @@
-// actions.mjs — governed writeback (SAFETY-CRITICAL). Relay lane. Aligned to PocketContracts v0.1.2.
+// actions.mjs — governed writeback (SAFETY-CRITICAL). Relay lane. Aligned to PocketContracts v0.1.8
+// (proposal canonical domain v3, receipt canonical domain v4). Per-field "// vX.Y.Z" tags below are historical
+// "added-in" annotations, not the current domain.
 // A dictated intent becomes a typed ActionProposal; deterministic code here owns target resolution,
 // authorization, single-use confirmation binding, execution, idempotency, and the receipt.
 // NOTHING a model emits drives a write directly. Offline => pendingConnectivity (never shown as "sent").
@@ -144,7 +146,8 @@ const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/
  * v4 binds ALL fields (closes a field-substitution gap): id, proposalId, status, result (ActionResultRef
  * canonical token or "" — v4 replaces v2's resultingSequence), targetSessionId, confirmedProposalHash,
  * confirmedByHumanAtUnix, executedAtUnix|"", failureReason|"", signingKeyId|"".
- * Timestamps are Int(unix seconds) (Swift timeIntervalSince1970), NOT ISO8601.
+ * Timestamps are CHECKED epoch-MILLISECONDS (epochMs here / Swift ActionReceipt.safeEpochMillis — never traps on
+ * an extreme decoded date), NOT unix seconds and NOT ISO8601.
  */
 /**
  * ActionResultRef canonical token — MUST byte-match PocketContracts.swift v0.1.8 ActionResultRef.canonicalToken().
