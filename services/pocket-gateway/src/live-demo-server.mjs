@@ -12,6 +12,8 @@
 //
 // Usage: SENTI_API_BASE_URL=https://api.sentinelayer.com PORT=8787 SL_BIN=sl DEMO_SESSION_ID=<sid> node src/live-demo-server.mjs
 import { execFileSync } from 'node:child_process';
+import { createPrivateKey } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createLiveDemoServer } from './live-demo.mjs';
 
 const apiBaseUrl = process.env.SENTI_API_BASE_URL || 'https://api.sentinelayer.com';
@@ -34,11 +36,24 @@ const run = (args) => {
 // token; for the single-room demo the target is fixed + the api re-checks membership on the /human-message write anyway.)
 const knownSessionIdsFor = async () => [demoSession];
 
-const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor });
+// FIXED dev signing key (STABLE pubkey the app PINS out-of-band = trust-anchored, Warden #2): DEMO_SIGNING_KEY_PATH (a
+// PEM private-key file) or DEMO_SIGNING_JWK (a JWK string). Absent => generated per-boot (pubkey CHANGES each restart —
+// only safe if the app RE-pins; a stable pin is the honest closure). Private key NEVER committed/printed.
+let signingKey; // undefined => createLiveDemoGateway generates per-boot
+try {
+  if (process.env.DEMO_SIGNING_KEY_PATH) signingKey = createPrivateKey(readFileSync(process.env.DEMO_SIGNING_KEY_PATH));
+  else if (process.env.DEMO_SIGNING_JWK) signingKey = createPrivateKey({ key: JSON.parse(process.env.DEMO_SIGNING_JWK), format: 'jwk' });
+} catch (e) {
+  process.stderr.write(`[live-demo] FAILED to load fixed signing key (${(e && e.message) || e}) — falling back to a per-boot key\n`);
+  signingKey = undefined;
+}
+const keyMode = signingKey ? 'FIXED (stable pin across restarts)' : 'per-boot (pubkey changes each restart — app must re-pin)';
+
+const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor, signingKey });
 server.listen(port, () => {
   // Startup lines only — no secrets (apiBaseUrl / port / session / bin path / PUBLIC key); the gateway logs nothing per-request.
   process.stdout.write(`[live-demo] gateway :${port} -> api ${apiBaseUrl} | room ${demoSession} | sl=${slBin}\n`);
-  process.stdout.write('[live-demo] LOCAL runtime · in-memory idempotency · DEV ed25519 receipt key (real sig, NOT prod KMS)\n');
+  process.stdout.write(`[live-demo] LOCAL runtime · in-memory idempotency · DEV ed25519 receipt key [${keyMode}] (real sig, NOT prod KMS)\n`);
   process.stdout.write(`[live-demo] receipt PUBKEY (Ed25519 x, base64url) = ${publicKeyB64url}\n`);
   process.stdout.write(`[live-demo]   the app PINS this (or GET :${port}/demo-pubkey) to verify ActionReceipt sigs — never render "sent" unless signatureState==.verified\n`);
   process.stdout.write('[live-demo] POST /actions/execute with the caller\'s SENTI user-session bearer to author as human-<you>\n');
