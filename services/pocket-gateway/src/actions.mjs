@@ -139,10 +139,11 @@ const b64url = (buf) => buf.toString('base64').replace(/\+/g, '-').replace(/\//g
 const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 
 /**
- * EXACT bytes the gateway signs + the phone verifies — mirrors PocketContracts.swift v0.1.5
- * ActionReceipt.canonicalReceiptPayload() (domain v2) byte-for-byte. Length-prefixed lp(s)="<utf8count>:<s>".
- * v2 binds ALL fields (closes a field-substitution gap): id, proposalId, status, resultingSequence|"",
- * targetSessionId, confirmedProposalHash, confirmedByHumanAtUnix, executedAtUnix|"", failureReason|"", signingKeyId|"".
+ * EXACT bytes the gateway signs + the phone verifies — mirrors PocketContracts.swift v0.1.8
+ * ActionReceipt.canonicalReceiptPayload() (domain v4) byte-for-byte. Length-prefixed lp(s)="<utf8count>:<s>".
+ * v4 binds ALL fields (closes a field-substitution gap): id, proposalId, status, result (ActionResultRef
+ * canonical token or "" — v4 replaces v2's resultingSequence), targetSessionId, confirmedProposalHash,
+ * confirmedByHumanAtUnix, executedAtUnix|"", failureReason|"", signingKeyId|"".
  * Timestamps are Int(unix seconds) (Swift timeIntervalSince1970), NOT ISO8601.
  */
 /**
