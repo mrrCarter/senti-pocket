@@ -34,10 +34,12 @@ const run = (args) => {
 // token; for the single-room demo the target is fixed + the api re-checks membership on the /human-message write anyway.)
 const knownSessionIdsFor = async () => [demoSession];
 
-const { server } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor });
+const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor });
 server.listen(port, () => {
-  // Startup line only — no secrets (apiBaseUrl / port / session / bin path); the gateway itself logs nothing per-request.
+  // Startup lines only — no secrets (apiBaseUrl / port / session / bin path / PUBLIC key); the gateway logs nothing per-request.
   process.stdout.write(`[live-demo] gateway :${port} -> api ${apiBaseUrl} | room ${demoSession} | sl=${slBin}\n`);
   process.stdout.write('[live-demo] LOCAL runtime · in-memory idempotency · DEV ed25519 receipt key (real sig, NOT prod KMS)\n');
+  process.stdout.write(`[live-demo] receipt PUBKEY (Ed25519 x, base64url) = ${publicKeyB64url}\n`);
+  process.stdout.write(`[live-demo]   the app PINS this (or GET :${port}/demo-pubkey) to verify ActionReceipt sigs — never render "sent" unless signatureState==.verified\n`);
   process.stdout.write('[live-demo] POST /actions/execute with the caller\'s SENTI user-session bearer to author as human-<you>\n');
 });

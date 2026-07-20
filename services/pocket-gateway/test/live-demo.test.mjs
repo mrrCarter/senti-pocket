@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createLiveDemoGateway, createLiveDemoServer } from '../src/live-demo.mjs';
 import { computeProposalHash } from '../src/actions.mjs';
+import { generateSigningKeypair } from '../src/bundle.mjs';
 
 const KNOWN = '6cf7e861-546a-4b9f-b937-39182a5bd395';
 
@@ -77,11 +78,22 @@ test('LIVE-DEMO non-member => 403 before any post (membership precheck holds in 
   assert.equal(calls.some((c) => c.url.includes('/human-message')), false, 'no post for a non-member');
 });
 
-test('createLiveDemoServer constructs an http server (listen/close) wired to the live-demo gateway', () => {
-  const { server } = createLiveDemoServer({ apiBaseUrl: 'https://a', fetch: async () => {}, run: () => '{}', knownSessionIdsFor: async () => [] });
+test('createLiveDemoServer constructs an http server (listen/close) + exposes the receipt pubkey', () => {
+  const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl: 'https://a', fetch: async () => {}, run: () => '{}', knownSessionIdsFor: async () => [] });
   assert.equal(typeof server.listen, 'function');
   assert.equal(typeof server.close, 'function');
+  assert.equal(typeof publicKeyB64url, 'string');
+  assert.ok(publicKeyB64url.length > 0);
   server.close();
+});
+
+test('createLiveDemoGateway exposes the receipt-signing PUBLIC key matching the signing key (sig-verify-at-render, #2)', () => {
+  const { publicKey, privateKey } = generateSigningKeypair();
+  const gw = createLiveDemoGateway({ apiBaseUrl: 'https://a', fetch: async () => {}, run: () => '{}', knownSessionIdsFor: async () => [], signingKey: privateKey });
+  assert.equal(typeof gw.demoPublicKeyB64url, 'string');
+  assert.ok(gw.demoPublicKeyB64url.length > 0);
+  // MUST equal the signing key's public key — else pinning it can't verify the receipt signature.
+  assert.equal(gw.demoPublicKeyB64url, publicKey.export({ format: 'jwk' }).x);
 });
 
 test('factory requires apiBaseUrl + run + knownSessionIdsFor (fetch defaults to global)', () => {

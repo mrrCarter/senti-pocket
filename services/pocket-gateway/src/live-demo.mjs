@@ -12,6 +12,7 @@
 // Everything else — token validation, membership, the governed-write invariants, the landed message, the read-back — is
 // the SAME gated code path as prod (app.mjs); only the three bindings above differ.
 import http from 'node:http';
+import { createPublicKey } from 'node:crypto';
 import { createGateway } from './handlers.mjs';
 import { createInMemoryStore } from './store.mjs';
 import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
@@ -38,7 +39,7 @@ export function createLiveDemoGateway(opts = {}) {
   if (typeof knownSessionIdsFor !== 'function') throw new Error('createLiveDemoGateway: knownSessionIdsFor is required');
   const key = signingKey || generateSigningKeypair().privateKey; // DEV key: a REAL ed25519 signature, NOT prod KMS
 
-  return createGateway({
+  const gateway = createGateway({
     verifyToken: createSentiSessionVerifier({ fetch, apiBaseUrl }),   // validate the REAL SENTI token via /auth/me (no secret held)
     postHumanMessage: createHumanMessageClient({ fetch, apiBaseUrl }),// post to the REAL /api/v1/sessions/{id}/human-message
     store: createInMemoryStore(),                                     // single-instance idempotency (demo)
@@ -48,6 +49,12 @@ export function createLiveDemoGateway(opts = {}) {
     agent: 'claude-pocket-relay',
     now,                                                              // optional injected clock (tests / freshness window)
   });
+  // EXPOSE the dev PUBLIC key (raw ed25519 x, base64url) so the app + harness can VERIFY the ActionReceipt signature at
+  // render — never show "sent" unless signatureState(gatewayPublicKeyBase64url)==.verified (a forged .posted must NOT
+  // render sent). Closes the Forge/Warden #2 gap: generateSigningKeypair otherwise DISCARDS the pubkey, leaving the
+  // receipt-sig unverifiable. The private key stays on the host; only the public key is exposed (a pubkey is public).
+  gateway.demoPublicKeyB64url = createPublicKey(key).export({ format: 'jwk' }).x;
+  return gateway;
 }
 
 /**
@@ -57,10 +64,14 @@ export function createLiveDemoGateway(opts = {}) {
  */
 export function createLiveDemoServer(opts = {}, { maxBody = MAX_BODY } = {}) {
   const gateway = createLiveDemoGateway(opts);
+  const publicKeyB64url = gateway.demoPublicKeyB64url;
   const server = http.createServer((req, res) => {
     req.setTimeout(15_000, () => { try { res.writeHead(408).end('{"error":"request_timeout"}'); } catch { /* */ } req.destroy(); });
     const u = new URL(req.url, 'http://x');
     const send = (status, obj, hdrs) => { if (res.headersSent) return; res.writeHead(status, { 'content-type': 'application/json', ...(hdrs || {}) }); res.end(Buffer.isBuffer(obj) ? obj : JSON.stringify(obj)); };
+
+    // Public (no auth — a pubkey is public): the receipt-signing key so the app can verify ActionReceipt sigs at render.
+    if (u.pathname === '/demo-pubkey') return send(200, { publicKeyBase64url: publicKeyB64url, signingKeyId: opts.signingKeyId || 'demo-live-receipt-key', alg: 'Ed25519' });
 
     // Cheap pre-checks BEFORE buffering: real token validation happens inside gateway.handle (verifyToken → /auth/me).
     const authz = req.headers.authorization;
@@ -85,5 +96,5 @@ export function createLiveDemoServer(opts = {}, { maxBody = MAX_BODY } = {}) {
       } catch { send(500, { error: 'internal' }); }
     });
   });
-  return { server };
+  return { server, publicKeyB64url };
 }
