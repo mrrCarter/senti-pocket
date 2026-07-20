@@ -101,36 +101,27 @@ public struct CheckpointInboxView: View {
     }
 
     private var loadingView: some View {
-        VStack(spacing: 14) {
-            ProgressView()
-                .tint(PocketPalette.accent)
-                .scaleEffect(1.25)
-            Text("Syncing checkpoints…")
-                .font(.headline)
-            Text("Nothing is posted from the inbox.")
-                .font(.caption)
-                .foregroundStyle(PocketPalette.textSecondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        CheckpointInboxStatusPanel(
+            eyebrow: "Checking rooms",
+            title: "Looking for checkpoints",
+            message: "Senti is checking the selected session for a signed checkpoint that needs your attention.",
+            footnote: "Read-only sync. Nothing is posted from this screen.",
+            footnoteSymbolName: "lock.fill",
+            indicator: .progress,
+            accessibilityIdentifier: PocketAccessibilityID.inboxLoading
+        )
     }
 
     private var emptyView: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "waveform.badge.magnifyingglass")
-                .font(.system(size: 48))
-                .foregroundStyle(PocketPalette.accent)
-                .accessibilityHidden(true)
-            Text("No checkpoints yet")
-                .font(.title2.weight(.bold))
-            Text("When your agents reach a checkpoint, signed briefings appear here.")
-                .font(.body)
-                .foregroundStyle(PocketPalette.textSecondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(28)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityIdentifier(PocketAccessibilityID.inboxEmpty)
+        CheckpointInboxStatusPanel(
+            eyebrow: "All caught up",
+            title: "No active checkpoints",
+            message: "The selected session has no checkpoint waiting for your response.",
+            footnote: "Senti will call when your agents need a decision.",
+            footnoteSymbolName: "bell.badge.fill",
+            indicator: .symbol("checkmark.circle.fill"),
+            accessibilityIdentifier: PocketAccessibilityID.inboxEmpty
+        )
     }
 
     private func errorView(_ message: String) -> some View {
@@ -156,6 +147,90 @@ public struct CheckpointInboxView: View {
             .frame(maxWidth: .infinity)
         }
         .accessibilityIdentifier(PocketAccessibilityID.inboxError)
+    }
+}
+
+private enum CheckpointInboxStatusIndicator {
+    case progress
+    case symbol(String)
+}
+
+private struct CheckpointInboxStatusPanel: View {
+    let eyebrow: String
+    let title: String
+    let message: String
+    let footnote: String
+    let footnoteSymbolName: String
+    let indicator: CheckpointInboxStatusIndicator
+    let accessibilityIdentifier: String
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                statusSymbol
+
+                Text(eyebrow)
+                    .font(.caption.weight(.bold))
+                    .textCase(.uppercase)
+                    .tracking(1.1)
+                    .foregroundStyle(PocketPalette.accent)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(PocketPalette.accent.opacity(0.12), in: Capsule())
+
+                VStack(spacing: 8) {
+                    Text(title)
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(PocketPalette.textPrimary)
+
+                    Text(message)
+                        .font(.body)
+                        .foregroundStyle(PocketPalette.textSecondary)
+                }
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+                Divider()
+
+                Label(footnote, systemImage: footnoteSymbolName)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(PocketPalette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(24)
+            .background(PocketPalette.raised, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(PocketPalette.separator.opacity(0.72), lineWidth: 0.5)
+            }
+            .frame(maxWidth: 560)
+            .frame(maxWidth: .infinity)
+            .padding(20)
+        }
+        .accessibilityIdentifier(accessibilityIdentifier)
+    }
+
+    @ViewBuilder
+    private var statusSymbol: some View {
+        ZStack {
+            Circle()
+                .fill(PocketPalette.accent.opacity(0.12))
+                .frame(width: 76, height: 76)
+
+            switch indicator {
+            case .progress:
+                ProgressView()
+                    .tint(PocketPalette.accent)
+                    .scaleEffect(1.25)
+                    .accessibilityLabel("Checking for checkpoints")
+            case .symbol(let symbolName):
+                Image(systemName: symbolName)
+                    .font(.system(size: 38, weight: .semibold))
+                    .foregroundStyle(PocketPalette.accent)
+                    .accessibilityHidden(true)
+            }
+        }
     }
 }
 

@@ -99,6 +99,28 @@ private struct CanonicalVerifiedBundlePreview<Content: View>: View {
 }
 
 @available(iOS 17.0, macOS 14.0, *)
+#Preview("Inbox — authenticated loading") {
+    NavigationStack {
+        CheckpointInboxView(
+            state: CheckpointInboxState(items: [], isLoading: true),
+            connectivity: .online,
+            send: { _ in }
+        )
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, *)
+#Preview("Inbox — authenticated and caught up") {
+    NavigationStack {
+        CheckpointInboxView(
+            state: CheckpointInboxState(items: []),
+            connectivity: .online,
+            send: { _ in }
+        )
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, *)
 #Preview("Root — canonical inbox") {
     CanonicalVerifiedBundlePreview { verifiedBundle in
         PocketRootView(
