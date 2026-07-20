@@ -65,9 +65,25 @@ final class PocketUIDeviceFlowTests: XCTestCase {
         XCTAssertFalse(app.buttons[PocketAccessibilityID.pushToTalk].exists)
         XCTAssertFalse(app.buttons[PocketAccessibilityID.interrupt].exists)
         XCTAssertFalse(app.buttons[PocketAccessibilityID.proposalConfirm].exists)
-        XCTAssertTrue(app.buttons[PocketAccessibilityID.stop].isHittable)
-        XCTAssertTrue(app.buttons[PocketAccessibilityID.replay].isHittable)
-        XCTAssertTrue(app.buttons[PocketAccessibilityID.listenOnlyDone].isHittable)
+
+        let readingStatus = app.staticTexts["Senti is reading the briefing"]
+        XCTAssertTrue(readingStatus.waitForExistence(timeout: 5))
+
+        let stop = app.buttons[PocketAccessibilityID.stop]
+        XCTAssertTrue(stop.isHittable)
+        stop.tap()
+        XCTAssertTrue(app.staticTexts["Briefing complete"].waitForExistence(timeout: 5))
+
+        let replay = app.buttons[PocketAccessibilityID.replay]
+        XCTAssertTrue(replay.isHittable)
+        replay.tap()
+        XCTAssertTrue(readingStatus.waitForExistence(timeout: 5))
+
+        let done = app.buttons[PocketAccessibilityID.listenOnlyDone]
+        XCTAssertTrue(done.isHittable)
+        done.tap()
+        XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))
+        XCTAssertFalse(element(PocketAccessibilityID.conversationScreen).exists)
     }
 
     func testProposalRequiresExactReadBackBeforeOneConfirmation() {
