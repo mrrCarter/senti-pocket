@@ -83,9 +83,9 @@ public struct SessionListPresentationState: Equatable, Sendable {
         let canPresentRows = identitiesAreValid && sourceAllowsContent && failureAllowsContent
 
         self.rows = canPresentRows ? page.sessions.map(SessionRowPresentation.init) : []
-        self.resultCount = page.count
+        self.resultCount = canPresentRows ? page.count : 0
         self.includesArchived = page.includeArchived
-        self.hasMore = page.hasMore
+        self.hasMore = canPresentRows && page.hasMore
         self.provenance = provenance
         self.isRefreshing = isRefreshing
         self.failure = identitiesAreValid ? failure : .invalidData

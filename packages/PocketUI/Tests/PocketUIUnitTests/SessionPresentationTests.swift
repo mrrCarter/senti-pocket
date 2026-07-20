@@ -126,6 +126,8 @@ final class SessionPresentationTests: XCTestCase {
                 failure: failure
             )
             XCTAssertTrue(state.rows.isEmpty, "\(failure) must suppress protected rows")
+            XCTAssertEqual(state.resultCount, 0)
+            XCTAssertFalse(state.hasMore)
         }
 
         let unavailable = SessionListPresentationState(
@@ -133,6 +135,8 @@ final class SessionPresentationTests: XCTestCase {
             provenance: .unavailable
         )
         XCTAssertTrue(unavailable.rows.isEmpty)
+        XCTAssertEqual(unavailable.resultCount, 0)
+        XCTAssertFalse(unavailable.hasMore)
     }
 
     func testAuthPresentationContainsOnlyClosedNonSecretPhases() {
