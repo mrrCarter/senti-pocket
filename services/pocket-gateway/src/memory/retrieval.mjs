@@ -11,13 +11,24 @@
 // gateway's grounding set must come from once memory needles across many sessions — otherwise
 // "grounded == cited any id in the corpus" degrades to meaningless as the corpus grows.
 
-/** Exact int8 dot-product similarity. `a`,`b` are Int8Array | number[] of (ideally) equal length. */
+/**
+ * Exact int8 dot-product similarity. STRICT dimension equality (Warden adversarial finding 1):
+ * a raw int8 dot MAGNITUDE grows with dimension (more terms), so silently comparing mixed dims (e.g.
+ * Matryoshka 512-d global vs 256-d chunk in one index) ranks by dimensionality, not relevance — a
+ * silent recall-rot, no error. Invariant: ONE embedding dim per index. Throw loudly on mismatch.
+ * `a`,`b` are Int8Array | number[] of EQUAL length.
+ */
 export function int8Dot(a, b) {
   const av = a || [];
   const bv = b || [];
-  const n = Math.min(av.length, bv.length);
+  if (av.length !== bv.length) {
+    throw new Error(
+      `int8Dot: dimension mismatch (${av.length} vs ${bv.length}) — one embedding dim per index; ` +
+        'Matryoshka dims (512/256/…) must not share an index. Cosine-normalize + fix the dim upstream.',
+    );
+  }
   let acc = 0;
-  for (let i = 0; i < n; i += 1) acc += av[i] * bv[i];
+  for (let i = 0; i < av.length; i += 1) acc += av[i] * bv[i];
   return acc;
 }
 
@@ -60,9 +71,30 @@ export function rrfFuse(rankedLists, { k = 60, limit = 50 } = {}) {
  * The RETRIEVED grounding subset (Atlas honesty invariant): fuse the lexical ranking with the dense
  * exact-scan and return the top-K ids. THIS is what a memory-scale /answer grounds on —
  * relevance-filtered, never the whole corpus.
+ *
+ * ⚠ `topK` is a TUNING GATE, not a free constant (Warden adversarial finding 2): it is the pre-rerank
+ * grounding POOL, and the 8-Needle SCATTER eval requires that pool to hold >=95% of dispersed relevant
+ * items. If a query has many high-ranking lexical matches, dispersed needles can get pushed past top-K
+ * and the "grounded" guarantee silently under-covers. So `topK` MUST be validated against
+ * Needle-Scatter recall in CI (raise it, or add a recall-floor, if it drops needles). `scatterRecall()`
+ * below is the check; the 8-Needle CI harness asserts it >=0.95 so topK can never silently fall below bar.
  * @param {{lexicalRanked?:{id:string}[]|string[], dense?:{id:string}[], k?:number, topK?:number}} args
  * @returns {string[]} the grounded id subset, best-first.
  */
 export function retrieveGrounding({ lexicalRanked = [], dense = [], k = 60, topK = 12 } = {}) {
   return rrfFuse([lexicalRanked, dense], { k, limit: topK }).map((r) => r.id);
+}
+
+/**
+ * Needle-Scatter recall = |grounding ∩ needles| / |needles| — the fraction of DISPERSED relevant items
+ * that survived into the grounding pool. The 8-Needle CI gate asserts this >= 0.95 for the chosen topK
+ * (Warden finding 2); a drop means raise topK or add a recall-floor. `needleIds` = the known-relevant set.
+ */
+export function scatterRecall(groundingIds, needleIds) {
+  const need = new Set(Array.isArray(needleIds) ? needleIds : []);
+  if (need.size === 0) return 1;
+  const got = new Set(Array.isArray(groundingIds) ? groundingIds : []);
+  let hit = 0;
+  for (const id of need) if (got.has(id)) hit += 1;
+  return hit / need.size;
 }
