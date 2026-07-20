@@ -512,6 +512,16 @@ test('verifyHumanMessageLanded: eventId===messageId + who===human-mrrcarter; rej
   assert.equal(verifyHumanMessageLanded('s1', { messageId: 'hm_abc' }, { run: found('human-mrrcarter') }), false); // no senderId reported -> fail-closed
 });
 
+test('parseHumanMessageResult: message.senderId PRIMARY, event.agent.id corroboration, both-absent -> senderId null', () => {
+  const mk = (extra) => JSON.stringify({ message: { id: 'm1', cursor: 'c', ...(extra.message || {}) }, event: { sequenceId: 7, ...(extra.event || {}) } });
+  // message.senderId present -> PRIMARY even when event.agent.id differs (api L7416 guarantees message.senderId)
+  assert.equal(parseHumanMessageResult(mk({ message: { senderId: 'human-mrrcarter' }, event: { agent: { id: 'human-other' } } })).senderId, 'human-mrrcarter');
+  // message.senderId absent -> event.agent.id corroboration
+  assert.equal(parseHumanMessageResult(mk({ event: { agent: { id: 'human-corrob' } } })).senderId, 'human-corrob');
+  // BOTH absent -> null (verifyHumanMessageLanded then fails closed = NOT-landed)
+  assert.equal(parseHumanMessageResult(mk({})).senderId, null);
+});
+
 test('humanMessage validateProposal: ENFORCES targetSequence===0 (Atlas ==0 mirror); other kinds keep >0', () => {
   assert.deepEqual(validateProposal(makeProposal({ kind: 'humanMessage', targetSequence: 0 }), { knownSessionIds: [KNOWN] }), []);
   assert.ok(validateProposal(makeProposal({ kind: 'humanMessage', targetSequence: 7 }), { knownSessionIds: [KNOWN] }).some((m) => /targetSequence must be 0/.test(m)));

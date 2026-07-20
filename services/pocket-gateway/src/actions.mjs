@@ -253,7 +253,10 @@ export function parseHumanMessageResult(out) {
   const seq = toSafeSequence(ev && ev.sequenceId);
   if (seq == null) return null; // no durable sequence => unidentifiable landing; never finalize on it
   const cursor = (typeof m.cursor === 'string' && m.cursor.length > 0) ? m.cursor : null;
-  const senderId = (ev && ev.agent && ev.agent.id) || (typeof m.senderId === 'string' ? m.senderId : null);
+  // message.senderId is PRIMARY — api L7416 sets it = normalize(agent.id) OR sender_id, so it's GUARANTEED populated;
+  // event.agent.id is CORROBORATION (depends on the agent blob surviving storage). Fail-closed downstream if BOTH absent.
+  const senderId = (typeof m.senderId === 'string' && m.senderId ? m.senderId : null)
+    || (ev && ev.agent && typeof ev.agent.id === 'string' && ev.agent.id ? ev.agent.id : null);
   return { messageId: m.id, sequenceId: seq, targetCursor: cursor, senderId };
 }
 
@@ -288,7 +291,8 @@ export function verifyActionLanded(sessionId, parsed, { run, agent = 'claude-poc
 export function verifyHumanMessageLanded(sessionId, parsed, { run, attempts = 3 } = {}) {
   if (!run || !parsed || typeof parsed.messageId !== 'string') return false;
   // Match the re-read author against the identity the api ACTUALLY authored under — `parsed.senderId`, taken from the
-  // POST response's event.agent.id (the api's OWN truth) — NOT a predicted/replicated normalization of the caller. The
+  // POST response's message.senderId (primary) / event.agent.id (corroboration), the api's OWN truth — NOT a
+  // predicted/replicated normalization of the caller. The
   // api authors human writes as human-<normalize(github_username||id)> and that rule can change; reading it back from the
   // POST response is drift-proof (a future normalization change can't silently break this). Fail-closed if the POST
   // reported no author (can't confirm identity).
