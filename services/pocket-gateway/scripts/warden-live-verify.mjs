@@ -65,14 +65,14 @@ const rec = (body && (body.status || body.receipt)) ? body : (body && body[propo
 if (!rec || rec.status !== 'posted') fail(`not a 'posted' receipt (status=${rec && rec.status})`, body);
 ok(`receipt status = posted`);
 
-// 3) Extract the real sequence + the authored sender the receipt/response reports.
+// 3) Extract the real sequence from the receipt. The posted humanMessage receipt carries it in its ActionResultRef:
+//    receipt.result = {kind:'sequence', sequenceId} (actions.mjs L137/L164). rec.sequenceId / __emitted do NOT exist in
+//    the serialized HTTP body (Relay review — verified at source: receiptResponse -> json(200, receipt)).
 const receipt = rec.receipt || rec;
-const seq = rec.sequenceId ?? receipt.sequenceId ?? (rec.__emitted && rec.__emitted.parsed && rec.__emitted.parsed.sequenceId);
-const senderReported = rec.senderId ?? (rec.__emitted && rec.__emitted.parsed && rec.__emitted.parsed.senderId) ?? receipt.senderId;
-if (!(typeof seq === 'number' && seq > 0)) fail('no real sequenceId in the receipt (message did not durably land)', rec);
-ok(`receipt sequenceId = ${seq}`);
-if (typeof senderReported === 'string' && senderReported.startsWith('human-')) ok(`receipt authored sender = ${senderReported}`);
-else console.log(`  (note: sender not surfaced in receipt; the independent read-back below is the authority)`);
+const seq = receipt.result?.sequenceId ?? rec.result?.sequenceId;
+const senderReported = receipt.result?.senderId; // not surfaced today (result is {kind,sequenceId}); read-back is the authority
+if (!(typeof seq === 'number' && seq > 0)) fail('no real sequenceId in receipt.result (message did not durably land)', rec);
+ok(`receipt result.sequenceId = ${seq}`);
 
 // 4) INDEPENDENT proof: read the room ourselves (member `sl`), anchored on the claimed sequence, and confirm the
 //    exact proposalHash message is there authored by a human-* identity. This is the real cross-service assertion.
@@ -83,12 +83,20 @@ try {
   const j = JSON.parse(out); events = j.events || j || [];
 } catch (e) { fail('independent `sl session read` failed (is SL_BIN a member of the room?)', e && (e.stdout || e.message)); }
 
-// messageId is the deterministic client id = proposalHash; match the landed event by it.
-const hit = events.find((e) => (e.eventId === proposal.proposalHash) || (e.payload && e.payload.clientId === proposal.proposalHash) || (e.eventId && String(e.eventId).includes(proposal.id)));
-if (!hit) fail(`independent read-back did NOT find the message (proposalHash=${proposal.proposalHash}) at/around seq ${seq} — a real message would be here`, events.map((e) => ({ eventId: e.eventId, seq: e.sequenceId, who: (e.agent && e.agent.id) || e.agentId })));
+// The room event's eventId is a SERVER id (cli-<uuid>), NOT the proposalHash, and the clientId isn't a queryable event
+// field (Relay review — verified vs a live event: eventId=cli-3b96f15d-...). Match on the SEQUENCE the receipt reports:
+// the message IS the event at that exact seq, and we read --before-sequence seq+1 so it's in the window. Then corroborate
+// the UNIQUE per-run content (payload.message) so we're certain it's OUR write, not merely something at that sequence.
+const hit = events.find((e) => e.sequenceId === seq);
+if (!hit) fail(`independent read-back did NOT find an event at seq ${seq} — a real landing would be here`, events.map((e) => ({ eventId: e.eventId, seq: e.sequenceId, who: (e.agent && e.agent.id) || e.agentId })));
+const content = hit.payload && (hit.payload.message ?? hit.payload.text);
+if (content !== MSG) fail(`event at seq ${seq} does NOT carry our exact message content (unique per run)`, `got: ${JSON.stringify(String(content).slice(0, 100))}`);
 const who = (hit.agent && hit.agent.id) || hit.agentId;
-ok(`independent read-back FOUND the message: eventId=${hit.eventId} seq=${hit.sequenceId} author=${who}`);
+ok(`independent read-back FOUND our message: eventId=${hit.eventId} seq=${hit.sequenceId} (content matches, unique per run)`);
 if (!(typeof who === 'string' && who.startsWith('human-'))) fail(`the landed message is NOT authored by a human-* identity (author=${who}) — it must post AS the human, not an agent`);
+ok(`authored by ${who}`);
+const expectedHuman = process.env.EXPECTED_HUMAN;
+if (expectedHuman && who !== expectedHuman) fail(`author ${who} != EXPECTED_HUMAN ${expectedHuman}`);
 if (senderReported && who !== senderReported) fail(`read-back author (${who}) != receipt-reported sender (${senderReported}) — cross-service identity mismatch`);
 
-console.log(`\n✅ FIRST REAL POCKET WRITE VERIFIED — a message authored as ${who} landed in room ${ROOM} at sequence ${hit.sequenceId}, its content-bound proposalHash matches, and the receipt reported it. Real post · real authoring · real read-back. (Local gateway + dev receipt key, honestly labeled.)`);
+console.log(`\n✅ FIRST REAL POCKET WRITE VERIFIED — our exact message (unique per-run content) landed in room ${ROOM} at sequence ${hit.sequenceId}, authored as ${who}, and the gateway receipt reported that same sequence. Real post · real authoring (human, not agent) · real independent read-back. (Local gateway + dev receipt key, honestly labeled; message + authoring + landing are REAL.)`);
