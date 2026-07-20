@@ -2,15 +2,17 @@
 // MINIMAL child env + bounded timeout, and byte-preserve injection metacharacters (Echo #233114 P0 + #233248 P1).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeSlRunner } from '../src/sl-runner.mjs';
 
-// the entrypoint must resolve to the sentinelayer-cli package (basename check) — name it accordingly
-const CLI = join(mkdtempSync(join(tmpdir(), 'slr-')), 'sentinelayer-cli.js');
+// the entrypoint must resolve to the sentinelayer-cli package (basename check) — name it accordingly.
+// realpathSync the temp dir so the expected path matches makeSlRunner's realpath resolution on macOS
+// (/var/folders -> /private/var/folders via the /var symlink); a no-op on Windows/Linux.
+const CLI = join(realpathSync(mkdtempSync(join(tmpdir(), 'slr-'))), 'sentinelayer-cli.js');
 writeFileSync(CLI, '// fake sentinelayer-cli.js for tests');
-const NOT_CLI = join(mkdtempSync(join(tmpdir(), 'slr-')), 'random.js');
+const NOT_CLI = join(realpathSync(mkdtempSync(join(tmpdir(), 'slr-'))), 'random.js');
 writeFileSync(NOT_CLI, '// not the cli');
 
 test('dispatches via node + validated cli.js (no shell), byte-preserves metacharacters, minimal env, bounded timeout', () => {
