@@ -18,19 +18,19 @@ Lambda/API-Gateway (`src/lambda.mjs`) or a local HTTP server (`src/app.mjs` / `s
 - **Authorization to write is server-derived**: `knownSessionIdsFor(humanId)` — a client can never name an arbitrary target session.
 - **Cross-tenant isolation**: all durable state + the exactly-once lock are namespaced by the FULL principal
   (issuer + aud/resource + site + pairwise sub), not the sub alone.
-- **Scopes** (least-privilege): `pocket:read` (sync), `pocket:write` (execute), `pocket:voice` (tts). A read+write token
+- **Scopes** (least-privilege): `sessions:read` (sync), `sessions:write` (execute), `pocket:voice` (tts). A read+write token
   must NOT authorize voice (third-party egress). Missing scope => 403.
 
 ## Endpoints
 
 ### `GET /health` → 200 `{ok:true}`  (no auth)
 
-### `GET /sync?since=<sequence>` → 200 `{bundles: PocketBundle[]}`  (scope `pocket:read`)
+### `GET /sync?since=<sequence>` → 200 `{bundles: PocketBundle[]}`  (scope `sessions:read`)
 - Returns signed `PocketBundle`s for the caller's principal newer than `since` (0 = all). Tenant-scoped.
 - The phone MUST verify each bundle's Ed25519 signature under the pinned pubkey AND `isSemanticallyValid()` before briefing.
 - 403 missing scope · 501 sync backend not configured.
 
-### `POST /actions/execute`  (scope `pocket:write`)
+### `POST /actions/execute`  (scope `sessions:write`)
 Body: `{ proposal: ActionProposal, confirmation: Confirmation }` (frozen shapes in PocketContracts).
 - Success → **200 `ActionReceipt`** (`status: posted | pending`), Ed25519-signed, `confirmedProposalHash` non-null.
 - **422 `{error:"proposal_rejected", reason}`** — proposal could NOT be bound to a confirmation (never a null-hash "receipt").

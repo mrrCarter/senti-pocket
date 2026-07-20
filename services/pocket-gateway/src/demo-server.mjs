@@ -47,7 +47,7 @@ export function createDemoServer(opts = {}) {
   const BUNDLE = buildSignedBundle(rawCheckpoint, summarize(rawCheckpoint, CKPT), privateKey, { signingKeyId: 'demo-bundle-key', createdAt: '2026-07-18T18:00:00Z' });
 
   const gateway = createGateway({
-    verifyToken: async (h) => (singleBearer(h.authorization, token) ? { humanId: 'pairwise-demo', principal: 'demo:site_sentinelayer:pairwise-demo', site: 'site_sentinelayer', scopes: ['pocket:read', 'pocket:write', 'pocket:voice'] } : null),
+    verifyToken: async (h) => (singleBearer(h.authorization, token) ? { humanId: 'pairwise-demo', principal: 'demo:site_sentinelayer:pairwise-demo', site: 'site_sentinelayer', scopes: ['sessions:read', 'sessions:write', 'pocket:voice'] } : null),
     store: createInMemoryStore(),
     run: opts.run, // injected (real shell-free sl-runner in prod-of-demo; mock in tests)
     signingKey: privateKey, signingKeyId: 'demo-receipt-key',
