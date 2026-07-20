@@ -1,140 +1,155 @@
-# Pocket Memory & Recall — design spec (v0.1)
+# Pocket Memory & Recall — canonical spec (v0.2)
 
-**Author:** claude-warden · **Status:** draft blueprint for review (NOT a merge request) · **Source:** extracted from Carter's `ENGRAM-architecture-v3` (his personal-memory research), scoped down to Senti Pocket's checkpoint/session domain.
+**Design + eval owner:** claude-warden · **Implementation-contract co-author:** claude-pocket-atlas (the on-device Swift `PocketEngram` package that implements this design) · **Status:** draft blueprint for review (NOT a merge request) · **Source:** extracted from Carter's `ENGRAM-architecture-v3` (his personal-memory research), pointed at Senti Pocket's **session/checkpoint** corpus. Warden and Atlas reached the same ENGRAM essentials independently — that convergence is the validation; this is the one canonical doc (supersedes the two draft specs).
 
-> **Read this first — sequencing discipline.** This is the **NEXT-phase** blueprint. It does **not** jump the queue ahead of the unproven **spine**: (1) a real message posting **phone → MCP → live Senti** (needs Carter's AS-registration GO), and (2) **E4B actually reasoning** over a checkpoint instead of emitting a fixture summary. The memory system is what makes recall *magical*, but we prove the loop first, then this compounds on top. Nothing here should be built before the spine is green.
+> **Read this first — sequencing discipline.** This is the **NEXT-phase** blueprint. It does **not** jump the queue ahead of the unproven **spine**: (1) a real message posting **phone → MCP → live Senti** (needs Carter's AS-registration GO), and (2) **E4B/gateway reasoning** over a checkpoint instead of a fixture summary. The memory system is what makes recall *magical*, but we prove the loop first, then this compounds on top. Nothing here is built before the spine is green.
 
 ---
 
 ## 1. Thesis — Pocket memory is small-data on-device
 
-A heavy Senti user over years generates **thousands** of checkpoints and **tens of thousands** of evidence refs / agent utterances — not billions. ENGRAM's Thesis 1 applies with room to spare: the whole corpus fits on the phone, and the retrieval problem is a **sub-10ms personal-scale problem**, not a hyperscale one.
+A heavy multi-year Senti user generates on the order of 10²–10³ sessions × hundreds of events ≈ **~500K observations** — not billions. ENGRAM's Thesis 1 applies with room to spare: the whole corpus fits on the phone, and recall is a **sub-10ms personal-scale problem**.
 
-**The ANN plot twist (ENGRAM §7), stated for us:** at this scale you do **not** need a vector database. A few hundred-K int8 vectors × 512-d is ~200M multiply-accumulates — **<10ms with NEON SIMD**. An **exact brute-force scan is 100% recall by definition**, with zero index maintenance, zero tuning, and trivial metadata pre-filtering. Reach for HNSW (usearch/ObjectBox) **only** if a corpus ever passes ~1M vectors or on old hardware — one function's worth of abstraction boundary, deferred.
+**The ANN plot twist (ENGRAM §7), stated for us:** at this scale you do **not** need a vector database. A few hundred-K int8 vectors × 512-d ≈ 200M multiply-accumulates — **<10ms with NEON SIMD**. An **exact brute-force scan is 100% recall by definition**, zero index maintenance, trivial metadata pre-filter. Reach for HNSW only past ~1M vectors or on old hardware — one function's worth of abstraction boundary, deferred.
 
-**Consequence:** the "95%+ recall" bar is not a hope. Exact scan gives 100% dense recall; the honest work is **fusion quality** (finding the *right* evidence across channels) and **reasoning over it**, not index recall.
+**Consequence:** "95%+ recall" is not a hope. Exact scan gives 100% dense recall; the honest work is **fusion quality** (finding the right evidence across channels) and **grounded reasoning over it** — and this is *why* local-memory + local-reasoning beats a cloud assistant's lossy remembered summary: it's on your device, instant, private, and complete.
 
 ---
 
 ## 2. Data model — tri-layer, immutable-facts (reuses our honesty wedge)
 
-ENGRAM's load-bearing decision maps cleanly onto what Pocket already is: **observations are immutable facts; entities are mutable interpretations; bindings are reversible glue.** For Pocket this is a *gift* — it's the same tamper-evidence/immutability we already sell.
+ENGRAM's load-bearing decision maps onto what Pocket already is: **observations are immutable facts; entities are mutable interpretations; bindings are reversible glue.** For Pocket this is a *gift* — it's the same tamper-evidence/immutability we already sell. **Never destructively merge**: a bad merge is a *split*, a user correction is a *rebinding*, every identity decision is auditable and undoable.
 
 | ENGRAM concept | Pocket binding |
 |---|---|
-| `observation` (immutable) | a checkpoint **EvidenceRef** (id, ts, snippet, agentId, sequenceId) — already immutable, already inside the signed bundle |
-| `entity` (mutable interpretation) | session · agent · checkpoint · topic · project |
-| `binding` (reversible, audited) | evidence → entity links, method-stamped (`auto_knn`/`consolidator`/`user`) and reversible |
-| `edge` (traversal graph) | `appeared_in` / `by_agent` / `in_session` / `about_topic` / `references_checkpoint`, weighted by co-occurrence + recency |
-| `occurrence` (ACT-R fuel) | capture / view / listen / answer / act — engagement that raises a memory's activation |
+| `observation` (immutable) | a checkpoint **EvidenceRef** (id, ts, snippet, agentId, sequenceId) — already immutable, already inside the signed bundle (the canonical binding; tighter than a raw "session-artifact") |
+| `observation.kind` (extraction taxonomy) | `agent_claim · decision · file_touched · error · gate_verdict · tool_call · entity_mention` |
+| `entity` (mutable interpretation) | `agent · session · topic · decision · repo · file · pr · moment ("that one time")` |
+| `binding` (reversible, audited) | evidence→entity, `method ∈ {auto_knn, consolidator, user, cross_ref}` |
+| `edge` (traversal graph) | `authored_by · in_session · about_topic · decided · touched_file · supersedes · references_pr · co_occurred_with`, weighted by co-occurrence + recency |
+| `occurrence` (ACT-R fuel) | capture / recall / surface_engaged / acted_on — engagement that raises a memory's activation |
 
 ```sql
--- Immutable facts: what the session/checkpoint actually contained
+-- Immutable facts. The EvidenceRef IS the observation (content-addressed, signed-bundle-native).
 CREATE TABLE evidence (
-  id TEXT PRIMARY KEY,           -- EvidenceRef.id (content-addressed)
-  checkpoint_id TEXT, session_id TEXT, agent_id TEXT,
-  sequence_id INTEGER, ts INTEGER,
+  id TEXT PRIMARY KEY,           -- EvidenceRef.id
+  checkpoint_id TEXT, session_id TEXT, agent_id TEXT, sequence_id INTEGER, ts INTEGER,
+  kind TEXT,                     -- agent_claim|decision|file_touched|error|gate_verdict|tool_call|entity_mention
   snippet TEXT,                  -- verbatim; FTS5-indexed
-  embedding_id INTEGER,          -- FK into the int8 vector store
-  extractor_ver INTEGER          -- model upgrade -> lazy re-embed, never a migration
+  embedding_id INTEGER, extractor_ver INTEGER   -- model upgrade -> lazy re-embed, never a migration
 );
 CREATE VIRTUAL TABLE evidence_fts USING fts5(snippet, content='evidence', content_rowid='rowid');
 
-CREATE TABLE entity (            -- mutable interpretation
-  id INTEGER PRIMARY KEY, kind TEXT,   -- session|agent|checkpoint|topic|project
-  label TEXT, state TEXT,              -- tentative|auto|user_labeled|tombstoned
-  exemplars JSON                       -- canonical evidence ids (a set, not a centroid)
-);
-CREATE TABLE binding (
-  evidence_id TEXT, entity_id INTEGER, confidence REAL,
-  method TEXT, bound_at INTEGER, PRIMARY KEY (evidence_id, entity_id)
-);
-CREATE TABLE edge (
-  src INTEGER, dst INTEGER, type TEXT, weight REAL,
-  evidence_count INTEGER, first_seen INTEGER, last_seen INTEGER,
-  PRIMARY KEY (src, dst, type)
-);
+CREATE TABLE entity ( id INTEGER PRIMARY KEY, kind TEXT, label TEXT, state TEXT, exemplars JSON );  -- exemplars = a SET, not a centroid
+CREATE TABLE binding ( evidence_id TEXT, entity_id INTEGER, confidence REAL, method TEXT, bound_at INTEGER, PRIMARY KEY (evidence_id, entity_id) );
+CREATE TABLE edge ( src INTEGER, dst INTEGER, type TEXT, weight REAL, evidence_count INTEGER, first_seen INTEGER, last_seen INTEGER, PRIMARY KEY (src, dst, type) );
 CREATE TABLE occurrence ( entity_or_evidence INTEGER, kind TEXT, at INTEGER );
 ```
 
-**Never destructively merge.** A bad merge is a *split*; a user correction is a *rebinding*. The signed-bundle spine is untouched — memory is derived, idempotently rebuildable from the immutable evidence, and never re-labels signed content as something it isn't (same discipline as PR #21's `MembershipAuthorizedCheckpoint` ≠ `VerifiedBundle`).
+The signed-bundle spine is untouched — memory is **derived, idempotently rebuildable** from the immutable evidence, and never re-labels signed content as something it isn't (same discipline as PR #21's `MembershipAuthorizedCheckpoint` ≠ `VerifiedBundle`). **Graph store:** plain SQLite + an in-memory CSR snapshot, two ops only (weighted push + bounded BFS) ≈ 300 lines of Swift; no embedded graph-DB dependency.
 
 ---
 
-## 3. Retrieval — the fix for "no cache evidence / super brief"
+## 3. Encoder — three passes (sessions)
 
-Carter's build hit two failures: the briefing was **too brief** (E4B not reasoning over the checkpoint) and the gate **hard-refused** ("I don't have cache evidence for that"). Both are a **retrieval** problem, and ENGRAM §7 is the fix. Query path, p99 < 100ms, **no LLM in the hot path**:
+- **Pass 1 (sync, at capture, <50ms).** Index the artifact: text embedding (EmbeddingGemma/MobileCLIP text tower, Matryoshka-truncate to 256-d), FTS5 tokenize, parse `{session_id, seq, agent, ts}`. **The session is searchable the instant it lands.**
+- **Pass 2 (opportunistic).** On-device **Gemma E4B** entity/relation extraction → typed structs (agents, decisions, files, PRs, topics). **Eager binding**: an observation that k-NN-matches a known entity above threshold binds now and emits a **recall trigger** ("this connects to the PR#418 provider-trust decision") — surfaced while the work is warm.
+- **Pass 3 (overnight, on charger, `BGProcessingTask` + `requiresExternalPower`).** The full Consolidator (§5). Thermal discipline: never run Gemma and heavy indexing concurrently.
+
+---
+
+## 4. Retrieval — the fix for "no cache evidence / super brief"
+
+Carter's build hit two failures: the briefing was **too brief** (reasoning over one bare checkpoint, no memory) and the gate **hard-refused** ("I don't have cache evidence for that"). Both are a **retrieval** problem, and ENGRAM §7 is the fix. Query path, p99 < 100ms, **no LLM in the hot path**:
 
 | Stage | What | Budget |
 |---|---|---|
-| 1 | Query embed (EmbeddingGemma/MobileCLIP text tower) + entity-mention match | ~5ms |
-| 2a | **Dense** candidates: exact int8 scan over evidence vectors | ~8ms |
-| 2b | **Lexical** candidates: FTS5/BM25 over snippets, agent labels, checkpoint titles (parallel with 2a) | ~3ms |
+| 1 | Query embed + entity-mention match | ~5ms |
+| 2a | **Dense** candidates: exact int8 scan over evidence vectors (100% recall by definition) | ~8ms |
+| 2b | **Lexical** candidates: FTS5/BM25 over snippets/labels (parallel with 2a) | ~3ms |
 | 3 | **RRF-pool** 2a + 2b + entity matches → candidate set; seed the session graph | ~1ms |
-| 4 | Spreading activation (forward-push Personalized PageRank) over the session/checkpoint graph | ~5ms |
-| 5 | Fusion score + optional late-interaction rerank of top ~100 | ~20ms |
-| 6 | Assemble + **path evidence** ("this answer traces: your question → checkpoint cp_… → agent pulse → this line") | ~5ms |
+| 4 | **Spreading activation** = forward-push Personalized PageRank over the session graph (α≈0.1 ⇒ deep diffusion; runtime independent of graph size) | ~5ms |
+| 5 | Fusion score (logistic over cos + logPPR + ACT-R base-level + affinity) + late-interaction rerank of top ~100 | ~20ms |
+| 6 | Assemble + **path evidence** ("query → session-951 → the trust-chain decision → PR#418 → this recap") | ~5ms |
 
-**Why 2b matters (ENGRAM's line):** *dense embeddings are semantic geniuses and string idiots.* "The checkpoint where Omar 403'd," "the sessions:write scope decision," a literal PR number — those are **string** problems FTS5 solves for free. Reciprocal-rank fusion pools the ranked lists (rank-based, so incompatible score scales don't matter); the fusion model *orders* them.
+**Why 2b matters:** *dense embeddings are semantic geniuses and string idiots.* "The checkpoint where Omar 403'd," a literal PR number, `sessions:write` — those are **string** problems FTS5 solves for free. RRF pools the ranked lists (rank-based; incompatible score scales don't matter); the fusion model orders them. **Reasoning is the slow-path RAG over the recalled set — never in the hot path.**
 
-**Then E4B reasons over the fused top-K** — not a one-line fixture summary. And on a genuine miss, the honest behavior is **a clarifying question** ("do you mean the auth-scope checkpoint from tonight, or the earlier gateway one?"), **not** a hard refuse. The refuse gate stays only for the truly-empty case, and even then it offers the nearest candidates.
-
-**One-pass where multi-agent is overkill (Carter's point):** E4B is a single-pass multimodal reasoner — for "summarize this checkpoint" or "answer from this evidence set," it does not need a separate sidecar listener agent. Reserve multi-agent for genuine decomposition.
+**This already has its first small landing in the spine.** The gateway's grounding-first `/answer` router (`routeAnswer` @ `29033f3`, warden-gated) *is* retrieval-grounded needling in miniature: it retrieves grounding from the verified checkpoint, and the **grounding** — not the LLM's self-confidence — routes `answered` / `clarify` / `unavailable(nearestTopics)`. `.answered` requires non-empty grounded citations; hallucinated cites are dropped. That is exactly this §4 discipline at checkpoint scale; the memory MVP generalizes it across all sessions.
 
 ---
 
-## 4. Recall as a control loop + the 8-Needle eval (Carter's bar, measured)
+## 5. Consolidator — overnight re-association (ENGRAM §6)
 
-ENGRAM §6 step 9 / §11 turn "95%+ recall" from a claim into **two CI jobs** — exactly Carter's "8-needle @ >95%" phrase:
-
-- **Needle-Chain** — plant chains of 8 memories linked only through shared entities (evidence → agent → session → topic → … → a later checkpoint). Query the head with a paraphrase; success = the tail in top-20. **Gate ≥ 95% chain completion.** (Tests *depth* through the graph.)
-- **Needle-Scatter** — 8 relevant items dispersed across the corpus; the **pre-rerank candidate pool** must contain ≥ 95% of them. (Tests *breadth* across the corpus.)
-- Plus: **recall@10 ≥ 0.95** vs exact ground truth (self-maintaining — the nightly consolidator brute-forces ground truth and auto-tunes), **p99 < 100ms** on-device.
-
-This is the warden's kind of bar: **recall isn't hoped, it's measured**, and it fails closed if it regresses.
+Retroactive binding via a **Pending Association Store** (parked observations re-scored only when an entity's exemplar set changes → work ∝ what improved, not corpus size); session/topic re-segmentation; edge-weight recompute (recency decay); and **precompute recall surfaces** — this is where **weekly standups**, "you're resuming session X, here's its history," and "you're about to touch file Y, here's every prior decision on it" get computed *while charging*, so the app feels psychic at open. Nightly **recall QA**: sample 100 queries, brute-force ground truth, verify recall@10 ≥ 0.95, auto-tune. **Recall is a control loop, not a hope.**
 
 ---
 
-## 5. Storage, sync, cold-start
+## 6. Recall as a control loop + the 8-Needle eval (Carter's bar, measured)
 
-- **SQLite is the source of truth** on-device; vectors (sqlite-vec/usearch) + the CSR graph snapshot are **derived and idempotently rebuildable** — a crash re-runs a job, never corrupts state.
-- **Sync = E2EE op-log** to a **thin cloud fabric** (ciphertext only; the server relays and stores no plaintext graph). This is Carter's "cache-on-phone + rest-on-cloud" done privacy-first — don't dump memories to S3 plaintext; keep source-of-truth on-device, spill only encrypted. Cheaper *and* it's the privacy moat.
+ENGRAM §6-step-9 / §11 turn "95%+ recall" into **two CI jobs** — exactly Carter's "8-needle @ >95%":
+
+- **Needle-Chain ≥ 95%** (depth) — chains of 8 memories linked only through shared entities (evidence → agent → session → topic → … → a later checkpoint); query the head with a paraphrase; success = tail in top-20.
+- **Needle-Scatter ≥ 95%** (breadth) — 8 relevant items dispersed; the **pre-rerank candidate pool** must contain ≥ 95%.
+- Plus **recall@10 ≥ 0.95** vs exact ground truth (the nightly consolidator makes it self-maintaining), **p99 < 100ms** on-device, ER pairwise precision ≥ 0.995. Two CI jobs (Forge's on-device harness).
+
+The warden's kind of bar: **recall is measured, not hoped**, and it fails closed if it regresses.
+
+---
+
+## 7. Storage, sync, cold-start
+
+- **SQLite is the source of truth** on-device; vectors (sqlite-vec/usearch) + the CSR graph are **derived + idempotently rebuildable** — a crash re-runs a job, never corrupts state. int8, mmap'd (~35MB hot).
+- **Sync = E2EE op-log** to a **thin cloud fabric** — append-heavy → causal-ordered ops, LWW scalars + set-union edges (not a full CRDT). **The server relays and stores ciphertext ONLY; it never holds a plaintext graph.** This is Carter's "cache-on-phone + rest-on-cloud" done privacy-first — *not* an S3 plaintext dump. An opt-in cold/low-end **vault tier** does server-side extraction only inside confidential-compute with **client-held keys** (still ciphertext at rest); opt-in, labeled, never the default. Cheaper *and* it's the privacy moat (ENGRAM Thesis 3: privacy IS scale).
 - **Cold-start (ENGRAM §13):** front-load by indexing the user's **existing** Senti checkpoints/sessions on day one, so the first overnight consolidation wakes to years of re-associations. Day two should feel like Pocket has known your work for years.
 
 ---
 
-## 6. Near-term product fixes (from the build feedback — these are NOW-lane, not memory)
+## 8. Near-term product fixes (from the build feedback — NOW-lane, not memory)
 
-1. **Audio-tagged speech.** Keep AVSpeech for now, but have the speech layer **emit ElevenLabs-style audio tags** in the generated text now, so switching providers later is a one-line change. AVSpeech strips/ignores tags; ElevenLabs consumes them.
-2. **Online toggle + web-search.** The phone is usually online — auto-detect (or a visible toggle where the "offline cache evidence" copy lives). Online → agents get web-search + normal capability; offline → the honest cached path.
-3. **Reasoning, not summary.** Wire E4B to reason over the retrieved checkpoint context (§3), which is what kills the "super brief / did blabla and stopped" feel.
-
----
-
-## 7. MCP memory-substrate (platform, later — Carter's vision, already in ENGRAM §1/§12)
-
-ENGRAM §1 wrote Carter's platform idea verbatim: *"don't compete with assistants — become their memory substrate; expose the graph via MCP so any assistant queries your memory with per-scope consent."* For us this is a natural extension of the hosted MCP-auth chain: expose Pocket memory as **scoped, consent-gated MCP tools**, where each cross-boundary grant is a **signed consent receipt** `{grantor, grantee, scope, ts, sig}` — which is **the same signed-ActionReceipt discipline** we already ship. Detached MCP services (ring-a-phone; narrate-a-deck → CDN audio/video URL) live here too. All of it **after** the phone proves the core loop.
+1. **Audio-tagged speech** — keep AVSpeech now, but emit ElevenLabs-style audio tags in the generated text so the provider swap is one line. (Shipped + gated: `audio-tags.mjs` @ `ec71ac7`.)
+2. **Online toggle + web-search** — auto-detect (or a visible toggle where the "offline cache evidence" copy lives). Online → agents get web-search; offline → the honest cached path (Atlas's `CheckpointFeed` connectivity states).
+3. **Reasoning, not summary** — the `ReasoningProvider` seam feeds the gateway/E4B the checkpoint + needled context; `.clarify`/`.unavailable(nearestTopics)` replace the hard-refuse. Honest fallback: any cached fixture renders as `.cachedSample`, never posing as a live brief.
 
 ---
 
-## 8. Sequencing & ownership
+## 9. The MCP memory-substrate (platform, later — Carter's vision, ENGRAM §1/§12)
+
+ENGRAM §1 wrote Carter's platform idea verbatim: *"don't compete with assistants — become their memory substrate; expose the graph via MCP with per-scope consent."* Pocket = the **coding/agent-work** memory substrate. `api.sentinelayer.com/mcp` exposes memory as scoped-consent tools any assistant can call:
+
+- `memory.recall(query, scope) → [{memory, score, path_evidence}]` — ranked, with the "why" chain.
+- `memory.needle(entity, hops) → chain` — the 8-hop story.
+- `memory.timeline(session | topic | file) → ordered events`.
+- `memory.standup(window) → precomputed digest`.
+
+"Claude, ask my Senti memory about the trust-chain decision" → `memory.needle` → answer + receipt. Every assistant becomes a **distribution channel** for Pocket. Each cross-boundary grant is a **signed consent receipt** `{grantor, grantee, scope, ts, sig}` — the **same signed-ActionReceipt discipline** we already ship (warden's lane; aligns with AIdenID's crypto/receipt model). Scopes granular + revocable. Detached MCP services (ring-a-phone; narrate-a-deck → CDN audio/video URL) live here too. All of it **after** the phone proves the core loop.
+
+---
+
+## 10. Sequencing & ownership
 
 | Phase | Work | Owner |
 |---|---|---|
-| **NOW** (spine) | E4B reasons over checkpoint context · audio-tagged speech · online toggle · retrieval-instead-of-hard-refuse · **the real write (phone→MCP→live Senti)** | Atlas / Relay / Forge; **gated by warden**; write blocked on Carter's AS-registration GO |
-| **NEXT** | Memory MVP: FTS5 + dense int8 exact-scan + RRF over real checkpoints; Needle-Chain/Scatter CI | Relay (index service) + warden (spec/eval) |
-| **LATER** | On-device graph + spreading activation + nightly consolidator + E2EE op-log sync | crew |
-| **FUTURE** | MCP memory-substrate + detached narration/ring services | crew |
+| **NOW** (spine) | gateway/E4B reasons over the checkpoint (grounding-routed) · audio-tagged speech · online toggle · retrieval-not-hard-refuse · **the real write (phone→MCP→live Senti)** | Atlas / Relay / Forge; **gated by warden**; write blocked on Carter's AS-registration GO |
+| **NEXT** | Memory MVP: FTS5 + dense int8 exact-scan + RRF over real checkpoints; Needle-Chain/Scatter CI | Relay (index/MCP tools) · Atlas (`PocketEngram` on-device contract) · warden (spec/eval) |
+| **LATER** | On-device graph + spreading activation + nightly consolidator + E2EE op-log sync | crew · Echo (Gemma slow-path RAG + Pass-2 extraction) when back |
+| **FUTURE** | MCP memory-substrate + detached narration/ring services + confidential-compute vault tier | crew |
 
 ---
 
-## 9. Honest open problems (ENGRAM §13, Pocket-scoped)
+## 11. How this fixes the "absolutely bad build" (why it's not premature)
+
+- **Shallow briefing** ("two agents did blabla then stopped"): the model was fed ONE checkpoint with no memory. With recall, reasoning runs over the checkpoint **+ the relevant past sessions it needled** → a rich, specific brief.
+- **"no cache evidence" refusal**: Q&A **needles near-answers across all sessions** before reasoning → it finds the remotely-close thing or asks a clarifying question, never a hard refuse. Recall is the retrieval; the LLM is the reasoning; neither is the shallow fixture.
+
+---
+
+## 12. Honest open problems (ENGRAM §13, Pocket-scoped)
 
 - **Entity-resolution under drift** — agents/sessions/topics rename; exemplar sets + reversible bindings mitigate; continuous eval is the discipline.
-- **The empty-vs-close-enough line** — when to answer-with-caveat vs ask-a-clarifying-question vs honestly refuse. This is a product-judgment threshold; measure it.
+- **The empty-vs-close-enough line** — answer-with-caveat vs clarifying-question vs honest-refuse is a product-judgment threshold; measure it (and route on grounding, never on LLM self-confidence).
 - **Thermal/battery** — nightly consolidation on charger only; never co-schedule the LLM and heavy indexing.
 - **Cold-start** — before the graph is dense the magic is sparse; day-one import of existing checkpoints is the answer.
 
 ---
 
-*This spec is a blueprint for discussion, not a claim of built work. The retrieval math and evals are transplanted from ENGRAM v3 and must be validated on real Pocket corpora before any recall number is asserted.*
+*This spec is a blueprint for discussion, not a claim of built work. The retrieval math and evals are transplanted from ENGRAM v3 and must be validated on real Pocket corpora before any recall number is asserted. Review asks: warden owns the MCP consent-scope + E2EE posture; Relay the index/gateway/vault boundary; Forge the 8-needle CI feasibility on-device.*
