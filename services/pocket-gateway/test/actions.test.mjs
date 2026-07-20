@@ -505,7 +505,7 @@ test('verifyHumanMessageLanded: eventId===messageId + who===human-mrrcarter; rej
   const found = (agentId) => () => JSON.stringify({ events: [{ eventId: 'hm_abc', agent: { id: agentId } }] });
   // parsed.senderId = the identity the api ACTUALLY authored under (from the POST response's event.agent.id) — the
   // read-back matches THAT (drift-proof), not a predicted/replicated normalization. Works for ANY authored identity.
-  const parsed = { messageId: 'hm_abc', senderId: 'human-mrrcarter' };
+  const parsed = { messageId: 'hm_abc', sequenceId: 900, senderId: 'human-mrrcarter' };
   assert.equal(verifyHumanMessageLanded('s1', parsed, { run: found('human-mrrcarter') }), true);
   assert.equal(verifyHumanMessageLanded('s1', parsed, { run: found('claude-pocket-relay') }), false); // same msg, WRONG author
   assert.equal(verifyHumanMessageLanded('s1', parsed, { run: () => JSON.stringify({ events: [] }) }), false); // not landed
@@ -516,6 +516,25 @@ test('verifyHumanMessageLanded: eventId===messageId + who===human-mrrcarter; rej
   assert.equal(verifyHumanMessageLanded('s1', parsed, { run: capRun }), true);
   const readCall = seen.find((a) => Array.isArray(a) && a[1] === 'read');
   assert.equal(readCall.includes('--agent'), false, 'reads as self — no --agent author filter');
+  assert.equal(readCall.includes('--before-sequence'), true, 'anchored on the landing sequence (no tail-clip)');
+  assert.equal(readCall.includes('--no-view'), true, 'read-back records no view receipt');
+});
+
+test('verifyHumanMessageLanded: sequenceId-anchored read finds the message even when >25 newer events land (tail-clip case)', () => {
+  const parsed = { messageId: 'hm_x', sequenceId: 1000, senderId: 'human-mrrcarter' };
+  const seen = [];
+  // busy room: a plain --tail read would return only NEWER events (message clipped); the --before-sequence anchor reads
+  // the window ending at seq 1000, which INCLUDES the message.
+  const run = (args) => {
+    seen.push(args);
+    if (args[1] !== 'read') return '{}';
+    return args.includes('--before-sequence')
+      ? JSON.stringify({ events: [{ eventId: 'hm_x', sequenceId: 1000, agent: { id: 'human-mrrcarter' } }] })
+      : JSON.stringify({ events: [{ eventId: 'newer', sequenceId: 1050 }] }); // tail-only would clip the message
+  };
+  assert.equal(verifyHumanMessageLanded('s1', parsed, { run }), true);
+  const readCall = seen.find((a) => a[1] === 'read');
+  assert.equal(readCall[readCall.indexOf('--before-sequence') + 1], '1001', '--before-sequence = sequenceId + 1');
 });
 
 test('parseHumanMessageResult: message.senderId PRIMARY, event.agent.id corroboration, both-absent -> senderId null', () => {

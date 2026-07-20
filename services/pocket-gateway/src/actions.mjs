@@ -298,14 +298,19 @@ export function verifyHumanMessageLanded(sessionId, parsed, { run, attempts = 3 
   // reported no author (can't confirm identity).
   const author = (typeof parsed.senderId === 'string' && parsed.senderId) ? parsed.senderId : null;
   if (!author) return false;
+  // Read as the RUNNER's OWN identity (Warden: `--agent` is the READING identity, not an author filter — --agent <human>
+  // would read AS a human the runner isn't). ANCHOR the window on the KNOWN landing sequence (`--before-sequence seq+1`,
+  // parseHumanMessageResult already returns sequenceId) so the message is ALWAYS covered no matter how much traffic lands
+  // after it — a plain `--tail` clips in a high-traffic room (6cf7e861). `--no-view`: the read-back is an internal
+  // confirmation, never a user view, so it records NO view receipt. Identity is asserted by exact-eventId + who===author.
+  const seq = (typeof parsed.sequenceId === 'number' && parsed.sequenceId > 0) ? parsed.sequenceId : null;
+  const readArgs = seq
+    ? ['session', 'read', sessionId, '--remote', '--before-sequence', String(seq + 1), '--tail', '25', '--no-view', '--json']
+    : ['session', 'read', sessionId, '--remote', '--tail', '25', '--no-view', '--json'];
   for (let i = 0; i < attempts; i++) {
     try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
     let j;
-    // Read as the RUNNER's OWN identity — Warden empirically confirmed (live room 6cf7e861) that `--agent` is the READING
-    // identity, NOT an author filter: `--agent human-mrrcarter` would read AS a human the runner isn't (mis-attribution /
-    // failure), for ZERO filtering benefit. The humanMessage is the LATEST event (read-back runs right after the post), so
-    // a modest tail always covers it; identity is asserted by the exact-eventId find + who===author below, not the read.
-    try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '25', '--json'])); } catch { continue; }
+    try { j = JSON.parse(run(readArgs)); } catch { continue; }
     const hit = (j.events || []).find((e) => e && e.eventId === parsed.messageId); // EXACT message identity
     if (hit) {
       const who = (hit.agent && hit.agent.id) || hit.agentId;
