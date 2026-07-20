@@ -30,6 +30,16 @@ final class PocketUIDemoFixturesTests: XCTestCase {
         }))
     }
 
+    func testTypedEvidenceMatchesSignedFixtureAndUnlocksCanonicalFlow() throws {
+        let verifiedBundle = try loadVerifiedBundle()
+
+        XCTAssertEqual(verifiedBundle.bundle.evidence, PocketFixtures.evidence)
+        XCTAssertNotNil(PocketUIDemoFixtures.conversationState(
+            verifiedBundle: verifiedBundle,
+            includesCachedAnswer: false
+        ))
+    }
+
     func testProposalRequiresExactReadBackAndProducesOnlyPendingReceipt() throws {
         let verifiedBundle = try loadVerifiedBundle()
         let now = PocketFixtures.ts.addingTimeInterval(60)
