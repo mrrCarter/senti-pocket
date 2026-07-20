@@ -27,6 +27,28 @@ final class PocketUIDeviceFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons[PocketAccessibilityID.evidenceCard("ev_1")].exists)
     }
 
+    func testIncomingBriefingListenLaterReturnsCheckpointToInbox() {
+        launch(scenario: "incoming")
+
+        XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))
+        let listenLater = app.buttons[PocketAccessibilityID.listenLater]
+        XCTAssertTrue(listenLater.isHittable)
+        listenLater.tap()
+
+        XCTAssertTrue(element(PocketAccessibilityID.inboxScreen).waitForExistence(timeout: 5))
+        XCTAssertFalse(element(PocketAccessibilityID.conversationScreen).exists)
+
+        let deferredCheckpoint = app.buttons[PocketAccessibilityID.inboxItem(
+            sessionId: "954233b7-1822-42bc-9cfe-1eb95eb0357a",
+            checkpointId: "cp_954233b7_000012"
+        )]
+        XCTAssertTrue(deferredCheckpoint.waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            deferredCheckpoint.label.localizedCaseInsensitiveContains("Listen later"),
+            "The deferred checkpoint must retain its Listen later attention state"
+        )
+    }
+
     func testIncomingBriefingOffersPassiveListeningWithoutInteractionControls() {
         launch(scenario: "incoming")
 
