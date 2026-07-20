@@ -70,6 +70,19 @@ test('different tokens validate + cache independently (hashed key)', async () =>
   assert.equal(calls.length, 2);
 });
 
+test('cache is size-bounded: at capacity the OLDEST positive is evicted (re-validates)', async () => {
+  const { fetch, calls } = fakeFetch((_u, init) => meOk('u_' + init.headers.authorization));
+  const verify = createSentiSessionVerifier({ fetch, apiBaseUrl: 'https://a', maxCacheEntries: 2, now: () => 1000 });
+  await verify({ authorization: 'Bearer A' });                 // cache {A}
+  await verify({ authorization: 'Bearer B' });                 // cache {A,B}
+  await verify({ authorization: 'Bearer C' });                 // at cap -> evict oldest (A) -> cache {B,C}
+  assert.equal(calls.length, 3);
+  await verify({ authorization: 'Bearer B' });                 // still cached
+  assert.equal(calls.length, 3, 'B not evicted -> served from cache');
+  await verify({ authorization: 'Bearer A' });                 // A was evicted -> re-validated
+  assert.equal(calls.length, 4, 'A evicted -> re-fetched');
+});
+
 test('factory requires fetch + apiBaseUrl', () => {
   assert.throws(() => createSentiSessionVerifier({ apiBaseUrl: 'https://a' }), /fetch is required/);
   assert.throws(() => createSentiSessionVerifier({ fetch: async () => {} }), /apiBaseUrl is required/);

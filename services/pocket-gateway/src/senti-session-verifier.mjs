@@ -17,8 +17,12 @@ import { createHash } from 'node:crypto';
 // bar is <=60s and we default well under. Failures (401/403) are NEVER cached, so a revoked token stops validating within
 // one TTL at worst, immediately once the cache entry lapses.
 const DEFAULT_CACHE_TTL_MS = 20_000;
-const DEFAULT_SCOPES = ['sessions:read', 'sessions:write', 'pocket:voice']; // a real user session is not scope-limited
+// A validated user session is not scope-limited on its OWN data, so it gets the full Pocket scope set. NOTE: this makes
+// each route's hasScope() gate effectively always-true for a valid session — the REAL per-write authz is MEMBERSHIP
+// (knownSessionIdsFor + the /execute membership precheck), not scope granularity. Correct for the native-door model.
+const DEFAULT_SCOPES = ['sessions:read', 'sessions:write', 'pocket:voice'];
 const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_MAX_CACHE_ENTRIES = 5000; // bound the positive cache (evict oldest) so a long-warm instance can't grow unbounded
 
 /** length-prefixed segment — makes the principal string unambiguous (no humanId can inject a delimiter). */
 const lp = (s) => String(s).length + ':' + String(s);
@@ -37,7 +41,7 @@ const tokenKey = (authz) => createHash('sha256').update(authz).digest('base64url
  * @param {Function} [cfg.now]
  * @returns {(headers: object) => Promise<null | {humanId,principal,scopes,site,tokenClaims}>}
  */
-export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT_SCOPES, cacheTtlMs = DEFAULT_CACHE_TTL_MS, timeoutMs = DEFAULT_TIMEOUT_MS, now = () => Date.now() } = {}) {
+export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT_SCOPES, cacheTtlMs = DEFAULT_CACHE_TTL_MS, timeoutMs = DEFAULT_TIMEOUT_MS, maxCacheEntries = DEFAULT_MAX_CACHE_ENTRIES, now = () => Date.now() } = {}) {
   if (typeof fetch !== 'function') throw new Error('createSentiSessionVerifier: fetch is required');
   const base = String(apiBaseUrl || '').replace(/\/+$/, '');
   if (!base) throw new Error('createSentiSessionVerifier: apiBaseUrl is required');
@@ -50,7 +54,10 @@ export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT
 
     const key = tokenKey(authz);
     const hit = cache.get(key);
-    if (hit && hit.exp > now()) return hit.result;                    // fresh positive validation only
+    if (hit) {
+      if (hit.exp > now()) return hit.result;                         // fresh positive validation only
+      cache.delete(key);                                             // expired -> drop it, don't let stale positives linger
+    }
 
     const signal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') ? AbortSignal.timeout(timeoutMs) : undefined;
     let res;
@@ -64,6 +71,9 @@ export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT
 
     let me;
     try { me = await res.json(); } catch { return null; }
+    // Contract: GET /api/v1/auth/me returns the user with a TOP-LEVEL `id` (api auth route get_current_user -> UserResponse;
+    // corroborated by the shipped CLI create-sentinelayer/src/auth/service.js fetchCurrentUser -> normalizeUser, which
+    // reads user.id top-level). Pinned here so an api response reshape can't silently break B3 unnoticed.
     const humanId = me && (typeof me.id === 'string' && me.id ? me.id : null);
     if (!humanId) return null;                                        // no identity -> fail-closed
 
@@ -76,6 +86,9 @@ export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT
       site: null,
       tokenClaims: { authMethod: 'senti_session', via: 'auth/me' },
     };
+    // Bound the cache: at capacity evict the OLDEST entry (Map preserves insertion order). Positives also drop on expiry
+    // (above) + on any observed failure; this cap covers tokens validated once and never seen again (long-warm instance).
+    if (cache.size >= maxCacheEntries) { const oldest = cache.keys().next().value; if (oldest !== undefined) cache.delete(oldest); }
     cache.set(key, { result, exp: now() + cacheTtlMs });
     return result;
   };
