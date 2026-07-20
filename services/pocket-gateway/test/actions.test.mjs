@@ -44,6 +44,15 @@ test('canonicalPayload matches the frozen v0.1.8 v3 format exactly (@7e1cfbe, so
   assert.equal(canonicalPayload(p), 'pocket.actionproposal.v3\n2:p113:threadedReply2:s13:1006:post X13:17528352000000');
 });
 
+test('KAV: humanMessage(seq=0) canonicalPayload + proposalHash pin Node<->Swift byte-parity (Forge #2 — cross-verify on Mac)', () => {
+  // THE authority path posts AS human-mrrcarter (Carter himself) — asserted != tested until this KAV is green on
+  // BOTH impls. Swift ActionProposal.computeHash MUST produce these identical canonical bytes + hash for this proposal.
+  const p = { id: 'p1', kind: 'humanMessage', targetSessionId: 's1', targetSequence: 0, renderedPreview: 'post X', createdAt: new Date(1752835200 * 1000), sourceQuestionId: null };
+  // seq=0 -> "1:0" sentinel (lp(String(0))="1:0", byte-exact w/ Swift @9842cef); kind -> "12:humanMessage".
+  assert.equal(canonicalPayload(p), 'pocket.actionproposal.v3\n2:p112:humanMessage2:s11:06:post X13:17528352000000');
+  assert.equal(computeProposalHash(p), 'NaD2_tUZjseqqQzhGfROsNKxELJOYyHCWsmeVW9dmFM');
+});
+
 test('KAV: Node proposalHash byte-matches the Swift v0.1.8 v3 known-answer vector (@7e1cfbe)', async () => {
   const p = { id: 'p1', kind: 'threadedReply', targetSessionId: 's1', targetSequence: 100, renderedPreview: 'post X', createdAt: new Date(1752835200 * 1000), sourceQuestionId: null };
   assert.equal(computeProposalHash(p), 'Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY', 'Node hash == Swift v3 KAV @7e1cfbe');
