@@ -31,6 +31,19 @@ const lp = (s) => String(s).length + ':' + String(s);
 const tokenKey = (authz) => createHash('sha256').update(authz).digest('base64url');
 
 /**
+ * Replicates the api's `_normalize_human_sender` (session_relay_service.py): the EXACT identity a human write is authored
+ * under = human-<normalize(github_username || user_id)>. The gateway's read-back MUST match this, NOT `human-<user.id>` —
+ * `id` and `github_username` are distinct UserResponse fields, so deriving the read-back from `id` would miss every
+ * landed write (false-'failed'). Prefers github_username, falls back to the user id, then 'human'.
+ */
+function humanSenderId(githubUsername, userId) {
+  const norm = (v) => (typeof v === 'string' ? v : '').trim();
+  const candidate = norm(githubUsername) || norm(userId) || 'human';
+  const normalized = candidate.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'human';
+  return 'human-' + normalized;
+}
+
+/**
  * @param {object}   cfg
  * @param {Function} cfg.fetch        injected fetch (deploy-owned transport)
  * @param {string}   cfg.apiBaseUrl   api ORIGIN (GET /api/v1/auth/me is appended)
@@ -80,8 +93,11 @@ export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT
     const result = {
       humanId,
       // Distinct principal namespace from AIdenID tokens (prefix), so SENTI + AIdenID durable state never collide for
-      // the same humanId. The user id IS the stable anchor for a user session (not a pairwise sub).
+      // the same humanId. The user id IS the stable, collision-free anchor for principal/membership (not a pairwise sub).
       principal: 'pocket.principal.senti.v1\n' + lp(humanId),
+      // The EXACT identity the api authors human writes under (github_username-derived) — the read-back must match THIS,
+      // not human-<user.id>. Kept separate from humanId so principal/membership stay keyed on the canonical id.
+      humanAgentId: humanSenderId(me.github_username, humanId),
       scopes: [...grantedScopes],
       site: null,
       tokenClaims: { authMethod: 'senti_session', via: 'auth/me' },

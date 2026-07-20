@@ -10,7 +10,7 @@ function fakeFetch(handler) {
   const fetch = async (url, init) => { calls.push({ url, init }); return handler(url, init, calls.length); };
   return { fetch, calls };
 }
-const meOk = (id) => ({ ok: true, status: 200, json: async () => ({ id, email: 'x@example.com' }) });
+const meOk = (id, github = 'GhUser') => ({ ok: true, status: 200, json: async () => ({ id, github_username: github, email: 'x@example.com' }) });
 const httpStatus = (s) => ({ ok: s >= 200 && s < 300, status: s, json: async () => ({ error: 'no' }) });
 
 test('valid SENTI bearer -> GET /auth/me -> {humanId, principal, scopes}', async () => {
@@ -22,7 +22,21 @@ test('valid SENTI bearer -> GET /auth/me -> {humanId, principal, scopes}', async
   assert.equal(calls[0].init.headers.authorization, 'Bearer SENTI_TOK'); // caller token forwarded verbatim
   assert.equal(ctx.humanId, 'user_42');
   assert.equal(ctx.principal, 'pocket.principal.senti.v1\n7:user_42'); // distinct namespace + length-prefixed
+  assert.equal(ctx.humanAgentId, 'human-ghuser'); // read-back identity from github_username (normalized), NOT the raw id
   assert.deepEqual(ctx.scopes, ['sessions:read', 'sessions:write', 'pocket:voice']);
+});
+
+test('humanAgentId matches the api author identity (_normalize_human_sender): github preferred, normalized, id-fallback', async () => {
+  const mk = (fetchImpl) => createSentiSessionVerifier({ fetch: fetchImpl, apiBaseUrl: 'https://a' });
+  // github_username preferred + lowercased (mrrCarter -> human-mrrcarter, matching the live room)
+  const g = await mk(async () => ({ ok: true, status: 200, json: async () => ({ id: 'uuid-1', github_username: 'mrrCarter' }) }))({ authorization: 'Bearer t' });
+  assert.equal(g.humanAgentId, 'human-mrrcarter');
+  // special chars -> dash-collapsed + trimmed
+  const s = await mk(async () => ({ ok: true, status: 200, json: async () => ({ id: 'uuid-2', github_username: 'Foo@Bar! Baz' }) }))({ authorization: 'Bearer t' });
+  assert.equal(s.humanAgentId, 'human-foo-bar-baz');
+  // no github_username -> falls back to the user id
+  const f = await mk(async () => ({ ok: true, status: 200, json: async () => ({ id: 'User_9' }) }))({ authorization: 'Bearer t' });
+  assert.equal(f.humanAgentId, 'human-user_9');
 });
 
 test('fail-closed: 401 -> null and NOT cached (a revoked token keeps failing)', async () => {

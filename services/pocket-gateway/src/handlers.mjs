@@ -257,7 +257,11 @@ export function createGateway(deps) {
         // the write authors as human-mrrcarter under the user's own identity. Unused for agent-kind proposals.
         postHumanMessage: deps.postHumanMessage,
         userToken: (req.headers && (req.headers.authorization || req.headers.Authorization)) || undefined,
-        humanId: ctx.humanId ? `human-${ctx.humanId}` : undefined,
+        // Read-back identity MUST equal the identity the api AUTHORS the human write under. The SENTI verifier computes it
+        // (ctx.humanAgentId = human-<normalize(github_username||id)>, matching the api's _normalize_human_sender). Falling
+        // back to `human-${humanId}` only for a verifier that doesn't supply it — deriving from the raw id would miss the
+        // landed write (github_username != id) and false-'failed' every human write.
+        humanId: ctx.humanAgentId || (ctx.humanId ? `human-${ctx.humanId}` : undefined),
       });
       const persisted = map.get(id); // posted / emitted marker
       if (persisted) await deps.store.put(key, persisted);
