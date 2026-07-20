@@ -3,7 +3,7 @@
 // fail-closed on bad auth / non-member — the same gated invariants as prod, over an in-memory store + dev receipt key.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createLiveDemoGateway } from '../src/live-demo.mjs';
+import { createLiveDemoGateway, createLiveDemoServer } from '../src/live-demo.mjs';
 import { computeProposalHash } from '../src/actions.mjs';
 
 const KNOWN = '6cf7e861-546a-4b9f-b937-39182a5bd395';
@@ -75,6 +75,13 @@ test('LIVE-DEMO non-member => 403 before any post (membership precheck holds in 
   const out = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer SENTI_USER_TOK' }, body: JSON.stringify({ proposal: p, confirmation: makeConfirm(p) }) });
   assert.equal(out.status, 403);
   assert.equal(calls.some((c) => c.url.includes('/human-message')), false, 'no post for a non-member');
+});
+
+test('createLiveDemoServer constructs an http server (listen/close) wired to the live-demo gateway', () => {
+  const { server } = createLiveDemoServer({ apiBaseUrl: 'https://a', fetch: async () => {}, run: () => '{}', knownSessionIdsFor: async () => [] });
+  assert.equal(typeof server.listen, 'function');
+  assert.equal(typeof server.close, 'function');
+  server.close();
 });
 
 test('factory requires apiBaseUrl + run + knownSessionIdsFor (fetch defaults to global)', () => {
