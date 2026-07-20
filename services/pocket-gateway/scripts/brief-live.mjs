@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { createPublicKey } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { verifyBundle } from '../src/bundle.mjs';
+import { AUDIO_TAG_HINT, splitTagged } from '../src/audio-tags.mjs';
 
 const OPENAI = process.env.OPENAI_API_KEY;
 const ELEVEN = process.env.ELEVENLABS_API_KEY;
@@ -30,7 +31,7 @@ if (!verified) { console.error('REFUSED: checkpoint signature did not verify —
 
 // Ground the LLM strictly on the checkpoint summary/evidence — no invention.
 const facts = JSON.stringify({ summary: bundle.summary, evidence: bundle.evidence, sessionId: bundle.sessionId }, null, 0);
-const sys = 'You are Senti, an AI that phones its founder with a spoken status briefing. Speak in second person, warm, concise (<=90 words), spoken-word cadence (no bullet chars, no markdown). Ground EVERY claim strictly in the provided checkpoint JSON; invent nothing. End with the single most important decision or blocker.';
+const sys = 'You are Senti, an AI that phones its founder with a spoken status briefing. Speak in second person, warm, concise (<=90 words), spoken-word cadence (no bullet chars, no markdown). Ground EVERY claim strictly in the provided checkpoint JSON; invent nothing. End with the single most important decision or blocker. ' + AUDIO_TAG_HINT;
 const chat = await fetch('https://api.openai.com/v1/chat/completions', {
   method: 'POST', headers: { Authorization: `Bearer ${OPENAI}`, 'Content-Type': 'application/json' },
   body: JSON.stringify({ model: 'gpt-4o-mini', temperature: 0.3,
@@ -38,20 +39,23 @@ const chat = await fetch('https://api.openai.com/v1/chat/completions', {
 });
 if (!chat.ok) { console.error('LLM error', chat.status, (await chat.text()).slice(0, 300)); process.exit(4); }
 const text = (await chat.json()).choices[0].message.content.trim();
-console.log('\n=== Senti is calling — LIVE briefing (signature VERIFIED ✓) ===\n' + text + '\n');
+// Author ONCE with audio tags: ElevenLabs voices the tagged form; plain-TTS / AVSpeech get the stripped form.
+const { tagged, plain } = splitTagged(text);
+console.log('\n=== Senti is calling — LIVE briefing (signature VERIFIED ✓) ===\n' + plain + '\n');
+console.log('[audio-tagged form, ready for the ElevenLabs switch]\n' + tagged + '\n');
 
-// Voice: ElevenLabs if keyed, else OpenAI TTS.
+// Voice: ElevenLabs if keyed (tagged), else OpenAI TTS (plain).
 let audio;
 if (ELEVEN) {
   const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE}`, {
     method: 'POST', headers: { 'xi-api-key': ELEVEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, model_id: 'eleven_turbo_v2_5' }) });
+    body: JSON.stringify({ text: tagged, model_id: 'eleven_turbo_v2_5' }) });
   if (!r.ok) { console.error('ElevenLabs error', r.status, (await r.text()).slice(0, 200)); process.exit(5); }
   audio = Buffer.from(await r.arrayBuffer());
 } else {
   const r = await fetch('https://api.openai.com/v1/audio/speech', {
     method: 'POST', headers: { Authorization: `Bearer ${OPENAI}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'gpt-4o-mini-tts', voice: 'shimmer', input: text }) });
+    body: JSON.stringify({ model: 'gpt-4o-mini-tts', voice: 'shimmer', input: plain }) });
   if (!r.ok) { console.error('OpenAI TTS error', r.status, (await r.text()).slice(0, 200)); process.exit(5); }
   audio = Buffer.from(await r.arrayBuffer());
 }
