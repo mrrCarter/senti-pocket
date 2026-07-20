@@ -47,3 +47,30 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: false
         SWIFT_VERSION: "5.9"
+  # XCUITest device/sim target (Atlas-owned per Pulse #249472) — enables the DeviceUITests to run at all.
+  # The app-under-test is wired via the `target: SentiPocketApp` dependency (XcodeGen sets the target application).
+  # Forge runs a NAMED single test until Atlas maps the -PocketUITestScenario reducer for the other 14.
+  SentiPocketAppUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: ../../packages/PocketUI/DeviceUITests
+    dependencies:
+      - target: SentiPocketApp
+      - package: PocketUI
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_VERSION: "5.9"
+schemes:
+  SentiPocketApp:
+    build:
+      targets:
+        SentiPocketApp: all
+        SentiPocketAppUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SentiPocketAppUITests
