@@ -1,45 +1,40 @@
-// app.mjs — deploy composition: wires the REAL components (AIdenID verifier + DynamoDB store + ElevenLabs TTS +
+// app.mjs — deploy composition: wires the REAL components (SENTI-session verifier + DynamoDB store + ElevenLabs TTS +
 // governed gateway) into a Lambda handler. Zero-dep: the deploy INJECTS the externals it owns (a DynamoDB
-// DocumentClient, the AIdenID JWKS, the Ed25519 signing key from KMS/Secrets Manager, a senti `run`ner, fetch).
+// DocumentClient, the Ed25519 signing key from KMS/Secrets Manager, a senti `run`ner, fetch).
 // Scalar config comes from `env`. Nothing here reaches out on its own — all boundaries are explicit + testable.
 import { createGateway } from './handlers.mjs';
 import { createHumanMessageClient } from './human-message-client.mjs';
-import { createAidenIdVerifier } from './auth.mjs';
-import { createDynamoStore, createStoreReplayGuard } from './store.mjs';
+import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
+import { createDynamoStore } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { lambdaHandler } from './lambda.mjs';
 
 /**
- * @param {object} env    scalar config (AIDENID_ISSUER, GATEWAY_AUDIENCE, DDB_TABLE, SIGNING_KEY_ID, TTS_VOICE_ID, REQUIRE_DPOP, ELEVENLABS_API_KEY)
+ * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID, ELEVENLABS_API_KEY)
  * @param {object} deps   injected externals the deploy owns:
- *   { dynamoClient, jwks, signingKey, run, knownSessionIdsFor, bundleStore, fetch }
+ *   { dynamoClient, signingKey, run, knownSessionIdsFor, bundleStore, fetch }
  *   - dynamoClient: @aws-sdk/lib-dynamodb DocumentClient (get/put/delete)
- *   - jwks: AIdenID public keys (fetched + cached from the JWKS endpoint)
  *   - signingKey: Ed25519 private key (KMS/Secrets Manager) for receipts
+ *   - fetch: validates SENTI sessions (GET /auth/me) + posts the human write — the gateway holds NO signing secret
  *   - run: a senti writeback runner (bundled sl or a senti API client) — `POST /actions/execute` uses it
  *   - knownSessionIdsFor(humanId): the sessions the human may write to (server-derived authorization)
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
  */
 export function createProdGateway(env = {}, deps = {}) {
-  // FAIL BOOT if any production binding is absent (Echo P0): all of these gate real security decisions — a missing
-  // issuer/audience/resource/siteId would silently SKIP that check in the verifier. Never boot half-configured.
-  // SENTI_API_BASE_URL gates the HUMAN write door — required so deps.postHumanMessage is always constructed (see below).
-  const missingEnv = ['AIDENID_ISSUER', 'GATEWAY_AUDIENCE', 'GATEWAY_RESOURCE', 'GATEWAY_SITE_ID', 'DDB_TABLE', 'SIGNING_KEY_ID', 'GATEWAY_PUBLIC_URL', 'SENTI_API_BASE_URL']
+  // FAIL BOOT if any production binding is absent (Echo P0). SENTI_API_BASE_URL is load-bearing twice: it's where the
+  // gateway VALIDATES the caller's SENTI session (verifyToken -> GET /auth/me) AND where the human write posts.
+  const missingEnv = ['DDB_TABLE', 'SIGNING_KEY_ID', 'GATEWAY_PUBLIC_URL', 'SENTI_API_BASE_URL']
     .filter((k) => !env[k]);
   if (missingEnv.length) throw new Error('pocket-gateway prod config missing: ' + missingEnv.join(', '));
-  if (!deps.dynamoClient || !Array.isArray(deps.jwks) || deps.jwks.length === 0 || !deps.signingKey || typeof deps.knownSessionIdsFor !== 'function' || typeof deps.fetch !== 'function') {
-    throw new Error('pocket-gateway prod deps missing: dynamoClient + non-empty jwks + signingKey + knownSessionIdsFor + fetch are required');
+  if (!deps.dynamoClient || !deps.signingKey || typeof deps.knownSessionIdsFor !== 'function' || typeof deps.fetch !== 'function') {
+    throw new Error('pocket-gateway prod deps missing: dynamoClient + signingKey + knownSessionIdsFor + fetch are required');
   }
   const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
-  const verifyToken = createAidenIdVerifier({
-    jwks: deps.jwks,
-    issuer: env.AIDENID_ISSUER,
-    audience: env.GATEWAY_AUDIENCE,
-    resource: env.GATEWAY_RESOURCE,
-    siteId: env.GATEWAY_SITE_ID,
-    requireDpop: true,                                    // prod tokens MUST be sender-constrained (DPoP)
-    replayGuard: createStoreReplayGuard(store),           // DPoP jti single-use across Lambda instances
-  });
+  // Pocket-native auth (B3): pocket-gateway is Pocket-PRIVATE — all routes are Pocket-app routes, NO external-MCP/DPoP
+  // resource-server surface — so it authenticates the caller's ONE SENTI user-session token by CALLING the api
+  // (GET /auth/me). It holds NO signing secret and can never mint a session (the api's HS256 secret never leaves the
+  // api). Membership stays the server-derived knownSessionIdsFor(humanId); the SAME token is forwarded to the human write.
+  const verifyToken = createSentiSessionVerifier({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
   const ttsBackend = env.ELEVENLABS_API_KEY
     ? createElevenLabsBackend({ apiKey: env.ELEVENLABS_API_KEY, fetch: deps.fetch, defaultVoiceId: env.TTS_VOICE_ID })
     : undefined;
