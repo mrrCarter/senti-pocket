@@ -172,6 +172,26 @@ private struct CanonicalVerifiedBundlePreview<Content: View>: View {
 }
 
 @available(iOS 17.0, macOS 14.0, *)
+#Preview("Briefing — verified listen only") {
+    CanonicalVerifiedBundlePreview { verifiedBundle in
+        NavigationStack {
+            ConversationView(
+                state: ConversationState(
+                    verifiedBundle: verifiedBundle,
+                    briefingPlan: PocketFixtures.briefingPlan,
+                    transcript: PocketFixtures.briefingPlan.segments.map(ConversationEntry.briefing),
+                    voiceState: .speaking(segmentId: "b2"),
+                    isPushToTalkActive: false,
+                    interactionMode: .listenOnly
+                ),
+                connectivity: .offline(cachedAt: verifiedBundle.bundle.createdAt),
+                send: { _ in }
+            )
+        }
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, *)
 #Preview("Conversation — integrity blocked") {
     CanonicalVerifiedBundlePreview { verifiedBundle in
         let bundle = verifiedBundle.bundle

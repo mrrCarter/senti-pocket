@@ -1,19 +1,42 @@
 import SwiftUI
 import PocketContracts
 import PocketCall   // VerifiedBundle — the ONLY trusted way to hold a bundle
+import PocketUI
 
 /// App shell (Atlas). The end-to-end state machine + lane feature views plug in here as they land.
 /// For Sunday watchability, every screen ships a #Preview wired to the canonical fixture so the Xcode
 /// canvas renders live on `git pull` + open — no simulator run required to see progress.
 @main
 struct SentiPocketApp: App {
+    #if DEBUG
+    @StateObject private var model = PocketAppModel()
+    #endif
+
     var body: some Scene {
         WindowGroup {
-            RootView()   // ships the fail-closed verified briefing; never blank tabs. AppShell (injection-only) mounts
-                         // as `AppShell(sessions:{…}, activity:{…})` once Pulse supplies the real Sessions/Activity screens.
+            #if DEBUG
+            RootAppView(model: model)
+            #else
+            RootView()
+            #endif
         }
     }
 }
+
+#if DEBUG
+/// DEBUG uses the canonical verified fixture and the in-module demo seam. Release never names that seam.
+private struct RootAppView: View {
+    @ObservedObject var model: PocketAppModel
+
+    var body: some View {
+        if model.verifiedBundle != nil {
+            PocketRootView(state: model.state, send: model.send)
+        } else {
+            RootView()
+        }
+    }
+}
+#endif
 
 /// Placeholder root until Pulse's PocketUI lands. FAIL-CLOSED: it decodes the cached checkpoint and then
 /// requires `VerifiedBundle.verify` (trusted signingKeyId + semantic validity + ed25519 under the pinned key)

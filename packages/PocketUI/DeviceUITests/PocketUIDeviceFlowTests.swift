@@ -27,6 +27,65 @@ final class PocketUIDeviceFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons[PocketAccessibilityID.evidenceCard("ev_1")].exists)
     }
 
+    func testIncomingBriefingListenLaterReturnsCheckpointToInbox() {
+        launch(scenario: "incoming")
+
+        XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))
+        let listenLater = app.buttons[PocketAccessibilityID.listenLater]
+        XCTAssertTrue(listenLater.isHittable)
+        listenLater.tap()
+
+        XCTAssertTrue(element(PocketAccessibilityID.inboxScreen).waitForExistence(timeout: 5))
+        XCTAssertFalse(element(PocketAccessibilityID.conversationScreen).exists)
+
+        let deferredCheckpoint = app.buttons[PocketAccessibilityID.inboxItem(
+            sessionId: "954233b7-1822-42bc-9cfe-1eb95eb0357a",
+            checkpointId: "cp_954233b7_000012"
+        )]
+        XCTAssertTrue(deferredCheckpoint.waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            deferredCheckpoint.label.localizedCaseInsensitiveContains("Listen later"),
+            "The deferred checkpoint must retain its Listen later attention state"
+        )
+    }
+
+    func testIncomingBriefingOffersPassiveListeningWithoutInteractionControls() {
+        launch(scenario: "incoming")
+
+        XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons[PocketAccessibilityID.answer].isHittable)
+        XCTAssertTrue(app.buttons[PocketAccessibilityID.listenLater].isHittable)
+
+        let listenToBriefing = app.buttons[PocketAccessibilityID.listenToBriefing]
+        XCTAssertTrue(listenToBriefing.isHittable)
+        listenToBriefing.tap()
+
+        XCTAssertTrue(element(PocketAccessibilityID.conversationScreen).waitForExistence(timeout: 5))
+        XCTAssertTrue(element(PocketAccessibilityID.listenOnlyStatus).exists)
+        XCTAssertFalse(app.buttons[PocketAccessibilityID.pushToTalk].exists)
+        XCTAssertFalse(app.buttons[PocketAccessibilityID.interrupt].exists)
+        XCTAssertFalse(app.buttons[PocketAccessibilityID.proposalConfirm].exists)
+
+        let readingStatus = app.staticTexts["Senti is reading the briefing"]
+        XCTAssertTrue(readingStatus.waitForExistence(timeout: 5))
+
+        let stop = app.buttons[PocketAccessibilityID.stop]
+        XCTAssertTrue(stop.isHittable)
+        stop.tap()
+        XCTAssertTrue(app.staticTexts["Briefing complete"].waitForExistence(timeout: 5))
+
+        let replay = app.buttons[PocketAccessibilityID.replay]
+        XCTAssertTrue(replay.isHittable)
+        replay.tap()
+        XCTAssertTrue(readingStatus.waitForExistence(timeout: 5))
+
+        let done = app.buttons[PocketAccessibilityID.listenOnlyDone]
+        XCTAssertTrue(done.isHittable)
+        done.tap()
+        XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))
+        XCTAssertFalse(element(PocketAccessibilityID.conversationScreen).exists)
+    }
+
     func testProposalRequiresExactReadBackBeforeOneConfirmation() {
         launch(scenario: "proposal")
 
@@ -187,6 +246,7 @@ final class PocketUIDeviceFlowTests: XCTestCase {
 
         XCTAssertTrue(element(PocketAccessibilityID.incomingScreen).waitForExistence(timeout: 5))
         XCTAssertFalse(app.buttons[PocketAccessibilityID.answer].isEnabled)
+        XCTAssertFalse(app.buttons[PocketAccessibilityID.listenToBriefing].isEnabled)
         XCTAssertFalse(element(PocketAccessibilityID.conversationScreen).exists)
     }
 

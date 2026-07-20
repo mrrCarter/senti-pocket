@@ -12,8 +12,8 @@ public enum PocketFixtures {
     public static let sessionId = "954233b7-1822-42bc-9cfe-1eb95eb0357a"
 
     public static let evidence: [EvidenceRef] = [
-        EvidenceRef(id: "ev_1", sessionId: sessionId, sequence: 230141, agentId: "claude-pocket-relay", snippet: "ACCESS_TOKEN_PATTERN now matches atk_<payload>.<43-char-HMAC>", ts: ts),
-        EvidenceRef(id: "ev_2", sessionId: sessionId, sequence: 230160, agentId: "claude-warden", snippet: "entryPoint predicate is now exact-equality; positive-accept fixture present", ts: ts)
+        EvidenceRef(id: "ev_1", sessionId: sessionId, sequence: 230141, agentId: "claude-pocket-relay", snippet: "ACCESS_TOKEN_PATTERN now matches atk_<payload>.<43-char-HMAC>", ts: Date(timeIntervalSince1970: 1_784_370_900)),   // 2026-07-18T10:35:00Z — matches signed fixture ev_1 (per-evidence ts, not the shared `ts`)
+        EvidenceRef(id: "ev_2", sessionId: sessionId, sequence: 230160, agentId: "claude-warden", snippet: "entryPoint predicate is now exact-equality; positive-accept fixture present", ts: Date(timeIntervalSince1970: 1_784_370_994))   // 2026-07-18T10:36:34Z — matches signed fixture ev_2
     ]
 
     public static let briefingPlan = BriefingPlan(checkpointId: "cp_954233b7_000012", segments: [

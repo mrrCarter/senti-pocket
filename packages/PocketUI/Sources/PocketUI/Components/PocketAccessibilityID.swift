@@ -11,6 +11,7 @@ public enum PocketAccessibilityID {
 
     public static let incomingScreen = "pocket.incoming.screen"
     public static let answer = "pocket.incoming.answer"
+    public static let listenToBriefing = "pocket.incoming.listenToBriefing"
     public static let listenLater = "pocket.incoming.listenLater"
     public static let snooze = "pocket.incoming.snooze"
 
@@ -18,6 +19,8 @@ public enum PocketAccessibilityID {
     public static let conversationIntegrityBlocked = "pocket.conversation.integrityBlocked"
     public static let conversationIntegrityBlockedEnd = "pocket.conversation.integrityBlocked.end"
     public static let conversationTranscript = "pocket.conversation.transcript"
+    public static let listenOnlyStatus = "pocket.conversation.listenOnlyStatus"
+    public static let listenOnlyDone = "pocket.conversation.listenOnlyDone"
     public static let interrupt = "pocket.conversation.interrupt"
     public static let pushToTalk = "pocket.conversation.pushToTalk"
     public static let stop = "pocket.conversation.stop"

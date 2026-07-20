@@ -26,6 +26,7 @@ public enum SnoozeOption: Hashable, CaseIterable, Sendable {
 public enum PocketUIIntent: Equatable, Sendable {
     case selectCheckpoint(CheckpointContext)
     case answer(CheckpointContext)
+    case listenToBriefing(CheckpointContext)
     case listenLater(CheckpointContext)
     case snooze(CheckpointContext, SnoozeOption)
     case callSenti(CheckpointContext)
