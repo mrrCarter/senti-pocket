@@ -16,6 +16,8 @@ public enum PocketProductIntent: Equatable, Sendable {
     case refreshActivity(sessionId: String)
     case openEvent(sessionId: String, sequenceId: Int64)
     case openAction(sessionId: String, actionId: String)
+    case refreshCheckpoints(sessionId: String)
+    case openCheckpoint(sessionId: String, checkpointId: String)
 }
 
 /// A deliberately credential-free projection of the native authorization coordinator.
