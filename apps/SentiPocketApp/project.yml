@@ -12,12 +12,16 @@ packages:
     path: ../../packages/PocketContracts
   PocketCall:
     path: ../../packages/PocketCall
-  PocketBriefing:
-    path: ../../packages/PocketBriefing
   PocketUI:
     path: ../../packages/PocketUI
-  PocketVoice:
-    path: ../../packages/PocketVoice
+  PocketReasoning:
+    path: ../../packages/PocketReasoning
+  # PocketBriefing CUT from the app target 2026-07-20 (Atlas, per Warden #252313): the rich briefing is SERVER-SIDE
+  # now (Relay's gateway reasons via a cloud LLM), so BriefingBuilder is off the Release critical path. Package stays
+  # on disk — it's the home for Echo's LATER on-device offline briefing (Gemma). Cut-from-target, NOT deleted.
+  # PocketVoice CUT from the app target 2026-07-20 (Atlas, per Pulse #251864): app STT is Apple on-device Speech
+  # (OnDeviceSpeechRecognizer), NOT PocketVoice/whisper.cpp — zero `import PocketVoice` in the app closure. The
+  # package stays on disk; re-add WITH a real import when on-device Whisper STT actually ships (needs PrivacyInfo).
   # Relay's PocketSyncClient/PocketActionsClient are Phase-B (real gateway); not wired for the Phase-A fixture build.
 targets:
   SentiPocketApp:
@@ -30,9 +34,8 @@ targets:
     dependencies:
       - package: PocketContracts
       - package: PocketCall
-      - package: PocketBriefing
       - package: PocketUI
-      - package: PocketVoice
+      - package: PocketReasoning
     info:
       path: Sources/Info.plist
       properties:
