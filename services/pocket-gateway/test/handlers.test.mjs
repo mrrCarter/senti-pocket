@@ -122,6 +122,42 @@ test('GET /checkpoint is fail-closed: non-member => 403, no scope => 403, no tok
   assert.equal((await gw.handle({ method: 'GET', path: '/checkpoint', query: { sessionId: KNOWN }, headers: {} })).status, 401);
 });
 
+test('POST /answer grounds in the VERIFIED checkpoint and answers with a grounded citation', async () => {
+  const reason = async ({ groundedEvidenceIds }) => ({
+    text: 'Relay fixed the parser.',
+    taggedText: '[calm] Relay fixed the parser.',
+    evidenceIds: groundedEvidenceIds.slice(0, 1), // cite a REAL grounded id from the verified bundle
+    llmConfidence: 0.9,
+  });
+  const gw = createGateway(baseDeps({ run: cpRun, reason }));
+  const r = await gw.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'what did relay do?' }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.status, 'answered');
+  assert.ok(r.body.answer.evidenceIds.length >= 1); // grounded citation survived routing
+  assert.equal(r.body.checkpointId, 'cp_test_1');    // provenance: which verified checkpoint it reasoned from
+});
+
+test('POST /answer does NOT answer a confident LLM with no grounded citation (grounding-first, reason-dont-refuse)', async () => {
+  // Confidently wrong: high confidence but the only cite is NOT in the checkpoint grounding.
+  const reason = async () => ({ text: 'Absolutely, it deployed.', evidenceIds: ['ev_hallucinated'], llmConfidence: 0.99 });
+  const gw = createGateway(baseDeps({ run: cpRun, reason }));
+  const r = await gw.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'did it deploy?' }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.notEqual(r.body.status, 'answered'); // confident-but-ungrounded is NEVER "answered"
+  assert.equal(r.body.status, 'clarify');     // grounding exists -> clarify (not a flat refuse, not a hallucinated cite)
+});
+
+test('POST /answer is fail-closed: non-member 403, no scope 403, no token 401, no reason backend 501', async () => {
+  const reason = async ({ groundedEvidenceIds }) => ({ text: 'x', evidenceIds: groundedEvidenceIds.slice(0, 1), llmConfidence: 0.9 });
+  const nonMember = createGateway(baseDeps({ run: cpRun, reason, knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
+  assert.equal((await nonMember.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'q' }, headers: { authorization: 'Bearer good' } })).status, 403);
+  const gw = createGateway(baseDeps({ run: cpRun, reason }));
+  assert.equal((await gw.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'q' }, headers: { authorization: 'Bearer noscope' } })).status, 403);
+  assert.equal((await gw.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'q' }, headers: {} })).status, 401);
+  const noReason = createGateway(baseDeps({ run: cpRun })); // deps.reason not configured
+  assert.equal((await noReason.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'q' }, headers: { authorization: 'Bearer good' } })).status, 501);
+});
+
 test('GET /checkpoint: no durable checkpoint => honest 503 retryable, never a fabricated bundle', async () => {
   const emptyRun = (args) => (args.includes('list') ? '[]' : args.includes('export') ? JSON.stringify(CP_EXPORT) : '{}');
   const gw = createGateway(baseDeps({ run: emptyRun }));

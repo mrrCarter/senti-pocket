@@ -12,6 +12,7 @@ import { withLock } from './store.mjs';
 import { extractCheckpoint } from './extract.mjs';
 import { summarize } from './summarize.mjs';
 import { buildSignedBundle } from './bundle.mjs';
+import { routeAnswer } from './reasoning-router.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -98,6 +99,58 @@ export function createGateway(deps) {
       return json(503, { error: 'checkpoint not available', reason: String((e && e.message) || e), retryable: true });
     }
     return json(200, { bundle });
+  }
+
+  // POST /answer — the "reason / clarify, don't refuse" fix (Carter). Grounds a question in the
+  // session's exact VERIFIED checkpoint and routes GROUNDING-FIRST (routeAnswer): a confident LLM
+  // with no retrieval grounding is NEVER "answered" — it becomes clarify/unavailable, never a flat
+  // refuse and never a hallucinated cite. Fail-closed like /checkpoint: membership-gated (no confused
+  // deputy), reasons ONLY over a signature-verified bundle (never synthesizes), honest 503 when no
+  // durable checkpoint exists. The LLM key lives ONLY in deps.reason — it never reaches the phone.
+  async function handleAnswer(req, ctx) {
+    if (!hasScope(ctx, SCOPES.sync)) return json(403, { error: 'missing scope ' + SCOPES.sync });
+    if (typeof deps.reason !== 'function') return json(501, { error: 'reasoning backend not configured' });
+    if (!deps.signingKey) return json(501, { error: 'signing not configured' });
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    const sessionId = body.sessionId;
+    const question = typeof body.question === 'string' ? body.question.trim() : '';
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
+    if (!question) return json(400, { error: 'question required' });
+    if (Buffer.byteLength(question, 'utf8') > 4096) return json(413, { error: 'question exceeds 4096 bytes' });
+    // Server-derived membership authz: reason ONLY over a session this principal belongs to.
+    let known = [];
+    try { known = await deps.knownSessionIdsFor(ctx.principal || ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
+    const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
+    // Fail-closed: reason ONLY over a signature-verified checkpoint bundle (never over an unverified/synthesized one).
+    let bundle;
+    try {
+      const checkpointId = body.checkpointId || undefined;
+      const extracted = extractCheckpoint(sessionId, { run: deps.run, checkpointId });
+      const summary = summarize(extracted.rawCheckpoint, extracted.checkpoint);
+      bundle = buildSignedBundle(extracted.rawCheckpoint, summary, deps.signingKey, { signingKeyId: deps.signingKeyId, createdAt: now() });
+    } catch (e) {
+      return json(503, { error: 'checkpoint not available', reason: String((e && e.message) || e), retryable: true });
+    }
+    // The GROUNDING = evidence ids in the verified bundle. routeAnswer intersects the LLM's claimed
+    // cites with this set (dropping hallucinated ones), so a citation can only be real grounded evidence.
+    const groundedEvidenceIds = Array.isArray(bundle.evidence) ? bundle.evidence.map((e) => e && e.id).filter(Boolean) : [];
+    let reasoned;
+    try {
+      reasoned = await deps.reason({ question, bundle, groundedEvidenceIds });
+    } catch { return json(502, { error: 'reasoning backend error' }); }
+    const r = reasoned && typeof reasoned === 'object' ? reasoned : {};
+    const routed = routeAnswer(
+      {
+        groundedEvidenceIds,
+        llmAnswer: { text: r.text, taggedText: r.taggedText, evidenceIds: r.evidenceIds, llmConfidence: r.llmConfidence },
+        nearestTopics: r.nearestTopics,
+      },
+      { minConfidence: deps.minConfidence },
+    );
+    // Provenance: which verified checkpoint the answer was grounded in (auditable, phone-verifiable).
+    return json(200, { ...routed, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion });
   }
 
   async function handleExecute(req, ctx) {
@@ -196,6 +249,7 @@ export function createGateway(deps) {
       }
       if (method === 'GET' && path === '/sync') return handleSync(req, ctx);
       if (method === 'GET' && path === '/checkpoint') return handleCheckpoint(req, ctx);
+      if (method === 'POST' && path === '/answer') return handleAnswer(req, ctx);
       if (method === 'POST' && path === '/actions/execute') return handleExecute(req, ctx);
       if (method === 'POST' && path === '/tts') return handleTts(req, ctx);
       return json(404, { error: 'not found' });
