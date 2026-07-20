@@ -241,10 +241,15 @@ export function createGateway(deps) {
         await deps.store.put(key, { state: 'in-flight', proposalId: id, reservedAt: now() });
       }
 
-      const receipt = executeAction(proposal, confirmation, {
+      const receipt = await executeAction(proposal, confirmation, {
         store: map, run: deps.run, knownSessionIds: known,
         signingKey: deps.signingKey, signingKeyId: deps.signingKeyId,
         agent: deps.agent, now: now(), freshnessSeconds: deps.freshnessSeconds,
+        // humanMessage (native Pocket write) authoring: the async /human-message poster + the CALLER's bearer token so
+        // the write authors as human-mrrcarter under the user's own identity. Unused for agent-kind proposals.
+        postHumanMessage: deps.postHumanMessage,
+        userToken: (req.headers && (req.headers.authorization || req.headers.Authorization)) || undefined,
+        humanId: ctx.humanId ? `human-${ctx.humanId}` : undefined,
       });
       const persisted = map.get(id); // posted / emitted marker
       if (persisted) await deps.store.put(key, persisted);

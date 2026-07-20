@@ -371,7 +371,7 @@ export function validateActionResultRef(ref) {
  * @param opts          { run, store(Map), online, knownSessionIds, agent, now }
  * @returns ActionReceipt
  */
-export function executeAction(proposal, confirmation, opts = {}) {
+export async function executeAction(proposal, confirmation, opts = {}) {
   // NOTE: the default Map is single-instance. Production (multi-Lambda) MUST inject a distributed atomic store
   // (e.g. DynamoDB conditional-put keyed by proposal.id) so idempotency + single-consume hold across instances.
   const store = opts.store || new Map();
@@ -384,6 +384,13 @@ export function executeAction(proposal, confirmation, opts = {}) {
   // getter/Proxy/mutation cannot make the posted content differ from the confirmed content (first-post TOCTOU, Echo).
   const snap = snapshotProposal(proposal);
   if (!snap) return receipt(null, 'failed', { failureReason: 'proposal missing', confirmedByHumanAt: confirmation?.confirmedAt ?? now });
+
+  // Authoring mode (keyed off the FROZEN snapshot, never the mutable proposal): a `humanMessage` is a TOP-LEVEL human
+  // write (human-mrrcarter via /human-message, the user's Bearer token authorizes the identity — no gateway confused
+  // deputy); every other kind is an agent threaded reply via the CLI. The read-back filters the SAME identity the write
+  // authored under (closes Atlas silent-false-fail #1). Every governed-write invariant below is IDENTICAL for both modes.
+  const isHuman = snap.kind === 'humanMessage';
+  const readbackId = isHuman ? (opts.humanId || 'human-mrrcarter') : agent;
 
   // Idempotency: only a TERMINAL .posted is single-use; a stored pending must allow a later online flush.
   const prior = snap.id ? store.get(snap.id) : undefined;
@@ -447,10 +454,14 @@ export function executeAction(proposal, confirmation, opts = {}) {
   // never the caller's mutable `proposal`: a hostile getter that flips AFTER snapshot would otherwise sign a receipt
   // whose identity diverges from what was validated/confirmed/posted (hostile-getter TOCTOU on the signed artifact, Echo P1).
   const doVerify = (parsed) => opts.verifyReadback
-    ? opts.verifyReadback(snap.targetSessionId, parsed, { run, agent })
-    : verifyActionLanded(snap.targetSessionId, parsed, { run, agent });
+    ? opts.verifyReadback(snap.targetSessionId, parsed, { run, agent: readbackId })
+    : (isHuman
+        ? verifyHumanMessageLanded(snap.targetSessionId, parsed, { run, humanId: readbackId })
+        : verifyActionLanded(snap.targetSessionId, parsed, { run, agent: readbackId }));
   const finalizePosted = (parsed, executedAtSnap) => {
-    const result = { kind: 'action', actionId: parsed.actionId, targetSequenceId: parsed.targetSequenceId, targetCursor: parsed.targetCursor };
+    const result = isHuman
+      ? { kind: 'sequence', sequenceId: parsed.sequenceId }
+      : { kind: 'action', actionId: parsed.actionId, targetSequenceId: parsed.targetSequenceId, targetCursor: parsed.targetCursor };
     if (!validateActionResultRef(result)) {
       return receipt(snap, 'failed', { failureReason: 'malformed action result ref (structural bounds)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap });
     }
@@ -502,15 +513,30 @@ export function executeAction(proposal, confirmation, opts = {}) {
   try {
     // --idempotency-key = the proposal hash (deterministic, unique per proposal): gives server-side dedup AND lets a
     // crash-recovery read-back bind to THIS exact proposal, not merely matching content (Echo P1).
-    const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--idempotency-key', live, '--json']);
-    const parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
-    if (!parsed || parsed.targetSequenceId !== snap.targetSequence) {
-      // The post returned but is unidentifiable, or landed under the WRONG sequence: it may have landed, so KEEP a
-      // block-re-post marker (parsed:null => never re-posted, never finalized) while reporting the SPECIFIC reason.
-      const why = !parsed ? 'post returned no structured action result' : 'posted action threads under a different target sequence than the proposal';
-      const r = { ...receipt(snap, 'failed', { failureReason: why, confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap }), __emitted: { parsed: null, executedAt: nowSnap } };
-      store.set(snap.id, r);
-      return r;
+    let parsed;
+    if (isHuman) {
+      // humanMessage: TOP-LEVEL human write via the api /human-message (server authors as human-mrrcarter). clientId =
+      // the deterministic proposal hash so server-side idempotency AND the read-back bind to THIS exact proposal. The
+      // user's Bearer token authorizes the human identity — the gateway's own agent creds are NOT used (no confused deputy).
+      const out = await opts.postHumanMessage(snap.targetSessionId, snap.renderedPreview, { clientId: live, token: opts.userToken });
+      parsed = parseHumanMessageResult(out); // {messageId, sequenceId, senderId} — top-level, no thread target
+      if (!parsed) {
+        // Unidentifiable landing (no durable sequence): it MAY have landed, so keep a block-re-post marker.
+        const r = { ...receipt(snap, 'failed', { failureReason: 'human-message post returned no structured result (no durable sequence)', confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap }), __emitted: { parsed: null, executedAt: nowSnap } };
+        store.set(snap.id, r);
+        return r;
+      }
+    } else {
+      const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--idempotency-key', live, '--json']);
+      parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
+      if (!parsed || parsed.targetSequenceId !== snap.targetSequence) {
+        // The post returned but is unidentifiable, or landed under the WRONG sequence: it may have landed, so KEEP a
+        // block-re-post marker (parsed:null => never re-posted, never finalized) while reporting the SPECIFIC reason.
+        const why = !parsed ? 'post returned no structured action result' : 'posted action threads under a different target sequence than the proposal';
+        const r = { ...receipt(snap, 'failed', { failureReason: why, confirmedProposalHash: live, confirmedByHumanAt: confirmedAtSnap }), __emitted: { parsed: null, executedAt: nowSnap } };
+        store.set(snap.id, r);
+        return r;
+      }
     }
     // upgrade the reservation to carry the actionId so a retry can re-verify + finalize (still never re-posts).
     reserve(parsed);
