@@ -26,7 +26,7 @@ public struct ConversationView: View {
                 integrityBlockedContent
             }
         }
-        .navigationTitle("Briefing")
+        .navigationTitle(state.interactionMode == .listenOnly ? "Listen to briefing" : "Briefing")
         .accessibilityIdentifier(PocketAccessibilityID.conversationScreen)
         .pocketCanvas()
         .onChange(of: state.voiceState.accessibilityPhase) { _ in
@@ -67,7 +67,7 @@ public struct ConversationView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 14) {
-                        Text("Conversation")
+                        Text(state.interactionMode == .listenOnly ? "Briefing transcript" : "Conversation")
                             .font(.title2.weight(.bold))
                             .accessibilityAddTraits(.isHeader)
 
@@ -125,14 +125,25 @@ public struct ConversationView: View {
     }
 
     private var displayEntries: [ConversationEntry] {
-        if state.transcript.isEmpty {
-            return state.briefingPlan.segments.map(ConversationEntry.briefing)
-        }
-        return state.transcript
+        state.presentedTranscript
     }
 
     private func conversationHeader(context: CheckpointContext) -> some View {
         VStack(alignment: .leading, spacing: 12) {
+            if state.interactionMode == .listenOnly {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Listen-only briefing", systemImage: "speaker.wave.2.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(PocketPalette.accent)
+                    Text("Microphone is off. This mode cannot ask questions, create proposals, or send actions.")
+                        .font(.caption)
+                        .foregroundStyle(PocketPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier(PocketAccessibilityID.listenOnlyStatus)
+            }
+
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: voiceIcon)
                     .font(.title3.weight(.semibold))
@@ -151,7 +162,8 @@ public struct ConversationView: View {
                 Spacer(minLength: 8)
             }
 
-            if case .speaking = state.voiceState {
+            if state.interactionMode.allowsVoiceInput,
+               case .speaking = state.voiceState {
                 Button {
                     send(.interrupt(context))
                 } label: {
@@ -182,11 +194,13 @@ public struct ConversationView: View {
 
     private func controlDock(context: CheckpointContext) -> some View {
         VStack(spacing: 12) {
-            PushToTalkControl(
-                isActive: state.isPushToTalkActive,
-                onBegin: { send(.pushToTalkBegan(context)) },
-                onEnd: { send(.pushToTalkEnded(context)) }
-            )
+            if state.interactionMode.allowsVoiceInput {
+                PushToTalkControl(
+                    isActive: state.isPushToTalkActive,
+                    onBegin: { send(.pushToTalkBegan(context)) },
+                    onEnd: { send(.pushToTalkEnded(context)) }
+                )
+            }
 
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) {
@@ -209,7 +223,13 @@ public struct ConversationView: View {
         controlButton("Replay", systemImage: "arrow.counterclockwise", id: PocketAccessibilityID.replay) {
             send(.replayBriefing(context))
         }
-        controlButton("End", systemImage: "phone.down.fill", id: PocketAccessibilityID.end) {
+        controlButton(
+            state.interactionMode == .listenOnly ? "Done" : "End",
+            systemImage: state.interactionMode == .listenOnly ? "checkmark" : "phone.down.fill",
+            id: state.interactionMode == .listenOnly
+                ? PocketAccessibilityID.listenOnlyDone
+                : PocketAccessibilityID.end
+        ) {
             send(.endConversation(context))
         }
     }
@@ -230,6 +250,15 @@ public struct ConversationView: View {
     }
 
     private var voiceTitle: String {
+        if state.interactionMode == .listenOnly {
+            switch state.voiceState {
+            case .idle: return "Briefing complete"
+            case .speaking: return "Senti is reading the briefing"
+            case .interrupted: return "Playback stopped"
+            case .listening, .thinking: return "Listen-only mode unavailable"
+            case .error: return "Playback unavailable"
+            }
+        }
         switch state.voiceState {
         case .idle: return "Ready"
         case .speaking: return "Senti is speaking"
@@ -241,6 +270,16 @@ public struct ConversationView: View {
     }
 
     private var voiceDetail: String {
+        if state.interactionMode == .listenOnly {
+            switch state.voiceState {
+            case .idle: return "Replay the verified briefing or tap Done. The microphone stayed off."
+            case .speaking: return "Verified cached evidence is being read aloud. The microphone is off."
+            case .interrupted: return "Replay when you are ready, or tap Done."
+            case .listening, .thinking:
+                return "This state is not allowed because listen-only mode never captures speech."
+            case .error(let message): return message
+            }
+        }
         switch state.voiceState {
         case .idle: return "Hold the microphone to ask about this checkpoint."
         case .speaking: return "Tap Interrupt or begin speaking to pause immediately."

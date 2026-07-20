@@ -49,6 +49,53 @@ final class SafetyPresentationStateTests: XCTestCase {
         )
     }
 
+    func testListenOnlyStateFailsClosedForVoiceInput() throws {
+        let bundle = try canonicalBundle()
+        let verifiedBundle = VerifiedBundle.makeUnverifiedForTesting(bundle)
+        let invalidVoiceState = ConversationState(
+            verifiedBundle: verifiedBundle,
+            briefingPlan: PocketFixtures.briefingPlan,
+            transcript: [.questionAnswer(PocketFixtures.questionAnswer)],
+            voiceState: .listening,
+            isPushToTalkActive: true,
+            interactionMode: .listenOnly
+        )
+
+        XCTAssertEqual(invalidVoiceState.interactionMode, .listenOnly)
+        XCTAssertFalse(invalidVoiceState.interactionMode.allowsVoiceInput)
+        XCTAssertFalse(invalidVoiceState.isPushToTalkActive)
+        XCTAssertEqual(
+            invalidVoiceState.presentedTranscript,
+            PocketFixtures.briefingPlan.segments.map(ConversationEntry.briefing)
+        )
+        guard case .error(let message) = invalidVoiceState.voiceState else {
+            return XCTFail("listen-only voice input must become a visible fail-closed error")
+        }
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("cannot use the microphone"))
+
+        let validPlayback = ConversationState(
+            verifiedBundle: verifiedBundle,
+            briefingPlan: PocketFixtures.briefingPlan,
+            transcript: PocketFixtures.briefingPlan.segments.map(ConversationEntry.briefing),
+            voiceState: .speaking(segmentId: "b1"),
+            isPushToTalkActive: false,
+            interactionMode: .listenOnly
+        )
+        XCTAssertEqual(validPlayback.voiceState, .speaking(segmentId: "b1"))
+
+        let defaultInteractiveState = ConversationState(
+            verifiedBundle: verifiedBundle,
+            briefingPlan: PocketFixtures.briefingPlan,
+            transcript: [],
+            voiceState: .listening,
+            isPushToTalkActive: true
+        )
+        XCTAssertEqual(defaultInteractiveState.interactionMode, .interactive)
+        XCTAssertTrue(defaultInteractiveState.interactionMode.allowsVoiceInput)
+        XCTAssertEqual(defaultInteractiveState.voiceState, .listening)
+        XCTAssertTrue(defaultInteractiveState.isPushToTalkActive)
+    }
+
     func testInvalidCheckpointFailsClosedForBriefing() {
         XCTAssertFalse(BundleIntegrityState.unverified(reason: "fixture only").allowsBriefing)
         XCTAssertFalse(BundleIntegrityState.invalid(reason: "signature mismatch").allowsBriefing)

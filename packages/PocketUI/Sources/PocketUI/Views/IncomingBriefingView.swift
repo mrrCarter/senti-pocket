@@ -161,10 +161,18 @@ public struct IncomingBriefingView: View {
             .accessibilityIdentifier(PocketAccessibilityID.answer)
             .accessibilityHint(
                 state.integrity.allowsBriefing
-                    ? "Starts the cached checkpoint briefing"
+                    ? "Starts the interactive briefing; the microphone remains off until push to talk"
                     : "Unavailable until checkpoint integrity verification succeeds"
             )
             .disabled(!state.integrity.allowsBriefing)
+
+            listenToBriefingButton(context: context)
+
+            Text("Listen-only mode plays the verified briefing. It never turns on the microphone or creates an action.")
+                .font(.footnote)
+                .foregroundStyle(PocketPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 12) {
@@ -179,6 +187,25 @@ public struct IncomingBriefingView: View {
         }
     }
 
+    private func listenToBriefingButton(context: CheckpointContext) -> some View {
+        Button {
+            send(.listenToBriefing(context))
+        } label: {
+            Label("Listen to briefing", systemImage: "speaker.wave.2.fill")
+                .font(.headline)
+                .frame(maxWidth: .infinity, minHeight: 54)
+        }
+        .buttonStyle(.bordered)
+        .tint(PocketPalette.accent)
+        .accessibilityIdentifier(PocketAccessibilityID.listenToBriefing)
+        .accessibilityHint(
+            state.integrity.allowsBriefing
+                ? "Plays the verified briefing with the microphone off"
+                : "Unavailable until checkpoint integrity verification succeeds"
+        )
+        .disabled(!state.integrity.allowsBriefing)
+    }
+
     private func listenLaterButton(context: CheckpointContext) -> some View {
         Button {
             send(.listenLater(context))
@@ -188,6 +215,7 @@ public struct IncomingBriefingView: View {
         }
         .buttonStyle(.bordered)
         .accessibilityIdentifier(PocketAccessibilityID.listenLater)
+        .accessibilityHint("Saves this checkpoint for later without starting playback")
     }
 
     private func snoozeMenu(context: CheckpointContext) -> some View {

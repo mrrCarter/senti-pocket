@@ -354,6 +354,15 @@ public enum ConversationEntry: Equatable, Identifiable, Sendable {
     }
 }
 
+public enum ConversationInteractionMode: Equatable, Sendable {
+    case interactive
+    case listenOnly
+
+    public var allowsVoiceInput: Bool {
+        self == .interactive
+    }
+}
+
 public struct ConversationState: Equatable, Sendable {
     public let bundle: PocketBundle
     public let integrity: BundleIntegrityState
@@ -361,6 +370,7 @@ public struct ConversationState: Equatable, Sendable {
     public let transcript: [ConversationEntry]
     public let voiceState: VoiceConversationState
     public let isPushToTalkActive: Bool
+    public let interactionMode: ConversationInteractionMode
 
     public init(
         bundle: PocketBundle,
@@ -368,14 +378,29 @@ public struct ConversationState: Equatable, Sendable {
         briefingPlan: BriefingPlan,
         transcript: [ConversationEntry],
         voiceState: VoiceConversationState,
-        isPushToTalkActive: Bool
+        isPushToTalkActive: Bool,
+        interactionMode: ConversationInteractionMode = .interactive
     ) {
         self.bundle = bundle
         self.integrity = integrity.bound(to: bundle)
         self.briefingPlan = briefingPlan
         self.transcript = transcript
-        self.voiceState = voiceState
-        self.isPushToTalkActive = isPushToTalkActive
+        self.interactionMode = interactionMode
+
+        if interactionMode.allowsVoiceInput {
+            self.voiceState = voiceState
+            self.isPushToTalkActive = isPushToTalkActive
+        } else {
+            self.isPushToTalkActive = false
+            switch voiceState {
+            case .listening, .thinking:
+                self.voiceState = .error(
+                    message: "Listen-only mode cannot use the microphone or answer questions."
+                )
+            default:
+                self.voiceState = voiceState
+            }
+        }
     }
 
     public init(
@@ -383,7 +408,8 @@ public struct ConversationState: Equatable, Sendable {
         briefingPlan: BriefingPlan,
         transcript: [ConversationEntry],
         voiceState: VoiceConversationState,
-        isPushToTalkActive: Bool
+        isPushToTalkActive: Bool,
+        interactionMode: ConversationInteractionMode = .interactive
     ) {
         self.init(
             bundle: verifiedBundle.bundle,
@@ -391,8 +417,16 @@ public struct ConversationState: Equatable, Sendable {
             briefingPlan: briefingPlan,
             transcript: transcript,
             voiceState: voiceState,
-            isPushToTalkActive: isPushToTalkActive
+            isPushToTalkActive: isPushToTalkActive,
+            interactionMode: interactionMode
         )
+    }
+
+    var presentedTranscript: [ConversationEntry] {
+        if interactionMode == .listenOnly || transcript.isEmpty {
+            return briefingPlan.segments.map(ConversationEntry.briefing)
+        }
+        return transcript
     }
 
     func evidenceSelection(for evidence: EvidenceRef) -> PresentedEvidenceSelection? {
