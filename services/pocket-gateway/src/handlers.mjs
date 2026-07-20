@@ -9,6 +9,9 @@
 // audience/resource-scoped token minted via /v1/sessions/exchange (DPoP-bound). deps.verifyToken owns that check.
 import { executeAction, findLandedByProposal } from './actions.mjs';
 import { withLock } from './store.mjs';
+import { extractCheckpoint } from './extract.mjs';
+import { summarize } from './summarize.mjs';
+import { buildSignedBundle } from './bundle.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -66,6 +69,35 @@ export function createGateway(deps) {
     // scope bundles to the full principal (tenant isolation) — a site-A credential never lists site-B bundles.
     const bundles = await deps.bundleStore.listForHuman(ctx.principal || ctx.humanId, sinceSeq);
     return json(200, { bundles: Array.isArray(bundles) ? bundles : [] });
+  }
+
+  // GET /checkpoint?sessionId=...[&checkpointId=...] — "pull the exact checkpoint" (Carter).
+  // Extracts a session's exact DURABLE checkpoint, summarizes, and returns it SIGNED so the phone verifies it offline.
+  // Fail-closed throughout: membership-gated authz (a principal may pull ONLY sessions they belong to — no confused
+  // deputy); extractCheckpoint throws (no synthesis) on a partial/missing range; buildBundle asserts semantics + re-applies
+  // the egress scrub before signing, so a secret-bearing or malformed checkpoint can never be signed. Errors are honest +
+  // retryable, never a fabricated bundle.
+  async function handleCheckpoint(req, ctx) {
+    if (!hasScope(ctx, SCOPES.sync)) return json(403, { error: 'missing scope ' + SCOPES.sync });
+    const sessionId = req.query && req.query.sessionId;
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
+    if (!deps.signingKey) return json(501, { error: 'signing not configured' });
+    // Server-derived membership authz (Echo cross-tenant): scope by the FULL principal, never the token's claim alone.
+    let known = [];
+    try { known = await deps.knownSessionIdsFor(ctx.principal || ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
+    const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
+    let bundle;
+    try {
+      const checkpointId = (req.query && req.query.checkpointId) || undefined;
+      const extracted = extractCheckpoint(sessionId, { run: deps.run, checkpointId });
+      const summary = summarize(extracted.rawCheckpoint, extracted.checkpoint);
+      bundle = buildSignedBundle(extracted.rawCheckpoint, summary, deps.signingKey, { signingKeyId: deps.signingKeyId, createdAt: now() });
+    } catch (e) {
+      // No durable checkpoint contained in the export window, empty export, etc. Honest + retryable — never a fake bundle.
+      return json(503, { error: 'checkpoint not available', reason: String((e && e.message) || e), retryable: true });
+    }
+    return json(200, { bundle });
   }
 
   async function handleExecute(req, ctx) {
@@ -163,6 +195,7 @@ export function createGateway(deps) {
         return json(401, { error: 'authentication required' }, { 'www-authenticate': 'Bearer' });
       }
       if (method === 'GET' && path === '/sync') return handleSync(req, ctx);
+      if (method === 'GET' && path === '/checkpoint') return handleCheckpoint(req, ctx);
       if (method === 'POST' && path === '/actions/execute') return handleExecute(req, ctx);
       if (method === 'POST' && path === '/tts') return handleTts(req, ctx);
       return json(404, { error: 'not found' });

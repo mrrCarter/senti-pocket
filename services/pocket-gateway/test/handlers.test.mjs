@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { createGateway, storeKey } from '../src/handlers.mjs';
 import { createInMemoryStore } from '../src/store.mjs';
 import { computeProposalHash } from '../src/actions.mjs';
-import { generateSigningKeypair } from '../src/bundle.mjs';
+import { generateSigningKeypair, verifyBundle } from '../src/bundle.mjs';
 
 const KNOWN = '6cf7e861-546a-4b9f-b937-39182a5bd395';
 const { privateKey: KEY } = generateSigningKeypair();
@@ -38,6 +38,21 @@ const baseDeps = (over = {}) => ({
   verifyToken, store: createInMemoryStore(), run: makeRun(), signingKey: KEY, signingKeyId: 'gw-key',
   knownSessionIdsFor: async () => [KNOWN], now: () => '2026-07-18T12:02:00Z', ...over,
 });
+
+// --- /checkpoint fixtures: a valid export window + one durable checkpoint fully contained within it. ---
+const CP_EXPORT = {
+  session: { id: KNOWN, title: 'Pocket' },
+  agents: ['claude-pocket-relay', 'claude-warden'],
+  events: [
+    // Bracket the checkpoint range [230100,230180] so it is fully CONTAINED in the export window (Echo P0 containment).
+    { sequenceId: 230050, event: 'session_message', agent: { id: 'x' }, payload: { text: 'before window' }, ts: '2026-07-18T10:00:00Z' },
+    { sequenceId: 230141, event: 'session_message', agent: { id: 'claude-pocket-relay' }, payload: { text: 'parser fixed' }, idempotencyToken: 'i1', ts: '2026-07-18T10:35:00Z' },
+    { sequenceId: 230160, event: 'session_message', agent: { id: 'claude-warden' }, payload: { text: 'strong pass' }, idempotencyToken: 'i2', ts: '2026-07-18T10:36:34Z' },
+    { sequenceId: 230200, event: 'session_message', agent: { id: 'y' }, payload: { text: 'after window' }, ts: '2026-07-18T10:50:00Z' },
+  ],
+};
+const CP_CKPT = { checkpointId: 'cp_test_1', sessionId: KNOWN, startSequence: 230100, endSequence: 230180, summarySections: { window: { eventCount: 2 } } };
+const cpRun = (args) => (args.includes('list') ? JSON.stringify([CP_CKPT]) : args.includes('export') ? JSON.stringify(CP_EXPORT) : '{}');
 
 test('GET /health needs no auth', async () => {
   const gw = createGateway(baseDeps());
@@ -87,6 +102,33 @@ test('POST /actions/execute rejects a session the human does not belong to => ty
   assert.equal(r.body.error, 'proposal_rejected');
   assert.match(r.body.reason, /not a known session/);
   assert.equal(r.body.status, undefined, 'not a receipt — no null-hash receipt crosses');
+});
+
+test('GET /checkpoint returns a SIGNED, offline-verifiable bundle for a member session', async () => {
+  const { publicKey, privateKey } = generateSigningKeypair();
+  const gw = createGateway(baseDeps({ run: cpRun, signingKey: privateKey, signingKeyId: 'gw-key' }));
+  const r = await gw.handle({ method: 'GET', path: '/checkpoint', query: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.ok(r.body.bundle && r.body.bundle.signature, 'bundle is signed');
+  assert.equal(r.body.bundle.sessionId, KNOWN);
+  assert.equal(verifyBundle(r.body.bundle, publicKey), true, 'returned bundle verifies against the gateway key — the phone verifies it offline');
+});
+
+test('GET /checkpoint is fail-closed: non-member => 403, no scope => 403, no token => 401', async () => {
+  const nonMember = createGateway(baseDeps({ run: cpRun, knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
+  assert.equal((await nonMember.handle({ method: 'GET', path: '/checkpoint', query: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } })).status, 403);
+  const gw = createGateway(baseDeps({ run: cpRun }));
+  assert.equal((await gw.handle({ method: 'GET', path: '/checkpoint', query: { sessionId: KNOWN }, headers: { authorization: 'Bearer noscope' } })).status, 403);
+  assert.equal((await gw.handle({ method: 'GET', path: '/checkpoint', query: { sessionId: KNOWN }, headers: {} })).status, 401);
+});
+
+test('GET /checkpoint: no durable checkpoint => honest 503 retryable, never a fabricated bundle', async () => {
+  const emptyRun = (args) => (args.includes('list') ? '[]' : args.includes('export') ? JSON.stringify(CP_EXPORT) : '{}');
+  const gw = createGateway(baseDeps({ run: emptyRun }));
+  const r = await gw.handle({ method: 'GET', path: '/checkpoint', query: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 503);
+  assert.equal(r.body.retryable, true);
+  assert.equal(r.body.bundle, undefined, 'no bundle crosses on failure');
 });
 
 test('exactly-once across instances: a concurrent lock holder gets 409, not a second post', async () => {
