@@ -106,6 +106,18 @@ test('POST /actions/execute rejects a session the human does not belong to => 40
   assert.equal(await store.get(storeKey('consumer-123', p.id)), undefined, 'no in-flight reservation for a non-member');
 });
 
+test('POST /actions/execute: MEMBER with a bad confirmation => 422 proposal_rejected (keeps /execute->422 status mapping covered end-to-end)', async () => {
+  // Restores the end-to-end 422 coverage the non-member demo path used to give: a MEMBER passes the precheck, then a
+  // non-bindable confirmation (wrong confirmedProposalHash) is refused by executeAction -> mapped to 422, never a receipt.
+  const gw = createGateway(baseDeps()); // knownSessionIdsFor => [KNOWN] => membership passes
+  const p = makeProposal();             // targetSessionId: KNOWN (member)
+  const badConfirm = { proposalId: p.id, confirmedProposalHash: 'sha256-not-the-live-hash', confirmedAt: '2026-07-18T12:01:00Z' };
+  const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: badConfirm } });
+  assert.equal(r.status, 422);
+  assert.equal(r.body.error, 'proposal_rejected');
+  assert.equal(r.body.status, undefined, 'not a receipt — no null-hash receipt crosses');
+});
+
 test('GET /checkpoint returns a SIGNED, offline-verifiable bundle for a member session', async () => {
   const { publicKey, privateKey } = generateSigningKeypair();
   const gw = createGateway(baseDeps({ run: cpRun, signingKey: privateKey, signingKeyId: 'gw-key' }));
