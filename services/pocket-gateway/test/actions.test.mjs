@@ -510,6 +510,12 @@ test('verifyHumanMessageLanded: eventId===messageId + who===human-mrrcarter; rej
   assert.equal(verifyHumanMessageLanded('s1', parsed, { run: found('claude-pocket-relay') }), false); // same msg, WRONG author
   assert.equal(verifyHumanMessageLanded('s1', parsed, { run: () => JSON.stringify({ events: [] }) }), false); // not landed
   assert.equal(verifyHumanMessageLanded('s1', { messageId: 'hm_abc' }, { run: found('human-mrrcarter') }), false); // no senderId reported -> fail-closed
+  // reads as the RUNNER's own identity — NO `--agent <author>` (Warden: --agent is the reading identity, not a filter)
+  const seen = [];
+  const capRun = (args) => { seen.push(args); return JSON.stringify({ events: [{ eventId: 'hm_abc', agent: { id: 'human-mrrcarter' } }] }); };
+  assert.equal(verifyHumanMessageLanded('s1', parsed, { run: capRun }), true);
+  const readCall = seen.find((a) => Array.isArray(a) && a[1] === 'read');
+  assert.equal(readCall.includes('--agent'), false, 'reads as self — no --agent author filter');
 });
 
 test('parseHumanMessageResult: message.senderId PRIMARY, event.agent.id corroboration, both-absent -> senderId null', () => {

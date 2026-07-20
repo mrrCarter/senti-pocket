@@ -301,7 +301,11 @@ export function verifyHumanMessageLanded(sessionId, parsed, { run, attempts = 3 
   for (let i = 0; i < attempts; i++) {
     try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
     let j;
-    try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '25', '--agent', author, '--json'])); } catch { continue; }
+    // Read as the RUNNER's OWN identity — Warden empirically confirmed (live room 6cf7e861) that `--agent` is the READING
+    // identity, NOT an author filter: `--agent human-mrrcarter` would read AS a human the runner isn't (mis-attribution /
+    // failure), for ZERO filtering benefit. The humanMessage is the LATEST event (read-back runs right after the post), so
+    // a modest tail always covers it; identity is asserted by the exact-eventId find + who===author below, not the read.
+    try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '25', '--json'])); } catch { continue; }
     const hit = (j.events || []).find((e) => e && e.eventId === parsed.messageId); // EXACT message identity
     if (hit) {
       const who = (hit.agent && hit.agent.id) || hit.agentId;
