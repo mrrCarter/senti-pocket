@@ -539,7 +539,11 @@ public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
     /// before acting. The explicit/decoded init can carry requiresConfirmation=false or an arbitrary hash — this
     /// rejects those. On Apple/gateway (CryptoKit) it ALSO requires hashMatchesContent (full content-integrity).
     public func isValidForConfirmation() -> Bool {
-        guard requiresConfirmation, targetSequence > 0,
+        // targetSequence: a threadedReply/opinionRequest threads under a real sequence (>0); a humanMessage is a
+        // TOP-LEVEL say (no thread target) carrying the SENTINEL 0. Enforced identically to Node validateProposal
+        // (kind==='humanMessage' ? seq===0 : seq>0) so the shared canonical hash (lp("0")) is byte-exact, never divergent.
+        guard requiresConfirmation,
+              (kind == .humanMessage ? targetSequence == 0 : targetSequence > 0),
               !id.isEmpty, id.count <= 128,
               !targetSessionId.isEmpty, targetSessionId.count <= 256,
               !renderedPreview.isEmpty, renderedPreview.count <= 4096,
@@ -558,6 +562,9 @@ public struct ActionProposal: Codable, Equatable, Identifiable, Sendable {
 public enum ActionKind: String, Codable, Equatable, Sendable {
     case threadedReply
     case opinionRequest
+    case humanMessage    // native door (relay #258300): a top-level HUMAN-authored say — Carter dictating via Pocket,
+                         // posted as human-mrrcarter (his own authority, NOT a bot). Carries the sentinel targetSequence=0;
+                         // `humanMessage`.rawValue byte-mirrors Node ALLOWED_KINDS. Destructive-free — it's the user's message.
     // NO destructive/deploy/tool kinds in Sunday scope.
 }
 
