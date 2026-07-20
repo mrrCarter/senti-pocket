@@ -1,5 +1,6 @@
 public enum PocketAccessibilityID {
     public static let inboxScreen = "pocket.inbox.screen"
+    public static let inboxLoading = "pocket.inbox.loading"
     public static let inboxEmpty = "pocket.inbox.empty"
     public static let inboxError = "pocket.inbox.error"
     public static let inboxErrorEnd = "pocket.inbox.error.end"
