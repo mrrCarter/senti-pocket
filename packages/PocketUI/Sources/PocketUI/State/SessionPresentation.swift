@@ -44,6 +44,15 @@ public enum SessionLoadFailure: Equatable, Sendable {
             return "Senti could not load sessions right now."
         }
     }
+
+    fileprivate var suppressesProtectedContent: Bool {
+        switch self {
+        case .reauthenticationRequired, .accessDenied, .offlineNoCache, .invalidData:
+            return true
+        case .network, .service:
+            return false
+        }
+    }
 }
 
 public struct SessionListPresentationState: Equatable, Sendable {
@@ -64,8 +73,16 @@ public struct SessionListPresentationState: Equatable, Sendable {
         let ids = page.sessions.map(\.sessionId)
         let identitiesAreValid = ids.allSatisfy { $0.pocketNonblank != nil }
             && Set(ids).count == ids.count
+        let sourceAllowsContent: Bool
+        if case .unavailable = provenance {
+            sourceAllowsContent = false
+        } else {
+            sourceAllowsContent = true
+        }
+        let failureAllowsContent = failure?.suppressesProtectedContent != true
+        let canPresentRows = identitiesAreValid && sourceAllowsContent && failureAllowsContent
 
-        self.rows = identitiesAreValid ? page.sessions.map(SessionRowPresentation.init) : []
+        self.rows = canPresentRows ? page.sessions.map(SessionRowPresentation.init) : []
         self.resultCount = page.count
         self.includesArchived = page.includeArchived
         self.hasMore = page.hasMore
@@ -129,15 +146,25 @@ public struct SessionActivityPresentationState: Equatable, Sendable {
             && actionIDs.allSatisfy { $0.pocketNonblank != nil }
             && Set(eventIDs).count == eventIDs.count
             && Set(actionIDs).count == actionIDs.count
+        let sourceAllowsContent: Bool
+        if case .unavailable = provenance {
+            sourceAllowsContent = false
+        } else {
+            sourceAllowsContent = true
+        }
+        let failureAllowsContent = failure?.suppressesProtectedContent != true
 
         self.sessionId = sessionId
         self.provenance = provenance
         self.isRefreshing = isRefreshing
 
-        guard eventSessionsMatch, actionSessionsMatch, identitiesAreValid else {
+        guard eventSessionsMatch, actionSessionsMatch, identitiesAreValid,
+              sourceAllowsContent, failureAllowsContent else {
             self.events = []
             self.actions = []
-            self.failure = .invalidData
+            self.failure = identitiesAreValid && eventSessionsMatch && actionSessionsMatch
+                ? failure
+                : .invalidData
             return
         }
 

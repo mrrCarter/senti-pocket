@@ -104,6 +104,37 @@ final class SessionPresentationTests: XCTestCase {
         XCTAssertEqual(state.failure, .invalidData)
     }
 
+    func testAuthorizationFailureSuppressesOtherwiseValidProtectedRows() throws {
+        let page = try decode(SessionListPage.self, """
+        {"sessions":[{"sessionId":"room-1","status":"active","archiveStatus":"active",
+        "visibility":"private","membershipRole":"owner","title":"Private room","summaryText":"hidden",
+        "summaryGeneratedAt":null,"summaryModel":null,"agentCount":1,"eventCount":1,"totalCostUsd":0,
+        "createdAt":null,"lastActivityAt":null,"expiresAt":null,"killedAt":null,"templateName":null,
+        "codebasePath":null,"s3ArchivePath":null}],"count":1,"include_archived":false,
+        "next_cursor":null,"has_more":false}
+        """)
+
+        for failure in [
+            SessionLoadFailure.reauthenticationRequired,
+            .accessDenied,
+            .offlineNoCache,
+            .invalidData
+        ] {
+            let state = SessionListPresentationState(
+                page: page,
+                provenance: .cache(cachedAt: Date(), authenticationExpired: true),
+                failure: failure
+            )
+            XCTAssertTrue(state.rows.isEmpty, "\(failure) must suppress protected rows")
+        }
+
+        let unavailable = SessionListPresentationState(
+            page: page,
+            provenance: .unavailable
+        )
+        XCTAssertTrue(unavailable.rows.isEmpty)
+    }
+
     func testAuthPresentationContainsOnlyClosedNonSecretPhases() {
         let phases: [PocketSignInPhase] = [
             .signedOut,
