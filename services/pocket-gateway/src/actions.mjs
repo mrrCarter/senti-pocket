@@ -53,7 +53,7 @@ export function loadEd25519Private(raw) {
 }
 
 /** Sunday scope: the only writes allowed. No destructive/deploy/free-form tool kinds. */
-export const ALLOWED_KINDS = new Set(['threadedReply', 'opinionRequest']);
+export const ALLOWED_KINDS = new Set(['threadedReply', 'opinionRequest', 'humanMessage']);
 
 /**
  * canonicalPayload is delimiter (\n)-separated, so any NON-TERMINAL field that could contain the
@@ -111,7 +111,15 @@ export function validateProposal(p, { knownSessionIds } = {}) {
   } else if (!knownSessionIds.includes(p.targetSessionId)) {
     problems.push('targetSessionId is not a known session (possible model free-text / wrong-session)');
   }
-  if (!Number.isSafeInteger(p.targetSequence) || p.targetSequence <= 0) problems.push('invalid targetSequence');
+  // humanMessage is TOP-LEVEL (no thread target): targetSequence is the sentinel 0, ENFORCED ==0 (not merely
+  // skipped) so Node and Swift can never disagree on a producer bug — a seq!=0 humanMessage is rejected on BOTH
+  // sides (Atlas mirror @9842cef: Swift isValidForConfirmation = kind==.humanMessage ? seq==0 : seq>0). Every other
+  // kind keeps the >0 thread-target requirement. canonicalPayload is unchanged: lp(String(0))="1:0" byte-exact.
+  if (p.kind === 'humanMessage') {
+    if (p.targetSequence !== 0) problems.push('humanMessage targetSequence must be 0 (top-level sentinel)');
+  } else if (!Number.isSafeInteger(p.targetSequence) || p.targetSequence <= 0) {
+    problems.push('invalid targetSequence');
+  }
   if (typeof p.renderedPreview !== 'string' || p.renderedPreview.length === 0) problems.push('empty renderedPreview');
   else if (Buffer.byteLength(p.renderedPreview, 'utf8') > 4096) problems.push('renderedPreview exceeds 4096 bytes');
   if (p.requiresConfirmation !== true) problems.push('requiresConfirmation must be true');
@@ -230,6 +238,26 @@ export function parseActionResult(out) {
 }
 
 /**
+ * Parse the STRUCTURED result of a `/human-message` post (humanMessage kind). The server records a top-level
+ * `session_message` EVENT authored as human-<user>; the response is `{message:{id,cursor,senderId}, event:{sequenceId,agent}}`.
+ * Returns {messageId, sequenceId, targetCursor, senderId} or null. messageId is the deterministic client-set id (=proposalHash),
+ * sequenceId is the durable per-session sequence the message landed at (drives the ActionResultRef kind:'sequence').
+ */
+export function parseHumanMessageResult(out) {
+  if (out == null) return null;
+  let j;
+  try { j = JSON.parse(out); } catch { return null; }
+  const m = j && j.message;
+  const ev = j && j.event;
+  if (!m || typeof m.id !== 'string' || m.id.length === 0) return null;
+  const seq = toSafeSequence(ev && ev.sequenceId);
+  if (seq == null) return null; // no durable sequence => unidentifiable landing; never finalize on it
+  const cursor = (typeof m.cursor === 'string' && m.cursor.length > 0) ? m.cursor : null;
+  const senderId = (ev && ev.agent && ev.agent.id) || (typeof m.senderId === 'string' ? m.senderId : null);
+  return { messageId: m.id, sequenceId: seq, targetCursor: cursor, senderId };
+}
+
+/**
  * Bounded read-back VERIFY that the reply action actually landed in the room: find the event
  * eventId=session-action-<actionId>, authored by us, threading under the exact target. Returns bool.
  * Never claim .posted on an unverifiable/mismatched action.
@@ -246,6 +274,27 @@ export function verifyActionLanded(sessionId, parsed, { run, agent = 'claude-poc
       const who = (hit.agent && hit.agent.id) || hit.agentId;
       const tseq = hit.payload && hit.payload.targetSequenceId;
       return who === agent && Number(tseq) === parsed.targetSequenceId;
+    }
+  }
+  return false;
+}
+
+/**
+ * Bounded read-back VERIFY that a humanMessage actually landed, authored by the HUMAN identity (human-mrrcarter).
+ * A humanMessage is a top-level `session_message` event with eventId===messageId (the deterministic client id) — NOT a
+ * `session-action-…`. Matching who===humanId closes Atlas's silent-false-fail #1: the read-back filters the SAME
+ * identity the write authored under, so a landed human write is always found (never a false "unverified"). Returns bool.
+ */
+export function verifyHumanMessageLanded(sessionId, parsed, { run, humanId = 'human-mrrcarter', attempts = 3 } = {}) {
+  if (!run || !parsed || typeof parsed.messageId !== 'string') return false;
+  for (let i = 0; i < attempts; i++) {
+    try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
+    let j;
+    try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '25', '--agent', humanId, '--json'])); } catch { continue; }
+    const hit = (j.events || []).find((e) => e && e.eventId === parsed.messageId); // EXACT message identity
+    if (hit) {
+      const who = (hit.agent && hit.agent.id) || hit.agentId;
+      return who === humanId; // authored by the human identity the write posted under
     }
   }
   return false;
