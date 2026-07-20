@@ -34,6 +34,8 @@ final class PocketAppModel: NSObject, ObservableObject {
     private var recognizedQuestionAnswer: QuestionAnswer?
     private var pushToTalkIsActive = false
     private var completedPushToTalkCycles = 0
+    /// Persisted across every showConversation re-render (Pulse Listen-only contract #2). listenOnly disables mic input.
+    private var conversationInteractionMode: ConversationInteractionMode = .interactive
 
     override init() {
         let verified = FixtureLoader.canonicalBundle().flatMap(VerifiedBundle.verify)
@@ -63,6 +65,22 @@ final class PocketAppModel: NSObject, ObservableObject {
             }
             stopActiveSpeech(message: "Read-back stopped before the briefing began.")
             resetConversation()
+            conversationInteractionMode = .interactive
+            guard showConversation(verifiedBundle, includesCachedAnswer: false, voiceState: .speaking(segmentId: nil)) else {
+                return
+            }
+            speakBriefing()
+
+        case .listenToBriefing(let context):
+            // Pulse Listen-only contract #1: validate incoming checkpoint, enter a listenOnly speaking conversation,
+            // then AVSpeech the briefing. No mic, no proposal/write — the view hides Interrupt/PTT/proposal.
+            guard matchesIncomingCheckpoint(context, verifiedBundle: verifiedBundle) else {
+                failClosed("Checkpoint identity changed before the briefing began.")
+                return
+            }
+            stopActiveSpeech(message: "Read-back stopped before the briefing began.")
+            resetConversation()
+            conversationInteractionMode = .listenOnly
             guard showConversation(verifiedBundle, includesCachedAnswer: false, voiceState: .speaking(segmentId: nil)) else {
                 return
             }
@@ -91,6 +109,7 @@ final class PocketAppModel: NSObject, ObservableObject {
                 failClosed("The active briefing no longer matches this checkpoint.")
                 return
             }
+            guard conversationInteractionMode.allowsVoiceInput else { return }   // listen-only: no barge-in (Stop handles stopping)
             stopActiveSpeech(message: "Read-back interrupted before completion.")
             _ = showConversation(
                 verifiedBundle,
@@ -100,6 +119,7 @@ final class PocketAppModel: NSObject, ObservableObject {
 
         case .pushToTalkBegan(let context):
             guard matchesCurrentConversation(context, verifiedBundle: verifiedBundle),
+                  conversationInteractionMode.allowsVoiceInput,
                   !pushToTalkIsActive else { return }
             stopActiveSpeech(message: "Read-back interrupted before completion.")
             pushToTalkIsActive = true
@@ -125,6 +145,7 @@ final class PocketAppModel: NSObject, ObservableObject {
 
         case .pushToTalkEnded(let context):
             guard matchesCurrentConversation(context, verifiedBundle: verifiedBundle),
+                  conversationInteractionMode.allowsVoiceInput,
                   pushToTalkIsActive,
                   let recognitionID = activeRecognitionID else { return }
             pushToTalkIsActive = false
@@ -348,10 +369,13 @@ final class PocketAppModel: NSObject, ObservableObject {
             return false
         }
         var transcript = canonicalConversation.briefingPlan.segments.map(ConversationEntry.briefing)
-        transcript.append(.notice(ConversationNotice(
-            id: "on-device-speech-cached-answer",
-            text: "Microphone transcription runs on this device. Answers are matched against cached evidence; no live Gemma or network model is running."
-        )))
+        if conversationInteractionMode.allowsVoiceInput {
+            // Mic-transcription notice is honest only when the mic is live; listen-only shows mic-off copy in the view.
+            transcript.append(.notice(ConversationNotice(
+                id: "on-device-speech-cached-answer",
+                text: "Microphone transcription runs on this device. Answers are matched against cached evidence; no live Gemma or network model is running."
+            )))
+        }
         if includesCachedAnswer, let recognizedQuestionAnswer {
             transcript.append(.questionAnswer(recognizedQuestionAnswer))
         }
@@ -360,7 +384,8 @@ final class PocketAppModel: NSObject, ObservableObject {
             briefingPlan: canonicalConversation.briefingPlan,
             transcript: transcript,
             voiceState: voiceState,
-            isPushToTalkActive: isPushToTalkActive
+            isPushToTalkActive: isPushToTalkActive,
+            interactionMode: conversationInteractionMode
         )
         let preservesConversationPresentation: Bool
         if case .conversation = state.destination {
@@ -456,6 +481,7 @@ final class PocketAppModel: NSObject, ObservableObject {
         pushToTalkIsActive = false
         completedPushToTalkCycles = 0
         recognizedQuestionAnswer = nil
+        conversationInteractionMode = .interactive
     }
 
     private func failClosed(_ message: String) {
