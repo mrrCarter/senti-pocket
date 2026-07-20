@@ -503,9 +503,13 @@ test('humanMessage: posts via /human-message as human-mrrcarter -> signed .poste
 
 test('verifyHumanMessageLanded: eventId===messageId + who===human-mrrcarter; rejects wrong author / miss (Warden a, closes #1)', () => {
   const found = (agentId) => () => JSON.stringify({ events: [{ eventId: 'hm_abc', agent: { id: agentId } }] });
-  assert.equal(verifyHumanMessageLanded('s1', { messageId: 'hm_abc' }, { run: found('human-mrrcarter') }), true);
-  assert.equal(verifyHumanMessageLanded('s1', { messageId: 'hm_abc' }, { run: found('claude-pocket-relay') }), false); // same msg, WRONG author
-  assert.equal(verifyHumanMessageLanded('s1', { messageId: 'hm_abc' }, { run: () => JSON.stringify({ events: [] }) }), false); // not landed
+  // parsed.senderId = the identity the api ACTUALLY authored under (from the POST response's event.agent.id) — the
+  // read-back matches THAT (drift-proof), not a predicted/replicated normalization. Works for ANY authored identity.
+  const parsed = { messageId: 'hm_abc', senderId: 'human-mrrcarter' };
+  assert.equal(verifyHumanMessageLanded('s1', parsed, { run: found('human-mrrcarter') }), true);
+  assert.equal(verifyHumanMessageLanded('s1', parsed, { run: found('claude-pocket-relay') }), false); // same msg, WRONG author
+  assert.equal(verifyHumanMessageLanded('s1', parsed, { run: () => JSON.stringify({ events: [] }) }), false); // not landed
+  assert.equal(verifyHumanMessageLanded('s1', { messageId: 'hm_abc' }, { run: found('human-mrrcarter') }), false); // no senderId reported -> fail-closed
 });
 
 test('humanMessage validateProposal: ENFORCES targetSequence===0 (Atlas ==0 mirror); other kinds keep >0', () => {

@@ -285,16 +285,23 @@ export function verifyActionLanded(sessionId, parsed, { run, agent = 'claude-poc
  * `session-action-…`. Matching who===humanId closes Atlas's silent-false-fail #1: the read-back filters the SAME
  * identity the write authored under, so a landed human write is always found (never a false "unverified"). Returns bool.
  */
-export function verifyHumanMessageLanded(sessionId, parsed, { run, humanId = 'human-mrrcarter', attempts = 3 } = {}) {
+export function verifyHumanMessageLanded(sessionId, parsed, { run, attempts = 3 } = {}) {
   if (!run || !parsed || typeof parsed.messageId !== 'string') return false;
+  // Match the re-read author against the identity the api ACTUALLY authored under — `parsed.senderId`, taken from the
+  // POST response's event.agent.id (the api's OWN truth) — NOT a predicted/replicated normalization of the caller. The
+  // api authors human writes as human-<normalize(github_username||id)> and that rule can change; reading it back from the
+  // POST response is drift-proof (a future normalization change can't silently break this). Fail-closed if the POST
+  // reported no author (can't confirm identity).
+  const author = (typeof parsed.senderId === 'string' && parsed.senderId) ? parsed.senderId : null;
+  if (!author) return false;
   for (let i = 0; i < attempts; i++) {
     try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
     let j;
-    try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '25', '--agent', humanId, '--json'])); } catch { continue; }
+    try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '25', '--agent', author, '--json'])); } catch { continue; }
     const hit = (j.events || []).find((e) => e && e.eventId === parsed.messageId); // EXACT message identity
     if (hit) {
       const who = (hit.agent && hit.agent.id) || hit.agentId;
-      return who === humanId; // authored by the human identity the write posted under
+      return who === author; // re-read author == the POST-reported author (the api's truth on both hops)
     }
   }
   return false;
