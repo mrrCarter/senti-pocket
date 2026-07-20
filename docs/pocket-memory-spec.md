@@ -76,6 +76,10 @@ Carter's build hit two failures: the briefing was **too brief** (reasoning over 
 
 **This already has its first small landing in the spine.** The gateway's grounding-first `/answer` router (`routeAnswer` @ `29033f3`, warden-gated) *is* retrieval-grounded needling in miniature: it retrieves grounding from the verified checkpoint, and the **grounding** — not the LLM's self-confidence — routes `answered` / `clarify` / `unavailable(nearestTopics)`. `.answered` requires non-empty grounded citations; hallucinated cites are dropped. That is exactly this §4 discipline at checkpoint scale; the memory MVP generalizes it across all sessions.
 
+**Grounding-relevance contract (hard, enforced in code + CI @ `c58c0df`).** At checkpoint scale, "grounded" = "cited an id in the verified bundle." At **memory-needle scale** that would degrade to "cited *any* id in a huge corpus" — a confident-wrong answer citing a real-but-irrelevant id would pass. So the contract at memory scale is stricter: **"grounded" means "cited an id in the RETRIEVAL-RELEVANT subset — the RRF top-K (+ rerank) — NOT anywhere in the corpus."** `retrieveGrounding()` returns exactly that top-K subset. Two guardrails keep it honest as the corpus + dims grow, both now enforced (not just documented):
+- **Uniform embedding dim per index.** A raw int8 dot magnitude scales with dimension, so mixing dims in one index (e.g. Matryoshka 512-d vs 256-d) silently ranks by dimensionality, not relevance. `int8Dot` throws on a length mismatch — loud, never a silent recall-rot. Cosine-normalize + fix the dim upstream if mixed dims are ever needed.
+- **`topK` is a tuning gate, not a free constant.** It is the pre-rerank grounding pool; the **Needle-Scatter** eval (§6) requires that pool to hold ≥95% of dispersed relevant items. `scatterRecall(grounding, needles)` is the check and the 8-Needle CI asserts it ≥0.95 for the chosen `topK`, so `topK` can never silently fall below the bar (raise it or add a recall-floor if it drops needles).
+
 ---
 
 ## 5. Consolidator — overnight re-association (ENGRAM §6)
