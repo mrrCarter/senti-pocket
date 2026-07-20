@@ -13,13 +13,34 @@
 // scoped agent token). Exits non-zero with an empty stdout if there is no usable session (then `sl auth login` first, or
 // Carter supplies the bearer transiently). NEVER log/print/commit the emitted value.
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const require = createRequire(import.meta.url);
-let sessionStorePath;
-try {
-  sessionStorePath = require.resolve('sentinelayer-cli/src/auth/session-store.js');
-} catch {
-  process.stderr.write('emit-senti-token: sentinelayer-cli not resolvable here — run where `sl` is installed (the demo Mac)\n');
+
+// Resolve the CLI's session-store.js robustly — the Mac's `sl` is likely npm-GLOBAL, which require.resolve won't find
+// from a local dir. Order: explicit SL_PKG_DIR env → local dep → `npm root -g` → the `sl` binary's real target dir.
+function resolveSessionStore() {
+  const rel = 'src/auth/session-store.js';
+  const candidates = [];
+  if (process.env.SL_PKG_DIR) candidates.push(path.join(process.env.SL_PKG_DIR, rel));
+  try { candidates.push(require.resolve('sentinelayer-cli/' + rel)); } catch { /* not a local dep */ }
+  try {
+    const gRoot = execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim();
+    if (gRoot) candidates.push(path.join(gRoot, 'sentinelayer-cli', rel));
+  } catch { /* npm not on PATH */ }
+  try {
+    const slBin = execFileSync(process.platform === 'win32' ? 'where' : 'which', [process.env.SL_BIN || 'sl'], { encoding: 'utf8' }).split(/\r?\n/)[0].trim();
+    const real = fs.realpathSync(slBin);              // resolve the symlink to the actual bin script
+    candidates.push(path.join(real, '..', '..', rel)); // <pkg>/bin/*.js -> <pkg>/src/auth/session-store.js
+  } catch { /* sl not on PATH */ }
+  return candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || null;
+}
+
+const sessionStorePath = resolveSessionStore();
+if (!sessionStorePath) {
+  process.stderr.write('emit-senti-token: could not locate sentinelayer-cli session-store.js. Set SL_PKG_DIR=<npm root -g>/sentinelayer-cli and retry.\n');
   process.exit(2);
 }
 
