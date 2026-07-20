@@ -45,7 +45,7 @@ public enum SessionLoadFailure: Equatable, Sendable {
         }
     }
 
-    fileprivate var suppressesProtectedContent: Bool {
+    var suppressesProtectedContent: Bool {
         switch self {
         case .reauthenticationRequired, .accessDenied, .offlineNoCache, .invalidData:
             return true
