@@ -213,6 +213,14 @@ export function createGateway(deps) {
     let known = [];
     try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
 
+    // MEMBERSHIP PRECHECK (Forge nit / Warden hardening): reject a non-member BEFORE the durable in-flight reservation
+    // below, so an authenticated `sessions:write` principal can't amplify self-namespace storage by spamming /execute for
+    // sessions they don't belong to. executeAction re-checks membership authoritatively (validateProposal, fail-closed on
+    // empty `known`); this is the earlier, cheaper gate with the SAME notion of membership — no store touch on refuse.
+    if (!known.includes(proposal.targetSessionId)) {
+      return json(403, { error: 'not a member of the target session', proposalId: proposal.id });
+    }
+
     const id = proposal.id;
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
     // CROSS-TENANT ISOLATION (Echo): namespace ALL durable state + the lock by the FULL principal (issuer + aud/

@@ -94,14 +94,16 @@ test('POST /actions/execute posts once and returns a signed receipt', async () =
   assert.equal(state.replies, 1);
 });
 
-test('POST /actions/execute rejects a session the human does not belong to => typed 422 error envelope (not a null-hash receipt)', async () => {
-  const gw = createGateway(baseDeps({ knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
+test('POST /actions/execute rejects a session the human does not belong to => 403 BEFORE any reservation (not a null-hash receipt)', async () => {
+  const store = createInMemoryStore();
+  const gw = createGateway(baseDeps({ store, knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
   const p = makeProposal();
   const r = await gw.handle({ method: 'POST', path: '/actions/execute', headers: { authorization: 'Bearer good' }, body: { proposal: p, confirmation: makeConfirm(p) } });
-  assert.equal(r.status, 422);
-  assert.equal(r.body.error, 'proposal_rejected');
-  assert.match(r.body.reason, /not a known session/);
+  assert.equal(r.status, 403); // non-member => authz refusal, now consistent with /checkpoint + /answer
+  assert.match(r.body.error, /not a member/);
   assert.equal(r.body.status, undefined, 'not a receipt — no null-hash receipt crosses');
+  // amplification fix (Forge nit / Warden hardening): a non-member writes NO durable in-flight reservation
+  assert.equal(await store.get(storeKey('consumer-123', p.id)), undefined, 'no in-flight reservation for a non-member');
 });
 
 test('GET /checkpoint returns a SIGNED, offline-verifiable bundle for a member session', async () => {

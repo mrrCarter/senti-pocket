@@ -60,8 +60,8 @@ test('POSITIVE disposable auth: no confirmation => writeback refused (422), neve
     const p = { id: 'p1', kind: 'threadedReply', targetSessionId: DISPOSABLE, targetSequence: 5, renderedPreview: 'ok', requiresConfirmation: true, createdAt: '2026-07-18T12:00:00Z', sourceQuestionId: null };
     p.proposalHash = computeProposalHash(p);
     const r = await fetch(h.base + '/actions/execute', { method: 'POST', headers: { ...auth(h.token), 'content-type': 'application/json' }, body: JSON.stringify({ proposal: p, confirmation: { proposalId: p.id, confirmedProposalHash: p.proposalHash, confirmedAt: '2026-07-18T12:01:00Z' } }) });
-    assert.equal(r.status, 422, 'unconfirmed disposable => refused, not writable');
-    assert.equal((await r.json()).error, 'proposal_rejected');
+    assert.equal(r.status, 403, 'unconfirmed disposable => not in known (not an authorized member) => refused before reservation');
+    assert.match((await r.json()).error, /not a member/);
   } finally { h.server.close(); }
 });
 
