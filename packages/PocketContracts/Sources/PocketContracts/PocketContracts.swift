@@ -1,4 +1,12 @@
 // PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
+// v0.1.8++ (Atlas #252425, reasoning-seam, round 6): BriefingSegment gains an OPTIONAL taggedText (audio-tagged
+//   variant for ElevenLabs — the splitTagged pair, relay ec71ac7/#252160). ADDITIVE, nil-default, source-compatible.
+//   DELIBERATELY *NOT* a version bump and NO re-sign: BriefingSegment is reasoned OUTPUT — it is ABSENT from
+//   canonicalBundlePayload() AND ActionProposal.canonicalPayload/proposalHash, so no signed/canonical bytes change.
+//   (Bumping PocketContracts.version 0.1.8->0.1.9 would instead FAIL every already-signed 0.1.8 bundle via the
+//   `wrongContractsVersion` gate at semanticIssues(), and the Phase-A demo signing key was discarded — so a bump would
+//   break verification with no way to re-sign. Warden #252451 approved the field as additive-nil-default; the version
+//   stays 0.1.8 for exactly the signed-path-untouched reason warden gates on.)
 // v0.1.8++ (warden/bundle-kav-fix, P1 re-audit, round 5): bundle semantic caps are now the FROZEN PER-FIELD values
 //   mirroring the gateway (services/pocket-gateway SUMMARY_CAPS) + GroundedInferenceRequest (id 256 / evId 128 /
 //   str 512 / headline 4096 / summary+text 8192 / snippet 8000; perAgent 200 / evidence 256 / risks+blockers 100) so a
@@ -435,8 +443,13 @@ public struct BriefingSegment: Codable, Equatable, Identifiable, Sendable {
     public let text: String
     public let evidenceIds: [String]
     public let tone: BriefingTone?              // v0.1.6 (Echo): CONSTRAINED narration tone (nil = neutral default)
-    public init(id: String, text: String, evidenceIds: [String], tone: BriefingTone? = nil) {
-        self.id = id; self.text = text; self.evidenceIds = evidenceIds; self.tone = tone
+    public let taggedText: String?             // v0.1.8++ (Atlas #252425): OPTIONAL audio-tagged variant (ElevenLabs) —
+                                               // the splitTagged pair (relay ec71ac7/#252160). PLAIN `text` stays
+                                               // authoritative for display + AVSpeech/OpenAI-TTS; taggedText is purely
+                                               // additive (nil = no tags). Reasoned OUTPUT, NOT in any signed/hashed
+                                               // payload → no version bump, no re-sign (see header round 6).
+    public init(id: String, text: String, evidenceIds: [String], tone: BriefingTone? = nil, taggedText: String? = nil) {
+        self.id = id; self.text = text; self.evidenceIds = evidenceIds; self.tone = tone; self.taggedText = taggedText
     }
 }
 
