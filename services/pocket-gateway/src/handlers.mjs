@@ -13,6 +13,7 @@ import { extractCheckpoint } from './extract.mjs';
 import { summarize } from './summarize.mjs';
 import { buildSignedBundle } from './bundle.mjs';
 import { routeAnswer } from './reasoning-router.mjs';
+import { splitTagged } from './audio-tags.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -153,6 +154,54 @@ export function createGateway(deps) {
     return json(200, { ...routed, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion });
   }
 
+  // POST /brief — a REASONED, segmented briefing (fixes "too brief / no reasoning", Carter). Same
+  // fail-closed wedge as /answer: membership-gated, reasons ONLY over the signature-verified checkpoint,
+  // honest 503 when no durable checkpoint. GROUNDING-FIRST: each segment's cites are intersected with the
+  // verified bundle's evidence (hallucinated cites dropped), and a segment with no grounded evidence is
+  // dropped — the briefing is grounded ground-truth, never fabricated. Each surviving segment carries
+  // BOTH taggedText (audio-tagged, for ElevenLabs) and plain text (for AVSpeech/OpenAI-TTS) via splitTagged.
+  async function handleBrief(req, ctx) {
+    if (!hasScope(ctx, SCOPES.sync)) return json(403, { error: 'missing scope ' + SCOPES.sync });
+    if (typeof deps.brief !== 'function') return json(501, { error: 'briefing backend not configured' });
+    if (!deps.signingKey) return json(501, { error: 'signing not configured' });
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    const sessionId = body.sessionId;
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
+    let known = [];
+    try { known = await deps.knownSessionIdsFor(ctx.principal || ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
+    const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
+    let bundle;
+    try {
+      const checkpointId = body.checkpointId || undefined;
+      const extracted = extractCheckpoint(sessionId, { run: deps.run, checkpointId });
+      const summary = summarize(extracted.rawCheckpoint, extracted.checkpoint);
+      bundle = buildSignedBundle(extracted.rawCheckpoint, summary, deps.signingKey, { signingKeyId: deps.signingKeyId, createdAt: now() });
+    } catch (e) {
+      return json(503, { error: 'checkpoint not available', reason: String((e && e.message) || e), retryable: true });
+    }
+    const groundedEvidenceIds = Array.isArray(bundle.evidence) ? bundle.evidence.map((e) => e && e.id).filter(Boolean) : [];
+    let briefed;
+    try {
+      briefed = await deps.brief({ bundle, groundedEvidenceIds });
+    } catch { return json(502, { error: 'briefing backend error' }); }
+    const rawSegments = briefed && Array.isArray(briefed.segments) ? briefed.segments : [];
+    const segments = rawSegments
+      .map((seg) => {
+        const s = seg && typeof seg === 'object' ? seg : {};
+        const claimed = Array.isArray(s.evidenceIds) ? s.evidenceIds : [];
+        const evidenceIds = [...new Set(claimed.filter((id) => groundedEvidenceIds.includes(id)))]; // drop hallucinated cites
+        const source = typeof s.taggedText === 'string' ? s.taggedText : (typeof s.text === 'string' ? s.text : '');
+        const { tagged, plain } = splitTagged(source); // audio-tagged (ElevenLabs) + plain (AVSpeech/OpenAI-TTS)
+        return { text: plain, taggedText: tagged, evidenceIds };
+      })
+      .filter((seg) => seg.evidenceIds.length > 0 && seg.text); // grounding-first: only grounded segments cross
+    // `grounded:false` (no segment survived) is an HONEST "no reasoned briefing grounded in this checkpoint"
+    // signal — the caller labels it (never a fabricated brief), same discipline as /answer's unavailable.
+    return json(200, { segments, grounded: segments.length > 0, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion });
+  }
+
   async function handleExecute(req, ctx) {
     if (!hasScope(ctx, SCOPES.execute)) return json(403, { error: 'missing scope ' + SCOPES.execute });
     const body = readBody(req.body);
@@ -250,6 +299,7 @@ export function createGateway(deps) {
       if (method === 'GET' && path === '/sync') return handleSync(req, ctx);
       if (method === 'GET' && path === '/checkpoint') return handleCheckpoint(req, ctx);
       if (method === 'POST' && path === '/answer') return handleAnswer(req, ctx);
+      if (method === 'POST' && path === '/brief') return handleBrief(req, ctx);
       if (method === 'POST' && path === '/actions/execute') return handleExecute(req, ctx);
       if (method === 'POST' && path === '/tts') return handleTts(req, ctx);
       return json(404, { error: 'not found' });

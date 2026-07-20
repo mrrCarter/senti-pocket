@@ -158,6 +158,45 @@ test('POST /answer is fail-closed: non-member 403, no scope 403, no token 401, n
   assert.equal((await noReason.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'q' }, headers: { authorization: 'Bearer good' } })).status, 501);
 });
 
+test('POST /brief returns a grounded, segmented, audio-ready briefing; drops ungrounded segments', async () => {
+  const brief = async ({ groundedEvidenceIds }) => ({
+    segments: [
+      { text: 'Relay shipped the scale head.', taggedText: '[calm] Relay shipped the scale head.', evidenceIds: groundedEvidenceIds.slice(0, 1) },
+      { text: 'And it definitely deployed to prod.', evidenceIds: ['ev_hallucinated'] }, // ungrounded -> dropped
+    ],
+  });
+  const gw = createGateway(baseDeps({ run: cpRun, brief }));
+  const r = await gw.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.grounded, true);
+  assert.equal(r.body.segments.length, 1); // only the grounded segment survives
+  const seg = r.body.segments[0];
+  assert.equal(seg.taggedText, '[calm] Relay shipped the scale head.'); // audio-tagged for ElevenLabs
+  assert.equal(seg.text, 'Relay shipped the scale head.'); // plain (tags stripped) for AVSpeech/OpenAI-TTS
+  assert.ok(seg.evidenceIds.length >= 1); // grounded citation
+  assert.equal(r.body.checkpointId, 'cp_test_1'); // provenance
+});
+
+test('POST /brief is honest when nothing grounds: grounded:false, never a fabricated segment', async () => {
+  const brief = async () => ({ segments: [{ text: 'made up', evidenceIds: ['ev_fake'] }] });
+  const gw = createGateway(baseDeps({ run: cpRun, brief }));
+  const r = await gw.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.grounded, false);
+  assert.deepEqual(r.body.segments, []);
+});
+
+test('POST /brief is fail-closed: non-member 403, no scope 403, no token 401, no brief backend 501', async () => {
+  const brief = async ({ groundedEvidenceIds }) => ({ segments: [{ text: 'x', evidenceIds: groundedEvidenceIds.slice(0, 1) }] });
+  const nonMember = createGateway(baseDeps({ run: cpRun, brief, knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
+  assert.equal((await nonMember.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } })).status, 403);
+  const gw = createGateway(baseDeps({ run: cpRun, brief }));
+  assert.equal((await gw.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: { authorization: 'Bearer noscope' } })).status, 403);
+  assert.equal((await gw.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: {} })).status, 401);
+  const noBrief = createGateway(baseDeps({ run: cpRun })); // deps.brief not configured
+  assert.equal((await noBrief.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } })).status, 501);
+});
+
 test('GET /checkpoint: no durable checkpoint => honest 503 retryable, never a fabricated bundle', async () => {
   const emptyRun = (args) => (args.includes('list') ? '[]' : args.includes('export') ? JSON.stringify(CP_EXPORT) : '{}');
   const gw = createGateway(baseDeps({ run: emptyRun }));
