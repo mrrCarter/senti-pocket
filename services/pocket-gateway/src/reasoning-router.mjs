@@ -5,6 +5,7 @@
 // confidence is a secondary tiebreaker only. This keeps Carter's "reason, don't refuse" HONEST (grounded)
 // instead of confidently-wrong. It also drops HALLUCINATED citations: an evidenceId the LLM claims but that
 // is NOT in the retrieved grounding set is discarded — you can only cite evidence retrieval actually found.
+import { keepGrounded } from './grounding-gate.mjs';
 
 const normalizeTopics = (topics) =>
   (Array.isArray(topics) ? topics : [])
@@ -34,8 +35,8 @@ export function routeAnswer(input, opts = {}) {
   const grounded = Array.isArray(input?.groundedEvidenceIds) ? input.groundedEvidenceIds : [];
   const llm = input?.llmAnswer || {};
   const claimed = Array.isArray(llm.evidenceIds) ? llm.evidenceIds : [];
-  // Only citations that are ACTUALLY in the retrieved grounding survive (drop hallucinated ids).
-  const citedGrounded = [...new Set(claimed.filter((id) => grounded.includes(id)))];
+  // Only citations that are ACTUALLY in the retrieved grounding survive (drop hallucinated ids) — the shared honesty gate.
+  const citedGrounded = keepGrounded(claimed, grounded);
   const answerText = typeof llm.text === 'string' ? llm.text : '';
 
   // PRIMARY gate: grounding AND a non-empty answer. A grounded citation with EMPTY answer text is not an answer —
