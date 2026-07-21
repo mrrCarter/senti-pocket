@@ -18,6 +18,7 @@ import { scrubText } from './scrub.mjs';
 import { renderDeck } from './deck/templates.mjs';
 import { narrateDeck } from './deck/narration.mjs';
 import { buildStoryboard, assembleDeckVideo } from './deck/video.mjs';
+import { createDialRegistry } from './dial-registry.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -67,6 +68,10 @@ export function createGateway(deps) {
   // DISTINCT least-privilege `pocket:voice` (Echo): it triggers third-party voice processing/egress, not a passive
   // read, so a read+write token must NOT authorize it. Override via deps.scopes if the contract changes.
   const SCOPES = { execute: 'sessions:write', sync: 'sessions:read', tts: 'pocket:voice', dial: 'pocket:dial', ...(deps.scopes || {}) };
+  // /dial/register substrate: binds a device VoIP token to a session (deploy wires deps.deviceRegistry to Dynamo; the
+  // registry defers a missing backend to a register-time 501, so constructing it unconditionally is safe). now defaults
+  // to Date.now (ms) — the registeredAt stamp only.
+  const dialReg = createDialRegistry({ deviceRegistry: deps.deviceRegistry });
 
   async function authenticate(req) {
     if (typeof deps.verifyToken !== 'function') return null; // no verifier wired => deny everything (fail-closed)
@@ -423,6 +428,23 @@ export function createGateway(deps) {
     return json(dispatched ? 200 : 502, dispatched ? { dialId, dispatched: true } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' });
   }
 
+  // POST /dial/register — bind THIS device's VoIP token to a session the human belongs to (the onVoipToken(hex) seam,
+  // forge PR #40). The registry is dispatch-substrate for /dial: it AUTHORS NOTHING and holds no key. humanId comes from
+  // the VERIFIED token (ctx.humanId), NEVER the body — a caller can only register a device under their OWN identity,
+  // which is what makes /dial's ctx.humanId dispatch secure (register + dial + pushBackend lookup share the one key).
+  // Same least-privilege pocket:dial scope. Fail-closed: no registry -> 501, bad token -> 400/413, non-member -> 403.
+  async function handleDialRegister(req, ctx) {
+    if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    const r = await dialReg.register({
+      humanId: ctx.humanId,
+      body,
+      isMember: async (sid) => { const known = await deps.knownSessionIdsFor(ctx.humanId); return Array.isArray(known) && known.includes(sid); },
+    });
+    return json(r.status, r.body);
+  }
+
   return {
     async handle(req) {
       // handle() is the gateway's contract boundary — it must NEVER throw to an adapter (a throw becomes a runtime crash
@@ -446,6 +468,7 @@ export function createGateway(deps) {
         if (method === 'POST' && path === '/tts') return await handleTts(req, ctx);
         if (method === 'POST' && path === '/deck') return await handleDeck(req, ctx);
         if (method === 'POST' && path === '/dial') return await handleDial(req, ctx);
+        if (method === 'POST' && path === '/dial/register') return await handleDialRegister(req, ctx);
         return json(404, { error: 'not found' });
       } catch {
         return json(500, { error: 'internal error' }); // no stack/detail leaked to the client
