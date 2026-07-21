@@ -23,13 +23,10 @@ let package = Package(
             .product(name: "PocketInference", package: "PocketInference"),
             .product(name: "PocketCall", package: "PocketCall"),
             .product(name: "PocketContracts", package: "PocketContracts")
-        ]),
-        .testTarget(name: "PocketReasoningGemmaTests", dependencies: [
-            "PocketReasoningGemma",
-            .product(name: "PocketReasoning", package: "PocketReasoning"),
-            .product(name: "PocketInference", package: "PocketInference"),
-            .product(name: "PocketCall", package: "PocketCall"),
-            .product(name: "PocketContracts", package: "PocketContracts")
         ])
+        // NOTE: no .testTarget yet. A sourceless test target breaks `swift build` with "overlapping sources"
+        // (SwiftPM defaults its path onto the main target). A real one needs Tests/PocketReasoningGemmaTests/
+        // sources AND a buildable PocketInference (LiteRTLM currently ships unsafe build flags -> blocked).
+        // Re-add WITH real sources once LiteRTLM is unblocked.
     ]
 )
