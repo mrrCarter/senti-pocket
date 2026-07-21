@@ -23,7 +23,12 @@ export function createDeckVideoBackend({ resvgBin, ffmpegBin, fps = 24 } = {}) {
       const svgPath = join(dir, 'in.svg');
       const pngPath = join(dir, 'out.png');
       writeFileSync(svgPath, typeof svg === 'string' ? svg : String(svg ?? ''));
-      execFileSync(resvgBin, ['--width', String(width), '--height', String(height), svgPath, pngPath], { stdio: 'pipe' });
+      // --resources-dir pins resvg's relative-resource base to `dir` (which holds ONLY in.svg) — explicit
+      // defense-in-depth for the untrusted-SVG raster. resvg has NO flag to disable external loading, so the PRIMARY
+      // LFI/SSRF control is the gateway's safeImageHref allowlist (https/data:image only) applied UPSTREAM before the
+      // SVG reaches here, plus the deploy's RESVG_EGRESS_SANDBOXED exposure gate. This makes the base-scoping explicit
+      // rather than relying on resvg's default (= input file's directory). It is NOT a full traversal block on its own.
+      execFileSync(resvgBin, ['--width', String(width), '--height', String(height), '--resources-dir', dir, svgPath, pngPath], { stdio: 'pipe' });
       const png = readFileSync(pngPath);
       if (!png.length) throw new Error('resvg produced an empty png');
       return png;
