@@ -84,3 +84,14 @@ test('createProdGateway wires /deck?format=video: honest 501 without the native 
   assert.equal(rVid.status, 200);
   assert.equal(rVid.headers['content-type'], 'video/mp4', 'the injected backend produced a real mp4 response');
 });
+
+test('createProdGateway env-constructs the native video backend ONLY behind the sandbox ack (SSRF/LFI fail-safe)', async () => {
+  const deckBody = { deck: { slides: [{ template: 'title', content: { title: 'x' } }] }, format: 'video' };
+  // binaries present but NO RESVG_EGRESS_SANDBOXED ack -> deckVideo NOT constructed -> 501 (never exec an unsandboxed resvg)
+  const noAck = createProdGateway({ ...FULL_ENV, RESVG_BIN: '/nonexistent/resvg', FFMPEG_BIN: '/nonexistent/ffmpeg' }, { ...FULL_DEPS, fetch: dialFetch() });
+  assert.equal((await noAck.handle({ method: 'POST', path: '/deck', headers: { authorization: 'Bearer t' }, body: deckBody })).status, 501, 'no sandbox ack -> video stays off (fail-safe)');
+  // binaries + explicit ack -> deckVideo IS constructed + wired -> it ATTEMPTS assembly (the fake binary fails at exec ->
+  // raster-failed -> 502, NOT 501) — which distinguishes "wired but binary-failed" from "not wired", proving the wiring.
+  const acked = createProdGateway({ ...FULL_ENV, RESVG_BIN: '/nonexistent/resvg', FFMPEG_BIN: '/nonexistent/ffmpeg', RESVG_EGRESS_SANDBOXED: '1' }, { ...FULL_DEPS, fetch: dialFetch() });
+  assert.equal((await acked.handle({ method: 'POST', path: '/deck', headers: { authorization: 'Bearer t2' }, body: deckBody })).status, 502, 'acked -> deckVideo wired -> attempts assembly -> fake binary -> 502 (not 501)');
+});
