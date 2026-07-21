@@ -341,6 +341,7 @@ export function createGateway(deps) {
       // limit; the aggregate cap is the hard safety net so a pcm override / huge deck degrades honestly, never 500s.
       outputFormat: body.outputFormat || 'mp3_44100_128',
       maxTotalAudioBytes: 5 * 1024 * 1024,
+      maxSlideAudioBytes: 4 * 1024 * 1024, // per-slide bound (< aggregate) so ONE near-max/pcm slide can't alone blow the limit
       // Bound serial TTS round-trips (each ~1-3s) so a many-slide narrated deck can't exceed the request timeout. This
       // is a SAFETY bound; genuinely large decks should narrate via an async job, not one sync request.
       maxNarratedSlides: 30,

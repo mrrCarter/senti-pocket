@@ -7,7 +7,12 @@
 // fabricated/empty video.
 
 // Approx audio bytes/sec by format, so a slide's on-screen time can track its narration length. base64 -> raw is *3/4.
-const BYTES_PER_SEC = { mp3_44100_128: 16000, mp3_44100_192: 24000, mp3_22050_32: 4000, mp3_44100_64: 8000 };
+// mp3 bitrates AND raw pcm (s16le = 2 bytes/sample -> rate*2 B/s). tts.mjs labels pcm as 'pcm_s16le_<rate>', so a pcm
+// clip's duration must use its REAL byte-rate — falling back to the mp3 rate here made pcm durations ~3x too long.
+const BYTES_PER_SEC = {
+  mp3_44100_128: 16000, mp3_44100_192: 24000, mp3_22050_32: 4000, mp3_44100_64: 8000,
+  pcm_s16le_16000: 32000, pcm_s16le_22050: 44100, pcm_s16le_24000: 48000, pcm_s16le_44100: 88200,
+};
 const DEFAULT_SLIDE_MS = 5000;   // a slide with no narration holds this long
 const MIN_SLIDE_MS = 1500;       // floor so a very short line still reads
 const TAIL_PAD_MS = 600;         // breath after the narration ends
@@ -40,7 +45,7 @@ export function buildStoryboard(slides, opts = {}) {
     const audioMs = estimateAudioDurationMs(audio, n && n.format);
     const durationMs = audio
       ? Math.min(MAX_SLIDE_MS, Math.max(MIN_SLIDE_MS, audioMs + padMs))
-      : defaultMs;
+      : Math.min(MAX_SLIDE_MS, Math.max(MIN_SLIDE_MS, defaultMs)); // clamp no-audio slides too (caller slideMs is unbounded)
     totalMs += durationMs;
     return {
       index,
