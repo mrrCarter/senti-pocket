@@ -57,8 +57,14 @@ export function scanExport(events) {
 }
 
 const utf8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
-const clampUtf8 = (s, max, marker = '…[truncated]') =>
-  utf8(s) > max ? Buffer.from(String(s), 'utf8').subarray(0, max).toString('utf8') + marker : s;
+const clampUtf8 = (s, max, marker = '…[truncated]') => {
+  if (utf8(s) <= max) return s;
+  // scalar-safe: iterate by code point so a byte-offset cut never splits a multibyte char into a U+FFFD replacement.
+  const str = String(s);
+  let out = '', used = 0;
+  for (const ch of str) { const cb = Buffer.byteLength(ch, 'utf8'); if (used + cb > max) break; out += ch; used += cb; }
+  return out + marker;
+};
 
 /** A canonical sequence id: a POSITIVE SAFE integer. Rejects fractional/unsafe/negative/non-numeric (Echo P1). */
 export function toSeq(v) {

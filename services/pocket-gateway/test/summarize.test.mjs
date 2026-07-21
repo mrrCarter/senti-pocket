@@ -62,6 +62,21 @@ test('a blank/whitespace-payload event in range does NOT break bundle signing (e
   assert.equal(verifyBundle(signed, publicKey), true, 'signs + verifies end-to-end');
 });
 
+test('multibyte snippet truncation is codepoint-safe (no U+FFFD in phone-visible snippets) — regression', () => {
+  const big = '€'.repeat(200); // 200 euro signs = 600 bytes, exceeds SNIPPET_BYTES (280) -> clamp truncates
+  const EXPORT_MB = { session: { id: SID, title: 't' }, events: [
+    { sequenceId: 300, event: 'session_message', agent: { id: 'claude-pocket-relay' }, payload: { text: big }, ts: '2026-07-18T11:00:00Z' },
+    { sequenceId: 301, event: 'session_message', agent: { id: 'claude-warden' }, payload: { text: 'ok' }, ts: '2026-07-18T11:01:00Z' },
+  ] };
+  const CKPT_MB = { checkpointId: 'cp_mb', sessionId: SID, startSequence: 300, endSequence: 301, summarySections: { window: { eventCount: 2 } } };
+  const raw = buildRawCheckpoint(CKPT_MB, EXPORT_MB).rawCheckpoint;
+  const s = summarize(raw, CKPT_MB);
+  for (const a of s.perAgent) for (const ev of a.evidence) assert.ok(!ev.snippet.includes('�'), 'no U+FFFD replacement char in a snippet');
+  const relaySnippet = s.perAgent.find((a) => a.agentId === 'claude-pocket-relay').evidence[0].snippet;
+  assert.ok(relaySnippet.endsWith('…'), 'truncated snippet ends with the ellipsis');
+  assert.ok([...relaySnippet].every((c) => c === '€' || c === '…'), 'only whole euro codepoints + ellipsis (no split byte)');
+});
+
 test('summarize is deterministic: same input => byte-identical output', () => {
   assert.deepEqual(summarize(rc(), CKPT), summarize(rc(), CKPT));
 });
