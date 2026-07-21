@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  renderSlide, renderDeck, wrapText, escapeXml, CANVAS, SLIDE_STYLES, SLIDE_TEMPLATES,
+  renderSlide, renderDeck, wrapText, escapeXml, safeImageHref, CANVAS, SLIDE_STYLES, SLIDE_TEMPLATES,
 } from '../src/deck/templates.mjs';
 
 const sampleFor = (tpl) => ({
@@ -82,6 +82,43 @@ test('wrapText honors maxLines EXACTLY for every bound incl. 1 (regression: rela
   // imageCaption's real call site (title, size 52, full content width, maxLines 1) must not overflow.
   const capTitle = wrapText('An extremely long image caption title that would previously overflow the entire slide area', 52, 1620, 1);
   assert.equal(capTitle.length, 1, 'imageCaption title capped at 1 line');
+});
+
+test('safeImageHref allowlist: https/data-image allowed; file/http/js/data-html rejected (SSRF+XSS)', () => {
+  assert.equal(safeImageHref('https://cdn.example.com/a.png'), 'https://cdn.example.com/a.png');
+  assert.equal(safeImageHref('data:image/png;base64,iVBORw0KGgo='), 'data:image/png;base64,iVBORw0KGgo=');
+  // rejected -> null
+  for (const bad of ['http://169.254.169.254/latest/meta-data/', 'file:///etc/passwd', 'javascript:alert(1)',
+    'data:text/html,<script>1</script>', 'ftp://x/y', null, 42, 'HTTPS://x y']) {
+    assert.equal(safeImageHref(bad), null, `${JSON.stringify(bad)} rejected`);
+  }
+  // leading/trailing whitespace is trimmed, then a valid https URL is allowed (normalization, not a bypass)
+  assert.equal(safeImageHref('  https://ok/a.png  '), 'https://ok/a.png');
+});
+
+test('imageCaption: unsafe href -> placeholder (no <image>); safe href -> <image>', () => {
+  const bad = renderSlide({ template: 'imageCaption', content: { href: 'file:///etc/passwd', placeholder: 'ph' } });
+  assert.ok(!bad.svg.includes('<image '), 'no <image> for a rejected href');
+  assert.ok(bad.svg.includes('ph'), 'placeholder shown');
+  const good = renderSlide({ template: 'imageCaption', content: { href: 'https://cdn.example.com/a.png' } });
+  assert.ok(good.svg.includes('<image href="https://cdn.example.com/a.png"'), '<image> for an https href');
+});
+
+test('renderDeck namespaces element ids per slide (no cross-slide url(#acc) collision in one DOM)', () => {
+  const deck = renderDeck({ slides: [
+    { template: 'title', content: { title: 'A' } },
+    { template: 'stat', content: { value: '1' } },
+    { template: 'imageCaption', content: { title: 'C' } },
+  ] });
+  // every slide defines its OWN namespaced ids, and NO un-namespaced url(#acc|field|imgclip) survives (that's the
+  // collision vector). Not every template USES the acc gradient (imageCaption doesn't), so we assert define + no-bare-ref.
+  deck.slides.forEach((s, i) => {
+    assert.ok(s.svg.includes(`id="acc-${i}"`), `slide ${i} defines acc-${i}`);
+    assert.ok(!/url\(#(acc|field|imgclip)\)/.test(s.svg), `slide ${i} has no un-namespaced url(#...)`);
+  });
+  // ids are globally unique across the concatenated deck (what an inline-all-slides DOM would see)
+  const all = deck.slides.map((s) => s.svg).join('');
+  assert.equal((all.match(/id="acc-0"/g) || []).length, 1, 'acc-0 defined exactly once');
 });
 
 test('unknown template or style throws a helpful error', () => {
