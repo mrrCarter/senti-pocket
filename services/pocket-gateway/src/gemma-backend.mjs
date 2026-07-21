@@ -24,7 +24,10 @@ function evidenceLines(bundle) {
     .join('\n');
 }
 const groundedSet = (bundle, groundedEvidenceIds) => new Set(
-  Array.isArray(groundedEvidenceIds) && groundedEvidenceIds.length
+  // PROVIDED (even an explicit []) -> use verbatim: an empty retrieval set must ground against NOTHING (fail-closed),
+  // not silently fall back to the whole bundle (which would leak full-bundle citations). Only DERIVE from the bundle
+  // when the caller passed no grounding at all (null/undefined/non-array).
+  Array.isArray(groundedEvidenceIds)
     ? groundedEvidenceIds
     : (Array.isArray(bundle?.evidence) ? bundle.evidence : []).map((e) => e && e.id).filter(Boolean),
 );

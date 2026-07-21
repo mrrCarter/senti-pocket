@@ -96,6 +96,17 @@ test('brief: fail-closed on non-JSON -> no segments', async () => {
   assert.deepEqual(await g.brief({ bundle: BUNDLE, groundedEvidenceIds: GROUNDED }), { segments: [] });
 });
 
+test('reason: explicit EMPTY groundedEvidenceIds grounds against NOTHING (not the whole bundle) — fail-closed', async () => {
+  const { fetch } = fakeChat(JSON.stringify({ text: 'grounded-looking', evidenceIds: ['ev_1', 'ev_2'], confidence: 0.9 }));
+  const g = createGemmaBackend({ baseUrl: 'http://x/v1', fetch });
+  // the model cites real bundle ids, but the RETRIEVAL grounding is EMPTY -> every cite must be dropped
+  const r = await g.reason({ question: 'q', bundle: BUNDLE, groundedEvidenceIds: [] });
+  assert.deepEqual(r.evidenceIds, [], 'explicit [] grounds against nothing (was: silently fell back to the entire bundle)');
+  // control: ABSENT grounding still derives from the bundle -> the same cites survive
+  const r2 = await g.reason({ question: 'q', bundle: BUNDLE });
+  assert.deepEqual(r2.evidenceIds, ['ev_1', 'ev_2'], 'absent grounding derives from the bundle');
+});
+
 test('factory requires baseUrl + fetch', () => {
   assert.throws(() => createGemmaBackend({ fetch: async () => {} }), /baseUrl is required/);
   assert.throws(() => createGemmaBackend({ baseUrl: 'http://x', fetch: null }), /fetch is required/);
