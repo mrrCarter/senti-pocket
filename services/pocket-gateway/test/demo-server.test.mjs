@@ -8,7 +8,7 @@ import { computeProposalHash } from '../src/actions.mjs';
 const DISPOSABLE = '22222222-2222-4222-8222-222222222222';
 function mockRun(state = { replies: 0 }) {
   return (args) => {
-    if (args[1] === 'reply') { state.replies += 1; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'reply') { state.replies += 1; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }); }
     if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_' + state.replies, agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 5 } }] });
     return '{}';
   };

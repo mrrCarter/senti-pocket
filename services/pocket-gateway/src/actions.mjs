@@ -560,7 +560,10 @@ export async function executeAction(proposal, confirmation, opts = {}) {
         return r;
       }
     } else {
-      const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--idempotency-key', live, '--json']);
+      // Flags FIRST, then a `--` guard, then the positionals: commander treats an argv element starting with `-` as an
+      // OPTION, so a renderedPreview like "- item 1" / "-> next" (a markdown list, an arrow — normal reply content) would
+      // be misparsed as an unknown option and the reply would FAIL. `--` forces everything after it to be positional.
+      const out = run(['session', 'reply', '--agent', agent, '--idempotency-key', live, '--json', '--', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview]);
       parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
       if (!parsed || parsed.targetSequenceId !== snap.targetSequence) {
         // The post returned but is unidentifiable, or landed under the WRONG sequence: it may have landed, so KEEP a
