@@ -42,3 +42,33 @@ test('createProdGateway + createLambda boot with complete config', () => {
   assert.equal(typeof gw.handle, 'function');
   assert.equal(typeof createLambda(FULL_ENV, FULL_DEPS), 'function');
 });
+
+// DIAL-ME prod wiring: a valid session must reach /dial* (pocket:dial in the verifier's granted set), the device binds
+// under the VERIFIED identity, and /dial rings via deps.apnsSend — else honestly 501.
+const dialFetch = (id = 'u1') => async (url) => (String(url).includes('/auth/me')
+  ? { ok: true, status: 200, json: async () => ({ id }) }
+  : { ok: true, status: 200, json: async () => ({}), text: async () => '{}' });
+
+test('createProdGateway wires DIAL-ME: /dial/register binds under the VERIFIED humanId; /dial rings via apnsSend', async () => {
+  const registered = [];
+  const deviceRegistry = {
+    async register(r) { registered.push(r); return { deviceCount: 1 }; },
+    async lookup({ humanId, sessionId }) { return registered.filter((d) => d.humanId === humanId && d.sessionId === sessionId).map((d) => ({ voipToken: d.voipToken, platform: d.platform })); },
+  };
+  const apnsSent = [];
+  const gw = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), knownSessionIdsFor: async () => ['sess-1'], deviceRegistry, apnsSend: async (a) => { apnsSent.push(a); return { delivered: true }; } });
+  const reg = await gw.handle({ method: 'POST', path: '/dial/register', headers: { authorization: 'Bearer t' }, body: { voipToken: 'tok', sessionId: 'sess-1' } });
+  assert.equal(reg.status, 200, 'a valid session reaches /dial/register (pocket:dial is granted)');
+  assert.equal(registered[0].humanId, 'u1', 'device bound to the /auth/me identity, never the body');
+  const dial = await gw.handle({ method: 'POST', path: '/dial', headers: { authorization: 'Bearer t' }, body: { message: 'ring', sessionId: 'sess-1' } });
+  assert.equal(dial.status, 200);
+  assert.equal(apnsSent[0].voipToken, 'tok', 'the registered token is resolved + rung');
+});
+
+test('createProdGateway: /dial honestly 501s without apnsSend, but /dial/register still records', async () => {
+  const deviceRegistry = { async register() { return { deviceCount: 1 }; }, async lookup() { return []; } };
+  const gw = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), knownSessionIdsFor: async () => ['sess-1'], deviceRegistry }); // NO apnsSend
+  assert.equal((await gw.handle({ method: 'POST', path: '/dial/register', headers: { authorization: 'Bearer t' }, body: { voipToken: 'tok', sessionId: 'sess-1' } })).status, 200, 'register works before APNs is wired');
+  const dial = await gw.handle({ method: 'POST', path: '/dial', headers: { authorization: 'Bearer t2' }, body: { message: 'ring', sessionId: 'sess-1' } });
+  assert.equal(dial.status, 501, 'no apnsSend -> pushBackend undefined -> dial-not-configured');
+});

@@ -8,6 +8,7 @@ import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
 import { createDynamoStore } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
+import { createDialPushBackend, createStoreDeviceRegistry } from './dial-registry.mjs';
 import { lambdaHandler } from './lambda.mjs';
 
 /**
@@ -23,6 +24,9 @@ import { lambdaHandler } from './lambda.mjs';
  *   - run: a senti writeback runner (bundled sl or a senti API client) — `POST /actions/execute` uses it
  *   - knownSessionIdsFor(humanId): the sessions the human may write to (server-derived authorization)
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
+ *   - apnsSend({voipToken,platform,payload}): OPTIONAL VoIP push transport (APNs, cert-bound). Present => POST /dial
+ *     dispatch is live; absent => /dial 501s (dial-not-configured) while /dial/register still records device tokens.
+ *   - deviceRegistry / pushBackend: OPTIONAL overrides for the store-backed defaults (a dedicated device table, etc.)
  */
 export function createProdGateway(env = {}, deps = {}) {
   // FAIL BOOT if any production binding is absent (Echo P0). SENTI_API_BASE_URL is load-bearing twice: it's where the
@@ -56,6 +60,14 @@ export function createProdGateway(env = {}, deps = {}) {
   // so the humanMessage `undefined dep -> TypeError` gap cannot regress.
   const postHumanMessage = createHumanMessageClient({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
 
+  // DIAL-ME: the phone registers its VoIP token (POST /dial/register) into deviceRegistry; POST /dial resolves it via the
+  // registry-backed pushBackend and sends the VoIP push. deviceRegistry DEFAULTS to a store-backed impl (rides the
+  // existing DynamoDB table — zero new infra) so /dial/register works out of the box; a deploy may override it. /dial
+  // DISPATCH additionally needs deps.apnsSend (the VoIP push transport, cert-bound): absent, /dial honestly 501s
+  // (dial-not-configured) while /dial/register still records tokens for when APNs is wired.
+  const deviceRegistry = deps.deviceRegistry || createStoreDeviceRegistry({ store });
+  const pushBackend = deps.pushBackend || (typeof deps.apnsSend === 'function' ? createDialPushBackend({ deviceRegistry, apnsSend: deps.apnsSend }) : undefined);
+
   return createGateway({
     verifyToken,
     store,
@@ -69,6 +81,8 @@ export function createProdGateway(env = {}, deps = {}) {
     signingKeyId: env.SIGNING_KEY_ID,
     knownSessionIdsFor: deps.knownSessionIdsFor,
     bundleStore: deps.bundleStore,
+    deviceRegistry,   // POST /dial/register (store-backed default; deploy may override)
+    pushBackend,      // POST /dial dispatch (present only when deps.apnsSend is wired)
     agent: 'claude-pocket-relay',
   });
 }
