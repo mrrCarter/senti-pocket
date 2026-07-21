@@ -14,6 +14,8 @@ import { summarize } from './summarize.mjs';
 import { buildSignedBundle } from './bundle.mjs';
 import { routeAnswer } from './reasoning-router.mjs';
 import { splitTagged } from './audio-tags.mjs';
+import { renderDeck } from './deck/templates.mjs';
+import { narrateDeck } from './deck/narration.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -302,6 +304,46 @@ export function createGateway(deps) {
     };
   }
 
+  // POST /deck — render a presentation deck (deterministic SVG slides) + optional per-slide narration. The deck spec is
+  // caller-authored (a valid session), so the base op is a read-scope content render; synthesizing audio is voice egress
+  // and requires the DISTINCT pocket:voice scope (same boundary as /tts). Audio is opt-in (narrate:true) and honest: if
+  // requested without a backend, segments carry audioSkipped='no-backend' rather than fabricating silence.
+  async function handleDeck(req, ctx) {
+    if (!hasScope(ctx, SCOPES.sync)) return json(403, { error: 'missing scope ' + SCOPES.sync });
+    const body = readBody(req.body);
+    if (body === null) return json(400, { error: 'invalid JSON body' });
+    const spec = body && body.deck && typeof body.deck === 'object' ? body.deck : body;
+    if (!spec || !Array.isArray(spec.slides) || spec.slides.length === 0) return json(400, { error: 'deck.slides required (non-empty array)' });
+    if (spec.slides.length > 60) return json(413, { error: 'deck exceeds 60 slides' });
+    const narrate = body.narrate === true || body.audio === true;
+    if (narrate) {
+      if (!hasScope(ctx, SCOPES.tts)) return json(403, { error: 'missing scope ' + SCOPES.tts + ' (required to synthesize narration audio)' });
+      for (const s of spec.slides) {
+        const script = (s && (s.script ?? (s.content && s.content.script))) || '';
+        if (typeof script === 'string' && Buffer.byteLength(script, 'utf8') > 8192) return json(413, { error: 'a slide script exceeds 8192 bytes' });
+      }
+    }
+    let rendered;
+    try { rendered = renderDeck(spec); }
+    catch (e) { return json(400, { error: 'render failed: ' + (e && e.message ? String(e.message).slice(0, 160) : 'invalid slide') }); }
+    const narration = await narrateDeck(spec, {
+      ttsBackend: narrate ? deps.ttsBackend : null,
+      voiceId: body.voiceId, tone: body.tone, synthesize: narrate,
+      modelId: body.modelId || 'eleven_flash_v2_5', outputFormat: body.outputFormat || 'pcm_24000',
+    });
+    const slides = rendered.slides.map((s, i) => {
+      const n = narration.segments[i];
+      return {
+        template: s.template, style: s.style, width: s.width, height: s.height, svg: s.svg,
+        narration: n ? {
+          transcript: n.transcript, tagged: n.tagged, hasAudioTags: n.hasAudioTags, tone: n.tone,
+          audio: n.audio || null, format: n.format || null, audioSkipped: n.audioSkipped || null,
+        } : null,
+      };
+    });
+    return json(200, { style: rendered.style, count: rendered.count, audioEnabled: narration.audioEnabled, narratedCount: narration.narratedCount, slides });
+  }
+
   return {
     async handle(req) {
       const method = (req.method || 'GET').toUpperCase();
@@ -318,6 +360,7 @@ export function createGateway(deps) {
       if (method === 'POST' && path === '/brief') return handleBrief(req, ctx);
       if (method === 'POST' && path === '/actions/execute') return handleExecute(req, ctx);
       if (method === 'POST' && path === '/tts') return handleTts(req, ctx);
+      if (method === 'POST' && path === '/deck') return handleDeck(req, ctx);
       return json(404, { error: 'not found' });
     },
   };
