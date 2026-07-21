@@ -10,6 +10,7 @@
 // SAME token downstream to /human-message (one native token end-to-end).
 
 import { createHash } from 'node:crypto';
+import { timeoutSignal } from './http-timeout.mjs';
 
 // Cache TTL bounds how long a SUCCESSFUL validation is reused. SECURITY: we CANNOT read the token's own `exp` — it's an
 // HS256 JWT and we (correctly) hold no secret to decode it — so this TTL is the ONLY freshness bound. A cached identity
@@ -59,7 +60,7 @@ export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT
       cache.delete(key);                                             // expired -> drop it, don't let stale positives linger
     }
 
-    const signal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') ? AbortSignal.timeout(timeoutMs) : undefined;
+    const signal = timeoutSignal(timeoutMs); // bounded on any runtime (native AbortSignal.timeout, else an AbortController fallback)
     let res;
     try {
       // Delegate validation to the api under the caller's OWN token — the gateway holds no secret, mints nothing.
@@ -77,15 +78,19 @@ export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT
     const humanId = me && (typeof me.id === 'string' && me.id ? me.id : null);
     if (!humanId) return null;                                        // no identity -> fail-closed
 
-    const result = {
+    // FROZEN (Warden hardening note 1): this result is cached and returned BY REFERENCE on every cache hit, so a
+    // downstream in-place mutation (.push/.sort/.splice on ctx.scopes) would poison the entry for ALL later hits of this
+    // token. Freeze the nested array + claims + the object so the cached identity is deeply immutable. Handlers read via
+    // .includes() today (safe), but freezing removes the latent footgun for any future consumer.
+    const result = Object.freeze({
       humanId,
       // Distinct principal namespace from AIdenID tokens (prefix), so SENTI + AIdenID durable state never collide for
       // the same humanId. The user id IS the stable, collision-free anchor for principal/membership (not a pairwise sub).
       principal: 'pocket.principal.senti.v1\n' + lp(humanId),
-      scopes: [...grantedScopes],
+      scopes: Object.freeze([...grantedScopes]),
       site: null,
-      tokenClaims: { authMethod: 'senti_session', via: 'auth/me' },
-    };
+      tokenClaims: Object.freeze({ authMethod: 'senti_session', via: 'auth/me' }),
+    });
     // Bound the cache: at capacity evict the OLDEST entry (Map preserves insertion order). Positives also drop on expiry
     // (above) + on any observed failure; this cap covers tokens validated once and never seen again (long-warm instance).
     if (cache.size >= maxCacheEntries) { const oldest = cache.keys().next().value; if (oldest !== undefined) cache.delete(oldest); }

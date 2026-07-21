@@ -83,6 +83,19 @@ test('cache is size-bounded: at capacity the OLDEST positive is evicted (re-vali
   assert.equal(calls.length, 4, 'A evicted -> re-fetched');
 });
 
+test('the returned identity is deeply FROZEN (cached by-ref; no downstream mutation can poison the cache) — Warden note 1', async () => {
+  const { fetch } = fakeFetch(() => meOk('user_frozen'));
+  const verify = createSentiSessionVerifier({ fetch, apiBaseUrl: 'https://a', now: () => 1000 });
+  const ctx = await verify({ authorization: 'Bearer T' });
+  assert.ok(Object.isFrozen(ctx), 'result object frozen');
+  assert.ok(Object.isFrozen(ctx.scopes), 'scopes array frozen');
+  assert.ok(Object.isFrozen(ctx.tokenClaims), 'tokenClaims frozen');
+  assert.throws(() => ctx.scopes.push('sessions:admin'), TypeError, 'in-place scope mutation is rejected');
+  // the cached entry stays unpoisoned: a second (cached) hit still has the original scopes
+  const ctx2 = await verify({ authorization: 'Bearer T' });
+  assert.deepEqual(ctx2.scopes, ['sessions:read', 'sessions:write', 'pocket:voice']);
+});
+
 test('factory requires fetch + apiBaseUrl', () => {
   assert.throws(() => createSentiSessionVerifier({ apiBaseUrl: 'https://a' }), /fetch is required/);
   assert.throws(() => createSentiSessionVerifier({ fetch: async () => {} }), /apiBaseUrl is required/);
