@@ -2,7 +2,7 @@
 // The phone caches a PocketBundle and MUST verify its signature before briefing from it.
 // Signature covers the whole bundle EXCEPT the `signature` field itself (so signingKeyId is bound too).
 import { sign as edSign, verify as edVerify, generateKeyPairSync, createPrivateKey, createPublicKey } from 'node:crypto';
-import { scrubText } from './scrub.mjs';
+import { scrubText, scrubIdSafe } from './scrub.mjs';
 
 export const CONTRACTS_VERSION = '0.1.8';
 /** Max UTF-8 bytes for any single phone-visible evidence snippet (bounded egress). */
@@ -74,7 +74,12 @@ const scrubStr = (v, maxBytes) => boundStr(scrubText(String(v ?? '')).text, maxB
  * ids that share a prefix (a silent identity forgery). An over-cap id survives to validateBundleIngress, which REJECTS
  * it (preserving identity, fail-closed at sign) rather than mangling it.
  */
-const scrubId = (v) => scrubText(String(v ?? '')).text;
+// Identity/citation ids are STRUCTURED identifiers, not free text: scrubIdSafe applies only the EXPLICIT-format secret
+// rules (prefixes/PEM/JWT/Bearer/kv), NOT the high-entropy catch-alls (hex{40,}/base64url{48,}) — so a well-formed
+// hash/uuid/cp_/ev_ id (which a catch-all would REDACT, breaking grounding-citation matching + collapsing two distinct
+// ids to one token) passes VERBATIM, while a secret-PREFIXED value in an id field STILL redacts. (Warden's scrub-id-safe
+// #43 is the rigorous form of the earlier charset shortcut — it additionally redacts a secret-prefixed id.)
+const scrubId = (v) => scrubIdSafe(String(v ?? '')).text;
 
 /**
  * Per-field caps for the projected, phone-visible CheckpointSummary. `id`/`evId`/snippet are pinned to the FROZEN
@@ -152,8 +157,8 @@ export function buildBundle(rawCheckpoint, summary, opts = {}) {
   const evidence = dedupEvidence(projected.perAgent.flatMap((a) => a.evidence || []));
   const bundle = {
     contractsVersion: opts.contractsVersion || CONTRACTS_VERSION,
-    checkpointId: rawCheckpoint.checkpointId,
-    sessionId: rawCheckpoint.sessionId,
+    checkpointId: scrubId(rawCheckpoint.checkpointId), // symmetric with the projected summary.checkpointId (no scrub-divergence)
+    sessionId: scrubId(rawCheckpoint.sessionId),       // symmetric with projected evidence.sessionId
     sequenceStart: rawCheckpoint.startSequence,
     sequenceEnd: rawCheckpoint.endSequence,
     summary: projected,
