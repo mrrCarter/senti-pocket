@@ -547,7 +547,12 @@ export async function executeAction(proposal, confirmation, opts = {}) {
         return r;
       }
     } else {
-      const out = run(['session', 'reply', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview, '--agent', agent, '--idempotency-key', live, '--json']);
+      // Flags-first, then `--`, then positionals: renderedPreview is user content that CAN start with '-' ("- bullet",
+      // "-> ", "--note"); as a bare positional the CLI's commander parses it as an unknown option and the post FAILS.
+      // sessionId (UUID) + sequence (int) can't start with '-', so they're safe, but `--` before all positionals is the
+      // robust construction (nothing after it is treated as a flag). sl-runner uses execFile (no shell) — this is arg
+      // construction, not shell injection.
+      const out = run(['session', 'reply', '--agent', agent, '--idempotency-key', live, '--json', '--', snap.targetSessionId, String(snap.targetSequence), snap.renderedPreview]);
       parsed = parseActionResult(out); // {actionId, targetSequenceId, targetCursor} — a reply is a UUID action, not a numeric seq
       if (!parsed || parsed.targetSequenceId !== snap.targetSequence) {
         // The post returned but is unidentifiable, or landed under the WRONG sequence: it may have landed, so KEEP a

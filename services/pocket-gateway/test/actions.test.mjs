@@ -27,7 +27,7 @@ function recordingRun(actionId = 'act_test') {
   const calls = [];
   const run = (args) => {
     calls.push(args);
-    if (args[1] === 'reply') return JSON.stringify({ action: { id: actionId, targetSequenceId: Number(args[3]), targetCursor: 'cur_x' } });
+    if (args[1] === 'reply') return JSON.stringify({ action: { id: actionId, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'cur_x' } });
     if (args[1] === 'read') return JSON.stringify({ events: [] });
     return '{}';
   };
@@ -318,7 +318,7 @@ test('(TOCTOU) Date mutated during run does not affect the signed receipt', asyn
   const d = new Date('2026-07-18T12:02:00Z');
   const p = makeProposal({ id: 'ptoctou2' });
   const calls = [];
-  const run = (args) => { calls.push(args); d.setTime(NaN); return args[1] === 'reply' ? JSON.stringify({ action: { id: 'act_m', targetSequenceId: Number(args[3]), targetCursor: null } }) : '{}'; };
+  const run = (args) => { calls.push(args); d.setTime(NaN); return args[1] === 'reply' ? JSON.stringify({ action: { id: 'act_m', targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: null } }) : '{}'; };
   const r = await executeAction(p, makeConfirm(p), opts({ run, now: d }));
   assert.equal(r.status, 'posted');
   assert.equal(typeof r.executedAt, 'string');
@@ -378,9 +378,27 @@ test('(TOCTOU) getter-backed renderedPreview: EVIL content is never posted (snap
   const confirmation = { proposalId: 'pgetter', confirmedProposalHash: safeHash, confirmedAt: '2026-07-18T12:01:00Z' };
   const { run, calls } = recordingRun('act_g');
   const r = await executeAction(evil, confirmation, opts({ run }));
-  const postedPreview = (calls.find((c) => c[1] === 'reply') || [])[4];
+  const replyArgs = calls.find((c) => c[1] === 'reply') || [];
+  const postedPreview = replyArgs[replyArgs.indexOf('--') + 3]; // renderedPreview = 3rd positional after `--`
   assert.notEqual(postedPreview, 'EVIL POSTED', 'EVIL content must never be posted');
   if (r.status === 'posted') assert.equal(postedPreview, SAFE);
+});
+
+test('reply arg construction: user content starting with "-" is a positional AFTER `--`, never a misparsed flag', async () => {
+  const p = { id: 'pdash', kind: 'threadedReply', targetSessionId: KNOWN, targetSequence: 230160, renderedPreview: '--json is my favorite; -> ship it', requiresConfirmation: true, createdAt: '2026-07-18T12:00:00Z', sourceQuestionId: null };
+  p.proposalHash = computeProposalHash(p);
+  const confirmation = { proposalId: 'pdash', confirmedProposalHash: p.proposalHash, confirmedAt: '2026-07-18T12:01:00Z' };
+  const { run, calls } = recordingRun('act_dash');
+  await executeAction(p, confirmation, opts({ run }));
+  const a = calls.find((c) => c[1] === 'reply');
+  assert.ok(a, 'reply was attempted');
+  const dd = a.indexOf('--');
+  assert.ok(dd > 1, 'a `--` end-of-options separator is present after the flags');
+  assert.ok(a.slice(2, dd).includes('--agent') && a.slice(2, dd).includes('--json'), 'all flags precede `--`');
+  assert.equal(a[dd + 1], KNOWN);                                   // sessionId positional
+  assert.equal(a[dd + 2], '230160');                                // sequence positional
+  assert.equal(a[dd + 3], '--json is my favorite; -> ship it');     // the dash-leading message, safe as a positional
+  assert.equal(a.length, dd + 4, 'the message is last — nothing after it to reparse as a flag');
 });
 
 // ---------- Echo exact-head regressions @3f149b7 (locked so they can never silently return) ----------
@@ -409,7 +427,7 @@ test('(atomicity/P0) read-back miss never re-posts on retry; the emitted action 
   const store = new Map();
   let posts = 0;
   const run = (args) => (args[1] === 'reply'
-    ? (posts++, JSON.stringify({ action: { id: 'act_dup_' + posts, targetSequenceId: Number(args[3]), targetCursor: 'c' } }))
+    ? (posts++, JSON.stringify({ action: { id: 'act_dup_' + posts, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }))
     : '{}');
   const r1 = await executeAction(p, makeConfirm(p), opts({ run, store, verifyReadback: () => false }));
   assert.equal(r1.status, 'failed');
