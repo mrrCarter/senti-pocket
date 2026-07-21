@@ -32,7 +32,7 @@ const isJsonContentType = (v) => typeof v === 'string' && v.split(';')[0].trim()
  * @returns the gateway ({ handle }).
  */
 export function createLiveDemoGateway(opts = {}) {
-  const { apiBaseUrl, fetch = globalThis.fetch, run, knownSessionIdsFor, signingKey, signingKeyId = 'demo-live-receipt-key', now } = opts;
+  const { apiBaseUrl, fetch = globalThis.fetch, run, knownSessionIdsFor, signingKey, signingKeyId = 'demo-live-receipt-key', now, reason, brief } = opts;
   if (!apiBaseUrl) throw new Error('createLiveDemoGateway: apiBaseUrl (REAL api origin) is required');
   if (typeof fetch !== 'function') throw new Error('createLiveDemoGateway: fetch is required');
   if (typeof run !== 'function') throw new Error('createLiveDemoGateway: run (sl-runner for reads/read-back) is required');
@@ -46,6 +46,8 @@ export function createLiveDemoGateway(opts = {}) {
     run,                                                              // real reads / read-back against the live room
     knownSessionIdsFor,
     signingKey: key, signingKeyId,
+    reason,                                                           // optional Gemma-backed /answer (real Gemma over local Ollama in the demo)
+    brief,                                                            // optional Gemma-backed /brief
     agent: 'claude-pocket-relay',
     now,                                                              // optional injected clock (tests / freshness window)
   });

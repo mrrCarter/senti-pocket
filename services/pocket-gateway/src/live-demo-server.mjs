@@ -15,6 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { createPrivateKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createLiveDemoServer } from './live-demo.mjs';
+import { createGemmaBackend } from './gemma-backend.mjs';
 
 const apiBaseUrl = process.env.SENTI_API_BASE_URL || 'https://api.sentinelayer.com';
 const port = Number(process.env.PORT || 8787);
@@ -49,7 +50,15 @@ try {
 }
 const keyMode = signingKey ? 'FIXED (stable pin across restarts)' : 'per-boot (pubkey changes each restart — app must re-pin)';
 
-const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor, signingKey });
+// Gemma reasoning (Carter: "make sure Gemma is used"): set GEMMA_BASE_URL to a local key-free Ollama
+// (http://localhost:11434/v1, GEMMA_MODEL=gemma3) or the AI Studio OpenAI-compat URL (+ GEMMA_API_KEY) to light up
+// /answer + /brief with REAL Gemma. Absent => those routes stay 501 (reasoning not configured).
+const gemmaBaseUrl = process.env.GEMMA_BASE_URL || '';
+const gemma = gemmaBaseUrl
+  ? createGemmaBackend({ baseUrl: gemmaBaseUrl, model: process.env.GEMMA_MODEL || 'gemma3', apiKey: process.env.GEMMA_API_KEY, fetch: globalThis.fetch })
+  : undefined;
+
+const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor, signingKey, reason: gemma && gemma.reason, brief: gemma && gemma.brief });
 server.listen(port, () => {
   // Startup lines only — no secrets (apiBaseUrl / port / session / bin path / PUBLIC key); the gateway logs nothing per-request.
   process.stdout.write(`[live-demo] gateway :${port} -> api ${apiBaseUrl} | room ${demoSession} | sl=${slBin}\n`);
@@ -57,4 +66,7 @@ server.listen(port, () => {
   process.stdout.write(`[live-demo] receipt PUBKEY (Ed25519 x, base64url) = ${publicKeyB64url}\n`);
   process.stdout.write(`[live-demo]   the app PINS this (or GET :${port}/demo-pubkey) to verify ActionReceipt sigs — never render "sent" unless signatureState==.verified\n`);
   process.stdout.write('[live-demo] POST /actions/execute with the caller\'s SENTI user-session bearer to author as human-<you>\n');
+  process.stdout.write(gemma
+    ? `[live-demo] Gemma reasoning WIRED -> ${gemmaBaseUrl} (model ${gemma.model}) -> /answer + /brief live\n`
+    : '[live-demo] Gemma NOT wired (set GEMMA_BASE_URL=http://localhost:11434/v1 GEMMA_MODEL=gemma3 for real Gemma /answer + /brief)\n');
 });
