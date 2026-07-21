@@ -42,6 +42,10 @@ export async function narrateDeck(deck = {}, opts = {}) {
   // request timeout (API Gateway 29s). Past the count, skip synthesis honestly ('deck-slide-cap'). (Full large-deck
   // narration is inherently a job for async, not one sync request.)
   const maxNarratedSlides = Number.isFinite(opts.maxNarratedSlides) && opts.maxNarratedSlides > 0 ? opts.maxNarratedSlides : null;
+  // Per-slide byte bound: the aggregate cap only checks BEFORE each synth, so the FIRST slide (total=0) always synthesizes
+  // regardless of size — one near-max/pcm-override slide could alone exceed the response limit. Drop a single slide whose
+  // audio exceeds this ('slide-audio-too-big'); it never counts toward the total.
+  const maxSlideAudioBytes = Number.isFinite(opts.maxSlideAudioBytes) && opts.maxSlideAudioBytes > 0 ? opts.maxSlideAudioBytes : null;
 
   const segments = [];
   let narratedCount = 0;
@@ -83,11 +87,15 @@ export async function narrateDeck(deck = {}, opts = {}) {
         });
         if (out && out.audio && out.audio.length) {
           const b64 = Buffer.isBuffer(out.audio) ? out.audio.toString('base64') : Buffer.from(out.audio).toString('base64');
-          seg.audio = b64;
-          seg.format = out.format || null;
-          totalAudioBytes += b64.length;
-          narratedCount++;
-          if (maxTotalAudioBytes != null && totalAudioBytes >= maxTotalAudioBytes) capReached = true;
+          if (maxSlideAudioBytes != null && b64.length > maxSlideAudioBytes) {
+            seg.audioSkipped = 'slide-audio-too-big'; // one slide alone exceeds the per-slide bound -> drop, never counted
+          } else {
+            seg.audio = b64;
+            seg.format = out.format || null;
+            totalAudioBytes += b64.length;
+            narratedCount++;
+            if (maxTotalAudioBytes != null && totalAudioBytes >= maxTotalAudioBytes) capReached = true;
+          }
         } else {
           seg.audioSkipped = 'empty-audio';
         }
