@@ -6,6 +6,7 @@ import {
   canonicalPayload, computeProposalHash, hashMatchesContent, validateProposal, executeAction, ALLOWED_KINDS,
   signReceipt, verifyReceipt, canonicalReceiptPayload, actionResultCanonicalToken, parseActionResult,
   verifyActionLanded, verifyHumanMessageLanded, parseHumanMessageResult, toSafeSequence, snapshotProposal, validateActionResultRef,
+  findLandedByProposal,
 } from '../src/actions.mjs';
 import { generateSigningKeypair } from '../src/bundle.mjs';
 import { generateKeyPairSync } from 'node:crypto';
@@ -381,6 +382,26 @@ test('(TOCTOU) getter-backed renderedPreview: EVIL content is never posted (snap
   const postedPreview = (calls.find((c) => c[1] === 'reply') || [])[4];
   assert.notEqual(postedPreview, 'EVIL POSTED', 'EVIL content must never be posted');
   if (r.status === 'posted') assert.equal(postedPreview, SAFE);
+});
+
+test('findLandedByProposal RECONCILES a humanMessage (top-level session_message, eventId===proposalHash, human author) — was orphaned', () => {
+  const p = { id: 'ph', kind: 'humanMessage', targetSessionId: KNOWN, targetSequence: 0, renderedPreview: 'from carter', createdAt: '2026-07-18T12:00:00Z', sourceQuestionId: null };
+  const wantKey = computeProposalHash(p);
+  const run = (args) => (args[1] === 'read'
+    ? JSON.stringify({ events: [
+        { eventId: 'session-action-act_other', agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 5 } }, // decoy agent action
+        { eventId: wantKey, sequenceId: 264681, agent: { id: 'human-mrrcarter' }, cursor: 'c-9' },                       // the landed human write
+      ] })
+    : '{}');
+  const landed = findLandedByProposal(KNOWN, { proposal: p, run });
+  assert.ok(landed, 'a landed humanMessage is reconciled (pre-fix: null -> stuck 409, never a signed receipt)');
+  assert.equal(landed.messageId, wantKey);
+  assert.equal(landed.sequenceId, 264681);
+  assert.equal(landed.senderId, 'human-mrrcarter'); // shape matches parseHumanMessageResult -> doVerify + finalizePosted work
+  // no cross-shape confusion: an AGENT proposal over the same room finds no session-action match -> null
+  assert.equal(findLandedByProposal(KNOWN, { proposal: { ...p, kind: 'threadedReply', targetSequence: 100 }, run }), null);
+  // and a humanMessage whose hash isn't present -> null (no false reconcile)
+  assert.equal(findLandedByProposal(KNOWN, { proposal: { ...p, id: 'other', renderedPreview: 'different' }, run }), null);
 });
 
 // ---------- Echo exact-head regressions @3f149b7 (locked so they can never silently return) ----------
