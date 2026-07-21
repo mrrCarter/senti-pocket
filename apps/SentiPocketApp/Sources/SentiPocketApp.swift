@@ -37,9 +37,13 @@ struct PhoneRootView: View {
         let checkpointId = bundle?.checkpointId
         let cached = CachedReasoningProvider(cachedBriefing: PocketFixtures.briefingPlan,
                                              cachedEvidence: bundle?.evidence ?? [])
+        // ONLINE → real gateway reasoning (GatewayReasoningHTTPClient → relay's gated /brief+/answer, bearer session
+        // token). It reasons the moment relay's backend + a key/Gemma are live; until then /brief 501/503 → the driver
+        // surfaces .failed honestly (never a fabricated brief). OFFLINE/reconnecting → the honest Cached floor.
+        let online = GatewayReasoningProvider(client: GatewayReasoningHTTPClient(apiBaseURL: Self.gatewayURL()))
         _reasoning = StateObject(wrappedValue: RealReasoningCoordinator(
             sessionId: sessionId, checkpointId: checkpointId,
-            selectProvider: { _ in cached }))   // online→Gateway drops in here later; Cached is the honest floor now
+            selectProvider: { isOnline in isOnline ? (online as ReasoningProvider) : (cached as ReasoningProvider) }))
         _write = StateObject(wrappedValue: PhoneWriteViewModel(
             sessionId: sessionId,
             client: PocketWriteClient(apiBaseURL: Self.gatewayURL())))
