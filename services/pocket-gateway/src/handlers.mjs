@@ -87,9 +87,12 @@ export function createGateway(deps) {
     const sessionId = req.query && req.query.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
     if (!deps.signingKey) return json(501, { error: 'signing not configured' });
-    // Server-derived membership authz (Echo cross-tenant): scope by the FULL principal, never the token's claim alone.
+    // Server-derived membership authz: knownSessionIdsFor is keyed by HUMANID (the contract + the write path
+    // handleExecute), so scope by ctx.humanId — NOT the synthetic principal string (which never matches -> 403s a valid
+    // member in prod). Durable state stays principal-namespaced (below); membership is humanId. The token's claim alone
+    // still can never name an arbitrary target session.
     let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.principal || ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
     if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
     let bundle;
@@ -122,9 +125,9 @@ export function createGateway(deps) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
     if (!question) return json(400, { error: 'question required' });
     if (Buffer.byteLength(question, 'utf8') > 4096) return json(413, { error: 'question exceeds 4096 bytes' });
-    // Server-derived membership authz: reason ONLY over a session this principal belongs to.
+    // Server-derived membership authz: reason ONLY over a session this HUMAN belongs to (humanId-keyed, matching the write).
     let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.principal || ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
     if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
     // Fail-closed: reason ONLY over a signature-verified checkpoint bundle (never over an unverified/synthesized one).
@@ -172,7 +175,7 @@ export function createGateway(deps) {
     const sessionId = body.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
     let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.principal || ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
     if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
     let bundle;
