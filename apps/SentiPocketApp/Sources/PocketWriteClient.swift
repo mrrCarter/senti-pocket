@@ -130,9 +130,12 @@ final class PocketWriteClient {
         // NUMBER createdAt), but the RECEIPT leg comes back with ISO-8601-WITH-milliseconds dates — the gateway's
         // normalizeSaneDate → `new Date(ms).toISOString()` always emits fractional seconds. So decode ISO-with-fraction
         // first (preserving the millis the signature covers), with an epoch-millis fallback for robustness.
-        let isoFrac = ISO8601DateFormatter(); isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoWhole = ISO8601DateFormatter(); isoWhole.formatOptions = [.withInternetDateTime]
         d.dateDecodingStrategy = .custom { dec in
+            // Per-decode formatters (Swift-6 data-race fix, forge): ISO8601DateFormatter is non-Sendable + not
+            // documented thread-safe; a captured SHARED instance would race in this @Sendable decode closure.
+            // Receipt decode is infrequent (one per governed write) so per-call init is negligible + race eliminated.
+            let isoFrac = ISO8601DateFormatter(); isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let isoWhole = ISO8601DateFormatter(); isoWhole.formatOptions = [.withInternetDateTime]
             let c = try dec.singleValueContainer()
             if let s = try? c.decode(String.self) {
                 if let dt = isoFrac.date(from: s) { return dt }
