@@ -26,9 +26,15 @@ const json = (status, body, headers = {}) => ({ status, headers: { 'content-type
  * ERROR ENVELOPE instead of a null-hash "receipt". A posted / pending / post-confirmation-failed receipt (which
  * carries the verified non-null hash) is returned as-is.
  */
-const receiptResponse = (r) => (r && r.status === 'failed' && r.confirmedProposalHash == null)
-  ? json(422, { error: 'proposal_rejected', reason: (r.failureReason || 'proposal could not be bound to a confirmation') })
-  : json(200, r);
+export const receiptResponse = (r) => {
+  if (r && r.status === 'failed' && r.confirmedProposalHash == null) {
+    return json(422, { error: 'proposal_rejected', reason: (r.failureReason || 'proposal could not be bound to a confirmation') });
+  }
+  // Strip the internal __emitted reconcile marker (the EMITTED-RETRY signal set in actions.mjs) — it must NEVER cross
+  // into the response body (contract: the client gets a clean ActionReceipt, not gateway-internal reconcile state).
+  if (r && typeof r === 'object' && '__emitted' in r) { const { __emitted, ...clean } = r; return json(200, clean); }
+  return json(200, r);
+};
 const readBody = (body) => {
   if (body == null) return {};
   if (typeof body === 'string') { try { return JSON.parse(body); } catch { return null; } }
