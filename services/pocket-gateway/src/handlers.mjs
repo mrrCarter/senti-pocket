@@ -384,22 +384,30 @@ export function createGateway(deps) {
 
   return {
     async handle(req) {
-      const method = (req.method || 'GET').toUpperCase();
-      const path = req.path || '/';
-      if (method === 'GET' && path === '/health') return json(200, { ok: true });
+      // handle() is the gateway's contract boundary — it must NEVER throw to an adapter (a throw becomes a runtime crash
+      // / adapter-specific 5xx that can leak a stack). Any unexpected error from a handler collapses to a clean 500 here.
+      try {
+        const method = (req.method || 'GET').toUpperCase();
+        const path = req.path || '/';
+        if (method === 'GET' && path === '/health') return json(200, { ok: true });
 
-      const ctx = await authenticate(req);
-      if (!ctx || typeof ctx.humanId !== 'string' || !ctx.humanId) {
-        return json(401, { error: 'authentication required' }, { 'www-authenticate': 'Bearer' });
+        const ctx = await authenticate(req);
+        if (!ctx || typeof ctx.humanId !== 'string' || !ctx.humanId) {
+          return json(401, { error: 'authentication required' }, { 'www-authenticate': 'Bearer' });
+        }
+        // `return await` (not bare `return`): the handlers are async, so awaiting HERE keeps a rejection inside this
+        // try/catch — a bare `return handleX()` would settle in the caller's await, escaping the boundary.
+        if (method === 'GET' && path === '/sync') return await handleSync(req, ctx);
+        if (method === 'GET' && path === '/checkpoint') return await handleCheckpoint(req, ctx);
+        if (method === 'POST' && path === '/answer') return await handleAnswer(req, ctx);
+        if (method === 'POST' && path === '/brief') return await handleBrief(req, ctx);
+        if (method === 'POST' && path === '/actions/execute') return await handleExecute(req, ctx);
+        if (method === 'POST' && path === '/tts') return await handleTts(req, ctx);
+        if (method === 'POST' && path === '/deck') return await handleDeck(req, ctx);
+        return json(404, { error: 'not found' });
+      } catch {
+        return json(500, { error: 'internal error' }); // no stack/detail leaked to the client
       }
-      if (method === 'GET' && path === '/sync') return handleSync(req, ctx);
-      if (method === 'GET' && path === '/checkpoint') return handleCheckpoint(req, ctx);
-      if (method === 'POST' && path === '/answer') return handleAnswer(req, ctx);
-      if (method === 'POST' && path === '/brief') return handleBrief(req, ctx);
-      if (method === 'POST' && path === '/actions/execute') return handleExecute(req, ctx);
-      if (method === 'POST' && path === '/tts') return handleTts(req, ctx);
-      if (method === 'POST' && path === '/deck') return handleDeck(req, ctx);
-      return json(404, { error: 'not found' });
     },
   };
 }
