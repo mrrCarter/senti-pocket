@@ -7,10 +7,12 @@ import { createHumanMessageClient } from './human-message-client.mjs';
 import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
 import { createDynamoStore } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
+import { createGemmaBackend } from './gemma-backend.mjs';
 import { lambdaHandler } from './lambda.mjs';
 
 /**
- * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID, ELEVENLABS_API_KEY)
+ * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID,
+ *                        ELEVENLABS_API_KEY; GEMMA_BASE_URL + GEMMA_MODEL [+ optional GEMMA_API_KEY] to wire /answer+/brief to Gemma)
  * @param {object} deps   injected externals the deploy owns:
  *   { dynamoClient, signingKey, run, knownSessionIdsFor, bundleStore, fetch }
  *   - dynamoClient: the { get, put, delete } async shape createDynamoStore consumes. In prod this is a THIN ADAPTER
@@ -41,6 +43,13 @@ export function createProdGateway(env = {}, deps = {}) {
     ? createElevenLabsBackend({ apiKey: env.ELEVENLABS_API_KEY, fetch: deps.fetch, defaultVoiceId: env.TTS_VOICE_ID })
     : undefined;
 
+  // Gemma reasoning backend (Carter: "make sure Gemma is used"): light up /answer + /brief via a hosted/local Gemma over
+  // an OpenAI-compatible endpoint when GEMMA_BASE_URL is set (key-free Ollama, or AI Studio's OpenAI-compat with a free
+  // key). Absent => /answer + /brief stay 501 (reasoning not configured). A deploy-injected deps.reason/deps.brief wins.
+  const gemma = env.GEMMA_BASE_URL
+    ? createGemmaBackend({ baseUrl: env.GEMMA_BASE_URL, model: env.GEMMA_MODEL, apiKey: env.GEMMA_API_KEY, fetch: deps.fetch })
+    : undefined;
+
   // The HUMAN write door (executeAction humanMessage mode) posts to the api under the caller's OWN bearer — no gateway
   // credential in the path. Constructed HERE (not lazily) so "deps.postHumanMessage is defined" is a BOOT INVARIANT: a
   // prod boot cannot succeed without SENTI_API_BASE_URL + fetch (both required above), which are exactly what builds it,
@@ -51,6 +60,9 @@ export function createProdGateway(env = {}, deps = {}) {
     verifyToken,
     store,
     ttsBackend,
+    reason: deps.reason || (gemma ? gemma.reason : undefined),   // /answer  (grounding-first; 501 if neither configured)
+    brief: deps.brief || (gemma ? gemma.brief : undefined),     // /brief   (grounding-first; 501 if neither configured)
+    minConfidence: deps.minConfidence,
     run: deps.run,
     postHumanMessage,
     signingKey: deps.signingKey,
