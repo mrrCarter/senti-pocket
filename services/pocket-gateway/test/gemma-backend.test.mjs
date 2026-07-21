@@ -45,6 +45,15 @@ test('reason: grounded answer; hallucinated cites dropped; confidence clamped; u
   assert.equal(calls[0].init.headers.authorization, undefined, 'no apiKey -> no Authorization header (key-free Ollama)');
 });
 
+test('reason: ALL citations hallucinated (grounded set empties) -> text nulled too (parity with brief; defense-in-depth)', async () => {
+  const { fetch } = fakeChat(JSON.stringify({ text: 'confident but ungrounded', evidenceIds: ['ev_ghost1', 'ev_ghost2'], confidence: 0.95 }));
+  const g = createGemmaBackend({ baseUrl: 'http://x/v1', fetch });
+  const r = await g.reason({ question: 'q', bundle: BUNDLE, groundedEvidenceIds: GROUNDED });
+  assert.deepEqual(r.evidenceIds, [], 'all hallucinated cites dropped');
+  assert.equal(r.text, '', 'ungrounded -> empty text (was: text kept; now the backend fail-closes on its own, not just via routeAnswer)');
+  assert.equal(r.taggedText, undefined);
+});
+
 test('reason: apiKey -> Authorization: Bearer sent (AI Studio path)', async () => {
   const { fetch, calls } = fakeChat(JSON.stringify({ text: 'x', evidenceIds: ['ev_1'], confidence: 0.9 }));
   const g = createGemmaBackend({ baseUrl: 'https://ai.example/v1', apiKey: 'FREE_KEY', fetch });

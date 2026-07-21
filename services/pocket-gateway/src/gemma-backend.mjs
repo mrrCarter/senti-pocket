@@ -106,9 +106,14 @@ export function createGemmaBackend({ baseUrl, model = 'gemma3', apiKey, fetch = 
       const p = safeJson(raw);
       if (!p) return { text: '', evidenceIds: [], llmConfidence: 0, nearestTopics: [] };
       const evidenceIds = [...new Set((Array.isArray(p.evidenceIds) ? p.evidenceIds : []).filter((id) => grounded.has(id)))]; // grounding-first
+      // GROUNDED-FIRST at the BACKEND (parity with brief()'s ungrounded-segment drop + the module's "ungrounded -> empty"
+      // header): if NO citation survives the grounding filter, the answer is ungrounded -> return empty text. routeAnswer
+      // also gates this (citedGrounded===0 -> clarify/unavailable), so this is defense-in-depth; nearestTopics is kept so
+      // routeAnswer can still build a grounded clarify. (Forge cross-review: reason() previously kept text when cites emptied.)
+      const groundedAnswer = evidenceIds.length > 0;
       return {
-        text: typeof p.text === 'string' ? p.text : '',
-        taggedText: typeof p.taggedText === 'string' ? p.taggedText : undefined,
+        text: groundedAnswer && typeof p.text === 'string' ? p.text : '',
+        taggedText: groundedAnswer && typeof p.taggedText === 'string' ? p.taggedText : undefined,
         evidenceIds,
         llmConfidence: typeof p.confidence === 'number' ? Math.max(0, Math.min(1, p.confidence)) : undefined,
         nearestTopics: normTopics(p.nearestTopics, grounded),
