@@ -17,15 +17,22 @@ import CallKit
 import Foundation
 import PushKit
 
-/// The minimal incoming "decision call" the DialOrchestrator acts on. Mapping relay's /dial push payload → this type
-/// is a separate adapter (relay owns the wire); SentiCallKit needs only an id + who is calling + an advisory priority.
+/// The incoming "decision call" the DialOrchestrator acts on, decoded from relay's dial-registry `buildDialPayload`
+/// wire (`{ id:'dial_…', who, priority, message, context?, sessionId, ts }`). `id` here is a fresh CallKit UUID
+/// (CallKit requires a UUID); `dialId` is relay's correlation id to echo back with the answer/confirm.
 public struct IncomingDecisionCall: Equatable, Sendable {
-    public let id: UUID
+    public let id: UUID           // CallKit call UUID (generated — relay's dialId is not a UUID)
+    public let dialId: String     // relay's /dial correlation id ('dial_…') — echo back with the answer/confirm
     public let callerDisplayName: String
-    public let priority: String   // "update" | "decision" | "urgent" — advisory (ring styling / UX only)
-    public init(id: UUID, callerDisplayName: String, priority: String) {
+    public let message: String    // the decision text (read-back for warden's bar 2b / the briefing)
+    public let context: String?   // optional "what we need" context from the ring
+    public let priority: String   // low | medium | high | urgent (relay's DIAL_PRIORITIES; default medium)
+    public init(id: UUID, dialId: String, callerDisplayName: String, message: String, context: String?, priority: String) {
         self.id = id
+        self.dialId = dialId
         self.callerDisplayName = callerDisplayName
+        self.message = message
+        self.context = context
         self.priority = priority
     }
 }
@@ -79,8 +86,14 @@ public final class SentiCallManager: NSObject {
     }
 
     /// Demo convenience: ring from the foreground with no VoIP cert — Carter sees the native call UI today.
-    public func presentDemoRing(callerName: String = "Senti — decision needed", priority: String = "decision") {
-        ring(IncomingDecisionCall(id: UUID(), callerDisplayName: callerName, priority: priority))
+    public func presentDemoRing(
+        callerName: String = "Senti — decision needed",
+        message: String = "A decision needs your go.",
+        priority: String = "high"
+    ) {
+        ring(IncomingDecisionCall(
+            id: UUID(), dialId: "demo", callerDisplayName: callerName, message: message, context: nil, priority: priority
+        ))
     }
 
     /// Programmatically end an active call (e.g., the governed writeback finished and we hang up).
@@ -136,15 +149,25 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
         completion()
     }
 
-    /// Fail-safe decode: read only what CallKit needs and ALWAYS return a presentable call (a malformed push still
-    /// rings — never a silently-dropped delivery). The orchestrator re-validates the full episode on answer.
+    /// Fail-safe decode of relay's dial-registry `buildDialPayload` wire → always a presentable call (a malformed push
+    /// still rings — never a silently-dropped delivery; the orchestrator re-validates the full episode on answer).
+    /// Wire: `{ id:'dial_…', who, priority(low|medium|high|urgent), message, context?, sessionId, ts }`.
     static func decode(_ payload: [AnyHashable: Any]) -> IncomingDecisionCall {
-        let id = (payload["id"] as? String).flatMap(UUID.init(uuidString:)) ?? UUID()
-        let name = (payload["from"] as? String)
-            ?? (payload["message"] as? String)
-            ?? "Senti — decision needed"
-        let priority = (payload["priority"] as? String) ?? "decision"
-        return IncomingDecisionCall(id: id, callerDisplayName: String(name.prefix(80)), priority: priority)
+        let dialId = (payload["id"] as? String) ?? ""                       // relay's 'dial_…' correlation id (not a UUID)
+        let message = (payload["message"] as? String) ?? ""
+        let who = (payload["who"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let display = !who.isEmpty ? who : (message.isEmpty ? "Senti — decision needed" : message)
+        let raw = (payload["priority"] as? String) ?? "medium"
+        let priority = ["low", "medium", "high", "urgent"].contains(raw) ? raw : "medium"
+        let context = (payload["context"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return IncomingDecisionCall(
+            id: UUID(),                                                     // CallKit UUID; dialId carries relay's id
+            dialId: dialId,
+            callerDisplayName: String(display.prefix(80)),
+            message: message,
+            context: context,
+            priority: priority
+        )
     }
 }
 #endif
