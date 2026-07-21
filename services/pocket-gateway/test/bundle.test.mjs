@@ -265,6 +265,31 @@ test('buildSignedBundle FAILS CLOSED: over-cap identity id is REJECTED, never tr
   );
 });
 
+test('identity ids use scrubIdSafe: a hash-shaped id passes VERBATIM (grounding intact); a secret-prefixed id still redacts', () => {
+  const hashId = 'a'.repeat(64); // 64-hex: scrubText's entropy catch-all WOULD redact this; scrubIdSafe must NOT
+  const summary = {
+    checkpointId: hashId, headline: 'h', summaryBaselineSchema: 'v1', risks: [], blockers: [],
+    perAgent: [{ agentId: 'claude-pocket-relay', summary: 's', claims: [],
+      evidence: [{ id: 'ev_' + hashId, sessionId: hashId, sequence: 1, agentId: 'claude-pocket-relay', snippet: 'x', ts: '2026-07-18T10:00:00Z' }] }],
+  };
+  const draft = buildBundle({ checkpointId: hashId, sessionId: hashId, startSequence: 1, endSequence: 2 }, summary);
+  // hash-shaped ids pass through VERBATIM -> no [REDACTED] collapse, grounding-citation matching stays intact
+  assert.equal(draft.checkpointId, hashId, 'top-level checkpointId verbatim');
+  assert.equal(draft.sessionId, hashId, 'top-level sessionId verbatim (scrubId symmetry)');
+  assert.equal(draft.evidence[0].id, 'ev_' + hashId, 'evidence id verbatim');
+  assert.equal(draft.evidence[0].sessionId, hashId, 'evidence sessionId verbatim');
+  assert.ok(!JSON.stringify(draft).includes('[REDACTED'), 'no id was entropy-redacted');
+  // a secret-PREFIXED value in an id field is STILL redacted (the defense-in-depth scrubIdSafe keeps over the charset shortcut)
+  const secretId = 'sk-' + 'z'.repeat(24);
+  const summary2 = {
+    checkpointId: secretId, headline: 'h', summaryBaselineSchema: 'v1', risks: [], blockers: [],
+    perAgent: [{ agentId: 'a', summary: 's', claims: [],
+      evidence: [{ id: 'ev_1', sessionId: 's', sequence: 1, agentId: 'a', snippet: 'x', ts: '2026-07-18T10:00:00Z' }] }],
+  };
+  const draft2 = buildBundle({ checkpointId: secretId, sessionId: 's', startSequence: 1, endSequence: 2 }, summary2);
+  assert.ok(draft2.checkpointId.includes('[REDACTED'), 'a secret-prefixed id is redacted, not passed verbatim');
+});
+
 test('prose truncation is scalar-safe + cap-inclusive (never splits a code point; result <= cap)', () => {
   const ev = projectEvidenceRef({ id: 'e', sessionId: 's', sequence: 1, agentId: 'a', snippet: '€'.repeat(2000), ts: '' }); // 6000 bytes
   assert.ok(Buffer.byteLength(ev.snippet, 'utf8') <= 2048, 'result within cap (ellipsis reserved inside)');
