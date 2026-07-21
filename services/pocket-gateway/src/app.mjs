@@ -13,7 +13,9 @@ import { lambdaHandler } from './lambda.mjs';
  * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID, ELEVENLABS_API_KEY)
  * @param {object} deps   injected externals the deploy owns:
  *   { dynamoClient, signingKey, run, knownSessionIdsFor, bundleStore, fetch }
- *   - dynamoClient: @aws-sdk/lib-dynamodb DocumentClient (get/put/delete)
+ *   - dynamoClient: the { get, put, delete } async shape createDynamoStore consumes. In prod this is a THIN ADAPTER
+ *     (createDynamoClientAdapter in store.mjs) over a v3 @aws-sdk/lib-dynamodb DocumentClient — v3 exposes
+ *     .send(new GetCommand(...)), not bare get/put/delete, so the deploy wraps it before injecting here.
  *   - signingKey: Ed25519 private key (KMS/Secrets Manager) for receipts
  *   - fetch: validates SENTI sessions (GET /auth/me) + posts the human write — the gateway holds NO signing secret
  *   - run: a senti writeback runner (bundled sl or a senti API client) — `POST /actions/execute` uses it

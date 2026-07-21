@@ -92,6 +92,41 @@ export function createDynamoStore(cfg = {}) {
 }
 
 /**
+ * PROD DEPLOY SEAM — adapt a v3 `@aws-sdk/lib-dynamodb` DocumentClient to the `{ get, put, delete }` async contract that
+ * `createDynamoStore` CONSUMES. The v3 DocumentClient exposes `.send(new GetCommand(params))`, NOT bare
+ * get/put/delete-returning-promises (that was the aws-sdk v2 DocumentClient shape). This thin wrapper is the ONLY place
+ * that knows the v3 Command API, so `createDynamoStore` stays SDK-agnostic + hermetically testable against a plain fake.
+ *
+ * The Command classes are INJECTED (not imported) so this module stays ZERO-DEP + testable WITHOUT `@aws-sdk` installed:
+ * the deploy passes the real `{ GetCommand, PutCommand, DeleteCommand }`; tests pass fakes that capture their params.
+ *
+ * SHAPE CONTRACT (must match what `createDynamoStore` reads — see its get / acquireLock / putIfAbsent):
+ *   - `get` MUST resolve to the FULL response `{ Item }` (the store reads `r.Item.value`) — NOT a bare `r.Item`.
+ *     Returning `r.Item` would make every record read `undefined` → idempotency/emitted-marker misses → DUPLICATE posts.
+ *   - `put`/`delete`: the return value is unused by the store, but a thrown `ConditionalCheckFailedException` MUST
+ *     propagate UNCHANGED (the store's `isCond()` keys on `e.name`/`e.code`). So this wrapper does NO try/catch — throws
+ *     pass straight through.
+ *
+ * @param {{ send:Function }} docClient  a v3 DynamoDBDocumentClient (`DynamoDBDocumentClient.from(new DynamoDBClient())`)
+ * @param {{ GetCommand:Function, PutCommand:Function, DeleteCommand:Function }} commands  lib-dynamodb Command classes
+ * @returns {{ get:Function, put:Function, delete:Function }}  exactly the shape `createDynamoStore({ client })` expects
+ */
+export function createDynamoClientAdapter(docClient, commands = {}) {
+  if (!docClient || typeof docClient.send !== 'function') throw new Error('createDynamoClientAdapter: a v3 DynamoDBDocumentClient (with .send) is required');
+  const { GetCommand, PutCommand, DeleteCommand } = commands;
+  if (typeof GetCommand !== 'function' || typeof PutCommand !== 'function' || typeof DeleteCommand !== 'function') {
+    throw new Error('createDynamoClientAdapter: { GetCommand, PutCommand, DeleteCommand } from @aws-sdk/lib-dynamodb must be injected');
+  }
+  return {
+    // Return the FULL send() response ({ Item, $metadata, ... }); the store reads `r.Item.value`. Do NOT `.then(r=>r.Item)`.
+    get: (params) => docClient.send(new GetCommand(params)),
+    // Return unused by the store; a ConditionalCheckFailedException propagates unchanged (no try/catch here — by design).
+    put: (params) => docClient.send(new PutCommand(params)),
+    delete: (params) => docClient.send(new DeleteCommand(params)),
+  };
+}
+
+/**
  * Store-backed DPoP jti replay guard (prod): single-use jti across instances via an atomic putIfAbsent. `seen`
  * returns true iff the jti was already recorded (a replay). Shape mirrors createInMemoryReplayGuard (auth.mjs).
  */
