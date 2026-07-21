@@ -332,13 +332,26 @@ export function findLandedByProposal(sessionId, { proposal, run, agent = 'claude
   if (!run || !proposal) return null;
   const wantSeq = proposal.targetSequence;
   const wantKey = computeProposalHash(proposal); // deterministic proposal identity — NOT the body
+  const isHuman = proposal.kind === 'humanMessage';
   for (let i = 0; i < attempts; i++) {
     try { run(['session', 'sync', sessionId]); } catch { /* best-effort */ }
     let j;
     try { j = JSON.parse(run(['session', 'read', sessionId, '--remote', '--tail', '50', '--agent', agent, '--json'])); } catch { continue; }
     for (const e of (j.events || [])) {
-      if (!e || typeof e.eventId !== 'string' || !e.eventId.startsWith('session-action-')) continue;
+      if (!e || typeof e.eventId !== 'string') continue;
       const who = (e.agent && e.agent.id) || e.agentId;
+      if (isHuman) {
+        // A humanMessage lands as a TOP-LEVEL session_message whose eventId === the deterministic clientId (==
+        // proposalHash) authored by human-<user> — NOT a `session-action-*` event. Reconcile THAT shape (returning the
+        // same {messageId,sequenceId,senderId} that parseHumanMessageResult yields) so an ambiguous/crash retry can
+        // finalize the authors-AS-Carter write. Without this the human write is orphaned: stuck 409 forever, no receipt.
+        if (e.eventId === wantKey && typeof who === 'string' && who.startsWith('human-')) {
+          const seq = toSafeSequence(e.sequenceId);
+          if (seq != null) return { messageId: e.eventId, sequenceId: seq, senderId: who, targetCursor: (typeof e.cursor === 'string' ? e.cursor : null) };
+        }
+        continue;
+      }
+      if (!e.eventId.startsWith('session-action-')) continue;
       const p = e.payload || {};
       const tok = e.idempotencyToken ?? p.idempotencyToken ?? p.idempotencyKey;
       if (who === agent && Number(p.targetSequenceId) === wantSeq && typeof tok === 'string' && tok === wantKey) {
