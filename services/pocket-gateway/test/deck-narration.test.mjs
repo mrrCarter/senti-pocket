@@ -96,6 +96,16 @@ test('maxTotalAudioBytes caps aggregate audio — stops past the bound, honest d
   assert.ok(r.audioBytes >= 1200, 'aggregate bytes tracked');
 });
 
+test('maxNarratedSlides caps synth CALL-COUNT (serial TTS time bound) — past N -> deck-slide-cap', async () => {
+  const chunk = async () => ({ audio: Buffer.alloc(10), format: 'mp3' }); // tiny audio -> byte cap never triggers
+  const r = await narrateDeck({ slides: Array.from({ length: 5 }, (_, i) => ({ script: 's' + i })) }, { ttsBackend: chunk, maxNarratedSlides: 2 });
+  assert.equal(r.narratedCount, 2, 'only 2 slides synthesized');
+  assert.ok(r.segments[0].audio && r.segments[1].audio);
+  assert.equal(r.segments[2].audioSkipped, 'deck-slide-cap', 'slide 2 hits count cap');
+  assert.equal(r.segments[4].audioSkipped, 'deck-slide-cap');
+  assert.equal(r.capReached, true);
+});
+
 test('no cap -> all narrate; capReached false; audioBytes summed', async () => {
   const chunk = async () => ({ audio: Buffer.alloc(30), format: 'mp3' });
   const r = await narrateDeck({ slides: [{ script: 'a' }, { script: 'b' }] }, { ttsBackend: chunk });
