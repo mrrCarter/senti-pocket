@@ -9,11 +9,14 @@ import { createDynamoStore } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
 import { createDialPushBackend, createStoreDeviceRegistry } from './dial-registry.mjs';
+import { createDeckVideoBackend } from './deck/deck-video-backend.mjs';
 import { lambdaHandler } from './lambda.mjs';
 
 /**
  * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID,
- *                        ELEVENLABS_API_KEY; GEMMA_BASE_URL + GEMMA_MODEL [+ optional GEMMA_API_KEY] to wire /answer+/brief to Gemma)
+ *                        ELEVENLABS_API_KEY; GEMMA_BASE_URL + GEMMA_MODEL [+ optional GEMMA_API_KEY] to wire /answer+/brief to Gemma;
+ *                        RESVG_BIN + FFMPEG_BIN + RESVG_EGRESS_SANDBOXED=1 to enable /deck?format=video — the ack asserts
+ *                        the deploy runs resvg network-egress-disabled (the SSRF backstop); without it, video 501s)
  * @param {object} deps   injected externals the deploy owns:
  *   { dynamoClient, signingKey, run, knownSessionIdsFor, bundleStore, fetch }
  *   - dynamoClient: the { get, put, delete } async shape createDynamoStore consumes. In prod this is a THIN ADAPTER
@@ -68,16 +71,30 @@ export function createProdGateway(env = {}, deps = {}) {
   const deviceRegistry = deps.deviceRegistry || createStoreDeviceRegistry({ store });
   const pushBackend = deps.pushBackend || (typeof deps.apnsSend === 'function' ? createDialPushBackend({ deviceRegistry, apnsSend: deps.apnsSend }) : undefined);
 
+  // /deck?format=video native backend: resvg (SVG->PNG) + ffmpeg (frames->mp4), deploy-owned binaries via RESVG_BIN /
+  // FFMPEG_BIN. SECURITY (Warden's SSRF/LFI gate, carried from the #61 module review): this backend EXECS resvg on
+  // caller-authored SVG, so unlike the remote tts/gemma backends it is FAIL-SAFE-OFF unless the deploy EXPLICITLY asserts
+  // RESVG_EGRESS_SANDBOXED=1 — i.e. it runs resvg NETWORK-EGRESS-DISABLED (a safeImageHref bypass then still can't SSRF
+  // cloud-metadata / fetch a remote image). LFI is already mitigated upstream (safeImageHref allowlists only
+  // https/data:image) + by resvg resolving against the temp dir that holds just the one in.svg; a #61 module follow-up
+  // adds resvg --resources-dir <tmpdir> to make that local-file scoping EXPLICIT rather than default (Warden flag). The
+  // ack asserts the egress-disable — that is the control the gateway can't enforce from Node itself. Without the ack (or
+  // without the binaries) video stays 501 (no-video-capability) — the
+  // gateway NEVER silently execs an unsandboxed rasterizer on untrusted SVG. A deploy-injected deps.rasterize/encodeVideo
+  // (already sandboxed) wins over this env construction.
+  const deckVideo = (env.RESVG_BIN && env.FFMPEG_BIN && env.RESVG_EGRESS_SANDBOXED === '1')
+    ? createDeckVideoBackend({ resvgBin: env.RESVG_BIN, ffmpegBin: env.FFMPEG_BIN })
+    : undefined;
+
   return createGateway({
     verifyToken,
     store,
     ttsBackend,
-    // /deck?format=video assembles an mp4 via INJECTED native backends the deploy owns (SVG->PNG raster + frames->mp4
-    // mux). Forwarded so a deploy that ships resvg/sharp + ffmpeg can enable video; absent => handleDeck honestly 501s
-    // (no-video-capability), never a fabricated/empty video. (createProdGateway previously dropped these => /deck?
-    // format=video was un-enableable in prod regardless of the binaries — same gate!=live class as the dial wiring.)
-    rasterize: deps.rasterize,
-    encodeVideo: deps.encodeVideo,
+    // /deck?format=video assembles an mp4 via these INJECTED native backends. A deploy-injected (pre-sandboxed)
+    // deps.rasterize/encodeVideo wins; else the env-constructed deckVideo (sandbox-acknowledged) is used; else both are
+    // undefined and handleDeck honestly 501s (no-video-capability), never a fabricated/empty video.
+    rasterize: deps.rasterize || (deckVideo ? deckVideo.rasterize : undefined),
+    encodeVideo: deps.encodeVideo || (deckVideo ? deckVideo.encodeVideo : undefined),
     reason: deps.reason || (gemma ? gemma.reason : undefined),   // /answer  (grounding-first; 501 if neither configured)
     brief: deps.brief || (gemma ? gemma.brief : undefined),     // /brief   (grounding-first; 501 if neither configured)
     minConfidence: deps.minConfidence,
