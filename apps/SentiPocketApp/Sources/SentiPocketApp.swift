@@ -2,6 +2,7 @@ import SwiftUI
 import PocketContracts
 import PocketCall   // VerifiedBundle — the ONLY trusted way to hold a bundle
 import PocketUI
+import PocketReasoning   // ReasoningProvider + CachedReasoningProvider (the real coordinator's provider)
 
 /// App shell (Atlas). The end-to-end state machine + lane feature views plug in here as they land.
 /// For Sunday watchability, every screen ships a #Preview wired to the canonical fixture so the Xcode
@@ -17,9 +18,43 @@ struct SentiPocketApp: App {
             #if DEBUG
             RootAppView(model: model)
             #else
-            RootView()
+            PhoneRootView()   // B2: the REAL coordinator + phone-write flow (kills the old static RootView List)
             #endif
         }
+    }
+}
+
+/// B2 composition root (warden #261831): the real reasoning coordinator + the phone-write flow, wired to the
+/// live-demo gateway. Reasoning uses the Cached provider today (labeled sample); relay's GatewayReasoningProvider
+/// drops into `selectProvider`'s online branch when PocketSyncClient lands. The WRITE flow is fully live.
+struct PhoneRootView: View {
+    @StateObject private var reasoning: RealReasoningCoordinator
+    @StateObject private var write: PhoneWriteViewModel
+
+    init() {
+        let bundle = FixtureLoader.canonicalBundle()
+        let sessionId = bundle?.sessionId ?? "6cf7e861-546a-4b9f-b937-39182a5bd395"
+        let checkpointId = bundle?.checkpointId
+        let cached = CachedReasoningProvider(cachedBriefing: PocketFixtures.briefingPlan,
+                                             cachedEvidence: bundle?.evidence ?? [])
+        _reasoning = StateObject(wrappedValue: RealReasoningCoordinator(
+            sessionId: sessionId, checkpointId: checkpointId,
+            selectProvider: { _ in cached }))   // online→Gateway drops in here later; Cached is the honest floor now
+        _write = StateObject(wrappedValue: PhoneWriteViewModel(
+            sessionId: sessionId,
+            client: PocketWriteClient(apiBaseURL: Self.gatewayURL())))
+    }
+
+    var body: some View { PocketPhoneView(reasoning: reasoning, write: write) }
+
+    /// Item 5: the gateway URL is a CONFIG value (ephemeral cloudflared tunnel, forge re-publishes on churn), read
+    /// from Info.plist `SENTI_GATEWAY_URL` so forge re-points WITHOUT a code change. Falls back to the current tunnel.
+    private static func gatewayURL() -> URL {
+        let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
+        let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let chosen = (configured.map { $0.isEmpty ? fallback : $0 }) ?? fallback
+        return URL(string: chosen) ?? URL(string: fallback)!
     }
 }
 

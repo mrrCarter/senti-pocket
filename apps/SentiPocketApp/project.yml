@@ -46,6 +46,9 @@ targets:
         # Required or iOS SIGABRTs on the first permission request (on-device Speech STT + mic barge-in/PTT).
         NSMicrophoneUsageDescription: "Senti Pocket uses the microphone so you can barge in and answer the briefing by voice."
         NSSpeechRecognitionUsageDescription: "Senti Pocket transcribes your speech on-device so you can interrupt a briefing and dictate a proposed action."
+        # B2 item 5 (Atlas/Forge #261850): the live-demo gateway URL — CONFIG, not hard-baked. It's an ephemeral
+        # cloudflared quick-tunnel that churns on restart; forge re-publishes + updates this value with NO code change.
+        SENTI_GATEWAY_URL: "https://experienced-disposal-urge-approved.trycloudflare.com"
     settings:
       base:
         GENERATE_INFOPLIST_FILE: false
