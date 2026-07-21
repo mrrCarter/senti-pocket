@@ -14,6 +14,7 @@ import { summarize } from './summarize.mjs';
 import { buildSignedBundle } from './bundle.mjs';
 import { routeAnswer } from './reasoning-router.mjs';
 import { splitTagged } from './audio-tags.mjs';
+import { scrubText } from './scrub.mjs';
 import { renderDeck } from './deck/templates.mjs';
 import { narrateDeck } from './deck/narration.mjs';
 import { buildStoryboard, assembleDeckVideo } from './deck/video.mjs';
@@ -65,7 +66,7 @@ export function createGateway(deps) {
   // Route scope requirements, aligned to AIdenID's granted scopes. write => execute; read => sync. TTS requires a
   // DISTINCT least-privilege `pocket:voice` (Echo): it triggers third-party voice processing/egress, not a passive
   // read, so a read+write token must NOT authorize it. Override via deps.scopes if the contract changes.
-  const SCOPES = { execute: 'sessions:write', sync: 'sessions:read', tts: 'pocket:voice', ...(deps.scopes || {}) };
+  const SCOPES = { execute: 'sessions:write', sync: 'sessions:read', tts: 'pocket:voice', dial: 'pocket:dial', ...(deps.scopes || {}) };
 
   async function authenticate(req) {
     if (typeof deps.verifyToken !== 'function') return null; // no verifier wired => deny everything (fail-closed)
@@ -392,6 +393,36 @@ export function createGateway(deps) {
     });
   }
 
+  // POST /dial — place a "ring Carter" push about a session decision (the DIAL-ME flow). It DISPATCHES a ring via the
+  // injected deps.pushBackend and AUTHORS NOTHING (low-risk: it never posts as anyone). The grounded Q&A on the call
+  // reuses /answer + /brief; the spoken VOICE-GO -> post reuses the governed /actions/execute humanMessage write (which
+  // keeps its own bearer + confirm + hash gates — dialing does NOT relax the write's Carter-consent bar).
+  // Least-privilege: a DISTINCT pocket:dial scope (placing a call is its own capability, not sessions:write).
+  async function handleDial(req, ctx) {
+    if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
+    if (typeof deps.pushBackend !== 'function') return json(501, { error: 'dial backend not configured', reason: 'dial-not-configured' });
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    const message = typeof body.message === 'string' ? body.message : '';
+    if (!message.trim()) return json(400, { error: 'message required' });
+    if (Buffer.byteLength(message, 'utf8') > 4096) return json(413, { error: 'message exceeds 4096 bytes' });
+    const sessionId = body.sessionId;
+    if (typeof sessionId !== 'string' || !sessionId) return json(400, { error: 'sessionId required' });
+    const priority = ['low', 'medium', 'high', 'urgent'].includes(body.priority) ? body.priority : 'medium';
+    // Membership: only ring about a session this human belongs to (humanId-keyed, same as the read endpoints).
+    let known = [];
+    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this user' });
+    // context may echo session text -> best-effort scrub + bound before it leaves via the push payload.
+    const context = typeof body.context === 'string' ? scrubText(body.context).text.slice(0, 2048) : undefined;
+    let out;
+    try { out = await deps.pushBackend({ message, context, priority, sessionId, humanId: ctx.humanId }); }
+    catch { return json(502, { error: 'dial backend error', reason: 'dispatch-failed' }); }
+    const dispatched = !!(out && out.dispatched);
+    const dialId = out && typeof out.dialId === 'string' ? out.dialId : null;
+    return json(dispatched ? 200 : 502, dispatched ? { dialId, dispatched: true } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' });
+  }
+
   return {
     async handle(req) {
       // handle() is the gateway's contract boundary — it must NEVER throw to an adapter (a throw becomes a runtime crash
@@ -414,6 +445,7 @@ export function createGateway(deps) {
         if (method === 'POST' && path === '/actions/execute') return await handleExecute(req, ctx);
         if (method === 'POST' && path === '/tts') return await handleTts(req, ctx);
         if (method === 'POST' && path === '/deck') return await handleDeck(req, ctx);
+        if (method === 'POST' && path === '/dial') return await handleDial(req, ctx);
         return json(404, { error: 'not found' });
       } catch {
         return json(500, { error: 'internal error' }); // no stack/detail leaked to the client
