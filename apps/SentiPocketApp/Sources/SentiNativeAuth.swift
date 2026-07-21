@@ -122,7 +122,9 @@ final class SentiNativeAuth: NSObject {
     private let ideLabel: String
     private let appVersion: String
     private let urlSession: URLSession
-    /// Poll pacing — server is rate-limited 20/min, so ~2s honours it with headroom (relay #256742).
+    /// Poll pacing — 2s BASE cadence, but `pollUntilApproved` BACKS OFF on 429: a fixed 2s (~30/min) can exceed the
+    /// server's per-minute budget once a human takes a while to approve, so we absorb 429s with backoff rather than
+    /// aborting. Matches the sl-CLI reference device flow (create-sentinelayer auth/service.js) (relay #256742).
     private let pollInterval: Duration
     private let overallTimeout: Duration
     private var webSession: ASWebAuthenticationSession?
@@ -168,11 +170,26 @@ final class SentiNativeAuth: NSObject {
 
     private func pollUntilApproved(sessionId: String, challenge: String) async throws -> String {
         let deadline = ContinuousClock.now.advanced(by: overallTimeout)
+        // A 429 while polling for a browser approval is TRANSIENT, not terminal. The reference device flow
+        // (create-sentinelayer auth/service.js `pollCliAuthSession`) backs off + keeps polling on 429; a fixed 2s
+        // cadence can exceed the server's per-minute budget once the human takes a while to approve. Aborting the
+        // login on the first 429 (the old `throw .rateLimited` out of `postJSON`) would kill a legitimate slow login.
+        var rateLimitStrikes = 0
         while ContinuousClock.now < deadline {
-            let resp: CliPollResponse = try await postJSON(
-                path: "/api/v1/auth/cli/sessions/poll",
-                body: CliPollRequest(session_id: sessionId, challenge: challenge)
-            )
+            let resp: CliPollResponse
+            do {
+                resp = try await postJSON(
+                    path: "/api/v1/auth/cli/sessions/poll",
+                    body: CliPollRequest(session_id: sessionId, challenge: challenge)
+                )
+            } catch NativeAuthError.rateLimited {
+                rateLimitStrikes += 1
+                guard rateLimitStrikes <= 20 else { throw NativeAuthError.rateLimited } // sustained hammering → surface it
+                // Exponential backoff capped at 15s (base 2s → 4, 8, 15, 15…), still bounded overall by `deadline`.
+                let backoffSeconds = min(15.0, 2.0 * pow(2.0, Double(min(rateLimitStrikes, 3))))
+                try await Task.sleep(for: .seconds(backoffSeconds))
+                continue
+            }
             switch resp.status.lowercased() {
             case "approved":
                 guard let token = resp.auth_token, !token.isEmpty else { throw NativeAuthError.malformedResponse }
@@ -180,6 +197,7 @@ final class SentiNativeAuth: NSObject {
             case "rejected", "denied", "cancelled", "expired":
                 throw NativeAuthError.rejected
             default: // "pending" (or unknown-but-not-terminal) → keep waiting
+                rateLimitStrikes = 0 // a clean poll resets the transient-error budget
                 try await Task.sleep(for: pollInterval)
             }
         }
