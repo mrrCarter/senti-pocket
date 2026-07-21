@@ -16,7 +16,8 @@ import PocketContracts
 
 /// The explicit human confirmation the gateway binds against (actions.mjs L430-433): proposalId + the EXACT hash the
 /// human confirmed + when. `confirmedProposalHash` MUST equal the proposal's live hash or the gateway fails-closed.
-struct GovernedWriteConfirmation: Encodable, Sendable {
+/// Codable so a confirmed-but-offline intent can be persisted in the durable outbox for retry-after-reconnect.
+struct GovernedWriteConfirmation: Codable, Sendable, Equatable {
     let proposalId: String
     let confirmedProposalHash: String
     let confirmedAt: Date
@@ -30,13 +31,15 @@ private struct ExecuteRequest: Encodable {
 enum PocketWriteError: LocalizedError, Equatable {
     case notLoggedIn
     case network(String)
-    case rejected(String)        // gateway 4xx (proposal_rejected / hash mismatch / not a known session …)
+    case retryable(String)       // TRANSIENT gateway response (409 in-progress / 5xx / 503 checkpoint-not-available) — queue + retry
+    case rejected(String)        // TERMINAL 4xx (proposal_rejected / hash mismatch / not a known session / auth) — won't succeed on retry
     case malformedResponse
     case notPosted(String)       // a receipt came back but not a verified .posted (pending/failed) — NEVER render as sent
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:       return "Sign in first — the write needs your Senti session."
         case .network(let m):    return "Write network error: \(m)"
+        case .retryable(let m):  return "The gateway is busy — will retry: \(m)"
         case .rejected(let m):   return "The gateway rejected the write: \(m)"
         case .malformedResponse: return "The gateway returned an unexpected response."
         case .notPosted(let m):  return "Not sent: \(m)"
@@ -88,10 +91,16 @@ final class PocketWriteClient {
         catch { throw PocketWriteError.network(error.localizedDescription) }
 
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            // The gateway returns a typed error envelope on rejection (e.g. proposal_rejected). Surface it honestly.
-            let reason = (try? JSONDecoder().decode([String: String].self, from: data))?["reason"]
-                ?? (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
-                ?? "HTTP \(http.statusCode)"
+            // The gateway returns a typed error envelope (e.g. {error, reason, retryable}). Decode a tolerant subset —
+            // NOT [String:String] (that fails when `retryable` is a bool, silently dropping the reason).
+            struct ErrorEnvelope: Decodable { let error: String?; let reason: String? }
+            let env = try? JSONDecoder().decode(ErrorEnvelope.self, from: data)
+            let reason = env?.reason ?? env?.error ?? "HTTP \(http.statusCode)"
+            // 409 (execution-in-progress / reconcile) + any 5xx (transient / 503 checkpoint-not-available, retryable)
+            // → RETRYABLE (queue + retry, never terminal-refuse a write that could still land). Other 4xx → terminal.
+            if http.statusCode == 409 || (500..<600).contains(http.statusCode) {
+                throw PocketWriteError.retryable(reason)
+            }
             throw PocketWriteError.rejected(reason)
         }
 

@@ -40,6 +40,13 @@ final class PhoneWriteViewModel: ObservableObject {
     init(sessionId: String, client: PocketWriteClient) {
         self.sessionId = sessionId
         self.client = client
+        // Restore a confirmed-but-unsent write from a previous session (durable outbox) so an offline write survives
+        // an app kill. It's already human-confirmed — surfaced as PENDING + retryable; NEVER auto-fired here (retry
+        // is an explicit user tap or an app-driven reconnect), NEVER shown as sent.
+        if let persisted = OutboxStore.load() {
+            pendingIntent = (persisted.proposal, persisted.confirmation)
+            state = .pending("A message you confirmed earlier is queued — it will send when you reconnect.")
+        }
     }
 
     /// Compose → show the CONFIRM UI. Builds the humanMessage proposal (seq:0) but does NOT post — the human must tap.
@@ -62,9 +69,10 @@ final class PhoneWriteViewModel: ObservableObject {
         post(proposal, confirmation)
     }
 
-    /// Abandon the draft/confirmation — a cancelled decision must leave NOTHING posted.
+    /// Abandon the draft/confirmation — a cancelled decision must leave NOTHING posted or queued.
     func cancel() {
         pendingIntent = nil
+        OutboxStore.clear()
         state = .composing
     }
 
@@ -83,17 +91,27 @@ final class PhoneWriteViewModel: ObservableObject {
                 let receipt = try await self.client.execute(proposal: proposal, confirmation: confirmation)
                 self.applyRenderGate(receipt)
             } catch PocketWriteError.network(let detail) {
-                // OFFLINE: the POST couldn't reach the gateway → PENDING, retryable. The intent stays; NEVER "sent".
+                // OFFLINE: the POST couldn't reach the gateway → PENDING, retryable. PERSIST the confirmed intent so
+                // it survives an app kill (durable outbox); NEVER "sent".
+                OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation))
                 self.state = .pending("Offline — your message is queued and will send when you reconnect. (\(detail))")
+            } catch PocketWriteError.retryable(let detail) {
+                // TRANSIENT gateway response (busy / in-progress / temporarily unavailable) — NOT terminal. Queue +
+                // retry exactly like offline; the write may still land, so we must never refuse it.
+                OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation))
+                self.state = .pending("The gateway is busy — queued, tap Retry. (\(detail))")
             } catch PocketWriteError.notPosted(let why) {
                 // The gateway returned a receipt that is NOT a verified posted (pending/failed) → never sent.
                 self.pendingIntent = nil
+                OutboxStore.clear()
                 self.state = .refused("Not sent — \(why)")
             } catch PocketWriteError.rejected(let why) {
                 self.pendingIntent = nil
+                OutboxStore.clear()
                 self.state = .refused("The gateway refused this write — \(why)")
             } catch {
                 self.pendingIntent = nil
+                OutboxStore.clear()
                 self.state = .refused("Not sent — \(error.localizedDescription)")
             }
         }
@@ -102,6 +120,8 @@ final class PhoneWriteViewModel: ObservableObject {
     /// The 🔴 RENDER-GATE (item 3): a real .posted receipt is only "sent" if its gateway signature VERIFIES under the
     /// pinned key. Anything else (unsigned / tampered / no CryptoKit) is REFUSED, never rendered as sent.
     private func applyRenderGate(_ receipt: ActionReceipt) {
+        // Every path here is TERMINAL (sent or refused) — the confirmed intent is resolved, so drop the durable outbox.
+        OutboxStore.clear()
         #if canImport(CryptoKit)
         switch receipt.signatureState(gatewayPublicKeyBase64url: gatewayPublicKeyPin) {
         case .verified:
