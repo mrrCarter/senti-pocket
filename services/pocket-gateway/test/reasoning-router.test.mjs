@@ -61,3 +61,16 @@ test('grounded + low confidence but NO alternatives -> still answered (grounding
   });
   assert.equal(r.status, 'answered');
 });
+
+test('grounded citation but EMPTY/whitespace answer text -> NOT answered (parity with brief empty-segment drop)', () => {
+  // empty text + a grounded cite is not an answer (was previously routed .answered with no words)
+  assert.notEqual(routeAnswer({ groundedEvidenceIds: ['ev_1'], llmAnswer: { text: '', evidenceIds: ['ev_1'] }, nearestTopics: topics }).status, 'answered');
+  // whitespace-only likewise
+  assert.notEqual(routeAnswer({ groundedEvidenceIds: ['ev_1'], llmAnswer: { text: '  \n\t ', evidenceIds: ['ev_1'] } }).status, 'answered');
+  // grounding exists -> clarify (not unavailable)
+  assert.equal(routeAnswer({ groundedEvidenceIds: ['ev_1'], llmAnswer: { text: '', evidenceIds: ['ev_1'] }, nearestTopics: topics }).status, 'clarify');
+  // no grounding at all + empty text -> unavailable
+  assert.equal(routeAnswer({ groundedEvidenceIds: [], llmAnswer: { text: '', evidenceIds: [] } }).status, 'unavailable');
+  // control: SAME grounded cite WITH real text -> answered
+  assert.equal(routeAnswer({ groundedEvidenceIds: ['ev_1'], llmAnswer: { text: 'A real grounded answer.', evidenceIds: ['ev_1'] } }).status, 'answered');
+});
