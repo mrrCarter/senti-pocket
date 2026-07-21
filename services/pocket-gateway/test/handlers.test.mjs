@@ -28,7 +28,7 @@ const makeConfirm = (p) => ({ proposalId: p.id, confirmedProposalHash: p.proposa
 // sl runner: reply -> action; read -> optionally landed. `landed` toggles read-back success.
 function makeRun(state = { replies: 0, landed: true }) {
   return (args) => {
-    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }); }
     if (args[1] === 'read') return JSON.stringify({ events: state.landed ? [{ eventId: 'session-action-act_1', agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160 } }] : [] });
     return '{}';
   };
@@ -266,7 +266,7 @@ test('cross-human isolation: same proposal.id from two humans does NOT share ide
   const vt = async (h) => { const a = h && h.authorization; if (a === 'Bearer alice') return { humanId: 'alice', scopes: ['sessions:write'] }; if (a === 'Bearer bob') return { humanId: 'bob', scopes: ['sessions:write'] }; return null; };
   const state = { replies: 0 };
   const run = (args) => {
-    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }); }
     if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_' + state.replies, agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160 } }] });
     return '{}';
   };
@@ -291,7 +291,7 @@ test('durable state keyed by PRINCIPAL, not sub: same pairwise sub across sites 
   };
   const state = { replies: 0 };
   const run = (args) => {
-    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_' + state.replies, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }); }
     if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_' + state.replies, agent: { id: 'claude-pocket-relay' }, payload: { targetSequenceId: 230160 } }] });
     return '{}';
   };
@@ -311,7 +311,7 @@ test('crash recovery: in-flight reservation + landed post => retry FINALIZES via
   const KEY = computeProposalHash(p); // the reply was posted with --idempotency-key = proposal hash
   const state = { replies: 0 };
   const run = (args) => {
-    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_crash', targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_crash', targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }); }
     if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_crash', agent: { id: 'claude-pocket-relay' }, idempotencyToken: KEY, payload: { targetSequenceId: 230160 } }] });
     return '{}';
   };
@@ -328,7 +328,7 @@ test('reconciliation binds to PROPOSAL IDENTITY, not body: an older identical-co
   const p = makeProposal({ id: 'pident', renderedPreview: 'Approved.' });
   const state = { replies: 0 };
   const run = (args) => {
-    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_new', targetSequenceId: Number(args[3]), targetCursor: 'c' } }); }
+    if (args[1] === 'reply') { state.replies++; return JSON.stringify({ action: { id: 'act_new', targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }); }
     // an OLDER action with the SAME body but a DIFFERENT idempotency key (a different proposal)
     if (args[1] === 'read') return JSON.stringify({ events: [{ eventId: 'session-action-act_OLD', agent: { id: 'claude-pocket-relay' }, idempotencyToken: 'a-different-proposal-hash', payload: { targetSequenceId: 230160, text: 'Approved.' } }] });
     return '{}';

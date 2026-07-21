@@ -28,7 +28,7 @@ function recordingRun(actionId = 'act_test') {
   const calls = [];
   const run = (args) => {
     calls.push(args);
-    if (args[1] === 'reply') return JSON.stringify({ action: { id: actionId, targetSequenceId: Number(args[3]), targetCursor: 'cur_x' } });
+    if (args[1] === 'reply') return JSON.stringify({ action: { id: actionId, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'cur_x' } });
     if (args[1] === 'read') return JSON.stringify({ events: [] });
     return '{}';
   };
@@ -102,6 +102,22 @@ test('confirmed + online + known target + verified => posted with result=.action
   assert.equal(r.confirmedProposalHash, p.proposalHash);
   assert.equal(calls.length, 1);
   assert.equal(calls[0][1], 'reply');
+});
+
+test('reply args: `--` guards a "-"-leading renderedPreview (a markdown list / arrow would else misparse as an option)', async () => {
+  const preview = '- item 1\n-> next step'; // starts with '-': without the -- guard commander reads it as an unknown option
+  const p = makeProposal({ id: 'p_dash', renderedPreview: preview });
+  const { run, calls } = recordingRun('act_dash');
+  const r = await executeAction(p, makeConfirm(p), opts({ run }));
+  assert.equal(r.status, 'posted', 'the reply posts — the -- guard lets a "-"-leading preview through as a positional');
+  const replyArgs = calls.find((c) => c[1] === 'reply');
+  const dd = replyArgs.indexOf('--');
+  assert.ok(dd > 1, 'a `--` separator precedes the positionals');
+  // every flag sits BEFORE the -- (so no positional is ever read as a flag); positionals sit AFTER, in order
+  assert.ok(replyArgs.indexOf('--agent') < dd && replyArgs.indexOf('--idempotency-key') < dd && replyArgs.indexOf('--json') < dd, 'all flags precede the -- guard');
+  assert.equal(replyArgs[dd + 1], KNOWN, 'targetSessionId is the 1st positional after --');
+  assert.equal(replyArgs[dd + 2], String(p.targetSequence), 'targetSequence is the 2nd positional');
+  assert.equal(replyArgs[dd + 3], preview, 'the "-"-leading renderedPreview is the LAST positional after -- (safe)');
 });
 
 test('read-back verify FAILS => .failed, never a signed posted', async () => {
@@ -319,7 +335,7 @@ test('(TOCTOU) Date mutated during run does not affect the signed receipt', asyn
   const d = new Date('2026-07-18T12:02:00Z');
   const p = makeProposal({ id: 'ptoctou2' });
   const calls = [];
-  const run = (args) => { calls.push(args); d.setTime(NaN); return args[1] === 'reply' ? JSON.stringify({ action: { id: 'act_m', targetSequenceId: Number(args[3]), targetCursor: null } }) : '{}'; };
+  const run = (args) => { calls.push(args); d.setTime(NaN); return args[1] === 'reply' ? JSON.stringify({ action: { id: 'act_m', targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: null } }) : '{}'; };
   const r = await executeAction(p, makeConfirm(p), opts({ run, now: d }));
   assert.equal(r.status, 'posted');
   assert.equal(typeof r.executedAt, 'string');
@@ -379,7 +395,8 @@ test('(TOCTOU) getter-backed renderedPreview: EVIL content is never posted (snap
   const confirmation = { proposalId: 'pgetter', confirmedProposalHash: safeHash, confirmedAt: '2026-07-18T12:01:00Z' };
   const { run, calls } = recordingRun('act_g');
   const r = await executeAction(evil, confirmation, opts({ run }));
-  const postedPreview = (calls.find((c) => c[1] === 'reply') || [])[4];
+  const replyCall = calls.find((c) => c[1] === 'reply') || [];
+  const postedPreview = replyCall[replyCall.indexOf('--') + 3];
   assert.notEqual(postedPreview, 'EVIL POSTED', 'EVIL content must never be posted');
   if (r.status === 'posted') assert.equal(postedPreview, SAFE);
 });
@@ -430,7 +447,7 @@ test('(atomicity/P0) read-back miss never re-posts on retry; the emitted action 
   const store = new Map();
   let posts = 0;
   const run = (args) => (args[1] === 'reply'
-    ? (posts++, JSON.stringify({ action: { id: 'act_dup_' + posts, targetSequenceId: Number(args[3]), targetCursor: 'c' } }))
+    ? (posts++, JSON.stringify({ action: { id: 'act_dup_' + posts, targetSequenceId: Number(args[args.indexOf('--') + 2]), targetCursor: 'c' } }))
     : '{}');
   const r1 = await executeAction(p, makeConfirm(p), opts({ run, store, verifyReadback: () => false }));
   assert.equal(r1.status, 'failed');
