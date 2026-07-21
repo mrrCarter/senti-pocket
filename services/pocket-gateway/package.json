@@ -1,0 +1,11 @@
+{
+  "name": "@senti-pocket/pocket-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Relay gateway: Senti checkpoint extract -> secret-scrub -> summarize -> sign PocketBundle -> sync + governed writeback + receipts.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test"
+  }
+}

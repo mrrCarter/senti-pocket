@@ -1,0 +1,27 @@
+{
+  "_note": "NEGATIVE pocket.bundle.v1 KAV — proves the semantic gate is NOT dead code hidden behind crypto. This bundle is CRYPTO-VALID (its ed25519 signature verifies under the SAME pinned public key as the positive KAV) but SEMANTICALLY-INVALID: its sequence range is INVERTED (sequenceStart 300 > sequenceEnd 200). Therefore verifiesSignature() is TRUE, isSemanticallyValid() is FALSE, and VerifiedBundle.verify() MUST return nil. Signed once in the same ephemeral keypair session as the positive KAV; the private key is not committed.",
+  "demoKey": {
+    "PHASE_A_ONLY": true,
+    "neverProduction": true,
+    "signingKeyId": "pocket-demo-phase-a",
+    "publicKeyBase64url": "tbiyPLuRcBXqYRHazuik4y5mVG_5B__8vO6ov48GhmE"
+  },
+  "bundle": {
+    "note": "Identical to the positive KAV bundle EXCEPT sequenceStart=300 (inverted range) — the only change that makes it semantically invalid while staying crypto-valid.",
+    "contractsVersion": "0.1.8",
+    "checkpointId": "cp_demo_1",
+    "sessionId": "sess_demo_1",
+    "sequenceStart": 300,
+    "sequenceEnd": 200,
+    "createdAtEpochMillis": 1752835200000,
+    "signingKeyId": "pocket-demo-phase-a"
+  },
+  "kav": {
+    "canonicalBytesUtf8": "pocket.bundle.v1\n5:0.1.89:cp_demo_111:sess_demo_13:3003:2009:cp_demo_113:demo briefing30:checkpoint_summary_sections_v111:A1:17:agent-a13:did the thing1:12:c16:a fact4:fact1:13:ev11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:17528352000001:12:r11:12:b11:13:ev111:sess_demo_13:1507:agent-a7:snippet13:175283520000013:175283520000019:pocket-demo-phase-a",
+    "canonicalSha256Hex": "f6365cf012001d4e9eda366937178e14390aebfb0da29116539cae44e6cbbc86",
+    "signatureBase64url": "eyf3d2Oa64PdrqO0TY08Q2V9Vguw3IOEEHPSJ5Op7dDQgJH4c_TCJA9x0we15y7cNVUAHUsttBynJsgMUPp6Ag",
+    "verifiesUnderPinnedKey": true,
+    "isSemanticallyValid": false,
+    "verifyResult": "nil (rejected by the semantic gate despite a valid signature)"
+  }
+}

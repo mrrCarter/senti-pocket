@@ -1,0 +1,118 @@
+{
+  "schema": "pocket_kav_v1",
+  "demoAnchor": {
+    "keyClass": "demo",
+    "phase": "A",
+    "seedHex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "note": "DEMO Phase-A-only Ed25519 anchor generated from a FIXED seed; pinned by the demo phone. NEVER a production trust root."
+  },
+  "signingKeyId": "kav-key",
+  "publicKeyRawBase64url": "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU",
+  "keyBinding": {
+    "kav-key": "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU"
+  },
+  "bundle": {
+    "contractsVersion": "0.1.8",
+    "checkpointId": "cp_kav",
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "sequenceStart": 1,
+    "sequenceEnd": 2,
+    "summary": {
+      "checkpointId": "cp_kav",
+      "headline": "KAV checkpoint",
+      "summaryBaselineSchema": "checkpoint_summary_sections_v1",
+      "grade": null,
+      "perAgent": [
+        {
+          "agentId": "agent-a",
+          "summary": "agent-a (1 msg, seq 1): kav event one",
+          "claims": [
+            {
+              "id": "claim_cp_kav_1",
+              "text": "kav event one",
+              "kind": "fact",
+              "evidenceIds": [
+                "ev_cp_kav_1"
+              ]
+            }
+          ],
+          "evidence": [
+            {
+              "id": "ev_cp_kav_1",
+              "sessionId": "11111111-1111-4111-8111-111111111111",
+              "sequence": 1,
+              "agentId": "agent-a",
+              "snippet": "kav event one",
+              "ts": "2026-07-18T00:00:00.000Z"
+            }
+          ]
+        },
+        {
+          "agentId": "agent-b",
+          "summary": "agent-b (1 msg, seq 2): kav event two",
+          "claims": [
+            {
+              "id": "claim_cp_kav_2",
+              "text": "kav event two",
+              "kind": "fact",
+              "evidenceIds": [
+                "ev_cp_kav_2"
+              ]
+            }
+          ],
+          "evidence": [
+            {
+              "id": "ev_cp_kav_2",
+              "sessionId": "11111111-1111-4111-8111-111111111111",
+              "sequence": 2,
+              "agentId": "agent-b",
+              "snippet": "kav event two",
+              "ts": "2026-07-18T00:01:00.000Z"
+            }
+          ]
+        }
+      ],
+      "risks": [],
+      "blockers": []
+    },
+    "evidence": [
+      {
+        "id": "ev_cp_kav_1",
+        "sessionId": "11111111-1111-4111-8111-111111111111",
+        "sequence": 1,
+        "agentId": "agent-a",
+        "snippet": "kav event one",
+        "ts": "2026-07-18T00:00:00.000Z"
+      },
+      {
+        "id": "ev_cp_kav_2",
+        "sessionId": "11111111-1111-4111-8111-111111111111",
+        "sequence": 2,
+        "agentId": "agent-b",
+        "snippet": "kav event two",
+        "ts": "2026-07-18T00:01:00.000Z"
+      }
+    ],
+    "createdAt": "2026-07-18T00:03:00Z",
+    "signature": "PRfyYP+VouVEtSj9Ffv3Qz4h7tfR64lDzkkQdTooNuICSGJJ4j2tQ6VcZDfOwtvj79931dac5nWxjoUhLE56DA==",
+    "signingKeyId": "kav-key"
+  },
+  "receipt": {
+    "id": "kav_prop",
+    "proposalId": "kav_prop",
+    "status": "posted",
+    "result": {
+      "kind": "action",
+      "actionId": "kav_act",
+      "targetSequenceId": 2,
+      "targetCursor": null
+    },
+    "targetSessionId": "11111111-1111-4111-8111-111111111111",
+    "confirmedProposalHash": "KAVHASH_confirmed",
+    "confirmedByHumanAt": "2026-07-18T00:04:00Z",
+    "executedAt": "2026-07-18T00:04:30Z",
+    "failureReason": null,
+    "signingKeyId": "kav-key",
+    "signature": "unNg9kilMHjticQDVDje1mMCBKFVZjSS8G7r2Uprhjw5pp7-GmcoyGoz1A4uZiDFqJ-Ld9aY54-6sLIbmn8aDA"
+  }
+}
