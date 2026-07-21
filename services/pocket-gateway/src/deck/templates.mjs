@@ -72,7 +72,9 @@ export function wrapText(text, fontSize, maxWidth, maxLines = 8) {
     } else {
       lines.push(cur);
       cur = word;
-      if (lines.length === maxLines - 1) break;
+      // `>=` not `===`: for maxLines=1, `maxLines-1` is 0 and this is only reached AFTER a push (length>=1), so `===`
+      // never fired -> unbounded wrapping. `>=` breaks correctly at maxLines=1 and is identical for maxLines>=2.
+      if (lines.length >= maxLines - 1) break;
     }
   }
   if (cur && lines.length < maxLines) lines.push(cur);

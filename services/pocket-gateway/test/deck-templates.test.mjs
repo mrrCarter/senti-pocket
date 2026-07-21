@@ -69,6 +69,21 @@ test('wrapText wraps by width and never exceeds maxLines; truncation ellipsizes'
   assert.deepEqual(wrapText(null, 40, 800), []);
 });
 
+test('wrapText honors maxLines EXACTLY for every bound incl. 1 (regression: relay Finding 1)', () => {
+  const long = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda';
+  // maxLines=1 previously ran unbounded (returned 9 lines). Must be capped at 1 and ellipsized.
+  const one = wrapText(long, 40, 200, 1);
+  assert.equal(one.length, 1, 'maxLines=1 returns exactly one line');
+  assert.ok(one[0].endsWith('…'), 'maxLines=1 ellipsizes the truncated line');
+  // maxLines 2..4 stay exactly N when the text overflows (fix is a no-op for these).
+  for (const n of [2, 3, 4]) {
+    assert.equal(wrapText(long, 40, 200, n).length, n, `maxLines=${n} caps at ${n}`);
+  }
+  // imageCaption's real call site (title, size 52, full content width, maxLines 1) must not overflow.
+  const capTitle = wrapText('An extremely long image caption title that would previously overflow the entire slide area', 52, 1620, 1);
+  assert.equal(capTitle.length, 1, 'imageCaption title capped at 1 line');
+});
+
 test('unknown template or style throws a helpful error', () => {
   assert.throws(() => renderSlide({ template: 'nope' }), /unknown template "nope"/);
   assert.throws(() => renderSlide({ template: 'title', style: 'neon' }), /unknown style "neon"/);
