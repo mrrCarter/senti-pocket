@@ -72,6 +72,12 @@ export function createProdGateway(env = {}, deps = {}) {
     verifyToken,
     store,
     ttsBackend,
+    // /deck?format=video assembles an mp4 via INJECTED native backends the deploy owns (SVG->PNG raster + frames->mp4
+    // mux). Forwarded so a deploy that ships resvg/sharp + ffmpeg can enable video; absent => handleDeck honestly 501s
+    // (no-video-capability), never a fabricated/empty video. (createProdGateway previously dropped these => /deck?
+    // format=video was un-enableable in prod regardless of the binaries — same gate!=live class as the dial wiring.)
+    rasterize: deps.rasterize,
+    encodeVideo: deps.encodeVideo,
     reason: deps.reason || (gemma ? gemma.reason : undefined),   // /answer  (grounding-first; 501 if neither configured)
     brief: deps.brief || (gemma ? gemma.brief : undefined),     // /brief   (grounding-first; 501 if neither configured)
     minConfidence: deps.minConfidence,
