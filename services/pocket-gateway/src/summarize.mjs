@@ -17,7 +17,15 @@ const LIMITS = Object.freeze({
 });
 
 const utf8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
-const clamp = (s, max) => (utf8(s) > max ? Buffer.from(String(s), 'utf8').subarray(0, max).toString('utf8') + '…' : String(s ?? ''));
+// scalar-safe truncation: iterate by CODE POINT so a byte-offset cut never splits a multibyte char into a U+FFFD
+// replacement (which would surface a garbage char in a phone-visible snippet). Mirrors bundle.mjs boundStr.
+const clamp = (s, max) => {
+  const str = String(s ?? '');
+  if (utf8(str) <= max) return str;
+  let out = '', used = 0;
+  for (const ch of str) { const cb = Buffer.byteLength(ch, 'utf8'); if (used + cb > max) break; out += ch; used += cb; }
+  return out + '…';
+};
 const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
 /** Build one grounded EvidenceRef from a RawEvent (payload already scrubbed at extraction; bounded here again). */
