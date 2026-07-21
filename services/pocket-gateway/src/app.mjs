@@ -1,0 +1,66 @@
+// app.mjs — deploy composition: wires the REAL components (SENTI-session verifier + DynamoDB store + ElevenLabs TTS +
+// governed gateway) into a Lambda handler. Zero-dep: the deploy INJECTS the externals it owns (a DynamoDB
+// DocumentClient, the Ed25519 signing key from KMS/Secrets Manager, a senti `run`ner, fetch).
+// Scalar config comes from `env`. Nothing here reaches out on its own — all boundaries are explicit + testable.
+import { createGateway } from './handlers.mjs';
+import { createHumanMessageClient } from './human-message-client.mjs';
+import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
+import { createDynamoStore } from './store.mjs';
+import { createElevenLabsBackend } from './tts.mjs';
+import { lambdaHandler } from './lambda.mjs';
+
+/**
+ * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID, ELEVENLABS_API_KEY)
+ * @param {object} deps   injected externals the deploy owns:
+ *   { dynamoClient, signingKey, run, knownSessionIdsFor, bundleStore, fetch }
+ *   - dynamoClient: @aws-sdk/lib-dynamodb DocumentClient (get/put/delete)
+ *   - signingKey: Ed25519 private key (KMS/Secrets Manager) for receipts
+ *   - fetch: validates SENTI sessions (GET /auth/me) + posts the human write — the gateway holds NO signing secret
+ *   - run: a senti writeback runner (bundled sl or a senti API client) — `POST /actions/execute` uses it
+ *   - knownSessionIdsFor(humanId): the sessions the human may write to (server-derived authorization)
+ *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
+ */
+export function createProdGateway(env = {}, deps = {}) {
+  // FAIL BOOT if any production binding is absent (Echo P0). SENTI_API_BASE_URL is load-bearing twice: it's where the
+  // gateway VALIDATES the caller's SENTI session (verifyToken -> GET /auth/me) AND where the human write posts.
+  const missingEnv = ['DDB_TABLE', 'SIGNING_KEY_ID', 'GATEWAY_PUBLIC_URL', 'SENTI_API_BASE_URL']
+    .filter((k) => !env[k]);
+  if (missingEnv.length) throw new Error('pocket-gateway prod config missing: ' + missingEnv.join(', '));
+  if (!deps.dynamoClient || !deps.signingKey || typeof deps.knownSessionIdsFor !== 'function' || typeof deps.fetch !== 'function') {
+    throw new Error('pocket-gateway prod deps missing: dynamoClient + signingKey + knownSessionIdsFor + fetch are required');
+  }
+  const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
+  // Pocket-native auth (B3): pocket-gateway is Pocket-PRIVATE — all routes are Pocket-app routes, NO external-MCP/DPoP
+  // resource-server surface — so it authenticates the caller's ONE SENTI user-session token by CALLING the api
+  // (GET /auth/me). It holds NO signing secret and can never mint a session (the api's HS256 secret never leaves the
+  // api). Membership stays the server-derived knownSessionIdsFor(humanId); the SAME token is forwarded to the human write.
+  const verifyToken = createSentiSessionVerifier({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
+  const ttsBackend = env.ELEVENLABS_API_KEY
+    ? createElevenLabsBackend({ apiKey: env.ELEVENLABS_API_KEY, fetch: deps.fetch, defaultVoiceId: env.TTS_VOICE_ID })
+    : undefined;
+
+  // The HUMAN write door (executeAction humanMessage mode) posts to the api under the caller's OWN bearer — no gateway
+  // credential in the path. Constructed HERE (not lazily) so "deps.postHumanMessage is defined" is a BOOT INVARIANT: a
+  // prod boot cannot succeed without SENTI_API_BASE_URL + fetch (both required above), which are exactly what builds it,
+  // so the humanMessage `undefined dep -> TypeError` gap cannot regress.
+  const postHumanMessage = createHumanMessageClient({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
+
+  return createGateway({
+    verifyToken,
+    store,
+    ttsBackend,
+    run: deps.run,
+    postHumanMessage,
+    signingKey: deps.signingKey,
+    signingKeyId: env.SIGNING_KEY_ID,
+    knownSessionIdsFor: deps.knownSessionIdsFor,
+    bundleStore: deps.bundleStore,
+    agent: 'claude-pocket-relay',
+  });
+}
+
+/** The deployed Lambda handler: `export const handler = createLambda(process.env, injectedDeps)`. */
+export function createLambda(env, deps) {
+  // canonicalBaseUrl pins the DPoP htu to the deploy origin, not an attacker-spoofable Host header (Echo P0).
+  return lambdaHandler(createProdGateway(env, deps), { canonicalBaseUrl: env.GATEWAY_PUBLIC_URL });
+}

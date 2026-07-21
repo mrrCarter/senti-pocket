@@ -1,0 +1,38 @@
+{
+  "accessToken": "eyJhbGciOiJFZERTQSIsImtpZCI6Im5hdGl2ZS1pbnRlcm9wLWVkMjU1MTktMSIsInR5cCI6ImF0K2p3dCJ9.eyJhdWQiOiJzZW50aS1wb2NrZXQtZ2F0ZXdheSIsImNsaWVudF9pZCI6InNlbnRpLXBvY2tldC1pb3MiLCJjbmYiOnsiamt0IjoiY2Nnc2NXU09XTmU3emZFTENJUkhUZGI3SmtWeV9FbzJ2ZzM3MUM1cnBsWSJ9LCJleHAiOjE3ODQzNzYzMDAsImlhdCI6MTc4NDM3NjAwMCwiaXNzIjoiaHR0cHM6Ly9hcGkuYWlkZW5pZC5jb20iLCJqdGkiOiJpbnRlcm9wLWFjY2Vzcy1qdGktMDAwMDAwMDAwMDAxIiwia2V5X2Vwb2NoIjo3LCJuYmYiOjE3ODQzNzYwMDAsIm5vbmNlX2hhc2giOiJub25jZS1oYXNoLWludGVyb3BlcmFiaWxpdHktZml4dHVyZSIsIm9yZ2FuaXphdGlvbl9pZCI6Im9yZ19pbnRlcm9wIiwicHJvamVjdF9pZCI6InByb2pfaW50ZXJvcCIsInJlZnJlc2hfZmFtaWx5X2lkIjoibm9yZl9pbnRlcm9wX2ZpeHR1cmUiLCJyZXNvdXJjZSI6Imh0dHBzOi8vcG9ja2V0LWFwaS5zZW50aW5lbGF5ZXIuY29tIiwic2NvcGUiOiJwb2NrZXQ6cmVhZCBwb2NrZXQ6d3JpdGUiLCJzaXRlX2lkIjoic2l0ZV9zZW50aW5lbGF5ZXIiLCJzdWIiOiJwc2hfN2g1VmZ1elVrWENxQnRqSzk0eGl2M3pmc3FSSkE4eDd4blpuQzJNNzNyTSIsInRva2VuX3VzZSI6Im5hdGl2ZV9hY2Nlc3MiLCJ0cnVzdF9hbmNob3JfaWQiOiJuYXRpdmUtaW50ZXJvcC1lZDI1NTE5LTEifQ.-lcpnAGE7200ky_cSge4f6wodn_PUquqOUeatA_mLz_JIwQ2xNmQEFcVeu3aghzo2zIq6ktmDm12o2A5z8XhDg",
+  "description": "Byte-exact AIdenID native OAuth access JWT and ES256 DPoP interoperability vector.",
+  "dpopProof": "eyJhbGciOiJFUzI1NiIsImp3ayI6eyJjcnYiOiJQLTI1NiIsImt0eSI6IkVDIiwieCI6ImpsTTdiNkNfZTBZbHV6Qm1mQUg3WUg3NS1MaW9ELTliTUFZb2NER0hzcU0iLCJ5IjoiYy1zZHZlQXpHRFp0QnAtRHB2V1FBRlBITmpQTEJCc2h4VjRhaHNIMEFMUSJ9LCJ0eXAiOiJkcG9wK2p3dCJ9.eyJhdGgiOiIwUF9NMGFoVHVxak9ic3VaMEFjQ2Y0TkNjWW5JRF8tSEZpRDNCN3lGTmFNIiwiaHRtIjoiUE9TVCIsImh0dSI6Imh0dHBzOi8vcG9ja2V0LWFwaS5zZW50aW5lbGF5ZXIuY29tL3YxL3BvY2tldC9hY3Rpb25zIiwiaWF0IjoxNzg0Mzc2MDMwLCJqdGkiOiJpbnRlcm9wLWRwb3AtanRpLTAwMDAwMDAwMDAwMSJ9.RivZbyhvfKmOoT13Yq5ir3xH7KPHaEAJKOznAzQ-ym8j9cekxVrWRbuY2MFojHgDrWhAQJKxx-hWuGIkA3GYUg",
+  "expected": {
+    "audience": "senti-pocket-gateway",
+    "clientId": "senti-pocket-ios",
+    "dpopJkt": "ccgscWSOWNe7zfELCIRHTdb7JkVy_Eo2vg371C5rplY",
+    "expiresAt": "2026-07-18T12:05:00Z",
+    "issuer": "https://api.aidenid.com",
+    "keyEpoch": 7,
+    "organizationId": "org_interop",
+    "projectId": "proj_interop",
+    "resource": "https://pocket-api.sentinelayer.com",
+    "scope": "pocket:read pocket:write",
+    "siteId": "site_sentinelayer",
+    "subject": "psh_7h5VfuzUkXCqBtjK94xiv3zfsqRJA8x7xnZnC2M73rM",
+    "trustAnchorId": "native-interop-ed25519-1"
+  },
+  "jwks": {
+    "keys": [
+      {
+        "alg": "EdDSA",
+        "crv": "Ed25519",
+        "kid": "native-interop-ed25519-1",
+        "kty": "OKP",
+        "use": "sig",
+        "x": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "url": "https://pocket-api.sentinelayer.com/v1/pocket/actions"
+  },
+  "schemaVersion": 1,
+  "verificationTime": "2026-07-18T12:00:30Z"
+}
