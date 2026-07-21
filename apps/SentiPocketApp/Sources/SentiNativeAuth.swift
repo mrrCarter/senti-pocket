@@ -249,7 +249,10 @@ final class SentiNativeAuth: NSObject {
 
 #if canImport(AuthenticationServices)
 extension SentiNativeAuth: ASWebAuthenticationPresentationContextProviding {
-    nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+    // No `nonisolated`: the SDK declares presentationAnchor(for:) @MainActor and invokes it on the main thread, and
+    // SentiNativeAuth is @MainActor — so the method inherits that isolation and can read UIApplication's main-actor
+    // state without a data-race warning. (The prior `nonisolated` opted OUT of isolation → 5 main-actor warnings.)
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         // ASWebAuthenticationSession calls this on the main thread. Return the app's active key window so the
         // approval sheet presents over the current UI. (Forge: verify the anchor on-device — sim/headless can't.)
         #if canImport(UIKit)
