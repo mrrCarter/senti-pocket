@@ -67,6 +67,21 @@ test('assembleDeckVideo: injected raster+encoder -> base64 mp4; frames rastered 
   assert.equal(encodeInput.frames[1].audioBase64, null);
 });
 
+test('assembleDeckVideo: fps clamped to a sane ceiling (unbounded fps -> encoder frame-explosion DoS)', async () => {
+  const sb = buildStoryboard([{ template: 't', svg: '<svg/>' }]);
+  let seenFps;
+  const deps = { rasterize: async () => Buffer.from('png'), encodeVideo: async (input) => { seenFps = input.fps; return { video: Buffer.from('v'), format: 'mp4' }; } };
+  // A hostile/unbounded fps makes the injected encoder emit ~fps*totalMs frames -> OOM/timeout. Clamp to MAX_FPS(60).
+  await assembleDeckVideo(sb, deps, { fps: 1e9 });
+  assert.equal(seenFps, 60, 'huge fps clamped to 60');
+  await assembleDeckVideo(sb, deps, { fps: 24 });
+  assert.equal(seenFps, 24, 'a valid fps passes through unchanged');
+  for (const bad of [0, -5, Infinity, NaN, 'fast']) {
+    await assembleDeckVideo(sb, deps, { fps: bad });
+    assert.equal(seenFps, 30, `invalid fps ${String(bad)} -> default 30`);
+  }
+});
+
 test('no capability injected -> honest no-video-capability (never a fake video)', async () => {
   const sb = buildStoryboard([{ template: 't', svg: '<svg/>' }]);
   const r = await assembleDeckVideo(sb, {});

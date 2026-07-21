@@ -17,6 +17,11 @@ const DEFAULT_SLIDE_MS = 5000;   // a slide with no narration holds this long
 const MIN_SLIDE_MS = 1500;       // floor so a very short line still reads
 const TAIL_PAD_MS = 600;         // breath after the narration ends
 const MAX_SLIDE_MS = 120000;     // guard a pathological single slide
+// Output framerate is caller-supplied (body.fps). An injected encoder emits ~fps*totalMs frames, so an UNBOUNDED fps
+// (e.g. 1e9) with the 10-min duration cap = billions of frames -> encoder OOM/timeout. Clamp like buildStoryboard clamps
+// slideMs: 60 is the high end for any real video, and this deck is still frames (30 is already generous).
+const DEFAULT_FPS = 30;
+const MAX_FPS = 60;
 
 /** Estimate a narration clip's duration (ms) from its base64 size + format. Deterministic; 0 for no audio. */
 export function estimateAudioDurationMs(audioBase64, format) {
@@ -75,7 +80,7 @@ export async function assembleDeckVideo(storyboard = {}, deps = {}, opts = {}) {
   const shots = Array.isArray(storyboard.shots) ? storyboard.shots : [];
   const rasterize = typeof deps.rasterize === 'function' ? deps.rasterize : null;
   const encodeVideo = typeof deps.encodeVideo === 'function' ? deps.encodeVideo : null;
-  const fps = Number.isFinite(opts.fps) && opts.fps > 0 ? opts.fps : 30;
+  const fps = Number.isFinite(opts.fps) && opts.fps > 0 ? Math.min(MAX_FPS, opts.fps) : DEFAULT_FPS;
   if (!rasterize || !encodeVideo) {
     return { video: null, format: null, durationMs: storyboard.totalMs || 0, frames: shots.length, reason: 'no-video-capability' };
   }
