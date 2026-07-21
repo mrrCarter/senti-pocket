@@ -146,3 +146,37 @@ test('drop-in shape: segments match deps.brief { text, evidenceIds, taggedText? 
   assert.equal(typeof seg.text, 'string');
   assert.ok(Array.isArray(seg.evidenceIds));
 });
+
+test('draftConcurrency>1 runs DRAFT in parallel — order + isolation preserved (Atlas latency finding)', async () => {
+  let inFlight = 0, maxInFlight = 0;
+  const m = mock({
+    plan: () => ({ points: [{ label: 'a', evidenceIds: ['ev-1'] }, { label: 'b', evidenceIds: ['ev-2'] }, { label: 'c', evidenceIds: ['ev-3'] }] }),
+    draft: async ({ point }) => {
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 5));           // hold the slot so overlaps are observable
+      inFlight--;
+      if (point.label === 'b') throw new Error('draft b fails'); // isolation: only b drops
+      return { text: point.label, evidenceIds: point.evidenceIds };
+    },
+  });
+  const r = await run(m, { draftConcurrency: 3 });
+  assert.equal(r.status, 'briefed');
+  assert.ok(maxInFlight >= 2, 'draftConcurrency=3 -> drafts overlap (>=2 concurrently)');
+  assert.deepEqual(r.segments.map((s) => s.text), ['a', 'c'], 'segment ORDER preserved; failing point b dropped, not the whole brief');
+});
+
+test('default draftConcurrency=1 keeps DRAFT STRICTLY sequential (on-device thermal discipline)', async () => {
+  let inFlight = 0, maxInFlight = 0;
+  const m = mock({
+    plan: () => ({ points: Array.from({ length: 3 }, (_, i) => ({ label: `p${i}`, evidenceIds: ['ev-1'] })) }),
+    draft: async ({ point }) => {
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 3));
+      inFlight--;
+      return { text: point.label, evidenceIds: ['ev-1'] };
+    },
+  });
+  const r = await run(m); // no draftConcurrency -> default 1
+  assert.equal(maxInFlight, 1, 'default never co-schedules on-device inference (strictly one draft at a time)');
+  assert.deepEqual(r.segments.map((s) => s.text), ['p0', 'p1', 'p2'], 'order preserved');
+});

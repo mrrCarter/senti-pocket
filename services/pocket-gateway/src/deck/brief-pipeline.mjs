@@ -65,16 +65,20 @@ function isGrounded(seg) {
  *   DRAFT sub-agent: write one cited segment for a point. Throw / empty -> that point drops (not the whole brief).
  * @param {number} [deps.maxPoints=6]    hard cap on planned points fed to DRAFT (bounds sub-agent fan-out).
  * @param {number} [deps.maxSegments=6]  hard cap on segments that reach the terminal brief (bounds output).
+ * @param {number} [deps.draftConcurrency=1]  max concurrent DRAFT sub-agent calls. Default 1 = SEQUENTIAL — REQUIRED for
+ *   ON-DEVICE inference (never co-schedule on-device LiteRT-LM: thermal). Set >1 ONLY for a HOSTED Gemma backend to cut
+ *   brief latency from O(N) toward O(N/concurrency) round-trips. Isolation + segment ORDER are preserved at any concurrency.
  * @returns {{ brief: (a:{bundle:object, groundedEvidenceIds:string[]}) => Promise<{segments:Array<object>, plan:Array<object>, status:'briefed'|'unavailable', trace:string[]}> }}
  *   brief() is drop-in for deps.brief: handleBrief re-applies the SAME grounding filter downstream, so this is defense-in-depth.
  */
-export function createBriefPipeline({ plan, draft, maxPoints = 6, maxSegments = 6 } = {}) {
+export function createBriefPipeline({ plan, draft, maxPoints = 6, maxSegments = 6, draftConcurrency = 1 } = {}) {
   if (typeof plan !== 'function' || typeof draft !== 'function') {
     throw new Error('createBriefPipeline: plan and draft sub-agents are required (injected Gemma calls)');
   }
   const cap = (n, d) => (Number.isInteger(n) && n > 0 && n <= 100 ? n : d);
   const pointCap = cap(maxPoints, 6);
   const segCap = cap(maxSegments, 6);
+  const draftConc = cap(draftConcurrency, 1); // default 1 = SEQUENTIAL (on-device-safe); >1 only for a hosted backend
 
   return {
     async brief({ bundle, groundedEvidenceIds } = {}) {
@@ -99,14 +103,22 @@ export function createBriefPipeline({ plan, draft, maxPoints = 6, maxSegments = 
       if (points.length === 0) return { segments: [], plan: [], status: 'unavailable', trace: [...trace, 'unavailable'] };
 
       // ── DRAFT ──────────────────────────────────────────────────────────────────────────────────────────────────
+      // One segment per point via a bounded worker pool (draftConc workers). Segment ORDER is preserved (each result is
+      // stored at its point's index) and ISOLATION comes from the per-point try/catch (a throwing/rejecting draft drops
+      // ONLY its own point -> null -> filtered), NOT from sequentiality — so raising draftConcurrency for a HOSTED backend
+      // cuts latency without weakening fail-closedness. Default draftConc=1 is strictly sequential (on-device thermal).
       trace.push('draft');
-      const drafted = [];
-      for (const point of points) {
-        let seg;
-        try { seg = await draft({ point, bundle, groundedEvidenceIds }); }
-        catch { continue; } // per-point fail-closed: one bad draft drops its point, never the whole brief
-        drafted.push(normalizeSegment(seg, grounded));
-      }
+      const results = new Array(points.length).fill(null);
+      let next = 0;
+      const worker = async () => {
+        while (next < points.length) {
+          const i = next++;
+          try { results[i] = normalizeSegment(await draft({ point: points[i], bundle, groundedEvidenceIds }), grounded); }
+          catch { results[i] = null; } // per-point fail-closed: one bad draft drops its point, never the whole brief
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(draftConc, points.length) }, worker));
+      const drafted = results.filter(Boolean);
 
       // ── VERIFY (pure grounding gate) ───────────────────────────────────────────────────────────────────────────
       trace.push('verify');
