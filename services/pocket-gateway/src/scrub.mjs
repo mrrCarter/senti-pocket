@@ -36,29 +36,43 @@ const RULES = [
   [/\b[A-Za-z0-9_-]{48,}\b/g, 'opaque-token'],           // long opaque base64url-ish blob
 ];
 
-/**
- * Redact known-format secrets from a single string (best-effort).
- * @param {string} input
- * @returns {{ text: string, redactions: string[] }} scrubbed text + labels of what was removed
- */
-export function scrubText(input) {
-  if (typeof input !== 'string' || input.length === 0) {
-    return { text: input ?? '', redactions: [] };
-  }
+// The entropy CATCH-ALLS (long hex / opaque base64url) are format-blind: correct for free text, WRONG for identifiers —
+// a hash-shaped id would be redacted, breaking grounding-citation matching AND collapsing two distinct ids to the same
+// [REDACTED] token. scrubIdSafe keeps only the EXPLICIT-format rules for id fields.
+const ENTROPY_LABELS = new Set(['hex-secret', 'opaque-token']);
+const ID_SAFE_RULES = RULES.filter(([, label]) => !ENTROPY_LABELS.has(label));
+
+function scrubWith(input, rules) {
+  if (typeof input !== 'string' || input.length === 0) return { text: input ?? '', redactions: [] };
   let text = input;
   const redactions = [];
-  for (const [re, label] of RULES) {
+  for (const [re, label] of rules) {
     text = text.replace(re, (m, ...rest) => {
       redactions.push(label);
       // For the kv-secret rule, preserve the "key:" prefix (rest[0]) and only mask the value.
-      if (label === 'kv-secret' && typeof rest[0] === 'string') {
-        return `${rest[0]}[REDACTED:${label}]`;
-      }
+      if (label === 'kv-secret' && typeof rest[0] === 'string') return `${rest[0]}[REDACTED:${label}]`;
       return `[REDACTED:${label}]`;
     });
   }
   return { text, redactions };
 }
+
+/**
+ * Redact known-format secrets from a single string (best-effort). FULL rule set incl. the high-entropy catch-alls.
+ * @param {string} input
+ * @returns {{ text: string, redactions: string[] }} scrubbed text + labels of what was removed
+ */
+export function scrubText(input) { return scrubWith(input, RULES); }
+
+/**
+ * scrubText for IDENTIFIER fields: applies ONLY the explicit-format rules (secret prefixes / PEM / JWT / Bearer / kv),
+ * NOT the entropy catch-alls — so a well-formed hash/uuid/cp_/ev_ id passes through VERBATIM (no redaction-collapse or
+ * grounding break) while a secret-PREFIXED value in an id field is still redacted. bundle.mjs scrubId should use this
+ * for the fully-rigorous form (vs the charset-verbatim shortcut, which skips even secret-prefix redaction over ids).
+ * @param {string} input
+ * @returns {{ text: string, redactions: string[] }}
+ */
+export function scrubIdSafe(input) { return scrubWith(input, ID_SAFE_RULES); }
 
 /**
  * Coerce a Senti export event payload (object or string) to a display string, then scrub it.
