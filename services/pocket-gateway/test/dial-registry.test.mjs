@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  createDialRegistry, createDialPushBackend, validateRegistration, buildDialPayload, computeDialId,
+  createDialRegistry, createDialPushBackend, createStoreDeviceRegistry, validateRegistration, buildDialPayload, computeDialId,
   DIAL_LIMITS, DIAL_PRIORITIES,
 } from '../src/dial-registry.mjs';
 
@@ -155,6 +155,41 @@ test('pushBackend: fan-out — one dead token never fails the ring; all-fail is 
   assert.equal(r.dispatched, false);
   assert.equal(r.reason, 'all-deliveries-failed');
   assert.equal(r.dialId, computeDialId('u', 's', 'm', NOW));
+});
+
+test('createStoreDeviceRegistry: register (atomic put) + lookup over the KV store; latest-wins single device v1', async () => {
+  const m = new Map();
+  const store = { async get(k) { return m.get(k); }, async put(k, v) { m.set(k, v); return v; } };
+  const reg = createStoreDeviceRegistry({ store, now: () => NOW });
+  assert.deepEqual(await reg.lookup({ humanId: 'u', sessionId: 's' }), [], 'empty before register');
+  assert.deepEqual(await reg.register({ humanId: 'u', sessionId: 's', voipToken: 'tok-1', platform: 'apns' }), { deviceCount: 1 });
+  assert.deepEqual(await reg.lookup({ humanId: 'u', sessionId: 's' }), [{ voipToken: 'tok-1', platform: 'apns' }]);
+  // re-register the same session -> latest device wins (v1 single-device semantics, not a race)
+  await reg.register({ humanId: 'u', sessionId: 's', voipToken: 'tok-2', platform: 'fcm' });
+  assert.deepEqual(await reg.lookup({ humanId: 'u', sessionId: 's' }), [{ voipToken: 'tok-2', platform: 'fcm' }]);
+  // isolation: a different human is a distinct record
+  assert.deepEqual(await reg.lookup({ humanId: 'other', sessionId: 's' }), []);
+  // key injection-safe (humanId length-prefixed): ("a","b:c") vs ("a:b","c") never collide
+  await reg.register({ humanId: 'a', sessionId: 'b:c', voipToken: 'x', platform: 'apns' });
+  await reg.register({ humanId: 'a:b', sessionId: 'c', voipToken: 'y', platform: 'apns' });
+  assert.equal((await reg.lookup({ humanId: 'a', sessionId: 'b:c' }))[0].voipToken, 'x');
+  assert.equal((await reg.lookup({ humanId: 'a:b', sessionId: 'c' }))[0].voipToken, 'y');
+});
+
+test('createStoreDeviceRegistry: requires a get/put store', () => {
+  assert.throws(() => createStoreDeviceRegistry({}), /requires a \{ get, put \} store/);
+});
+
+test('createStoreDeviceRegistry composes with createDialPushBackend end-to-end (register -> lookup -> ring)', async () => {
+  const m = new Map();
+  const store = { async get(k) { return m.get(k); }, async put(k, v) { m.set(k, v); return v; } };
+  const reg = createStoreDeviceRegistry({ store, now: () => NOW });
+  await reg.register({ humanId: 'u', sessionId: 's', voipToken: 'tok-store', platform: 'apns' });
+  const sent = [];
+  const pb = createDialPushBackend({ deviceRegistry: reg, apnsSend: async (a) => { sent.push(a); return { delivered: true }; }, now: () => NOW });
+  const out = await pb({ message: 'ring', sessionId: 's', humanId: 'u' });
+  assert.equal(out.dispatched, true);
+  assert.equal(sent[0].voipToken, 'tok-store', 'the store-registered token is resolved + rung');
 });
 
 test('pushBackend: duplicate voipToken records ring the device ONCE (dedup — no double-ring on re-login)', async () => {

@@ -162,3 +162,36 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
       : { dispatched: false, reason: 'all-deliveries-failed', dialId: payload.id, devices: devices.length };
   };
 }
+
+/** Injection-safe device-record key: humanId is length-prefixed so ("a","b:c") and ("a:b","c") can never collide. */
+const DEVICE_KEY = (humanId, sessionId) => `dial:dev:${String(humanId ?? '').length}:${humanId ?? ''}:${sessionId ?? ''}`;
+
+/**
+ * A deps.deviceRegistry backed by the gateway's own {get,put,delete} store — ZERO new infra (it rides the existing
+ * DynamoDB table the gateway already uses), so a deploy can wire /dial/register with nothing but the store it already
+ * has. v1 stores ONE device per (humanId, sessionId): register is an ATOMIC put (race-free, latest device wins — no
+ * lost-update, no lock needed) and lookup a single get. Multi-device-per-session is a v2 nicety; createDialPushBackend
+ * already fans out to a device LIST, so a future multi-device registry drops in with NO pushBackend change. A deploy
+ * that wants a dedicated device table can inject its own deps.deviceRegistry instead — this is only the default.
+ * @param {{ store: {get:Function, put:Function}, now?: ()=>number }} cfg
+ */
+export function createStoreDeviceRegistry({ store, now = () => Date.now() } = {}) {
+  if (!store || typeof store.get !== 'function' || typeof store.put !== 'function') {
+    throw new Error('createStoreDeviceRegistry requires a { get, put } store');
+  }
+  const clock = typeof now === 'function' ? now : () => Date.now();
+  return {
+    async register({ humanId, sessionId, voipToken, platform, registeredAt } = {}) {
+      // atomic full-item put: no read-modify-write, so two concurrent registers for the same (human,session) can't lose
+      // an update (last-writer-wins is the intended v1 single-device semantics, not a race bug).
+      await store.put(DEVICE_KEY(humanId, sessionId), {
+        voipToken, platform: platform || 'apns', registeredAt: registeredAt || new Date(clock()).toISOString(),
+      });
+      return { deviceCount: 1 };
+    },
+    async lookup({ humanId, sessionId } = {}) {
+      const d = await store.get(DEVICE_KEY(humanId, sessionId));
+      return d && typeof d.voipToken === 'string' && d.voipToken ? [{ voipToken: d.voipToken, platform: d.platform || 'apns' }] : [];
+    },
+  };
+}

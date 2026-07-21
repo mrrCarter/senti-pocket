@@ -21,7 +21,10 @@ const DEFAULT_CACHE_TTL_MS = 20_000;
 // A validated user session is not scope-limited on its OWN data, so it gets the full Pocket scope set. NOTE: this makes
 // each route's hasScope() gate effectively always-true for a valid session — the REAL per-write authz is MEMBERSHIP
 // (knownSessionIdsFor + the /execute membership precheck), not scope granularity. Correct for the native-door model.
-const DEFAULT_SCOPES = ['sessions:read', 'sessions:write', 'pocket:voice'];
+// The FULL Pocket scope set — MUST list every SCOPES value handlers.mjs gates on (sync/execute/tts/dial), else a valid
+// session 403s on that route. pocket:dial was added with DIAL-ME; omitting it here made /dial + /dial/register
+// unreachable in prod despite a valid session. Keep in sync with createGateway's SCOPES.
+const DEFAULT_SCOPES = ['sessions:read', 'sessions:write', 'pocket:voice', 'pocket:dial'];
 const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_CACHE_ENTRIES = 5000; // bound the positive cache (evict oldest) so a long-warm instance can't grow unbounded
 

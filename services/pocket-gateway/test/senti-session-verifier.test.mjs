@@ -22,7 +22,7 @@ test('valid SENTI bearer -> GET /auth/me -> {humanId, principal, scopes}', async
   assert.equal(calls[0].init.headers.authorization, 'Bearer SENTI_TOK'); // caller token forwarded verbatim
   assert.equal(ctx.humanId, 'user_42');
   assert.equal(ctx.principal, 'pocket.principal.senti.v1\n7:user_42'); // distinct namespace + length-prefixed
-  assert.deepEqual(ctx.scopes, ['sessions:read', 'sessions:write', 'pocket:voice']);
+  assert.deepEqual(ctx.scopes, ['sessions:read', 'sessions:write', 'pocket:voice', 'pocket:dial']);
 });
 
 test('fail-closed: 401 -> null and NOT cached (a revoked token keeps failing)', async () => {
@@ -93,7 +93,7 @@ test('the returned identity is deeply FROZEN (cached by-ref; no downstream mutat
   assert.throws(() => ctx.scopes.push('sessions:admin'), TypeError, 'in-place scope mutation is rejected');
   // the cached entry stays unpoisoned: a second (cached) hit still has the original scopes
   const ctx2 = await verify({ authorization: 'Bearer T' });
-  assert.deepEqual(ctx2.scopes, ['sessions:read', 'sessions:write', 'pocket:voice']);
+  assert.deepEqual(ctx2.scopes, ['sessions:read', 'sessions:write', 'pocket:voice', 'pocket:dial']);
 });
 
 test('factory requires fetch + apiBaseUrl', () => {
