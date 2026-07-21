@@ -37,6 +37,11 @@ export async function narrateDeck(deck = {}, opts = {}) {
   // 100s of MB, past Lambda's 6 MB response limit. Once the cap is hit we STOP synthesizing + mark remaining slides
   // honestly ('deck-audio-cap') rather than 500-ing. Compressed formats (mp3) keep normal decks well under it.
   const maxTotalAudioBytes = Number.isFinite(opts.maxTotalAudioBytes) && opts.maxTotalAudioBytes > 0 ? opts.maxTotalAudioBytes : null;
+  // Bound the NUMBER of synthesized slides too, not just bytes. TTS calls are SERIAL, so N slides = N sequential
+  // round-trips; a deck of many small-audio slides stays under the byte cap yet still fires 60+ calls, blowing a
+  // request timeout (API Gateway 29s). Past the count, skip synthesis honestly ('deck-slide-cap'). (Full large-deck
+  // narration is inherently a job for async, not one sync request.)
+  const maxNarratedSlides = Number.isFinite(opts.maxNarratedSlides) && opts.maxNarratedSlides > 0 ? opts.maxNarratedSlides : null;
 
   const segments = [];
   let narratedCount = 0;
@@ -60,8 +65,11 @@ export async function narrateDeck(deck = {}, opts = {}) {
       seg.audioSkipped = 'no-script';
     } else if (!synthesize) {
       seg.audioSkipped = ttsBackend ? 'not-requested' : 'no-backend';
+    } else if (maxNarratedSlides != null && narratedCount >= maxNarratedSlides) {
+      seg.audioSkipped = 'deck-slide-cap'; // synth call-count bound hit -> stop (serial TTS time DoS: N calls > timeout)
+      capReached = true;
     } else if (maxTotalAudioBytes != null && totalAudioBytes >= maxTotalAudioBytes) {
-      seg.audioSkipped = 'deck-audio-cap'; // aggregate bound hit -> stop synthesizing, stay honest (don't 500)
+      seg.audioSkipped = 'deck-audio-cap'; // aggregate byte bound hit -> stop synthesizing, stay honest (don't 500)
       capReached = true;
     } else {
       // ElevenLabs voices the tags -> feed `tagged`. (A plain-only backend would be fed `plain`; the deploy chooses the
