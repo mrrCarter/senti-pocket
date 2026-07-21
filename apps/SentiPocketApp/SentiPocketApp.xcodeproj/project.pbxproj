@@ -1,0 +1,422 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		01C947493D8960C6B00A6F2B /* AppShell.swift in Sources */ = {isa = PBXBuildFile; fileRef = E54CC9132A97D8D966B68206 /* AppShell.swift */; };
+		16FE112196CC3C6789BED491 /* SentiPocketApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D3921E69EA56642651E1A0 /* SentiPocketApp.swift */; };
+		4A158C8563D233943AE1CBF4 /* PocketVoice in Frameworks */ = {isa = PBXBuildFile; productRef = 2A6C370A58E247740045A15B /* PocketVoice */; };
+		4A3F0FB177B6A35B30234DBB /* PocketContracts in Frameworks */ = {isa = PBXBuildFile; productRef = 583BD9E513A4C76AE8B16AA2 /* PocketContracts */; };
+		4B33BFB780E810C10E381E42 /* canonical_checkpoint.json in Resources */ = {isa = PBXBuildFile; fileRef = 9BC8F138BB358E9716B3F22C /* canonical_checkpoint.json */; };
+		654F8F7DC2D46B938F28BB55 /* PocketCall in Frameworks */ = {isa = PBXBuildFile; productRef = 6170E53F8CA61C526DB69529 /* PocketCall */; };
+		7CBB00ADB0D74D4BA9569C12 /* PocketBriefing in Frameworks */ = {isa = PBXBuildFile; productRef = 486D7135B07EBE932B8DAD5B /* PocketBriefing */; };
+		90B38142CE16DD4920CAB4E4 /* FixtureLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AB844D129D652E5FEA00EED /* FixtureLoader.swift */; };
+		B667228CB22E522EFBD186AA /* PocketAppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DADEC4C3C1C6F9BC6ECB806 /* PocketAppModel.swift */; };
+		D8AB8EC2D4803DEAA299E739 /* PocketUI in Frameworks */ = {isa = PBXBuildFile; productRef = 41C065D132C1B8962F82A447 /* PocketUI */; };
+		F8BB0A87CB17B023EB4147BB /* OnDeviceSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C8F3021589359DBB7ADBD4F /* OnDeviceSpeechRecognizer.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		0DADEC4C3C1C6F9BC6ECB806 /* PocketAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PocketAppModel.swift; sourceTree = "<group>"; };
+		2AB844D129D652E5FEA00EED /* FixtureLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureLoader.swift; sourceTree = "<group>"; };
+		5405FE8B229653E33E2F0900 /* PocketCall */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PocketCall; path = ../../packages/PocketCall; sourceTree = SOURCE_ROOT; };
+		6D3828D18519728B7B1A327F /* PocketVoice */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PocketVoice; path = ../../packages/PocketVoice; sourceTree = SOURCE_ROOT; };
+		7C8F3021589359DBB7ADBD4F /* OnDeviceSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnDeviceSpeechRecognizer.swift; sourceTree = "<group>"; };
+		7ED524FEF6962DC10C526162 /* SentiPocketApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = SentiPocketApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9A0E322AEC0415FF888C251B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		9BC8F138BB358E9716B3F22C /* canonical_checkpoint.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = canonical_checkpoint.json; sourceTree = "<group>"; };
+		A3D3921E69EA56642651E1A0 /* SentiPocketApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SentiPocketApp.swift; sourceTree = "<group>"; };
+		B952B09C54DB01165EC83078 /* PocketUI */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PocketUI; path = ../../packages/PocketUI; sourceTree = SOURCE_ROOT; };
+		DA5F6222816F875BDAEC3E16 /* PocketContracts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PocketContracts; path = ../../packages/PocketContracts; sourceTree = SOURCE_ROOT; };
+		DE29B18FD4B346FC344A0A32 /* PocketBriefing */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PocketBriefing; path = ../../packages/PocketBriefing; sourceTree = SOURCE_ROOT; };
+		E54CC9132A97D8D966B68206 /* AppShell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppShell.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		DC5A9D702999BE7BE080FE74 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4A3F0FB177B6A35B30234DBB /* PocketContracts in Frameworks */,
+				654F8F7DC2D46B938F28BB55 /* PocketCall in Frameworks */,
+				7CBB00ADB0D74D4BA9569C12 /* PocketBriefing in Frameworks */,
+				D8AB8EC2D4803DEAA299E739 /* PocketUI in Frameworks */,
+				4A158C8563D233943AE1CBF4 /* PocketVoice in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		68F8FFC810BCFAE0FA7AE683 = {
+			isa = PBXGroup;
+			children = (
+				7F11FD4BA7EB74C0573792B6 /* Packages */,
+				CAE48F396EBDE17FAC5F0E33 /* Resources */,
+				F466A97458551682E3406B6F /* Sources */,
+				8E9E9104EFFBE51CB38E9A76 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		7F11FD4BA7EB74C0573792B6 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				DE29B18FD4B346FC344A0A32 /* PocketBriefing */,
+				5405FE8B229653E33E2F0900 /* PocketCall */,
+				DA5F6222816F875BDAEC3E16 /* PocketContracts */,
+				B952B09C54DB01165EC83078 /* PocketUI */,
+				6D3828D18519728B7B1A327F /* PocketVoice */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		8E9E9104EFFBE51CB38E9A76 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				7ED524FEF6962DC10C526162 /* SentiPocketApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		CAE48F396EBDE17FAC5F0E33 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				9BC8F138BB358E9716B3F22C /* canonical_checkpoint.json */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		F466A97458551682E3406B6F /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				E54CC9132A97D8D966B68206 /* AppShell.swift */,
+				2AB844D129D652E5FEA00EED /* FixtureLoader.swift */,
+				9A0E322AEC0415FF888C251B /* Info.plist */,
+				7C8F3021589359DBB7ADBD4F /* OnDeviceSpeechRecognizer.swift */,
+				0DADEC4C3C1C6F9BC6ECB806 /* PocketAppModel.swift */,
+				A3D3921E69EA56642651E1A0 /* SentiPocketApp.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		9D2CF79713EE63538764B298 /* SentiPocketApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 20D9159BB105C61F57E1E70F /* Build configuration list for PBXNativeTarget "SentiPocketApp" */;
+			buildPhases = (
+				2D9669340AF4B97170959882 /* Sources */,
+				0EE53EE48125BFB86BCB776A /* Resources */,
+				DC5A9D702999BE7BE080FE74 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = SentiPocketApp;
+			packageProductDependencies = (
+				583BD9E513A4C76AE8B16AA2 /* PocketContracts */,
+				6170E53F8CA61C526DB69529 /* PocketCall */,
+				486D7135B07EBE932B8DAD5B /* PocketBriefing */,
+				41C065D132C1B8962F82A447 /* PocketUI */,
+				2A6C370A58E247740045A15B /* PocketVoice */,
+			);
+			productName = SentiPocketApp;
+			productReference = 7ED524FEF6962DC10C526162 /* SentiPocketApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		90A30374E85398191C38D1AB /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = FABC9E1FA27D0C9F2B46167A /* Build configuration list for PBXProject "SentiPocketApp" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 68F8FFC810BCFAE0FA7AE683;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				3937A686D54C0327B68C3D22 /* XCLocalSwiftPackageReference "../../packages/PocketBriefing" */,
+				034B4C11DFD09C06E60B248B /* XCLocalSwiftPackageReference "../../packages/PocketCall" */,
+				45174CBC1ADD16453DB87449 /* XCLocalSwiftPackageReference "../../packages/PocketContracts" */,
+				CED81CB3144E1CD02D023F10 /* XCLocalSwiftPackageReference "../../packages/PocketUI" */,
+				DBDAE8309BD307D172EF8889 /* XCLocalSwiftPackageReference "../../packages/PocketVoice" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 8E9E9104EFFBE51CB38E9A76 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				9D2CF79713EE63538764B298 /* SentiPocketApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		0EE53EE48125BFB86BCB776A /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4B33BFB780E810C10E381E42 /* canonical_checkpoint.json in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		2D9669340AF4B97170959882 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				01C947493D8960C6B00A6F2B /* AppShell.swift in Sources */,
+				90B38142CE16DD4920CAB4E4 /* FixtureLoader.swift in Sources */,
+				F8BB0A87CB17B023EB4147BB /* OnDeviceSpeechRecognizer.swift in Sources */,
+				B667228CB22E522EFBD186AA /* PocketAppModel.swift in Sources */,
+				16FE112196CC3C6789BED491 /* SentiPocketApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		59A028A7C1AB9D7D10CB5883 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Sources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.plexaura.sentipocket.SentiPocketApp;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		80E020A6847EE926C5CEC631 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		A317CD80E9C1C3BCE7364EC1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Sources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.plexaura.sentipocket.SentiPocketApp;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		CEF5C5C1D3A332DB88CCFBC2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		20D9159BB105C61F57E1E70F /* Build configuration list for PBXNativeTarget "SentiPocketApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				59A028A7C1AB9D7D10CB5883 /* Debug */,
+				A317CD80E9C1C3BCE7364EC1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FABC9E1FA27D0C9F2B46167A /* Build configuration list for PBXProject "SentiPocketApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CEF5C5C1D3A332DB88CCFBC2 /* Debug */,
+				80E020A6847EE926C5CEC631 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		034B4C11DFD09C06E60B248B /* XCLocalSwiftPackageReference "../../packages/PocketCall" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../packages/PocketCall;
+		};
+		3937A686D54C0327B68C3D22 /* XCLocalSwiftPackageReference "../../packages/PocketBriefing" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../packages/PocketBriefing;
+		};
+		45174CBC1ADD16453DB87449 /* XCLocalSwiftPackageReference "../../packages/PocketContracts" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../packages/PocketContracts;
+		};
+		CED81CB3144E1CD02D023F10 /* XCLocalSwiftPackageReference "../../packages/PocketUI" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../packages/PocketUI;
+		};
+		DBDAE8309BD307D172EF8889 /* XCLocalSwiftPackageReference "../../packages/PocketVoice" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../packages/PocketVoice;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		2A6C370A58E247740045A15B /* PocketVoice */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PocketVoice;
+		};
+		41C065D132C1B8962F82A447 /* PocketUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PocketUI;
+		};
+		486D7135B07EBE932B8DAD5B /* PocketBriefing */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PocketBriefing;
+		};
+		583BD9E513A4C76AE8B16AA2 /* PocketContracts */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PocketContracts;
+		};
+		6170E53F8CA61C526DB69529 /* PocketCall */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PocketCall;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 90A30374E85398191C38D1AB /* Project object */;
+}

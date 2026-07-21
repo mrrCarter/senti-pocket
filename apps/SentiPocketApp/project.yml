@@ -1,0 +1,49 @@
+# XcodeGen manifest — Atlas owns this + the generated project. Reproducible from these Windows-authored
+# sources: on a Mac run `xcodegen generate` (brew install xcodegen) then open SentiPocketApp.xcodeproj.
+# Keeps the Xcode project OUT of git-conflict territory (only this yaml + Swift sources are tracked).
+name: SentiPocketApp
+options:
+  bundleIdPrefix: com.plexaura.sentipocket
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+packages:
+  PocketContracts:
+    path: ../../packages/PocketContracts
+  PocketCall:
+    path: ../../packages/PocketCall
+  PocketBriefing:
+    path: ../../packages/PocketBriefing
+  PocketUI:
+    path: ../../packages/PocketUI
+  PocketVoice:
+    path: ../../packages/PocketVoice
+  # Relay's PocketSyncClient/PocketActionsClient are Phase-B (real gateway); not wired for the Phase-A fixture build.
+targets:
+  SentiPocketApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources
+        buildPhase: resources
+    dependencies:
+      - package: PocketContracts
+      - package: PocketCall
+      - package: PocketBriefing
+      - package: PocketUI
+      - package: PocketVoice
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Senti Pocket
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Required or iOS SIGABRTs on the first permission request (on-device Speech STT + mic barge-in/PTT).
+        NSMicrophoneUsageDescription: "Senti Pocket uses the microphone so you can barge in and answer the briefing by voice."
+        NSSpeechRecognitionUsageDescription: "Senti Pocket transcribes your speech on-device so you can interrupt a briefing and dictate a proposed action."
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: false
+        SWIFT_VERSION: "5.9"
