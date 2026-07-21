@@ -36,9 +36,12 @@ export function routeAnswer(input, opts = {}) {
   const claimed = Array.isArray(llm.evidenceIds) ? llm.evidenceIds : [];
   // Only citations that are ACTUALLY in the retrieved grounding survive (drop hallucinated ids).
   const citedGrounded = [...new Set(claimed.filter((id) => grounded.includes(id)))];
+  const answerText = typeof llm.text === 'string' ? llm.text : '';
 
-  // PRIMARY gate: grounding. No grounded citation => never .answered.
-  if (citedGrounded.length === 0) {
+  // PRIMARY gate: grounding AND a non-empty answer. A grounded citation with EMPTY answer text is not an answer —
+  // routing it .answered would show the user a citation with no words. (The parallel brief() path already drops
+  // empty-text segments; /answer was missing the same guard.)
+  if (citedGrounded.length === 0 || answerText.trim().length === 0) {
     return grounded.length > 0
       ? { status: 'clarify', clarify: buildClarify(input?.nearestTopics) }
       : { status: 'unavailable', unavailable: { nearestTopics: normalizeTopics(input?.nearestTopics) } };
