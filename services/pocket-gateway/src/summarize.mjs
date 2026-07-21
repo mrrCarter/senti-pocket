@@ -57,7 +57,12 @@ export function summarize(rawCheckpoint, descriptor = {}) {
     const span = first.sequenceId === last.sequenceId ? `seq ${first.sequenceId}` : `seq ${first.sequenceId}..${last.sequenceId}`;
     // bounded citations: first, last, and evenly-spread interior events (deterministic).
     const picks = pickSpread(evs, LIMITS.EVIDENCE_PER_AGENT);
-    const evidence = picks.map((e) => evidenceFrom(rc, e));
+    // DROP empty-snippet evidence: an event with an empty/whitespace/absent payload yields snippet:'' , but signBundle's
+    // ingress gate REQUIRES snippet 1..8000 — so a single blank-payload event (a contentless control/system event or an
+    // empty post) in the range would make the WHOLE bundle permanently unsignable -> /checkpoint,/answer,/brief 503
+    // "retryable" forever on stable data. Filtering here matches the existing quotes/claims empty-filter intent; all
+    // claim-cited evidence is non-empty anyway so citations still resolve.
+    const evidence = picks.map((e) => evidenceFrom(rc, e)).filter((e) => e.snippet);
     // GROUNDED CONTENT prose: quote the agent's ACTUAL messages (bounded) so the briefing conveys WHAT was said, not
     // just how many. Every quote is a real cited event — nothing is paraphrased or invented. (The LLM-enriched
     // summarizer later refines phrasing + adds inference/recommendation claims, reusing these same evidence ids.)

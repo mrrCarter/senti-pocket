@@ -41,6 +41,27 @@ test('every AgentSummary evidence cites a REAL event sequence (grounded), bounde
   }
 });
 
+test('a blank/whitespace-payload event in range does NOT break bundle signing (empty-snippet evidence dropped) — regression', () => {
+  const EXPORT_BLANK = {
+    session: { id: SID, title: 'blank-evt' },
+    events: [
+      { sequenceId: 200, event: 'session_message', agent: { id: 'claude-pocket-relay' }, payload: { text: 'real content here' }, ts: '2026-07-18T11:00:00Z' },
+      { sequenceId: 201, event: 'session_control', agent: { id: 'claude-pocket-relay' }, payload: null, ts: '2026-07-18T11:01:00Z' },        // contentless control event
+      { sequenceId: 202, event: 'session_message', agent: { id: 'claude-warden' }, payload: { text: '   ' }, ts: '2026-07-18T11:02:00Z' },    // whitespace-only
+      { sequenceId: 203, event: 'session_message', agent: { id: 'claude-warden' }, payload: { text: 'more real content' }, ts: '2026-07-18T11:03:00Z' },
+    ],
+  };
+  const CKPT_BLANK = { checkpointId: 'cp_blank_1', sessionId: SID, startSequence: 200, endSequence: 203, summarySections: { window: { eventCount: 4 } } };
+  const raw = buildRawCheckpoint(CKPT_BLANK, EXPORT_BLANK).rawCheckpoint;
+  const s = summarize(raw, CKPT_BLANK);
+  for (const a of s.perAgent) for (const ev of a.evidence) assert.ok(ev.snippet && ev.snippet.trim().length > 0, 'no empty-snippet evidence survives');
+  // the full pipeline must SIGN + VERIFY — pre-fix, signBundle's ingress threw on the empty snippet -> 503-forever.
+  const { publicKey, privateKey } = generateSigningKeypair();
+  let signed;
+  assert.doesNotThrow(() => { signed = buildSignedBundle(raw, s, privateKey, { signingKeyId: 'gw-key', createdAt: '2026-07-18T11:05:00Z' }); }, 'a blank event must not block signing');
+  assert.equal(verifyBundle(signed, publicKey), true, 'signs + verifies end-to-end');
+});
+
 test('summarize is deterministic: same input => byte-identical output', () => {
   assert.deepEqual(summarize(rc(), CKPT), summarize(rc(), CKPT));
 });
