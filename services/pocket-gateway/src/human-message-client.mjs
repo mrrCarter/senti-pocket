@@ -15,6 +15,8 @@
 // response missing `message.id` or `event.sequenceId` — so a 4xx/5xx/degraded/shape-drift response becomes a NON-landing
 // (executeAction never finalizes `.posted`), fail-closed. That closes Atlas silent-false-fail #1 at the transport edge.
 
+import { timeoutSignal } from './http-timeout.mjs';
+
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 /** Full api path for a human write. Kept greppable + pinned to the api route definition. */
@@ -55,10 +57,9 @@ export function createHumanMessageClient({ fetch, apiBaseUrl, timeoutMs = DEFAUL
     // upstream concern at the threading seam (tracked cross-lane); this client only guarantees a well-formed Bearer.
     const credential = token.replace(/^Bearer\s+/i, '');
 
-    // Bounded wait: abort rather than hang the execute path. AbortSignal.timeout is Node 18.17+/20+ — guard for absence.
-    const signal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
-      ? AbortSignal.timeout(timeoutMs)
-      : undefined;
+    // Bounded wait: abort rather than hang the execute path. timeoutSignal is any-runtime (native AbortSignal.timeout,
+    // else an AbortController fallback), so a POST can never hang unbounded on an older runtime.
+    const signal = timeoutSignal(timeoutMs);
 
     const res = await fetch(url, {
       method: 'POST',
