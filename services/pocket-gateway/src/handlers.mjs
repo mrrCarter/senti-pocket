@@ -16,6 +16,7 @@ import { routeAnswer } from './reasoning-router.mjs';
 import { splitTagged } from './audio-tags.mjs';
 import { renderDeck } from './deck/templates.mjs';
 import { narrateDeck } from './deck/narration.mjs';
+import { buildStoryboard, assembleDeckVideo } from './deck/video.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -323,6 +324,12 @@ export function createGateway(deps) {
         if (typeof script === 'string' && Buffer.byteLength(script, 'utf8') > 8192) return json(413, { error: 'a slide script exceeds 8192 bytes' });
       }
     }
+    // format:'video' -> assemble an mp4. Fail FAST (before the expensive render+TTS) if the deploy hasn't injected the
+    // raster + encoder tools.
+    const wantVideo = body.format === 'video';
+    if (wantVideo && (typeof deps.rasterize !== 'function' || typeof deps.encodeVideo !== 'function')) {
+      return json(501, { error: 'video backend not configured', reason: 'no-video-capability' });
+    }
     let rendered;
     try { rendered = renderDeck(spec); }
     catch (e) { return json(400, { error: 'render failed: ' + (e && e.message ? String(e.message).slice(0, 160) : 'invalid slide') }); }
@@ -345,6 +352,25 @@ export function createGateway(deps) {
         } : null,
       };
     });
+    if (wantVideo) {
+      const storyboard = buildStoryboard(slides, { defaultSlideMs: body.slideMs, padMs: body.padMs });
+      const MAX_VIDEO_MS = 10 * 60 * 1000; // 10 min — beyond this ffmpeg would blow Lambda's 15-min / API-GW 29s bounds
+      if (storyboard.totalMs > MAX_VIDEO_MS) {
+        return json(413, { error: 'video too long', reason: 'video-too-long', totalMs: storyboard.totalMs, maxMs: MAX_VIDEO_MS });
+      }
+      // deps.rasterize fetches <image href> during SVG->PNG. safeImageHref already limits hrefs to https/data:image, but
+      // the injected rasterizer MUST run network-egress-disabled / sandboxed (deploy contract) as the hard SSRF backstop.
+      const v = await assembleDeckVideo(storyboard, { rasterize: deps.rasterize, encodeVideo: deps.encodeVideo }, { fps: body.fps });
+      if (!v.video) {
+        return json(v.reason === 'no-video-capability' ? 501 : 502, { error: 'video assembly failed', reason: v.reason, failedIndex: v.failedIndex });
+      }
+      return {
+        status: 200,
+        headers: { 'content-type': 'video/mp4', 'x-senti-video-duration-ms': String(v.durationMs), 'x-senti-video-frames': String(v.frames) },
+        body: v.video,           // raw mp4 Buffer, streamed as binary (no base64-in-JSON)
+        isBase64Encoded: true,   // API Gateway binary contract; the local adapter ignores it
+      };
+    }
     return json(200, {
       style: rendered.style, count: rendered.count,
       audioEnabled: narration.audioEnabled, narratedCount: narration.narratedCount,

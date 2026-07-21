@@ -63,7 +63,7 @@ export function buildStoryboard(slides, opts = {}) {
  * @param {{ rasterize:(svg:string,size:{width,height})=>Promise<Buffer>, encodeVideo:(input:{frames,fps,totalMs})=>Promise<{video:Buffer,format?:string}> }} deps
  * @param {{ fps?:number }} [opts]
  * @returns {Promise<{video:string|null, format:string|null, durationMs:number, frames:number, reason?:string, failedIndex?:number, error?:string}>}
- *   On success: video is base64 mp4. On any gap: video=null + a typed reason (no-video-capability / raster-failed /
+ *   On success: video is a raw mp4 Buffer. On any gap: video=null + a typed reason (no-video-capability / raster-failed /
  *   raster-empty / encode-failed / encode-empty), never a silent/fake video.
  */
 export async function assembleDeckVideo(storyboard = {}, deps = {}, opts = {}) {
@@ -91,7 +91,9 @@ export async function assembleDeckVideo(storyboard = {}, deps = {}, opts = {}) {
   if (!out || !out.video || !out.video.length) {
     return { video: null, format: null, durationMs: 0, frames: frames.length, reason: 'encode-empty' };
   }
-  const video = Buffer.isBuffer(out.video) ? out.video.toString('base64') : Buffer.from(out.video).toString('base64');
+  // Return the raw Buffer (not base64): the endpoint streams it as a BINARY mp4 response, so base64-then-decode would be
+  // a wasteful round-trip on a large buffer. A JSON caller can `.toString('base64')` itself.
+  const video = Buffer.isBuffer(out.video) ? out.video : Buffer.from(out.video);
   return { video, format: out.format || 'mp4', durationMs: storyboard.totalMs || 0, frames: frames.length };
 }
 

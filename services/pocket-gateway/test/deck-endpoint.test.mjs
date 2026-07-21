@@ -100,3 +100,44 @@ test('accepts {deck:{...}} envelope as well as a bare deck', async () => {
   assert.equal(res.status, 200);
   assert.equal(parse(res).count, 2);
 });
+
+// ---------- format:'video' ----------
+const vgw = (rasterize, encodeVideo, scopes = FULL) => createGateway({
+  verifyToken: async (h) => (h && h.authorization ? { humanId: 'mrrcarter', scopes } : null),
+  rasterize, encodeVideo,
+});
+
+test('format:video WITHOUT a video backend -> 501 fail-fast (no wasted render/TTS)', async () => {
+  const res = await post(gateway(FULL), { ...DECK, format: 'video' });
+  assert.equal(res.status, 501);
+  assert.match(parse(res).reason, /no-video-capability/);
+});
+
+test('format:video with injected raster+encoder -> BINARY mp4 (not base64-in-JSON)', async () => {
+  const raster = async () => Buffer.from('PNG');
+  const enc = async ({ frames }) => ({ video: Buffer.from('MP4:' + frames.length), format: 'mp4' });
+  const res = await post(vgw(raster, enc), { ...DECK, format: 'video' });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers['content-type'], 'video/mp4');
+  assert.ok(Buffer.isBuffer(res.body), 'binary body');
+  assert.equal(res.body.toString(), 'MP4:2');
+  assert.ok(res.headers['x-senti-video-duration-ms'], 'duration header present');
+});
+
+test('format:video too long -> 413 video-too-long (relay video Finding 1)', async () => {
+  const raster = async () => Buffer.from('P');
+  const enc = async () => ({ video: Buffer.from('V') });
+  const big = { slides: Array.from({ length: 60 }, () => ({ template: 'stat', content: { value: '1' } })), format: 'video', slideMs: 11000 };
+  const res = await post(vgw(raster, enc), big);
+  assert.equal(res.status, 413);
+  assert.match(parse(res).reason, /video-too-long/);
+  assert.ok(parse(res).totalMs > 600000);
+});
+
+test('format:video raster failure -> 502 (honest reason, not a fake video)', async () => {
+  const raster = async () => { throw new Error('resvg boom'); };
+  const enc = async () => ({ video: Buffer.from('V') });
+  const res = await post(vgw(raster, enc), { ...DECK, format: 'video' });
+  assert.equal(res.status, 502);
+  assert.match(parse(res).reason, /raster-failed/);
+});
