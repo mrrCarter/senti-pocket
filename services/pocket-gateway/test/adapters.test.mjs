@@ -55,19 +55,30 @@ test('lambdaHandler decodes a base64 request body', async () => {
 });
 
 // ---------- ElevenLabs TTS backend ----------
-test('tts backend calls ElevenLabs with the key server-side; returns pcm; key never in the audio', async () => {
+test('tts backend: pcm request honored (output_format as QUERY param + matching Accept) + s16le label; key never leaks', async () => {
   let captured;
   const fakeFetch = async (url, init) => { captured = { url, init }; return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([9, 8, 7]).buffer }; };
-  const tts = createElevenLabsBackend({ apiKey: 'sk-secret', fetch: fakeFetch, defaultVoiceId: 'voice-1' });
+  const tts = createElevenLabsBackend({ apiKey: 'tts-test-key', fetch: fakeFetch, defaultVoiceId: 'voice-1' });
   const out = await tts('brief me', { modelId: 'eleven_flash_v2_5', outputFormat: 'pcm_24000', tone: 'urgent' });
   assert.ok(Buffer.isBuffer(out.audio));
   assert.deepEqual([...out.audio], [9, 8, 7]);
-  assert.equal(out.format, 'pcm_s16le_24000');
-  assert.equal(captured.init.headers['xi-api-key'], 'sk-secret'); // key sent to provider, not returned
-  assert.match(captured.url, /\/v1\/text-to-speech\/voice-1$/);
+  assert.equal(out.format, 'pcm_s16le_24000');                        // pcm keeps the descriptive s16le label
+  assert.equal(captured.init.headers['xi-api-key'], 'tts-test-key');  // key sent to provider, not returned
+  assert.equal(captured.init.headers.accept, 'audio/pcm');            // Accept matches pcm
+  assert.match(captured.url, /\/v1\/text-to-speech\/voice-1\?output_format=pcm_24000$/); // output_format is a QUERY param
   const bodySent = JSON.parse(captured.init.body);
   assert.equal(bodySent.model_id, 'eleven_flash_v2_5');
-  assert.equal(bodySent.output_format, 'pcm_24000');
+  assert.equal(bodySent.output_format, undefined, 'output_format must NOT be in the body (ElevenLabs ignores it there)');
+});
+
+test('tts backend: an mp3 request is honored end-to-end (query + Accept audio/mpeg + honest mp3 label) — F1 deck size fix', async () => {
+  let captured;
+  const fakeFetch = async (url, init) => { captured = { url, init }; return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer }; };
+  const tts = createElevenLabsBackend({ apiKey: 'k', fetch: fakeFetch, defaultVoiceId: 'v' });
+  const out = await tts('narrate', { outputFormat: 'mp3_44100_128' });
+  assert.equal(out.format, 'mp3_44100_128');                          // honest label — NOT mislabeled as pcm
+  assert.equal(captured.init.headers.accept, 'audio/mpeg');           // Accept matches mp3 (else the format is not honored)
+  assert.match(captured.url, /\?output_format=mp3_44100_128$/);       // output_format applied as a query param
 });
 
 test('tts backend throws on provider error / empty audio / missing voice / missing key', async () => {
