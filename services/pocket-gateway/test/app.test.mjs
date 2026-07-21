@@ -72,3 +72,15 @@ test('createProdGateway: /dial honestly 501s without apnsSend, but /dial/registe
   const dial = await gw.handle({ method: 'POST', path: '/dial', headers: { authorization: 'Bearer t2' }, body: { message: 'ring', sessionId: 'sess-1' } });
   assert.equal(dial.status, 501, 'no apnsSend -> pushBackend undefined -> dial-not-configured');
 });
+
+test('createProdGateway wires /deck?format=video: honest 501 without the native backends, assembles with them injected', async () => {
+  const deckBody = { deck: { slides: [{ template: 'title', content: { title: 'Hello' } }] }, format: 'video' };
+  // no rasterize/encodeVideo forwarded -> honest 501 no-video-capability (never a fabricated video)
+  const gwNo = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch() });
+  assert.equal((await gwNo.handle({ method: 'POST', path: '/deck', headers: { authorization: 'Bearer t' }, body: deckBody })).status, 501);
+  // deploy injects resvg/sharp + ffmpeg -> forwarded -> video assembles (binary mp4)
+  const gwYes = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), rasterize: async () => Buffer.from('PNG'), encodeVideo: async () => ({ video: Buffer.from('MP4'), format: 'mp4' }) });
+  const rVid = await gwYes.handle({ method: 'POST', path: '/deck', headers: { authorization: 'Bearer t2' }, body: deckBody });
+  assert.equal(rVid.status, 200);
+  assert.equal(rVid.headers['content-type'], 'video/mp4', 'the injected backend produced a real mp4 response');
+});
