@@ -52,7 +52,8 @@ test('assembleDeckVideo: injected raster+encoder -> base64 mp4; frames rastered 
   ]);
   const r = await assembleDeckVideo(sb, { rasterize, encodeVideo }, { fps: 24 });
   assert.equal(r.reason, undefined);
-  assert.equal(Buffer.from(r.video, 'base64').toString(), 'MP4:2');
+  assert.ok(Buffer.isBuffer(r.video), 'video is a raw Buffer (not base64)');
+  assert.equal(r.video.toString(), 'MP4:2');
   assert.equal(r.format, 'mp4');
   assert.equal(r.frames, 2);
   assert.equal(r.durationMs, sb.totalMs);
