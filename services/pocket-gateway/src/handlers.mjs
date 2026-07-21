@@ -329,7 +329,11 @@ export function createGateway(deps) {
     const narration = await narrateDeck(spec, {
       ttsBackend: narrate ? deps.ttsBackend : null,
       voiceId: body.voiceId, tone: body.tone, synthesize: narrate,
-      modelId: body.modelId || 'eleven_flash_v2_5', outputFormat: body.outputFormat || 'pcm_24000',
+      modelId: body.modelId || 'eleven_flash_v2_5',
+      // Compressed default (mp3 ~2 KB/s vs raw pcm ~48 KB/s) keeps a narrated deck's base64 well under the 6 MB response
+      // limit; the aggregate cap is the hard safety net so a pcm override / huge deck degrades honestly, never 500s.
+      outputFormat: body.outputFormat || 'mp3_44100_128',
+      maxTotalAudioBytes: 5 * 1024 * 1024,
     });
     const slides = rendered.slides.map((s, i) => {
       const n = narration.segments[i];
@@ -341,7 +345,12 @@ export function createGateway(deps) {
         } : null,
       };
     });
-    return json(200, { style: rendered.style, count: rendered.count, audioEnabled: narration.audioEnabled, narratedCount: narration.narratedCount, slides });
+    return json(200, {
+      style: rendered.style, count: rendered.count,
+      audioEnabled: narration.audioEnabled, narratedCount: narration.narratedCount,
+      audioBytes: narration.audioBytes, audioCapReached: narration.capReached,
+      slides,
+    });
   }
 
   return {

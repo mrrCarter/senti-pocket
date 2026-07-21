@@ -33,9 +33,15 @@ export async function narrateDeck(deck = {}, opts = {}) {
   const ttsBackend = typeof opts.ttsBackend === 'function' ? opts.ttsBackend : null;
   const synthesize = opts.synthesize === undefined ? !!ttsBackend : (!!opts.synthesize && !!ttsBackend);
   const defaultTone = TONES.has(opts.tone) ? opts.tone : 'default';
+  // Hard aggregate bound on synthesized audio (base64 response bytes). Raw pcm is ~48 KB/s -> a full narrated deck can be
+  // 100s of MB, past Lambda's 6 MB response limit. Once the cap is hit we STOP synthesizing + mark remaining slides
+  // honestly ('deck-audio-cap') rather than 500-ing. Compressed formats (mp3) keep normal decks well under it.
+  const maxTotalAudioBytes = Number.isFinite(opts.maxTotalAudioBytes) && opts.maxTotalAudioBytes > 0 ? opts.maxTotalAudioBytes : null;
 
   const segments = [];
   let narratedCount = 0;
+  let totalAudioBytes = 0;
+  let capReached = false;
   for (let index = 0; index < slides.length; index++) {
     const slide = slides[index];
     const raw = scriptOf(slide);
@@ -54,6 +60,9 @@ export async function narrateDeck(deck = {}, opts = {}) {
       seg.audioSkipped = 'no-script';
     } else if (!synthesize) {
       seg.audioSkipped = ttsBackend ? 'not-requested' : 'no-backend';
+    } else if (maxTotalAudioBytes != null && totalAudioBytes >= maxTotalAudioBytes) {
+      seg.audioSkipped = 'deck-audio-cap'; // aggregate bound hit -> stop synthesizing, stay honest (don't 500)
+      capReached = true;
     } else {
       // ElevenLabs voices the tags -> feed `tagged`. (A plain-only backend would be fed `plain`; the deploy chooses the
       // backend.) Per-slide failure is isolated + honest — one slide's TTS error never fails the whole deck.
@@ -65,9 +74,12 @@ export async function narrateDeck(deck = {}, opts = {}) {
           outputFormat: opts.outputFormat,
         });
         if (out && out.audio && out.audio.length) {
-          seg.audio = Buffer.isBuffer(out.audio) ? out.audio.toString('base64') : Buffer.from(out.audio).toString('base64');
+          const b64 = Buffer.isBuffer(out.audio) ? out.audio.toString('base64') : Buffer.from(out.audio).toString('base64');
+          seg.audio = b64;
           seg.format = out.format || null;
+          totalAudioBytes += b64.length;
           narratedCount++;
+          if (maxTotalAudioBytes != null && totalAudioBytes >= maxTotalAudioBytes) capReached = true;
         } else {
           seg.audioSkipped = 'empty-audio';
         }
@@ -78,5 +90,5 @@ export async function narrateDeck(deck = {}, opts = {}) {
     }
     segments.push(seg);
   }
-  return { segments, count: segments.length, narratedCount, audioEnabled: synthesize };
+  return { segments, count: segments.length, narratedCount, audioEnabled: synthesize, audioBytes: totalAudioBytes, capReached };
 }

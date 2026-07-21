@@ -84,7 +84,27 @@ test('per-slide tone overrides deck default; invalid tone falls back', async () 
   assert.equal(calls[0].opts.tone, 'urgent');
 });
 
+test('maxTotalAudioBytes caps aggregate audio — stops past the bound, honest deck-audio-cap (relay Finding 1)', async () => {
+  const chunk = async () => ({ audio: Buffer.alloc(700), format: 'mp3' }); // 700 raw -> 936 base64 bytes each
+  const r = await narrateDeck({ slides: [{ script: 'a' }, { script: 'b' }, { script: 'c' }] }, { ttsBackend: chunk, maxTotalAudioBytes: 1200 });
+  assert.ok(r.segments[0].audio, 'slide 0 narrated (total ~936 < 1200)');
+  assert.ok(r.segments[1].audio, 'slide 1 narrated (crosses the cap)');
+  assert.equal(r.segments[2].audioSkipped, 'deck-audio-cap', 'slide 2 skipped once cap reached');
+  assert.equal(r.segments[2].audio, undefined);
+  assert.equal(r.capReached, true);
+  assert.equal(r.narratedCount, 2);
+  assert.ok(r.audioBytes >= 1200, 'aggregate bytes tracked');
+});
+
+test('no cap -> all narrate; capReached false; audioBytes summed', async () => {
+  const chunk = async () => ({ audio: Buffer.alloc(30), format: 'mp3' });
+  const r = await narrateDeck({ slides: [{ script: 'a' }, { script: 'b' }] }, { ttsBackend: chunk });
+  assert.equal(r.capReached, false);
+  assert.equal(r.narratedCount, 2);
+  assert.ok(r.audioBytes > 0);
+});
+
 test('empty deck -> empty result, no throw', async () => {
   const r = await narrateDeck({}, { ttsBackend: mockTts([]) });
-  assert.deepEqual(r, { segments: [], count: 0, narratedCount: 0, audioEnabled: true });
+  assert.deepEqual(r, { segments: [], count: 0, narratedCount: 0, audioEnabled: true, audioBytes: 0, capReached: false });
 });
