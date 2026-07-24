@@ -29,3 +29,13 @@ export function keepGrounded(claimed, grounded) {
   const set = grounded instanceof Set ? grounded : new Set(Array.isArray(grounded) ? grounded : []);
   return [...new Set((Array.isArray(claimed) ? claimed : []).filter((id) => set.has(id)))];
 }
+
+/**
+ * A drafted/briefed SEGMENT survives the honesty gate only with VISIBLE text (non-whitespace) AND at least one grounded
+ * citation. A whitespace-only "segment" carries no words for the phone, so it is dropped — the same strictness
+ * routeAnswer applies to /answer text (`answerText.trim().length === 0`) and brief-pipeline applies to its segments.
+ */
+export function isGrounded(seg) {
+  return !!seg && typeof seg.text === 'string' && seg.text.trim().length > 0
+    && Array.isArray(seg.evidenceIds) && seg.evidenceIds.length > 0;
+}

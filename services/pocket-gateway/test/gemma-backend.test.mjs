@@ -99,6 +99,18 @@ test('brief: grounded segments kept; ungrounded + empty-text dropped', async () 
   assert.deepEqual(b.segments[0].evidenceIds, ['ev_1']);
 });
 
+test('brief: a WHITESPACE-ONLY segment with a grounded cite is DROPPED (isGrounded alignment — was kept by s.text-truthy)', async () => {
+  const content = JSON.stringify({ segments: [
+    { text: 'A real grounded segment.', evidenceIds: ['ev_1'] },
+    { text: '   \n\t  ', evidenceIds: ['ev_2'] }, // whitespace-only + grounded cite -> now dropped (no words for the phone)
+  ] });
+  const { fetch } = fakeChat(content);
+  const g = createGemmaBackend({ baseUrl: 'http://x/v1', fetch });
+  const b = await g.brief({ bundle: BUNDLE, groundedEvidenceIds: GROUNDED });
+  assert.equal(b.segments.length, 1, 'only the real segment survives; whitespace-only dropped');
+  assert.equal(b.segments[0].text, 'A real grounded segment.');
+});
+
 test('brief: fail-closed on non-JSON -> no segments', async () => {
   const { fetch } = fakeChat('nope');
   const g = createGemmaBackend({ baseUrl: 'http://x/v1', fetch });
