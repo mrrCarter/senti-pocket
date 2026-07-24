@@ -82,6 +82,15 @@ const scrubStr = (v, maxBytes) => boundStr(scrubText(String(v ?? '')).text, maxB
 const scrubId = (v) => scrubIdSafe(String(v ?? '')).text;
 
 /**
+ * Timestamp egress: coerce ts to a CANONICAL ISO instant, or '' if unparseable — the SAME instant the SIGNED canonical
+ * binds via msB()/bundleEpochMs() (both go through new Date(ts)). Two consequences: (1) the phone-visible ts field can
+ * never carry unscrubbed prose — a non-date secret -> '' (every OTHER phone-visible string is scrubStr'd; ts is a
+ * STRUCTURED timestamp, so it is normalized rather than scrubbed); (2) the displayed ts can never diverge from the epoch
+ * the signature covers. Leaves the signed bytes byte-identical: msB(tsIso(ts)) === msB(ts) for every input.
+ */
+const tsIso = (v) => { if (v == null || v === '') return ''; const d = new Date(v); return Number.isNaN(d.getTime()) ? '' : d.toISOString(); };
+
+/**
  * Per-field caps for the projected, phone-visible CheckpointSummary. `id`/`evId`/snippet are pinned to the FROZEN
  * ingress minimums (PocketInference/InferenceTypes.swift GroundedInferenceRequest: checkpoint/session 1...256,
  * evidence id/agent 1...128, snippet 1...8000) so egress is ALWAYS ⊆ the frozen ingress contract (the phone can never
@@ -103,7 +112,7 @@ export function projectEvidenceRef(r) {
     sequence: Number.isSafeInteger(r.sequence) && r.sequence > 0 ? r.sequence : 0,
     agentId: scrubId(r.agentId),       // identity
     snippet: scrubStr(r.snippet, SUMMARY_CAPS.snippet), // prose: scalar-safe bounded
-    ts: typeof r.ts === 'string' ? boundStr(r.ts, SUMMARY_CAPS.str) : (r.ts instanceof Date ? r.ts.toISOString() : ''),
+    ts: tsIso(r.ts), // structured timestamp: normalized to ISO/'' so it matches the SIGNED epoch + can't egress raw prose
   };
 }
 
