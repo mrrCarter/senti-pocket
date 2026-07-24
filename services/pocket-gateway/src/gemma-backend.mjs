@@ -11,7 +11,7 @@
 // a non-JSON / errored / ungrounded response degrades to empty -> routeAnswer routes it to clarify/unavailable, NEVER a
 // fabricated answer. handlers.mjs (routeAnswer / handleBrief) re-apply the SAME grounding intersection downstream, so
 // this backend is defense-in-depth, not the sole gate. Zero-dep, injected fetch (deploy owns transport), never logs.
-import { keepGrounded, groundingIdsFromBundle } from './grounding-gate.mjs';
+import { keepGrounded, groundingIdsFromBundle, isGrounded } from './grounding-gate.mjs';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_EVIDENCE = 24;   // bound the grounding context sent to the model
@@ -139,7 +139,7 @@ export function createGemmaBackend({ baseUrl, model = 'gemma3', apiKey, fetch = 
           taggedText: typeof s?.taggedText === 'string' ? s.taggedText : undefined,
           evidenceIds: keepGrounded(s?.evidenceIds, grounded),
         }))
-        .filter((s) => s.text && s.evidenceIds.length > 0); // grounding-first (handleBrief re-filters too)
+        .filter(isGrounded); // shared honesty gate: VISIBLE text (trim) + >=1 grounded cite (was s.text-truthy: kept whitespace-only)
       return { segments };
     },
   };

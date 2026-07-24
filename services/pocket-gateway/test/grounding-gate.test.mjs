@@ -2,7 +2,7 @@
 // inline form it replaced (routeAnswer + gemma-backend reason/brief), so the consolidation changed NO behavior.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { keepGrounded, groundingIdsFromBundle } from '../src/grounding-gate.mjs';
+import { keepGrounded, groundingIdsFromBundle, isGrounded } from '../src/grounding-gate.mjs';
 
 test('keepGrounded: keeps ONLY grounded ids, drops hallucinated, deduped + first-seen order', () => {
   const grounded = new Set(['ev_1', 'ev_2', 'ev_3']);
@@ -32,6 +32,15 @@ test('keepGrounded: fail-closed on a non-array claimed / non-array grounding', (
   assert.deepEqual(keepGrounded(null, new Set(['a'])), []);
   assert.deepEqual(keepGrounded(undefined, ['a']), []);
   assert.deepEqual(keepGrounded(['a'], null), [], 'no grounding -> nothing survives (fail-closed)');
+});
+
+test('isGrounded: survives only with VISIBLE text (trim) AND >=1 grounded cite', () => {
+  assert.equal(isGrounded({ text: 'a real segment', evidenceIds: ['ev_1'] }), true);
+  assert.equal(isGrounded({ text: '   \n\t ', evidenceIds: ['ev_1'] }), false, 'whitespace-only text -> dropped (the alignment)');
+  assert.equal(isGrounded({ text: '', evidenceIds: ['ev_1'] }), false, 'empty text -> dropped');
+  assert.equal(isGrounded({ text: 'words', evidenceIds: [] }), false, 'no grounded cite -> dropped');
+  assert.equal(isGrounded({ text: 'words' }), false);
+  assert.equal(isGrounded(null), false);
 });
 
 test('groundingIdsFromBundle: real evidence ids only; empty/id-less/null dropped', () => {
