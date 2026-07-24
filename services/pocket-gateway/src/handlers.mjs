@@ -19,6 +19,7 @@ import { renderDeck } from './deck/templates.mjs';
 import { narrateDeck } from './deck/narration.mjs';
 import { buildStoryboard, assembleDeckVideo } from './deck/video.mjs';
 import { createDialRegistry } from './dial-registry.mjs';
+import { groundingIdsFromBundle } from './grounding-gate.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -154,7 +155,7 @@ export function createGateway(deps) {
     }
     // The GROUNDING = evidence ids in the verified bundle. routeAnswer intersects the LLM's claimed
     // cites with this set (dropping hallucinated ones), so a citation can only be real grounded evidence.
-    const groundedEvidenceIds = Array.isArray(bundle.evidence) ? bundle.evidence.map((e) => e && e.id).filter(Boolean) : [];
+    const groundedEvidenceIds = groundingIdsFromBundle(bundle);
     let reasoned;
     try {
       reasoned = await deps.reason({ question, bundle, groundedEvidenceIds });
@@ -199,7 +200,7 @@ export function createGateway(deps) {
     } catch (e) {
       return json(503, { error: 'checkpoint not available', reason: String((e && e.message) || e), retryable: true });
     }
-    const groundedEvidenceIds = Array.isArray(bundle.evidence) ? bundle.evidence.map((e) => e && e.id).filter(Boolean) : [];
+    const groundedEvidenceIds = groundingIdsFromBundle(bundle);
     let briefed;
     try {
       briefed = await deps.brief({ bundle, groundedEvidenceIds });

@@ -11,6 +11,7 @@
 // a non-JSON / errored / ungrounded response degrades to empty -> routeAnswer routes it to clarify/unavailable, NEVER a
 // fabricated answer. handlers.mjs (routeAnswer / handleBrief) re-apply the SAME grounding intersection downstream, so
 // this backend is defense-in-depth, not the sole gate. Zero-dep, injected fetch (deploy owns transport), never logs.
+import { keepGrounded, groundingIdsFromBundle } from './grounding-gate.mjs';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_EVIDENCE = 24;   // bound the grounding context sent to the model
@@ -29,7 +30,7 @@ const groundedSet = (bundle, groundedEvidenceIds) => new Set(
   // when the caller passed no grounding at all (null/undefined/non-array).
   Array.isArray(groundedEvidenceIds)
     ? groundedEvidenceIds
-    : (Array.isArray(bundle?.evidence) ? bundle.evidence : []).map((e) => e && e.id).filter(Boolean),
+    : groundingIdsFromBundle(bundle),
 );
 
 /** Robust JSON extraction: strict parse first, else the outermost {...} (models sometimes wrap JSON in prose/fences). */
@@ -108,7 +109,7 @@ export function createGemmaBackend({ baseUrl, model = 'gemma3', apiKey, fetch = 
       catch { return { text: '', evidenceIds: [], llmConfidence: 0, nearestTopics: [] }; } // fail-closed -> unavailable
       const p = safeJson(raw);
       if (!p) return { text: '', evidenceIds: [], llmConfidence: 0, nearestTopics: [] };
-      const evidenceIds = [...new Set((Array.isArray(p.evidenceIds) ? p.evidenceIds : []).filter((id) => grounded.has(id)))]; // grounding-first
+      const evidenceIds = keepGrounded(p.evidenceIds, grounded); // grounding-first (shared honesty gate)
       // GROUNDED-FIRST at the BACKEND (parity with brief()'s ungrounded-segment drop + the module's "ungrounded -> empty"
       // header): if NO citation survives the grounding filter, the answer is ungrounded -> return empty text. routeAnswer
       // also gates this (citedGrounded===0 -> clarify/unavailable), so this is defense-in-depth; nearestTopics is kept so
@@ -136,7 +137,7 @@ export function createGemmaBackend({ baseUrl, model = 'gemma3', apiKey, fetch = 
         .map((s) => ({
           text: typeof s?.text === 'string' ? s.text : '',
           taggedText: typeof s?.taggedText === 'string' ? s.taggedText : undefined,
-          evidenceIds: [...new Set((Array.isArray(s?.evidenceIds) ? s.evidenceIds : []).filter((id) => grounded.has(id)))],
+          evidenceIds: keepGrounded(s?.evidenceIds, grounded),
         }))
         .filter((s) => s.text && s.evidenceIds.length > 0); // grounding-first (handleBrief re-filters too)
       return { segments };
