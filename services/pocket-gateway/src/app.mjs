@@ -30,6 +30,12 @@ import { lambdaHandler } from './lambda.mjs';
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
  *   - apnsSend({voipToken,platform,payload}): OPTIONAL VoIP push transport (APNs, cert-bound). Present => POST /dial
  *     dispatch is live; absent => /dial 501s (dial-not-configured) while /dial/register still records device tokens.
+ *     WIRE CONTRACT (load-bearing — the app decode depends on it): apnsSend MUST place the `payload` dial fields at the
+ *     TOP LEVEL of the delivered PKPushPayload.dictionaryPayload (alongside `aps`), NOT nested under a `payload`/`data`
+ *     key. The app's DialReceive.receive / SentiCallKit.decode read the dial fields (id/kind/message/…) at the top level;
+ *     an `aps` (or other) sibling key is harmless (ignored by the Decodable), but NESTING the DTO makes top-level `id`
+ *     absent -> every ring decodes .rejected, silently. NB the arg is literally named `payload` here — do NOT emit
+ *     `{ aps, payload: <DTO> }`; SPREAD the DTO at top level. (See part-b criterion #6 for the app-side round-trip test.)
  *   - deviceRegistry / pushBackend: OPTIONAL overrides for the store-backed defaults (a dedicated device table, etc.)
  */
 export function createProdGateway(env = {}, deps = {}) {
