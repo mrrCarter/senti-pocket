@@ -8,6 +8,11 @@
 
 export const SUMMARY_BASELINE_SCHEMA = 'relay_deterministic_v1';
 
+// Only SEMANTIC events feed the CONTENT pass (grouping / counts / citations / claims / headline). Heartbeats,
+// view/read-receipts, and other control/system events stay PROVENANCE-counted in extract (its completeness gate is
+// untouched) but are NEVER summarized, cited, or fed to the LLM — Carter's "no checkpoint noise" bar (Atlas re-eval).
+export const SEMANTIC_EVENT_TYPES = Object.freeze(new Set(['session_message', 'session_action']));
+
 const LIMITS = Object.freeze({
   EVIDENCE_PER_AGENT: 5,   // bounded citations per agent
   SNIPPET_BYTES: 280,      // per-evidence excerpt
@@ -51,10 +56,11 @@ export function summarize(rawCheckpoint, descriptor = {}) {
   const events = Array.isArray(rc.events) ? rc.events : [];
   const sections = descriptor.summarySections || {};
 
-  // group events by author, preserving sequence order (events already strictly increasing from extraction).
+  // CONTENT pass considers ONLY semantic events (Carter no-noise bar): heartbeats/views/control stay provenance-counted
+  // in extract but are never summarized/cited/fed-to-LLM. Grouped by author, sequence order preserved (already increasing).
+  const semanticEvents = events.filter((e) => e && e.agentId != null && SEMANTIC_EVENT_TYPES.has(e.event));
   const byAgent = new Map();
-  for (const e of events) {
-    if (!e || e.agentId == null) continue;
+  for (const e of semanticEvents) {
     if (!byAgent.has(e.agentId)) byAgent.set(e.agentId, []);
     byAgent.get(e.agentId).push(e);
   }
@@ -91,7 +97,7 @@ export function summarize(rawCheckpoint, descriptor = {}) {
 
   const headline = clamp(
     oneLine(sections.headline || rc.sessionTitle || '') ||
-      `${rc.checkpointId}: ${events.length} events from ${byAgent.size} agent${byAgent.size === 1 ? '' : 's'}`,
+      `${rc.checkpointId}: ${semanticEvents.length} events from ${byAgent.size} agent${byAgent.size === 1 ? '' : 's'}`,
     LIMITS.HEADLINE_BYTES,
   );
 
