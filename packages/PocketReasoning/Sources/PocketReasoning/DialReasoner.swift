@@ -4,10 +4,14 @@
 //
 // Lane split (agreed w/ forge #318849): forge owns the DialVoice adapter's AUDIO I/O (speak via pocket-tts, listen via
 // whisper) + the SentiCallManager.onAnswered→DialOrchestrator.run hookup; the follow-up-ANSWER comes from an injected
-// DialReasoner. This is that injectable — so forge's adapter calls `answer(...)` and gets a grounded, honest result
-// with NO PocketReasoning-internals leaking into the audio/orchestration layer.
+// DialReasoner. This is that injectable — so forge's adapter calls `answerFollowUp(...)` and gets a grounded, honest
+// result with NO PocketReasoning-internals leaking into the audio/orchestration layer.
+//
+// NB: DialSpokenAnswer moved to PocketContracts (plan A w/ forge) so DialVoice.answerFollowUp can return it while
+// PocketCall stays PocketContracts-only. This file keeps the protocol + the concrete provider-backed reasoner.
 
 import Foundation
+import PocketContracts
 
 /// The minimal reasoning seam the DialVoice adapter depends on. Forge's adapter holds one of these and calls it when
 /// the recognized transcript is a QUESTION (vs a dictated reply). Kept tiny + Sendable so the audio layer stays clean.
@@ -16,18 +20,6 @@ public protocol DialReasoner: Sendable {
     /// (what pocket-tts says back) plus whether it was actually grounded — so the adapter can honestly say
     /// "let me check…" then read a grounded answer, or "I don't have that in this checkpoint" instead of inventing one.
     func answerFollowUp(_ question: String, sessionId: String, checkpointId: String?) async -> DialSpokenAnswer
-}
-
-/// The spoken result of a dial follow-up. `grounded == false` is honest ("nothing in this checkpoint answers that")
-/// — the adapter must NOT present an ungrounded guess as if it were from the session.
-public struct DialSpokenAnswer: Equatable, Sendable {
-    public let spokenText: String
-    public let grounded: Bool
-    /// Evidence the answer cited (checkpoint evidence ids) — for the "jump Carter to this part of the session" UX.
-    public let evidenceIds: [String]
-    public init(spokenText: String, grounded: Bool, evidenceIds: [String]) {
-        self.spokenText = spokenText; self.grounded = grounded; self.evidenceIds = evidenceIds
-    }
 }
 
 /// The concrete reasoner backing DialVoice: bridges the ring's follow-up to a ReasoningProvider (online Gateway /
