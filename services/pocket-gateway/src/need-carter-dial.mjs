@@ -30,6 +30,14 @@
 //   (b) dial-id source: Swift dialFields() uses signal.id; my buildDialPayload computes computeDialId(...). Today's
 //       path dispatches through the existing pushBackend (id = computeDialId); mapSignalToDialFields exposes
 //       dialId=signal.id for the FOLLOW-UP that threads signal.id + callerName onto the wire (coordinated w/ warden).
+//   (c) Swift's default Date Codable is a 2001-epoch Double (not ISO) -> createdAt is carried OPAQUE here; the
+//       detector's producer side needs an agreed date strategy before it emits signals.
+//   (d) WIRE COMPLETENESS (Pulse cross-audit of f2daeb7): the current APNs wire (buildDialPayload -> APNs -> Swift
+//       decode) carries ONLY id/who/priority/message/context/sessionId/ts. So kind/options/callerName/checkpointId/
+//       evidenceSeqs do NOT reach the phone yet — "jump-to evidenceSeqs" + kind-shaped caller display are NOT
+//       end-to-end facts. This mapper SURFACES those fields (gateway-local); making them live needs ONE versioned,
+//       bounded APNs DTO + a Swift decoder test preserving canonical id, caller display, checkpointId, options, and
+//       evidenceSeqs (KAV byte-parity). Until that lands, treat them as gateway-local metadata, not delivered.
 import { DIAL_PRIORITIES, DIAL_LIMITS } from './dial-registry.mjs';
 
 /** A ring fires only when the detected need clears this confidence floor (parity: NeedCarterSignal.ringConfidenceFloor). */
@@ -200,10 +208,13 @@ export function mapSignalToPushInput(signal, { humanId } = {}) {
   };
   return {
     ring: true,
-    input,
-    dialFields: mapSignalToDialFields(signal).value, // for the follow-up who/id passthrough
+    input, // <- the ONLY fields on today's APNs wire (dispatched via the existing pushBackend)
+    // GATEWAY-LOCAL (seam (d), Pulse cross-audit): surfaced for audit + the versioned-DTO FOLLOW-UP, but NOT carried
+    // on the current wire, so they do NOT reach the phone yet. Do not claim "jump-to evidenceSeqs" / kind-shaped
+    // caller display as live until seam (d)'s versioned APNs DTO + Swift decoder land.
+    dialFields: mapSignalToDialFields(signal).value,
     kind: v.kind,
     confidence: v.confidence,
-    evidenceSeqs: v.evidenceSeqs, // audit + Pocket "jump to evidenceSeqs"
+    evidenceSeqs: v.evidenceSeqs,
   };
 }
