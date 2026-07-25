@@ -67,19 +67,43 @@ test('buildDialPayload v1: RICH shape (core + governed), deterministic, legacy d
   assert.ok(DIAL_PRIORITIES.includes('urgent'), 'urgent kept in sync with warden /dial');
 });
 
-test('buildDialPayload v1: signal fields — opaque id override, kind, callerName, checkpointId, evidenceSeqs dedup+sort', () => {
+test('buildDialPayload v1: signal core fields — opaque id override, kind, callerName, checkpointId (write-kind -> LEAN, governed shed)', () => {
   const p = buildDialPayload({ humanId: 'u', sessionId: '6cf7e861', id: 'need_1', kind: 'decisionYours', callerName: 'Senti needs your decision', message: 'Ship it?', checkpointId: 'cp_9', evidenceSeqs: [315050, 315038, 315038, 315050] }, NOW);
   assert.equal(p.id, 'need_1', 'opaque id override used verbatim (NOT computeDialId)');
   assert.equal(p.kind, 'decisionYours');
   assert.equal(p.callerName, 'Senti needs your decision');
-  assert.equal(p.checkpointId, 'cp_9');
-  assert.deepEqual(p.evidenceSeqs, [315038, 315050], 'de-duped + sorted ascending (deterministic)');
-  assert.equal(p.fetch, false);
+  assert.equal(p.checkpointId, 'cp_9', 'checkpointId is CORE -> stays on the doorbell (not governed content)');
+  assert.equal(p.fetch, true, 'decisionYours is a WRITE-KIND -> ALWAYS a LEAN doorbell (Warden push-model)');
+  assert.equal('message' in p, false, 'governed question SHED from the push (hydrate via GET /dial?id=)');
+  assert.equal('evidenceSeqs' in p, false, 'governed evidenceSeqs SHED from the push');
 });
 
-test('buildDialPayload v1: pickOption carries options; empty options is malformed -> throws (atomic unit)', () => {
-  assert.deepEqual(buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: ['A', 'B'] }, NOW).options, ['A', 'B']);
-  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: [] }, NOW), /pickOption requires/);
+test('buildDialPayload v1: info RICH carries governed (message/context/evidenceSeqs dedup+sort/confidence) when it fits', () => {
+  const p = buildDialPayload({ humanId: 'u', sessionId: '6cf7e861', id: 'need_4', kind: 'info', callerName: 'Senti · update', message: 'Deploy green.', context: 'summary', evidenceSeqs: [520, 511, 511, 520], confidence: 0.8 }, NOW);
+  assert.equal(p.fetch, false, 'info is LOW-SENSITIVITY -> RICH when it fits');
+  assert.equal(p.message, 'Deploy green.');
+  assert.equal(p.context, 'summary');
+  assert.deepEqual(p.evidenceSeqs, [511, 520], 'de-duped + sorted ascending (deterministic)');
+  assert.equal(p.confidence, 0.8);
+});
+
+test('buildDialPayload v1: pickOption is a WRITE-KIND -> LEAN (options SHED from the push); empty options still throws (validated pre-shed)', () => {
+  const p = buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: ['A', 'B'] }, NOW);
+  assert.equal(p.fetch, true, 'pickOption -> LEAN doorbell');
+  assert.equal('options' in p, false, 'options SHED from the push (never ride it) -> hydrate via GET /dial?id=');
+  assert.equal('message' in p, false, 'the question is SHED too');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: [] }, NOW), /pickOption requires/, 'malformed pickOption fails closed BEFORE it is shed to LEAN');
+});
+
+test('buildDialPayload v1 SECURITY: every WRITE-KIND is a LEAN doorbell even when tiny — governed content NEVER in the push', () => {
+  for (const kind of ['decisionYours', 'go']) {
+    const p = buildDialPayload({ sessionId: 's', id: 'need_x', kind, callerName: 'c', message: 'approve the wire to acct Y?', context: 'sensitive', evidenceSeqs: [1, 2], confidence: 0.9 }, NOW);
+    assert.equal(p.fetch, true, `${kind} forces LEAN even when it would fit RICH`);
+    for (const g of ['message', 'context', 'options', 'evidenceSeqs', 'confidence']) assert.equal(g in p, false, `${kind}: governed ${g} shed from the push`);
+    assert.equal(p.kind, kind); assert.equal(p.id, 'need_x'); assert.equal(p.sessionId, 's'); // core survives (the doorbell still routes)
+  }
+  const po = buildDialPayload({ sessionId: 's', id: 'need_y', kind: 'pickOption', options: ['A', 'B'], message: 'which?' }, NOW);
+  assert.equal(po.fetch, true); assert.equal('options' in po, false); assert.equal('message' in po, false);
 });
 
 test('buildDialPayload v1: over-budget -> LEAN (fetch=true, ALL governed shed, core-only); NEVER truncates the question', () => {
@@ -91,11 +115,13 @@ test('buildDialPayload v1: over-budget -> LEAN (fetch=true, ALL governed shed, c
   assert.ok(Buffer.byteLength(JSON.stringify(big)) <= DIAL_PAYLOAD_MAX_BYTES, 'lean core within budget');
 });
 
-test('buildDialPayload v1: confidence is non-governed (present when it fits; clamped)', () => {
-  const p = buildDialPayload({ sessionId: 's', message: 'm', kind: 'go', confidence: 0.87 }, NOW);
+test('buildDialPayload v1: confidence rides a RICH low-sensitivity ring (present when it fits; clamped); a write-kind sheds it', () => {
+  const p = buildDialPayload({ sessionId: 's', message: 'm', kind: 'checkpointReady', confidence: 0.87 }, NOW);
   assert.equal(p.confidence, 0.87);
-  assert.equal(p.fetch, false);
-  assert.equal(buildDialPayload({ sessionId: 's', message: 'm', kind: 'go', confidence: 1.9 }, NOW).confidence, 1, 'clamped to [0,1]');
+  assert.equal(p.fetch, false, 'checkpointReady is low-sensitivity -> RICH when it fits');
+  assert.equal(buildDialPayload({ sessionId: 's', message: 'm', kind: 'checkpointReady', confidence: 1.9 }, NOW).confidence, 1, 'clamped to [0,1]');
+  const g = buildDialPayload({ sessionId: 's', message: 'm', kind: 'go', confidence: 0.87 }, NOW);
+  assert.equal(g.fetch, true, 'go is a write-kind -> LEAN'); assert.equal('confidence' in g, false, 'confidence shed from a write-kind doorbell');
 });
 
 test('buildDialPayload v1: identity FAIL-CLOSED (blank/overbound/control id|sessionId, present-invalid checkpointId); opaque need_1 accepted', () => {
@@ -136,12 +162,16 @@ test('pushBackend: a resolved device with invalid identity -> fail-closed invali
 });
 
 // ── R1-R4 regression vectors (Pulse impl review of #77 @ ca1a095) ────────────────────────────────────────────
-test('R1: pickOption options are COMPLETE — 9 stay 9, a long label is NOT truncated (never capped)', () => {
+test('R1: pickOption options validated-but-SHED — a large valid set is accepted (never capped-to-error) then shed to LEAN; invalid fails closed', () => {
+  // pickOption is a WRITE-KIND -> ALWAYS LEAN, so options never ride the push (the full, uncapped set hydrates via GET
+  // /dial?id=). buildDialPayload still VALIDATES options (fail-closed on an invalid label) before shedding them.
   const opts = Array.from({ length: 9 }, (_, i) => 'option-' + i);
-  assert.deepEqual(buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: opts }, NOW).options, opts, 'all 9 preserved (was capped to 8)');
+  const p = buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: opts }, NOW);
+  assert.equal(p.fetch, true, 'pickOption -> LEAN doorbell');
+  assert.equal('options' in p, false, 'all 9 options SHED from the push (never capped, never on the wire) — hydrate via GET');
   const longLabel = 'L'.repeat(200);
-  assert.equal(buildDialPayload({ sessionId: 's', message: 'q', kind: 'pickOption', options: [longLabel] }, NOW).options[0], longLabel, '200-char label preserved (was truncated to 128)');
-  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'q', kind: 'pickOption', options: ['ok', ''] }, NOW), /non-empty string/, 'invalid label fails closed');
+  assert.equal('options' in buildDialPayload({ sessionId: 's', message: 'q', kind: 'pickOption', options: [longLabel] }, NOW), false, 'a 200-char label is accepted (not truncated-to-error) then shed');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'q', kind: 'pickOption', options: ['ok', ''] }, NOW), /non-empty string/, 'invalid label fails closed BEFORE shedding');
 });
 
 test('R1: evidenceSeqs are COMPLETE — 65 stay 65 (deduped/sorted, never capped); unsafe/invalid ints fail closed', () => {
@@ -282,20 +312,22 @@ test('pushBackend: fan-out — one dead token never fails the ring; all-fail is 
 // ---- pushBackend PR-B2: rich-field passthrough + GET /dial?id= hydration store-write --------------------------------
 const fakeSignalStore = () => { const m = new Map(); return { async put(id, sig) { m.set(id, sig); return { stored: true, expiresAtSec: 0 }; }, async get(id) { return m.get(id); } }; };
 
-test('pushBackend PR-B2: RICH ring threads rich fields onto the payload + stores the full signal (hydration copy)', async () => {
+test('pushBackend PR-B2: RICH low-sensitivity (info) ring threads rich fields onto the payload + stores the full signal', async () => {
   const reg = fakeRegistry();
   await reg.register({ humanId: 'u', sessionId: '6cf7e861', voipToken: 'tok', platform: 'apns' });
   const sent = [];
   const sig = fakeSignalStore();
-  const storedSignal = { id: 'need_1', kind: { decisionYours: {} }, question: 'Ship it?', context: { sessionId: '6cf7e861', whatWeNeed: 'go' }, confidence: 0.9, requestedBy: 'claude-warden' };
+  // info is a LOW-SENSITIVITY kind -> RICH-eligible, so its governed fields DO ride the push when they fit (a write-kind
+  // would force LEAN; that is covered by the SECURITY test in buildDialPayload + the LEAN fail-closed test below).
+  const storedSignal = { id: 'need_1', kind: { info: {} }, question: 'Deploy done.', context: { sessionId: '6cf7e861', whatWeNeed: 'fyi' }, confidence: 0.9, requestedBy: 'claude-warden' };
   const pb = createDialPushBackend({ deviceRegistry: reg, apnsSend: async (a) => { sent.push(a); return { delivered: true }; }, now: () => NOW, signalStore: sig });
-  const out = await pb({ message: 'Ship it?', context: 'go', priority: 'high', sessionId: '6cf7e861', humanId: 'u', id: 'need_1', kind: 'decisionYours', callerName: 'Senti · claude-warden needs your decision', evidenceSeqs: [315038], confidence: 0.9, storedSignal });
+  const out = await pb({ message: 'Deploy done.', context: 'fyi', priority: 'medium', sessionId: '6cf7e861', humanId: 'u', id: 'need_1', kind: 'info', callerName: 'Senti · update from relay', evidenceSeqs: [315038], confidence: 0.9, storedSignal });
   assert.equal(out.dispatched, true);
   assert.equal(out.dialId, 'need_1', 'signal-originated id becomes the dialId (== the store key)');
   const p = sent[0].payload;
-  assert.equal(p.fetch, false, 'small signal -> RICH (self-contained)');
-  assert.equal(p.kind, 'decisionYours');
-  assert.equal(p.callerName, 'Senti · claude-warden needs your decision');
+  assert.equal(p.fetch, false, 'small info signal -> RICH (self-contained)');
+  assert.equal(p.kind, 'info');
+  assert.equal(p.callerName, 'Senti · update from relay');
   assert.deepEqual(p.evidenceSeqs, [315038], 'rich fields reach the wire (were dropped pre-PR-B2)');
   assert.deepEqual(await sig.get('need_1'), storedSignal, 'full signal stored under the dialId for GET /dial?id=');
 });
@@ -323,15 +355,17 @@ test('pushBackend PR-B2: LEAN ring FAILS CLOSED when the signal cannot be persis
   assert.equal((await sig.get('need_big')).question, bigMsg, 'full untruncated signal stored for GET /dial?id= hydration');
 });
 
-test('pushBackend PR-B2: RICH ring rings anyway when the best-effort store-write fails (self-contained payload)', async () => {
+test('pushBackend PR-B2: RICH (low-sensitivity) ring rings anyway when the best-effort store-write fails (self-contained payload)', async () => {
   const reg = fakeRegistry();
   await reg.register({ humanId: 'u', sessionId: 's', voipToken: 'tok', platform: 'apns' });
-  const storedSignal = { id: 'need_1', kind: { go: {} }, question: 'GO?', context: { sessionId: 's', whatWeNeed: 'ship' }, confidence: 0.9, requestedBy: 'detector' };
+  // info is RICH-eligible, so the payload is self-contained -> a store-write hiccup is best-effort, never blocks the ring.
+  // (A write-kind would be LEAN and MUST persist -> fail-closed; that is the LEAN test above, not this one.)
+  const storedSignal = { id: 'need_1', kind: { info: {} }, question: 'FYI: deploy green.', context: { sessionId: 's', whatWeNeed: 'note' }, confidence: 0.9, requestedBy: 'detector' };
   let sent = 0;
   const throwingStore = { async put() { throw new Error('dynamo down'); }, async get() {} };
   const out = await createDialPushBackend({ deviceRegistry: reg, apnsSend: async () => { sent += 1; return { delivered: true }; }, now: () => NOW, signalStore: throwingStore })(
-    { message: 'GO?', sessionId: 's', humanId: 'u', id: 'need_1', kind: 'go', storedSignal });
-  assert.equal(out.dispatched, true, 'RICH ring is self-contained -> a store hiccup never blocks it');
+    { message: 'FYI: deploy green.', sessionId: 's', humanId: 'u', id: 'need_1', kind: 'info', storedSignal });
+  assert.equal(out.dispatched, true, 'RICH info ring is self-contained -> a store hiccup never blocks it');
   assert.equal(sent, 1, 'the phone still got the complete RICH push');
 });
 

@@ -63,6 +63,11 @@ export const DIAL_PUSHKIT_CAP = 5120;               // Apple PushKit VoIP total-
 const DIAL_ENVELOPE_RESERVE = 256;                  // headroom for the APNs aps envelope + framing wrapping our JSON
 export const DIAL_PAYLOAD_MAX_BYTES = DIAL_PUSHKIT_CAP - DIAL_ENVELOPE_RESERVE; // 4864: budget our serialized payload fits under
 export const DIAL_KINDS = Object.freeze(['go', 'decisionYours', 'pickOption', 'info', 'checkpointReady']);
+// WRITE-KINDS carry a GOVERNED decision (the question/options a caller must act on). Per Warden's push-model security
+// call, their governed content is NEVER placed in the APNs push (visible to Apple + the notification layer) — a write-kind
+// is ALWAYS a LEAN doorbell, hydrated via the authed GET /dial?id=. RICH (governed-in-push) is reserved for the
+// LOW-SENSITIVITY info/checkpointReady kinds. (decisionYours/pickOption/go = the three write-decision kinds.)
+export const DIAL_WRITE_KINDS = Object.freeze(new Set(['decisionYours', 'pickOption', 'go']));
 const DIAL_ID_MAX = 128, DIAL_CALLER_MAX = 128; // identity byte-bound + display codepoint-bound. options + evidenceSeqs are NEVER capped/truncated (R1: complete or LEAN).
 // Reject Unicode Cc controls in an opaque identity: C0 (< 0x20) + DEL (0x7f) + C1 (0x80-0x9f). charCodeAt avoids control-char regex literals.
 const hasControlChar = (s) => { for (let i = 0; i < s.length; i += 1) { const c = s.charCodeAt(i); if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true; } return false; };
@@ -128,6 +133,13 @@ export function buildDialPayload(f = {}, nowMs = 0) {
   const ts = new Date(nowMs).toISOString();
 
   const core = { v: 1, id, kind, priority, callerName, who, sessionId, ...(checkpointId ? { checkpointId } : {}), fetch: false, ts };
+  // SECURITY (Warden push-model doorbell): a WRITE-KIND (decisionYours/pickOption/go) carries a governed decision the
+  // push must not reveal — even post-scrub, "approve the wire to acct Y?" leaks a pending action to Apple/the notification
+  // layer. So a write-kind is ALWAYS a LEAN doorbell: ALL governed content (message/options/context/evidenceSeqs/confidence)
+  // is shed and hydrated only via the authed, membership-gated GET /dial?id=. This is unbypassable — the policy lives in the
+  // wire builder keyed on kind, not on any caller flag. RICH (governed-in-push) stays available for info/checkpointReady only.
+  // (Validation above still runs first, so a malformed write-kind still fails closed before it is shed to LEAN.)
+  if (DIAL_WRITE_KINDS.has(kind)) return { ...core, fetch: true };
   const governed = {
     ...(message ? { message } : {}),
     ...(options.length ? { options } : {}),
