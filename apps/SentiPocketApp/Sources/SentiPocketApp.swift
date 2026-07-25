@@ -12,15 +12,28 @@ struct SentiPocketApp: App {
     #if DEBUG
     @StateObject private var model = PocketAppModel()
     #endif
+    #if canImport(CallKit) && canImport(PushKit)
+    /// App-lifetime DIALS wiring (onAnswered hookup part-b): owns the SentiCallManager (its PKPushRegistry delegate
+    /// must live the whole app) + the DialCoordinator, and installs the push-receive/answer adapters + the governed
+    /// DI seams (hydrate via the authed DialHydrationClient / runDial via LiveDialVoice+PhoneWriteAdapter+orchestrator).
+    @StateObject private var dialHost = DialHost()
+    #endif
 
     var body: some Scene {
         WindowGroup {
-            #if DEBUG
-            RootAppView(model: model)
-            #else
-            PhoneRootView()   // B2: the REAL coordinator + phone-write flow (kills the old static RootView List)
+            rootView
+            #if canImport(CallKit) && canImport(PushKit)
+                .environmentObject(dialHost)   // hold + provide the host; ensures it inits + registers for VoIP at launch
             #endif
         }
+    }
+
+    @ViewBuilder private var rootView: some View {
+        #if DEBUG
+        RootAppView(model: model)
+        #else
+        PhoneRootView()   // B2: the REAL coordinator + phone-write flow (kills the old static RootView List)
+        #endif
     }
 }
 
