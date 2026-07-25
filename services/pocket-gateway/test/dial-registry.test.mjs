@@ -127,6 +127,48 @@ test('pushBackend: a resolved device with invalid identity -> fail-closed invali
   assert.equal(sent.length, 0, 'no ring sent on a fail-closed payload');
 });
 
+// ── R1-R4 regression vectors (Pulse impl review of #77 @ ca1a095) ────────────────────────────────────────────
+test('R1: pickOption options are COMPLETE — 9 stay 9, a long label is NOT truncated (never capped)', () => {
+  const opts = Array.from({ length: 9 }, (_, i) => 'option-' + i);
+  assert.deepEqual(buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: opts }, NOW).options, opts, 'all 9 preserved (was capped to 8)');
+  const longLabel = 'L'.repeat(200);
+  assert.equal(buildDialPayload({ sessionId: 's', message: 'q', kind: 'pickOption', options: [longLabel] }, NOW).options[0], longLabel, '200-char label preserved (was truncated to 128)');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'q', kind: 'pickOption', options: ['ok', ''] }, NOW), /non-empty string/, 'invalid label fails closed');
+});
+
+test('R1: evidenceSeqs are COMPLETE — 65 stay 65 (deduped/sorted, never capped); unsafe/invalid ints fail closed', () => {
+  const seqs = Array.from({ length: 65 }, (_, i) => i + 1);
+  assert.equal(buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: seqs }, NOW).evidenceSeqs.length, 65, 'all 65 preserved (was capped to 64)');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: [9007199254740993] }, NOW), /positive safe integer/, 'unsafe int64 -> fail closed (no numeric corruption)');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: [-1] }, NOW), /positive safe integer/);
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: [1.5] }, NOW), /positive safe integer/);
+});
+
+test('R2: kind absent -> info (legacy); PRESENT-invalid -> fail closed; message required', () => {
+  assert.equal(buildDialPayload({ sessionId: 's', message: 'm' }, NOW).kind, 'info', 'absent kind -> legacy info');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', kind: 'bogus' }, NOW), /unknown kind/, 'present-invalid kind fails closed');
+  assert.throws(() => buildDialPayload({ sessionId: 's', id: 'i' }, NOW), /message required/, 'no message -> fail closed (fetch=false must carry a validated question)');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: '   ' }, NOW), /message required/, 'whitespace-only message -> fail closed');
+});
+
+test('R3: opaque id — whitespace-only rejected; a valid opaque value kept UNALTERED; C1 controls rejected', () => {
+  assert.throws(() => buildDialPayload({ sessionId: 's', id: '   ', message: 'm' }, NOW), /required/, 'whitespace-only id rejected');
+  assert.equal(buildDialPayload({ sessionId: 's', id: ' need 1 ', message: 'm' }, NOW).id, ' need 1 ', 'valid opaque value kept byte-for-byte (not trimmed)');
+  const c1 = 'a' + String.fromCharCode(0x85) + 'b'; // U+0085 NEL — a C1 control
+  assert.throws(() => buildDialPayload({ sessionId: 's', id: c1, message: 'm' }, NOW), /control chars/, 'C1 control in id rejected (was only C0+DEL)');
+  assert.throws(() => buildDialPayload({ sessionId: c1, message: 'm' }, NOW), /control chars/, 'C1 control in sessionId rejected');
+});
+
+test('R4: display truncation is codepoint-safe — never a lone surrogate at the bound', () => {
+  const emoji = String.fromCodePoint(0x1f600); // an astral char (surrogate pair)
+  // 'a'*127 + emoji + 'b' = 129 codepoints -> slice(0,128) keeps 'a'*127 + the WHOLE emoji. OLD .slice(0,128) split the pair.
+  const split = buildDialPayload({ sessionId: 's', message: 'm', callerName: 'a'.repeat(127) + emoji + 'b' }, NOW).callerName;
+  assert.equal([...split].length, 128, 'bounded to 128 codepoints');
+  assert.ok(split.endsWith(emoji), 'emoji at the 128th codepoint kept whole');
+  assert.equal(Buffer.from(split, 'utf8').toString('utf8'), split, 'valid UTF-8 — no lone surrogate');
+  assert.equal(buildDialPayload({ sessionId: 's', message: 'm', callerName: 'a'.repeat(200) + emoji }, NOW).callerName, 'a'.repeat(128), 'past-bound astral char dropped whole');
+});
+
 test('register: happy path binds token to the token-derived humanId (never the body)', async () => {
   const reg = fakeRegistry();
   const svc = createDialRegistry({ deviceRegistry: reg, now: () => NOW });

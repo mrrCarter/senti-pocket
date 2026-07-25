@@ -63,24 +63,32 @@ export const DIAL_PUSHKIT_CAP = 5120;               // Apple PushKit VoIP total-
 const DIAL_ENVELOPE_RESERVE = 256;                  // headroom for the APNs aps envelope + framing wrapping our JSON
 export const DIAL_PAYLOAD_MAX_BYTES = DIAL_PUSHKIT_CAP - DIAL_ENVELOPE_RESERVE; // 4864: budget our serialized payload fits under
 export const DIAL_KINDS = Object.freeze(['go', 'decisionYours', 'pickOption', 'info', 'checkpointReady']);
-const DIAL_ID_MAX = 128, DIAL_CALLER_MAX = 128, DIAL_OPT_MAX = 128, DIAL_OPT_COUNT = 8, DIAL_SEQ_COUNT = 64;
-// C0 controls (< 0x20) + DEL (0x7f) are never valid in an opaque identity. charCodeAt avoids control-char regex literals.
-const hasControlChar = (s) => { for (let i = 0; i < s.length; i += 1) { const c = s.charCodeAt(i); if (c < 0x20 || c === 0x7f) return true; } return false; };
+const DIAL_ID_MAX = 128, DIAL_CALLER_MAX = 128; // identity byte-bound + display codepoint-bound. options + evidenceSeqs are NEVER capped/truncated (R1: complete or LEAN).
+// Reject Unicode Cc controls in an opaque identity: C0 (< 0x20) + DEL (0x7f) + C1 (0x80-0x9f). charCodeAt avoids control-char regex literals.
+const hasControlChar = (s) => { for (let i = 0; i < s.length; i += 1) { const c = s.charCodeAt(i); if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true; } return false; };
 
-/** Opaque identity validator (id/sessionId/checkpointId): NON-BLANK, UTF-8 <= max, no control chars. Throws (fail-closed) — NEVER truncates. */
+/** Opaque identity validator (id/sessionId/checkpointId): NON-BLANK (not whitespace-only), UTF-8 <= max, no Cc controls. Throws (fail-closed); value returned UNALTERED (never trimmed/truncated). */
 function assertOpaqueId(name, v) {
-  if (typeof v !== 'string' || v.length === 0) throw new Error(`dial: ${name} required (opaque, non-blank)`);
+  if (typeof v !== 'string' || v.trim().length === 0) throw new Error(`dial: ${name} required (opaque, non-blank)`);
   if (utf8(v) > DIAL_ID_MAX) throw new Error(`dial: ${name} exceeds ${DIAL_ID_MAX} bytes`);
   if (hasControlChar(v)) throw new Error(`dial: ${name} has control chars`);
-  return v;
+  return v; // unaltered — an opaque value's own spaces/casing are preserved
 }
 /** Optional opaque id: absent -> undefined; PRESENT-but-invalid -> throws (fail-closed; never silently omit identity). */
 function optOpaqueId(name, v) { return (v === undefined || v === null) ? undefined : assertOpaqueId(name, v); }
-/** Display string: bounded + safe fallback (never fail-closed — display is not identity). */
-const boundDisplay = (v, max, fallback) => { const s = typeof v === 'string' ? v.trim() : ''; return s ? s.slice(0, max) : fallback; };
-/** evidenceSeqs: positive int64 only, de-duplicated, SORTED ASC (deterministic), bounded count. */
-const normSeqs = (v) => Array.isArray(v) ? [...new Set(v.filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b).slice(0, DIAL_SEQ_COUNT) : [];
-const normOptions = (v) => Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, DIAL_OPT_COUNT).map((x) => x.slice(0, DIAL_OPT_MAX)) : [];
+/** Display string (callerName/who): codepoint-safe bound + safe fallback. Never splits a surrogate pair (R4). Display is not identity -> never fail-closed. */
+const boundDisplay = (v, max, fallback) => { const s = typeof v === 'string' ? v.trim() : ''; if (!s) return fallback; const cp = [...s]; return cp.length <= max ? s : cp.slice(0, max).join(''); };
+/** evidenceSeqs: every element MUST be a POSITIVE SAFE integer (fail-closed on unsafe/negative/non-int); de-duped + SORTED ASC. COMPLETE — never capped (R1); over-budget -> the ladder emits LEAN. */
+const normSeqs = (v) => {
+  if (!Array.isArray(v)) return [];
+  for (const n of v) if (!Number.isSafeInteger(n) || n <= 0) throw new Error('dial: evidenceSeq must be a positive safe integer (int64 beyond JS-safe range needs a versioned string wire, not numeric corruption)');
+  return [...new Set(v)].sort((a, b) => a - b);
+};
+/** pickOption labels: every label MUST be a non-empty string (fail-closed). COMPLETE + UNALTERED — never capped/truncated (R1, atomic unit); over-budget -> LEAN. */
+const normOptions = (v) => {
+  if (!Array.isArray(v)) return [];
+  return v.map((x) => { if (typeof x !== 'string' || x.trim().length === 0) throw new Error('dial: every pickOption label must be a non-empty string'); return x; });
+};
 const serializedBytes = (obj) => Buffer.byteLength(JSON.stringify(obj), 'utf8');
 
 /**
@@ -97,10 +105,17 @@ const serializedBytes = (obj) => Buffer.byteLength(JSON.stringify(obj), 'utf8');
 export function buildDialPayload(f = {}, nowMs = 0) {
   const sessionId = assertOpaqueId('sessionId', typeof f.sessionId === 'string' ? f.sessionId : '');
   const checkpointId = optOpaqueId('checkpointId', f.checkpointId); // present-but-invalid throws (never silently omitted)
-  const message = typeof f.message === 'string' ? f.message : ''; // full question — ladder sheds it WHOLE (LEAN) if over budget; NEVER truncated (spec D)
+  // R2: message is REQUIRED (a fetch=false payload must carry a validated question). The FULL message rides the payload;
+  // the ladder sheds it WHOLE (LEAN) if over budget; NEVER truncated (spec D).
+  const message = typeof f.message === 'string' ? f.message : '';
+  if (message.trim().length === 0) throw new Error('dial: message required');
   const priority = DIAL_PRIORITIES.includes(f.priority) ? f.priority : 'medium';
   const who = boundDisplay(f.who, DIAL_LIMITS.WHO, 'senti-pocket');
-  const kind = DIAL_KINDS.includes(f.kind) ? f.kind : 'info';
+  // R2: kind ABSENT -> "info" (documented legacy default); PRESENT-but-invalid -> fail closed.
+  let kind;
+  if (f.kind === undefined || f.kind === null) kind = 'info';
+  else if (DIAL_KINDS.includes(f.kind)) kind = f.kind;
+  else throw new Error('dial: unknown kind (present-but-invalid fails closed)');
   const callerName = boundDisplay(f.callerName, DIAL_CALLER_MAX, 'Senti needs you');
   const id = f.id !== undefined ? assertOpaqueId('id', f.id) : computeDialId(f.humanId, sessionId, message, nowMs);
   const context = typeof f.context === 'string' && f.context.length ? f.context : undefined; // governed — ladder drops it WHOLE if over budget, never truncated (spec D)
