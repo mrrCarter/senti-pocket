@@ -5,7 +5,7 @@ import SwiftUI
 
 private enum SessionSurfacePreviewFixture {
     static let sessionID = "room-1"
-    static let referenceDate = Date(timeIntervalSince1970: 1_774_425_600)
+    static let referenceDate = Date(timeIntervalSince1970: 1_784_970_300)
 
     static let sessionPage = decode(SessionListPage.self, """
     {
