@@ -44,6 +44,11 @@ public final class SentiCallManager: NSObject {
     public var onVoipToken: ((String) -> Void)?
     /// The human ANSWERED the ring → begin the briefing/converse flow (wire to PocketCallMachine `.answered`).
     public var onAnswered: ((IncomingDecisionCall) -> Void)?
+    /// A VoIP push ARRIVED → the LEAN/RICH `DialReceiveState` decoded from it (+ relay's dialId), fired at RECEIVE so
+    /// the DialCoordinator stores it for the answer's hydrate. Governed content is fetched on answer (authed GET),
+    /// NEVER carried here — this only surfaces the ring shape + the dialId. Decoded via the KAV-locked DialReceive.receive.
+    /// (internal, not public: DialReceiveState is app-internal; the DialHost consumer is in-module.)
+    var onDialReceived: ((DialReceiveState, String) -> Void)?
     /// The call ended / was declined → tear down (stop audio, drop the episode).
     public var onEnded: ((UUID) -> Void)?
     /// CallKit ACTIVATED the audio session → safe to start capture/playback (hand to PocketVoice's DuplexAudioSessionLease).
@@ -144,19 +149,43 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
         completion: @escaping () -> Void
     ) {
         guard type == .voIP else { completion(); return }
+        let dict = payload.dictionaryPayload
         // Report the incoming call (inside `ring`) BEFORE completion() — the iOS 13+ requirement.
-        ring(Self.decode(payload.dictionaryPayload))
+        ring(Self.decode(dict))
+        // ALSO surface the full DialReceiveState for the coordinator to hydrate on answer, via the extracted+tested
+        // receiveState() so the ENVELOPED-push round-trip has coverage (relay's find). Reuses the KAV-locked
+        // DialReceive.receive — never a 2nd decoder. Governed content stays behind the authed GET.
+        if let (state, dialId) = Self.receiveState(from: dict) {
+            onDialReceived?(state, dialId)
+        }
         completion()
     }
 
     /// Fail-safe decode of relay's dial-registry `buildDialPayload` wire → always a presentable call (a malformed push
     /// still rings — never a silently-dropped delivery; the orchestrator re-validates the full episode on answer).
     /// Wire: `{ id:'dial_…', who, priority(low|medium|high|urgent), message, context?, sessionId, ts }`.
+    /// Decode the ENVELOPED VoIP push dict (APNs `{ aps:{…}, <dial DTO TOP-LEVEL> }`) → the DialReceiveState + relay's
+    /// dialId, via the SAME KAV-locked DialReceive.receive (#96). The dial fields are read TOP-LEVEL (the `aps` envelope
+    /// is ignored by the Codable). DEPLOY CONTRACT (relay): apnsSend MUST place the dial DTO top-level, NOT nested — if
+    /// top-level `id` is absent (a nested/malformed envelope) this returns nil, so the coordinator simply has no state
+    /// for that ring (declines on answer) rather than a silent wrong-decode.
+    static func receiveState(from dict: [AnyHashable: Any]) -> (state: DialReceiveState, dialId: String)? {
+        // isValidJSONObject FIRST: data(withJSONObject:) raises an NSException (NOT a Swift error) on a non-conforming
+        // dict, which `try?` does NOT catch → it would CRASH on a malformed push. Guarding returns the fail-safe nil.
+        // (warden #5b; atlas + relay both caught it independently — a malformed VoIP push must never crash the app.)
+        guard let dialId = dict["id"] as? String,
+              JSONSerialization.isValidJSONObject(dict),
+              let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return (DialReceive.receive(data), dialId)
+    }
+
     static func decode(_ payload: [AnyHashable: Any]) -> IncomingDecisionCall {
         let dialId = (payload["id"] as? String) ?? ""                       // relay's 'dial_…' correlation id (not a UUID)
         let message = (payload["message"] as? String) ?? ""
         let who = (payload["who"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let display = !who.isEmpty ? who : (message.isEmpty ? "Senti — decision needed" : message)
+        let callerName = (payload["callerName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let named = !callerName.isEmpty ? callerName : who   // warden's minor: prefer the nicer callerName over `who`
+        let display = !named.isEmpty ? named : (message.isEmpty ? "Senti — decision needed" : message)
         let raw = (payload["priority"] as? String) ?? "medium"
         let priority = ["low", "medium", "high", "urgent"].contains(raw) ? raw : "medium"
         let context = (payload["context"] as? String).flatMap { $0.isEmpty ? nil : $0 }
