@@ -1,8 +1,10 @@
 import Foundation
+import PocketContracts
 
 // DialOrchestrator — the app-side state flow for DIALS ("Senti Pocket dials Carter"). Composes the SHIPPED pieces
 // (SentiCallKit ring, SpokenConfirm bar-2b verdict, the governed write) into warden's VERIFIED consent-flow:
-//   answer → hear the decision → DICTATE a reply → read-back → DETERMINISTIC confirm → the governed write posts as Carter.
+//   answer → hear the decision → CONVERSE (grounded Q&A) → DICTATE a reply → read-back → DETERMINISTIC confirm →
+//   the governed write posts as Carter.
 // Load-bearing invariant (warden's bar): a governed write NEVER happens without his explicit DICTATED reply AND an
 // explicit confirm. Decline / hangup (cancellation) / unclear-confirm-exhausted → NOTHING is posted or queued.
 // Dependencies are injected protocols, so this consent state machine is unit-testable WITHOUT CallKit / ASR / network,
@@ -27,6 +29,11 @@ public struct DialRequest: Equatable, Sendable {
 public protocol DialVoice: Sendable {
     func speak(_ text: String) async
     func listen() async -> String   // the recognized transcript ("" if nothing was recognized)
+    /// Answer a spoken follow-up QUESTION aloud, grounded-or-honestly-unavailable (never invents). Used ONLY in the
+    /// conversing phase; it speaks a NEW answer and returns it — it does NOT, and MUST NOT, post anything. The
+    /// orchestrator routes an utterance here only when DialReplyMarker classifies it as a question, so answering a
+    /// follow-up can never be confused with authorizing a write.
+    func answerFollowUp(_ question: String) async -> DialSpokenAnswer
 }
 
 public enum DialWriteResult: Equatable, Sendable {
@@ -55,11 +62,13 @@ public final class DialOrchestrator {
     private let voice: DialVoice
     private let writer: DialWriter
     private let maxConfirmRetries: Int
+    private let maxConversingTurns: Int
 
-    public init(voice: DialVoice, writer: DialWriter, maxConfirmRetries: Int = 2) {
+    public init(voice: DialVoice, writer: DialWriter, maxConfirmRetries: Int = 2, maxConversingTurns: Int = 6) {
         self.voice = voice
         self.writer = writer
         self.maxConfirmRetries = max(0, maxConfirmRetries)
+        self.maxConversingTurns = max(1, maxConversingTurns)
     }
 
     /// Drive one answered decision call to a terminal outcome. Honors Task cancellation (a hangup cancels the run
@@ -69,12 +78,9 @@ public final class DialOrchestrator {
         if Task.isCancelled { return .declined("hung up before briefing") }
         await voice.speak("Decision needed. \(request.message)")
 
-        // 2. DICTATE: capture his spoken reply. No reply → no write (never a default/ambient reply).
-        if Task.isCancelled { return .declined("hung up before dictation") }
-        await voice.speak("What should I post as you? Speak your reply after the tone.")
-        let reply = (await voice.listen()).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !reply.isEmpty else {
-            await voice.speak("I didn't catch a reply, so nothing was posted.")
+        // 2. CONVERSE: grounded Q&A until an EXPLICIT reply-marker. A marker-less utterance is ALWAYS answered,
+        //    NEVER posted — the marker is the ONLY path from speech to a governed write. No reply → nothing posted.
+        guard let reply = await converse() else {
             return .declined("no dictated reply")
         }
 
@@ -111,5 +117,41 @@ public final class DialOrchestrator {
         // Unreachable (the loop returns), but fail-safe: never fall through to a post.
         await writer.cancel()
         return .declined("confirm not obtained")
+    }
+
+    /// The CONVERSING phase: let Carter ask grounded follow-ups, then dictate his reply. Returns the dictated reply
+    /// — the ONLY path from speech to a governed write — or nil (silence / hangup / exhausted without a marker →
+    /// decline, nothing posted).
+    ///
+    /// Consent seam (co-designed + gated w/ atlas): every utterance is classified by `DialReplyMarker`. A question
+    /// (no marker) is ALWAYS answered via `voice.answerFollowUp` and NEVER posted; ambiguity resolves toward
+    /// "answer," never "post." Only an explicit prefix reply-marker exits to a write. A bare marker takes the NEXT
+    /// utterance verbatim. Even so, the returned reply still flows through DRAFT → the SAME governed confirmAndPost
+    /// the tap uses — a false marker can never auto-post.
+    private func converse() async -> String? {
+        await voice.speak("Ask me anything about this, or say 'my reply is' when you're ready to post.")
+        for _ in 0..<maxConversingTurns {
+            if Task.isCancelled { return nil }
+            let heard = (await voice.listen()).trimmingCharacters(in: .whitespacesAndNewlines)
+            switch DialReplyMarker.classify(heard) {
+            case .question:
+                guard !heard.isEmpty else {
+                    // silence / hangup without a marker → nothing posted (never a default/ambient reply)
+                    await voice.speak("I didn't hear anything, so nothing was posted.")
+                    return nil
+                }
+                // Grounded-or-honest answer, spoken aloud by the voice. This NEVER posts.
+                _ = await voice.answerFollowUp(heard)
+            case .reply(let text):
+                return text
+            case .awaitingReply:
+                await voice.speak("Go ahead with your reply.")
+                let next = (await voice.listen()).trimmingCharacters(in: .whitespacesAndNewlines)
+                return next.isEmpty ? nil : next
+            }
+        }
+        // Exhausted the conversing budget without an explicit reply-marker → nothing posted.
+        await voice.speak("We can pick this up later — nothing was posted.")
+        return nil
     }
 }
