@@ -59,7 +59,8 @@ final class DialHost: ObservableObject {
     }
 
     /// Gateway URL config (Info.plist SENTI_GATEWAY_URL; ephemeral cloudflared tunnel, forge re-points on churn).
-    static func gatewayURL() -> URL {
+    /// `nonisolated` so it's usable as the init's default arg (evaluated off the main actor) — it touches no state.
+    nonisolated static func gatewayURL() -> URL {
         let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
         let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
