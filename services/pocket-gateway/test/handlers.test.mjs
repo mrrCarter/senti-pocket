@@ -191,6 +191,21 @@ test('POST /brief returns a grounded, segmented, audio-ready briefing; drops ung
   assert.equal(r.body.checkpointId, 'cp_test_1'); // provenance
 });
 
+test('POST /brief drops a WHITESPACE-ONLY segment even with grounded cites (handler-level isGrounded; was kept by seg.text-truthy)', async () => {
+  const brief = async ({ groundedEvidenceIds }) => ({
+    segments: [
+      { text: 'Relay shipped the mapper.', taggedText: '[calm] Relay shipped the mapper.', evidenceIds: groundedEvidenceIds.slice(0, 1) },
+      { text: '   \n\t  ', evidenceIds: groundedEvidenceIds.slice(0, 1) }, // whitespace-only + grounded cite -> no words for the phone -> dropped
+    ],
+  });
+  const gw = createGateway(baseDeps({ run: cpRun, brief }));
+  const r = await gw.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.grounded, true);
+  assert.equal(r.body.segments.length, 1, 'only the real segment survives; whitespace-only dropped by the shared gate');
+  assert.equal(r.body.segments[0].text, 'Relay shipped the mapper.');
+});
+
 test('POST /brief is honest when nothing grounds: grounded:false, never a fabricated segment', async () => {
   const brief = async () => ({ segments: [{ text: 'made up', evidenceIds: ['ev_fake'] }] });
   const gw = createGateway(baseDeps({ run: cpRun, brief }));
