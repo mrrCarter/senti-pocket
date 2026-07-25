@@ -105,7 +105,7 @@ test('confirmed + online + known target + verified => posted with result=.action
 });
 
 test('reply args: `--` guards a "-"-leading renderedPreview (a markdown list / arrow would else misparse as an option)', async () => {
-  const preview = '- item 1\n-> next step'; // starts with '-': without the -- guard commander reads it as an unknown option
+  const preview = '--json is my favorite; -> ship it'; // worst case: looks EXACTLY like a real flag -> without -- commander misparses it
   const p = makeProposal({ id: 'p_dash', renderedPreview: preview });
   const { run, calls } = recordingRun('act_dash');
   const r = await executeAction(p, makeConfirm(p), opts({ run }));
