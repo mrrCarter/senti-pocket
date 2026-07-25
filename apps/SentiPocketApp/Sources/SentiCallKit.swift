@@ -47,7 +47,8 @@ public final class SentiCallManager: NSObject {
     /// A VoIP push ARRIVED → the LEAN/RICH `DialReceiveState` decoded from it (+ relay's dialId), fired at RECEIVE so
     /// the DialCoordinator stores it for the answer's hydrate. Governed content is fetched on answer (authed GET),
     /// NEVER carried here — this only surfaces the ring shape + the dialId. Decoded via the KAV-locked DialReceive.receive.
-    public var onDialReceived: ((DialReceiveState, String) -> Void)?
+    /// (internal, not public: DialReceiveState is app-internal; the DialHost consumer is in-module.)
+    var onDialReceived: ((DialReceiveState, String) -> Void)?
     /// The call ended / was declined → tear down (stop audio, drop the episode).
     public var onEnded: ((UUID) -> Void)?
     /// CallKit ACTIVATED the audio session → safe to start capture/playback (hand to PocketVoice's DuplexAudioSessionLease).
