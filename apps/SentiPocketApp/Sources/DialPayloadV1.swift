@@ -10,8 +10,10 @@
 //                     AUTHENTICATED GET /dial?id= (#78 dial-signal-store) BEFORE rendering evidence/options — NEVER
 //                     render push-delivered governed content pre-auth (a push is unauthenticated transport).
 //
-// Byte-parity target: services/pocket-gateway/test/fixtures/dial-payload-v1.json (5 cases) — the SAME fixtures
-// relay's gateway test locks. A round-trip decode of each `payload` must reproduce these fields exactly.
+// Byte-parity target: services/pocket-gateway/test/fixtures/dial-payload-v1.json (6 cases post-#93 doorbell:
+// writekind_decision_lean / writekind_pickOption_lean / rich_info / lean_overflow / worst_byte / max_core) — the
+// SAME physical fixture relay's Node producer test locks. DialPayloadV1KAVTests reads it via a #filePath repo-root
+// walk (zero copy) and asserts each `payload` decodes to the right DialReceiveState, so the two sides can't drift.
 
 import Foundation
 
