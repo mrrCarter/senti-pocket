@@ -7,7 +7,7 @@
 // (knownSessionIdsFor(humanId)) — a client can never name an arbitrary target session.
 // Token model (per Echo's AIdenID research): atk_ = workload/project token; the phone uses a human-bound,
 // audience/resource-scoped token minted via /v1/sessions/exchange (DPoP-bound). deps.verifyToken owns that check.
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { executeAction, findLandedByProposal } from './actions.mjs';
 import { withLock } from './store.mjs';
 import { extractCheckpoint } from './extract.mjs';
@@ -53,6 +53,23 @@ const hasScope = (ctx, scope) => Array.isArray(ctx.scopes) && ctx.scopes.include
  * exact key rather than hardcoding the separator.
  */
 export const storeKey = (humanId, id) => `${String(humanId).length}:${humanId}:${id}`;
+
+/**
+ * Idempotency key for a ring-owner dispatch (PR-B4). An explicit caller `idempotencyKey` wins (bounded); otherwise a
+ * content hash of the ring's INTENT (session + question + kind + options) so a naive network RETRY of the identical body
+ * dedupes to the same dialId automatically. Distinct intentional rings (different content) or a re-ring after the TTL
+ * window get a fresh dialId. Prefixed (k:/h:) so an explicit key can never collide with a content hash.
+ */
+export function ringIdempotencyKey(body = {}) {
+  const explicit = typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim() ? body.idempotencyKey.trim().slice(0, 200) : '';
+  if (explicit) return 'k:' + explicit;
+  const sessionId = body.context && typeof body.context.sessionId === 'string' ? body.context.sessionId : '';
+  const q = typeof body.question === 'string' ? body.question.trim() : '';
+  const kindStr = typeof body.kind === 'string' ? body.kind : 'info';
+  const opts = Array.isArray(body.options) ? body.options.join('') : '';
+  const h = createHash('sha256').update([sessionId, q, kindStr, opts].map((v) => { const t = String(v); return `${t.length}:${t}`; }).join(''), 'utf8').digest('base64url').slice(0, 32);
+  return 'h:' + h;
+}
 
 /**
  * @param {{
@@ -480,15 +497,75 @@ export function createGateway(deps) {
       requestedBy: typeof body.requestedBy === 'string' && body.requestedBy ? body.requestedBy.slice(0, 128) : (deps.agent || 'an agent'),
       createdAt: Math.floor(nowMs / 1000), // Unix-epoch SECONDS (seam (c) contract)
     };
-    // mapSignalToPushInput enforces the confused-deputy guard (target humanId from ctx, never the signal) + the ring floor.
-    const mapped = mapSignalToPushInput(signal, { humanId: ctx.humanId });
-    if (!mapped.ring) return json(422, { error: 'signal not rung', reason: mapped.reason, ...(mapped.error ? { detail: mapped.error } : {}) });
-    let out;
-    try { out = await deps.pushBackend({ ...mapped.input, storedSignal: mapped.storedSignal }); }
-    catch { return json(502, { error: 'dial backend error', reason: 'dispatch-failed' }); }
-    const dispatched = !!(out && out.dispatched);
-    const dialId = (out && typeof out.dialId === 'string' ? out.dialId : null) || mapped.input.id;
-    return json(dispatched ? 200 : 502, dispatched ? { dialId, dispatched: true, kind: mapped.kind.slug } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' });
+    // The ring dispatch (shared): map -> pushBackend -> {status, body}. mapSignalToPushInput enforces the confused-deputy
+    // guard (target humanId from ctx, never the signal) + the ring floor.
+    const doDispatch = async () => {
+      const mapped = mapSignalToPushInput(signal, { humanId: ctx.humanId });
+      if (!mapped.ring) return { status: 422, body: { error: 'signal not rung', reason: mapped.reason, ...(mapped.error ? { detail: mapped.error } : {}) } };
+      let out;
+      try { out = await deps.pushBackend({ ...mapped.input, storedSignal: mapped.storedSignal }); }
+      catch { return { status: 502, body: { error: 'dial backend error', reason: 'dispatch-failed' } }; }
+      const dispatched = !!(out && out.dispatched);
+      const dialId = (out && typeof out.dialId === 'string' ? out.dialId : null) || mapped.input.id;
+      return { status: dispatched ? 200 : 502, body: dispatched ? { dialId, dispatched: true, kind: mapped.kind.slug } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' } };
+    };
+
+    // ROBUSTNESS (Warden #86 follow-up): idempotency + a soft per-human ring rate-limit, BEST-EFFORT over deps.store.
+    // FAIL-OPEN: a store that is absent or erroring NEVER drops a genuine ring — the guard only DEDUPES a retry / limits a
+    // storm on the happy path; the ring itself always proceeds when the store can't help. (This rings Carter's phone — a
+    // missed ring is worse than a rare duplicate, so an infra problem must never suppress a real ring.)
+    const store = deps.store;
+    if (!store || typeof store.get !== 'function' || typeof store.put !== 'function' || typeof store.acquireLock !== 'function') {
+      const r = await doDispatch();
+      return json(r.status, r.body);
+    }
+    const rateMax = Number.isInteger(deps.ringRateMax) && deps.ringRateMax > 0 ? deps.ringRateMax : 20;             // rings per window per human
+    const rateWindowSec = Number.isInteger(deps.ringRateWindowSec) && deps.ringRateWindowSec > 0 ? deps.ringRateWindowSec : 60;
+    const idemTtlSec = Number.isInteger(deps.ringIdemTtlSec) && deps.ringIdemTtlSec > 0 ? deps.ringIdemTtlSec : 120; // dedupe window for an identical/keyed retry
+    const nowSec = Math.floor(nowMs / 1000);
+    const idemStoreKey = storeKey(ctx.principal || ctx.humanId, 'ring:' + ringIdempotencyKey(body));
+    // The guarded ring: idempotent-replay check -> soft rate-limit -> dispatch -> record. Runs UNDER the per-idemKey lock.
+    const runGuarded = async () => {
+      // 1. Idempotent replay: an identical/keyed ring within the window returns the SAME dialId — never a 2nd ring.
+      let prior;
+      try { prior = await store.get(idemStoreKey); } catch { prior = undefined; } // read error -> fail-open (proceed to ring)
+      if (prior && typeof prior.dialId === 'string' && Number.isFinite(prior.expiresAtSec) && nowSec < prior.expiresAtSec) {
+        return { status: 200, body: { dialId: prior.dialId, dispatched: true, idempotent: true } };
+      }
+      // 2. Soft per-human ring rate-limit (fixed window; get->check->put, fail-open on store error). Only a genuine
+      //    (non-replay) ring consumes a token — a deduped retry above never counts against the limit.
+      const bucket = Math.floor(nowSec / rateWindowSec);
+      const rateKey = storeKey(ctx.principal || ctx.humanId, 'ringrate:' + bucket);
+      let cnt = 0;
+      try { const rr = await store.get(rateKey); cnt = rr && Number.isFinite(rr.count) ? rr.count : 0; } catch { cnt = 0; }
+      if (cnt >= rateMax) return { status: 429, body: { error: 'ring rate limit exceeded', reason: 'rate-limited', retryAfterSec: (bucket + 1) * rateWindowSec - nowSec } };
+      try { await store.put(rateKey, { count: cnt + 1 }, { ttlEpochSec: (bucket + 2) * rateWindowSec }); } catch { /* best-effort */ }
+      // 3. Dispatch the ring, then 4. record the idempotency result ONLY on a successful dispatch (a failed ring is
+      //    immediately retryable — we never cache a failure).
+      const r = await doDispatch();
+      if (r.status === 200 && r.body && typeof r.body.dialId === 'string') {
+        try { await store.put(idemStoreKey, { dialId: r.body.dialId, expiresAtSec: nowSec + idemTtlSec }, { ttlEpochSec: nowSec + idemTtlSec }); } catch { /* best-effort: a write miss just means a later retry may re-ring */ }
+      }
+      return r;
+    };
+    // SERIALIZE per idemKey so two concurrent identical retries can't both ring — acquired INLINE (not via withLock) so we
+    // FAIL OPEN on an acquisition ERROR (Atlas/Warden #90 gap: withLock throws if store.acquireLock throws -> the ring would
+    // DROP, violating never-drop-a-genuine-ring). Three cases: acquire THROWS -> infra error BEFORE any dispatch -> ring
+    // anyway (same as absent-store); acquire -> null -> lock HELD (concurrent identical ring) -> 409 (don't double-ring);
+    // acquire -> token -> run the guard, release BEST-EFFORT in finally (a release throw is swallowed so it can NEVER
+    // re-dispatch -> no double-ring; the lock self-heals via its TTL).
+    let token;
+    try {
+      token = await store.acquireLock(idemStoreKey);
+    } catch {
+      const r = await doDispatch(); // acquisition infra error, nothing dispatched yet -> fail-open, never drop the ring
+      return json(r.status, r.body);
+    }
+    if (!token) return json(409, { error: 'a concurrent ring for this idempotency key is in flight', reason: 'ring-in-flight' });
+    let guarded;
+    try { guarded = await runGuarded(); }
+    finally { try { await store.releaseLock(idemStoreKey, token); } catch { /* best-effort: the lock self-heals via TTL */ } }
+    return json(guarded.status, guarded.body);
   }
 
   // POST /dial/register — bind THIS device's VoIP token to a session the human belongs to (the onVoipToken(hex) seam,
