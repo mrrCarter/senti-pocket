@@ -60,7 +60,11 @@ struct DialSignalClient {
         do { (data, response) = try await urlSession.data(for: req) }
         catch { throw DialSignalError.network(error.localizedDescription) }
         if let http = response as? HTTPURLResponse {
-            if http.statusCode == 404 { throw DialSignalError.notFound }
+            // relay's handleDialFetch emits a UNIFORM 410 (Gone) for absent|expired|non-member — the COMMON path
+            // once a LEAN ring passes its ~900s TTL (existence-oracle-safe, warden-PASSED #83). Map it to the
+            // graceful .notFound so the answered-call ends cleanly, not on a generic error. 404 kept as defense
+            // (only fires on a routing bug). Confirmed w/ relay + atlas (converged from atlas's #95 seam).
+            if http.statusCode == 410 || http.statusCode == 404 { throw DialSignalError.notFound }
             guard (200..<300).contains(http.statusCode) else { throw DialSignalError.http(http.statusCode) }
         }
         do { return try JSONDecoder().decode(NeedCarterSignal.self, from: data) }
