@@ -3,10 +3,14 @@
 // fail-closed (no registry -> 501), and a stable/testable payload for forge decode() (id/who/priority).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   createDialRegistry, createDialPushBackend, createStoreDeviceRegistry, validateRegistration, buildDialPayload, computeDialId,
-  DIAL_LIMITS, DIAL_PRIORITIES,
+  DIAL_LIMITS, DIAL_PRIORITIES, DIAL_PUSHKIT_CAP, DIAL_PAYLOAD_MAX_BYTES,
 } from '../src/dial-registry.mjs';
+
+// Shared byte fixtures — the SAME file forge's Swift decoder byte-matches (KAV parity). Generated from buildDialPayload.
+const fixtures = JSON.parse(readFileSync(new URL('./fixtures/dial-payload-v1.json', import.meta.url), 'utf8'));
 
 const NOW = 1_770_000_000_000; // fixed injected clock
 const fakeRegistry = () => {
@@ -44,24 +48,83 @@ test('validateRegistration: rejects missing/oversized/bad fields', () => {
   assert.equal(validateRegistration(null).ok, false);
 });
 
-test('buildDialPayload: forge-decode shape (id/who/priority), deterministic, defaults + bounds', () => {
+test('buildDialPayload v1: RICH shape (core + governed), deterministic, legacy defaults', () => {
   const p = buildDialPayload({ humanId: 'u', sessionId: 'sess-1', message: 'Two shipped; one blocker.', priority: 'high', who: 'Warden' }, NOW);
-  assert.deepEqual(Object.keys(p).sort(), ['id', 'message', 'priority', 'sessionId', 'ts', 'who']);
-  assert.equal(p.id, computeDialId('u', 'sess-1', 'Two shipped; one blocker.', NOW));
+  assert.deepEqual(Object.keys(p).sort(), ['callerName', 'fetch', 'id', 'kind', 'message', 'priority', 'sessionId', 'ts', 'v', 'who']);
+  assert.equal(p.v, 1);
+  assert.equal(p.fetch, false, 'fits -> complete/renderable');
+  assert.equal(p.kind, 'info', 'legacy default kind');
+  assert.equal(p.callerName, 'Senti needs you', 'legacy default callerName');
+  assert.equal(p.id, computeDialId('u', 'sess-1', 'Two shipped; one blocker.', NOW), 'no override -> computeDialId');
   assert.equal(p.who, 'Warden');
   assert.equal(p.priority, 'high');
   assert.equal(p.ts, new Date(NOW).toISOString());
-  assert.deepEqual(p, buildDialPayload({ humanId: 'u', sessionId: 'sess-1', message: 'Two shipped; one blocker.', priority: 'high', who: 'Warden' }, NOW));
-  // defaults: who -> senti-pocket, unknown priority -> medium, empty context omitted
+  assert.deepEqual(p, buildDialPayload({ humanId: 'u', sessionId: 'sess-1', message: 'Two shipped; one blocker.', priority: 'high', who: 'Warden' }, NOW), 'deterministic');
   const d = buildDialPayload({ humanId: 'u', sessionId: 'sess-1', message: 'x', priority: 'nope' }, NOW);
-  assert.equal(d.who, 'senti-pocket');
-  assert.equal(d.priority, 'medium');
+  assert.equal(d.who, 'senti-pocket', 'who default');
+  assert.equal(d.priority, 'medium', 'unknown priority -> medium');
   assert.equal('context' in d, false, 'no context key when absent');
   assert.ok(DIAL_PRIORITIES.includes('urgent'), 'urgent kept in sync with warden /dial');
-  // context present -> included + bounded; who bounded
-  const c = buildDialPayload({ humanId: 'u', sessionId: 's', message: 'm', context: 'y'.repeat(DIAL_LIMITS.CONTEXT + 500), who: 'W'.repeat(DIAL_LIMITS.WHO + 50) }, NOW);
-  assert.equal(c.context.length, DIAL_LIMITS.CONTEXT);
-  assert.equal(c.who.length, DIAL_LIMITS.WHO);
+});
+
+test('buildDialPayload v1: signal fields — opaque id override, kind, callerName, checkpointId, evidenceSeqs dedup+sort', () => {
+  const p = buildDialPayload({ humanId: 'u', sessionId: '6cf7e861', id: 'need_1', kind: 'decisionYours', callerName: 'Senti needs your decision', message: 'Ship it?', checkpointId: 'cp_9', evidenceSeqs: [315050, 315038, 315038, 315050] }, NOW);
+  assert.equal(p.id, 'need_1', 'opaque id override used verbatim (NOT computeDialId)');
+  assert.equal(p.kind, 'decisionYours');
+  assert.equal(p.callerName, 'Senti needs your decision');
+  assert.equal(p.checkpointId, 'cp_9');
+  assert.deepEqual(p.evidenceSeqs, [315038, 315050], 'de-duped + sorted ascending (deterministic)');
+  assert.equal(p.fetch, false);
+});
+
+test('buildDialPayload v1: pickOption carries options; empty options is malformed -> throws (atomic unit)', () => {
+  assert.deepEqual(buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: ['A', 'B'] }, NOW).options, ['A', 'B']);
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'which?', kind: 'pickOption', options: [] }, NOW), /pickOption requires/);
+});
+
+test('buildDialPayload v1: over-budget -> LEAN (fetch=true, ALL governed shed, core-only); NEVER truncates the question', () => {
+  const big = buildDialPayload({ humanId: 'u', sessionId: 's', id: 'need_big', kind: 'info', message: 'Q'.repeat(4000), context: 'C'.repeat(2000) }, NOW);
+  assert.equal(big.fetch, true, 'message+context exceed budget -> LEAN');
+  assert.equal('message' in big, false, 'governed content shed (hydrate via GET), not truncated');
+  assert.equal('context' in big, false);
+  assert.equal(big.id, 'need_big', 'core identity preserved for the ring + hydration');
+  assert.ok(Buffer.byteLength(JSON.stringify(big)) <= DIAL_PAYLOAD_MAX_BYTES, 'lean core within budget');
+});
+
+test('buildDialPayload v1: confidence is non-governed (present when it fits; clamped)', () => {
+  const p = buildDialPayload({ sessionId: 's', message: 'm', kind: 'go', confidence: 0.87 }, NOW);
+  assert.equal(p.confidence, 0.87);
+  assert.equal(p.fetch, false);
+  assert.equal(buildDialPayload({ sessionId: 's', message: 'm', kind: 'go', confidence: 1.9 }, NOW).confidence, 1, 'clamped to [0,1]');
+});
+
+test('buildDialPayload v1: identity FAIL-CLOSED (blank/overbound/control id|sessionId, present-invalid checkpointId); opaque need_1 accepted', () => {
+  assert.throws(() => buildDialPayload({ sessionId: '', message: 'x' }, NOW), /sessionId required/);
+  assert.throws(() => buildDialPayload({ sessionId: 'x'.repeat(129), message: 'm' }, NOW), /exceeds/);
+  assert.throws(() => buildDialPayload({ sessionId: 's', id: 'a' + String.fromCharCode(1) + 'b', message: 'm' }, NOW), /control chars/);
+  assert.throws(() => buildDialPayload({ sessionId: 's', checkpointId: 'c'.repeat(129), message: 'm' }, NOW), /checkpointId exceeds/);
+  // the SHIPPED NeedCarterSignal opaque vector is ACCEPTED — never require dial_/UUID syntax (Pulse C)
+  assert.equal(buildDialPayload({ humanId: 'u', sessionId: '6cf7e861', id: 'need_1', kind: 'go', message: 'm' }, NOW).id, 'need_1');
+});
+
+test('buildDialPayload v1: EVERY shared fixture is reproduced byte-for-byte (KAV parity for forge decode)', () => {
+  assert.ok(Object.keys(fixtures.cases).length >= 4, 'fixtures present');
+  for (const [name, c] of Object.entries(fixtures.cases)) {
+    const got = buildDialPayload(c.input, fixtures.meta.clockMs);
+    assert.deepEqual(got, c.payload, `fixture ${name} reproduced exactly (drift -> regenerate the fixture)`);
+    assert.ok(Buffer.byteLength(JSON.stringify(got), 'utf8') <= DIAL_PUSHKIT_CAP, `fixture ${name} <= 5120 (PushKit cap)`);
+  }
+});
+
+test('pushBackend: a resolved device with invalid identity -> fail-closed invalid-dial-payload (never a garbage ring)', async () => {
+  const badSession = 'bad' + String.fromCharCode(1); // control char -> buildDialPayload throws
+  const reg = fakeRegistry();
+  await reg.register({ humanId: 'u', sessionId: badSession, voipToken: 't', platform: 'apns' }); // device found -> reaches buildDialPayload
+  const sent = [];
+  const pb = createDialPushBackend({ deviceRegistry: reg, apnsSend: async (a) => { sent.push(a); return { delivered: true }; }, now: () => NOW });
+  const out = await pb({ message: 'm', sessionId: badSession, humanId: 'u' });
+  assert.deepEqual(out, { dispatched: false, reason: 'invalid-dial-payload' });
+  assert.equal(sent.length, 0, 'no ring sent on a fail-closed payload');
 });
 
 test('register: happy path binds token to the token-derived humanId (never the body)', async () => {
