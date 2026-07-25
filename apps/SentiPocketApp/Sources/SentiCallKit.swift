@@ -170,7 +170,11 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
     /// top-level `id` is absent (a nested/malformed envelope) this returns nil, so the coordinator simply has no state
     /// for that ring (declines on answer) rather than a silent wrong-decode.
     static func receiveState(from dict: [AnyHashable: Any]) -> (state: DialReceiveState, dialId: String)? {
+        // isValidJSONObject FIRST: data(withJSONObject:) raises an NSException (NOT a Swift error) on a non-conforming
+        // dict, which `try?` does NOT catch → it would CRASH on a malformed push. Guarding returns the fail-safe nil.
+        // (warden #5b; atlas + relay both caught it independently — a malformed VoIP push must never crash the app.)
         guard let dialId = dict["id"] as? String,
+              JSONSerialization.isValidJSONObject(dict),
               let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
         return (DialReceive.receive(data), dialId)
     }
