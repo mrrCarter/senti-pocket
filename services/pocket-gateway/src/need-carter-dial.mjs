@@ -219,13 +219,21 @@ export function mapSignalToPushInput(signal, { humanId } = {}) {
   };
   // The FROZEN NeedCarterSignal to STORE for GET /dial?id= hydration — the EXACT object the app decodes. kind is
   // re-encoded to the Codable wire shape; ONLY the canonical fields are stored (no caller-supplied extras leak through).
+  // PARITY (Warden #83 HOLD, gate!=live): Swift's SYNTHESIZED Codable calls decode(forKey:) for a NON-OPTIONAL field, so
+  // a field that is optional-in-JS but non-optional-in-Swift MUST be ALWAYS emitted or Swift decode throws keyNotFound at
+  // hydrate (a dead ring the Node emit-shape tests structurally can't catch):
+  //   - evidenceSeqs: Swift `[Int]` (non-optional) -> ALWAYS emit ([] when empty; a list the pure mapper CAN default).
+  //   - checkpointId: Swift `String?` (optional) -> conditional omit is CORRECT.
+  //   - createdAt:    Swift `Date` (non-optional) -> can't be defaulted here (pure mapper, no clock); the PRODUCER always
+  //                   emits it (Unix seconds) and atlas's decoder decodeIfPresent's it (absent -> .distantPast). Kept
+  //                   conditional: `undefined` is JSON-dropped anyway, so an always-emit here would be identical.
   const storedSignal = {
     id: v.id,
     kind: encodeSignalKind(v.kind),
     question: v.question,
     context: { sessionId: v.context.sessionId, ...(v.context.checkpointId ? { checkpointId: v.context.checkpointId } : {}), whatWeNeed: v.context.whatWeNeed },
     confidence: v.confidence,
-    ...(v.evidenceSeqs.length ? { evidenceSeqs: v.evidenceSeqs } : {}),
+    evidenceSeqs: v.evidenceSeqs, // ALWAYS emit ([] when empty) — Swift [Int] is non-optional (Warden #83 BUG 1)
     requestedBy: v.requestedBy,
     ...(v.createdAt !== undefined ? { createdAt: v.createdAt } : {}),
   };

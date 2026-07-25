@@ -161,16 +161,18 @@ test('mapSignalToPushInput: pickOption carries options into input + re-encodes s
   assert.deepEqual(r.storedSignal.kind, { pickOption: { _0: ['Merge now', 'Wait'] } }, 'storedSignal re-encodes pickOption to the shape atlas decodes');
 });
 
-test('mapSignalToPushInput: optional fields OMITTED when absent (no checkpointId / evidenceSeqs / options / createdAt keys)', () => {
+test('mapSignalToPushInput: absent optionals — checkpointId/options omitted, but storedSignal.evidenceSeqs ALWAYS [] (Warden #83 BUG 1)', () => {
   const bare = { id: 'need_2', kind: encodeSignalKind('go'), question: 'GO?', context: { sessionId: 'sess-1', whatWeNeed: 'ship it' }, confidence: 0.9, requestedBy: 'detector' };
   const r = mapSignalToPushInput(bare, { humanId: 'human-mrrcarter' });
   assert.equal(r.ring, true);
   assert.ok(!('checkpointId' in r.input), 'no input.checkpointId key when absent');
-  assert.ok(!('evidenceSeqs' in r.input), 'no input.evidenceSeqs key when absent');
+  assert.ok(!('evidenceSeqs' in r.input), 'input omits evidenceSeqs when empty (feeds buildDialPayload, which defaults [])');
   assert.ok(!('options' in r.input), 'no input.options key for a non-pickOption kind');
-  assert.ok(!('checkpointId' in r.storedSignal.context), 'storedSignal.context has no checkpointId key when absent');
-  assert.ok(!('evidenceSeqs' in r.storedSignal), 'storedSignal has no evidenceSeqs key when absent');
-  assert.ok(!('createdAt' in r.storedSignal), 'storedSignal has no createdAt key when absent');
+  assert.ok(!('checkpointId' in r.storedSignal.context), 'storedSignal.context omits checkpointId (Swift String? optional)');
+  // BUG 1: Swift NeedCarterSignal.evidenceSeqs is NON-OPTIONAL [Int] -> synthesized decode(forKey:) throws keyNotFound if
+  // omitted -> an evidence-less ring is a dead doorbell. The stored signal MUST ALWAYS carry it ([] when empty).
+  assert.deepEqual(r.storedSignal.evidenceSeqs, [], 'storedSignal ALWAYS emits evidenceSeqs ([] when empty) — non-optional Swift field');
+  assert.ok(!('createdAt' in r.storedSignal), 'createdAt omitted when absent (producer always emits Unix-sec; atlas decoder decodeIfPresent tolerates)');
 });
 
 test('mapSignalToPushInput: SECURITY — target humanId comes from AUTH, never the signal (confused-deputy)', () => {
