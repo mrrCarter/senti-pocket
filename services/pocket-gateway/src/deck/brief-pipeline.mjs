@@ -22,20 +22,16 @@
 // the multi-stage pipeline produces BETTER briefings than single-shot brief() — that is a QUALITY question answerable only
 // by a real-Gemma eval (see scripts/gemma-brief-pipeline-smoke.mjs). This module guarantees STRUCTURE + GROUNDING + fail-
 // closedness, not quality uplift. It is drop-in for handleBrief: its brief() matches deps.brief's shape exactly.
+//
+// The honesty gate (keepGrounded intersection + isGrounded segment survival) is the SHARED grounding-gate.mjs — one
+// audited no-fabrication boundary across routeAnswer / gemma-backend / handleBrief / this pipeline. groundingSet stays
+// LOCAL: it takes ONLY the retrieval ids (no bundle fallback — handleBrief always supplies them) and filters them,
+// distinct from gemma-backend's groundedSet (verbatim + bundle-fallback), so it is not unified.
+import { keepGrounded, isGrounded } from '../grounding-gate.mjs';
 
 /** The set of evidence ids retrieval found in the VERIFIED bundle — the only ids a citation may reference. */
 function groundingSet(groundedEvidenceIds) {
   return new Set(Array.isArray(groundedEvidenceIds) ? groundedEvidenceIds.filter((id) => typeof id === 'string' && id.length > 0) : []);
-}
-
-/** Intersect a claimed-id list with the grounding set, deduped, order-preserving. Hallucinated ids are dropped. */
-function keepGrounded(claimed, grounded) {
-  const seen = new Set();
-  const out = [];
-  for (const id of Array.isArray(claimed) ? claimed : []) {
-    if (typeof id === 'string' && grounded.has(id) && !seen.has(id)) { seen.add(id); out.push(id); }
-  }
-  return out;
 }
 
 /** Normalize one drafted segment to the shipped { text, taggedText?, evidenceIds } shape, cites grounding-filtered. */
@@ -48,11 +44,6 @@ function normalizeSegment(raw, grounded) {
   };
   if (typeof s.taggedText === 'string' && s.taggedText.length > 0) seg.taggedText = s.taggedText;
   return seg;
-}
-
-/** A segment crosses the VERIFY gate only if it has display text AND at least one grounded citation. */
-function isGrounded(seg) {
-  return !!seg && typeof seg.text === 'string' && seg.text.trim().length > 0 && Array.isArray(seg.evidenceIds) && seg.evidenceIds.length > 0;
 }
 
 /**
