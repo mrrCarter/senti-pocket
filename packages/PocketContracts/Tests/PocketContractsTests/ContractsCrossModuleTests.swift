@@ -1,0 +1,382 @@
+import XCTest
+import PocketContracts   // SEPARATE module — this test IS the external-consumer proof (v0.1.1 fix).
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
+
+/// Cross-module construction (compile-guard on public inits); Codable round-trip; hash binding invalidates on
+/// change; injection-proof canonicalization + a published known-answer HASH (Echo 84d463f) mirrored by Node;
+/// isValidForConfirmation fails closed; ActionReceipt structural + signature invariants.
+final class ContractsCrossModuleTests: XCTestCase {
+
+    private let ts = Date(timeIntervalSince1970: 1_752_835_200)
+
+    func testEveryContractConstructsCrossModule() throws {
+        let ev = EvidenceRef(id: "ev_1", sessionId: "s1", sequence: 230141, agentId: "a", snippet: "x", ts: ts)
+        let rawEvent = RawEvent(sequenceId: 230141, event: "session_message", agentId: "a1", payload: "hello", idempotencyToken: "tok1", ts: ts)
+        let rawCp = RawCheckpoint(checkpointId: "cp1", sessionId: "s1", sessionTitle: "room", startSequence: 230100, endSequence: 230180, capturedAt: ts, agents: ["a1"], events: [rawEvent])
+        let claim = Claim(id: "c1", text: "fact", kind: .fact, evidenceIds: ["ev_1"])
+        let agentSummary = AgentSummary(agentId: "a1", summary: "s", claims: [claim], evidence: [ev])
+        let summary = CheckpointSummary(checkpointId: "cp1", headline: "h", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A-", perAgent: [agentSummary], risks: ["r"], blockers: ["b"])
+        let bundle = PocketBundle(contractsVersion: PocketContracts.version, checkpointId: "cp1", sessionId: "s1", sequenceStart: 230100, sequenceEnd: 230180, summary: summary, evidence: [ev], createdAt: ts, signature: "sig", signingKeyId: "k1")
+        _ = BriefingPlan(checkpointId: "cp1", segments: [BriefingSegment(id: "b1", text: "t", evidenceIds: ["ev_1"])])
+        _ = QuestionAnswer(id: "q1", checkpointId: "cp1", question: "?", answer: "a", citations: ["ev_1"], answeredOffline: true, createdAt: ts)
+        _ = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 230180, renderedPreview: "x", requiresConfirmation: true, createdAt: ts, sourceQuestionId: "q1", proposalHash: "H")
+
+        XCTAssertEqual(rawCp.events.first?.sequenceId, 230141)
+        XCTAssertEqual(bundle.contractsVersion, "0.1.8")
+        XCTAssertEqual(agentSummary.claims.first?.kind, .fact)
+    }
+
+    /// Extreme decoded Date is rejected, NEVER trapped (Echo 62e08e9 A: Int(hugeDouble) crash/DoS).
+    func testExtremeDateRejectedNonTrapping() {
+        let extreme = Date(timeIntervalSince1970: 1e18)   // absurd; must be rejected, not crash
+        let r = ActionReceipt(id: "r1", proposalId: "p1", status: .posted, result: .sequence(sequenceId: 200), targetSessionId: "s1", confirmedByHumanAt: extreme, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: "k1")
+        XCTAssertNil(ActionReceipt.safeEpochMillis(extreme))
+        XCTAssertFalse(r.hasSaneDates())
+        XCTAssertFalse(r.isStructurallyValid())
+        _ = r.canonicalReceiptPayload()                   // must not trap even on the bad date
+    }
+
+    /// Receipt KAV + per-field tamper (Echo 43b796b): canonicalReceiptPayload v4 binds every field except
+    /// `signature`, so substituting id / confirmedByHumanAt / signingKeyId changes the signed bytes. Node mirrors this.
+    /// v4 (v0.1.7): the `result` field is the length-prefixed ActionResultRef token (here .sequence(200)).
+    func testReceiptCanonicalPayloadBindsAllFields() {
+        func receipt(id: String = "r1", confirmedAt: Date, keyId: String = "k1") -> ActionReceipt {
+            ActionReceipt(id: id, proposalId: "p1", status: .posted, result: .sequence(sequenceId: 200), targetSessionId: "s1", confirmedByHumanAt: confirmedAt, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: keyId)
+        }
+        let base = receipt(confirmedAt: ts)
+        XCTAssertEqual(base.canonicalReceiptPayload(), "pocket.actionreceipt.v4\n2:r12:p16:posted15:8:sequence3:2002:s11:H13:175283520000013:17528352000000:2:k1")
+        // each previously-omitted field now changes the signed bytes:
+        XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(id: "r2", confirmedAt: ts).canonicalReceiptPayload())
+        XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(confirmedAt: ts.addingTimeInterval(1)).canonicalReceiptPayload())
+        XCTAssertNotEqual(base.canonicalReceiptPayload(), receipt(confirmedAt: ts, keyId: "k2").canonicalReceiptPayload())
+    }
+
+    /// ActionResultRef (v0.1.7) — the tagged union that replaced resultingSequence:Int. Codable round-trips both
+    /// variants (explicit kind-discriminated JSON); canonical tokens are Node-mirrorable KAVs; nil cursor stays
+    /// distinct from "" via the presence flag. Relay's gateway MUST match these tokens byte-for-byte.
+    func testActionResultRefTaggedUnion() throws {
+        let action = ActionResultRef.action(actionId: "act_1", targetSequenceId: 230180, targetCursor: "cur_9")
+        let sequence = ActionResultRef.sequence(sequenceId: 230195)
+        for ref in [action, sequence, ActionResultRef.action(actionId: "act_2", targetSequenceId: 5, targetCursor: nil)] {
+            XCTAssertEqual(ref, try JSONDecoder().decode(ActionResultRef.self, from: JSONEncoder().encode(ref)))
+        }
+        // Canonical token KAVs (Node mirror):
+        XCTAssertEqual(action.canonicalToken(), "6:action5:act_16:23018015:cur_9")
+        XCTAssertEqual(sequence.canonicalToken(), "8:sequence6:230195")
+        // nil cursor MUST stay distinct from an empty-string cursor (presence flag, injection-proof).
+        XCTAssertNotEqual(
+            ActionResultRef.action(actionId: "a", targetSequenceId: 1, targetCursor: nil).canonicalToken(),
+            ActionResultRef.action(actionId: "a", targetSequenceId: 1, targetCursor: "").canonicalToken())
+    }
+
+    /// KAV — the exact `pocket.bundle.v1` canonical bytes (v0.1.9). Relay's Node gateway MUST reproduce this
+    /// byte-for-byte to sign real bundles; the `signature` field is excluded (any value -> same canonical).
+    func testBundleCanonicalKAV() {
+        let summary = CheckpointSummary(checkpointId: "cp1", headline: "h", summaryBaselineSchema: "sch", grade: nil, perAgent: [], risks: [], blockers: [])
+        let bundle = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp1", sessionId: "s1", sequenceStart: 1, sequenceEnd: 2, summary: summary, evidence: [], createdAt: ts, signature: "IGNORED", signingKeyId: "k1")
+        XCTAssertEqual(bundle.canonicalBundlePayload(),
+            "pocket.bundle.v1\n5:0.1.83:cp12:s11:11:23:cp11:h3:sch01:01:01:01:013:17528352000002:k1")
+        // signature is NOT bound: changing it does not change the canonical.
+        let other = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp1", sessionId: "s1", sequenceStart: 1, sequenceEnd: 2, summary: summary, evidence: [], createdAt: ts, signature: "DIFFERENT", signingKeyId: "k1")
+        XCTAssertEqual(bundle.canonicalBundlePayload(), other.canonicalBundlePayload())
+
+        // POPULATED KAV — pins nested element serialization (evidence/claim/agent + populated arrays + present grade),
+        // so Relay's Node mirror is fully specified (the empty-array case above does not exercise these).
+        let ev1 = EvidenceRef(id: "ev1", sessionId: "s1", sequence: 11, agentId: "a1", snippet: "sn", ts: ts)
+        let ag = AgentSummary(agentId: "a1", summary: "sum", claims: [Claim(id: "c1", text: "t", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev1])
+        let sum2 = CheckpointSummary(checkpointId: "cp1", headline: "H", summaryBaselineSchema: "sch", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
+        let pop = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp1", sessionId: "s1", sequenceStart: 10, sequenceEnd: 20, summary: sum2, evidence: [ev1], createdAt: ts, signature: "X", signingKeyId: "k1")
+        XCTAssertEqual(pop.canonicalBundlePayload(),
+            "pocket.bundle.v1\n5:0.1.83:cp12:s12:102:203:cp11:H3:sch11:A1:12:a13:sum1:12:c11:t4:fact1:13:ev11:13:ev12:s12:112:a12:sn13:17528352000001:12:r11:12:b11:13:ev12:s12:112:a12:sn13:175283520000013:17528352000002:k1")
+    }
+
+    #if canImport(CryptoKit)
+    /// SignatureState ordering (Echo): a signature PRESENT on a structurally-invalid receipt is .invalid (tamper), not .unsigned.
+    func testSignatureStateInvalidOnStructuralTamper() {
+        let tampered = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: "sig", signingKeyId: "k1")
+        XCTAssertEqual(tampered.signatureState(gatewayPublicKeyBase64url: "AA"), .invalid)   // present sig + bad structure
+        let unsigned = ActionReceipt(id: "r1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        XCTAssertEqual(unsigned.signatureState(gatewayPublicKeyBase64url: "AA"), .unsigned)  // truly no signature
+    }
+    #endif
+
+    func testCodableRoundTripFromExternalModule() throws {
+        let ev = EvidenceRef(id: "ev_1", sessionId: "s1", sequence: 1, agentId: "a1", snippet: "x", ts: ts)
+        let data = try JSONEncoder().encode(ev)
+        XCTAssertEqual(ev, try JSONDecoder().decode(EvidenceRef.self, from: data))
+    }
+
+    /// KAV_1 — the exact canonicalPayload string. Relay's Node gateway MUST match this byte-for-byte.
+    func testKnownAnswerVectorCanonicalPayload() {
+        XCTAssertEqual(
+            ActionProposal.canonicalPayload(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: nil),
+            "pocket.actionproposal.v3\n2:p113:threadedReply2:s13:1006:post X13:17528352000000")
+    }
+
+    /// Injection resistance: under OLD newline-delimiting these collide; length-prefix keeps them distinct.
+    func testCanonicalizationIsInjectionProof() {
+        let a = ActionProposal.canonicalPayload(id: "p", kind: .threadedReply, targetSessionId: "s", targetSequence: 1, renderedPreview: "1\nX", createdAt: ts, sourceQuestionId: nil)
+        let b = ActionProposal.canonicalPayload(id: "p", kind: .threadedReply, targetSessionId: "s\n1", targetSequence: 1, renderedPreview: "X", createdAt: ts, sourceQuestionId: nil)
+        XCTAssertNotEqual(a, b)
+    }
+
+    func testReceiptStructuralInvariants() {
+        // pending: no posted fields -> valid.
+        let pending = ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        XCTAssertTrue(pending.isStructurallyValid())
+        // pending WITH a signature -> invalid (a pending write must never look sent/signed).
+        let pendingSigned = ActionReceipt(id: "p1", proposalId: "p1", status: .pendingConnectivity, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: "sig", signingKeyId: "k")
+        XCTAssertFalse(pendingSigned.isStructurallyValid())
+        // posted MISSING signature/seq -> invalid.
+        let postedBad = ActionReceipt(id: "p1", proposalId: "p1", status: .posted, result: nil, targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: nil, failureReason: nil, signature: nil, signingKeyId: nil)
+        XCTAssertFalse(postedBad.isStructurallyValid())
+        // fully-formed posted -> valid.
+        let postedGood = ActionReceipt(id: "p1", proposalId: "p1", status: .posted, result: .sequence(sequenceId: 200), targetSessionId: "s1", confirmedByHumanAt: ts, confirmedProposalHash: "H", executedAt: ts, failureReason: nil, signature: "sig", signingKeyId: "k")
+        XCTAssertTrue(postedGood.isStructurallyValid())
+    }
+
+    #if canImport(CryptoKit)
+    func testProposalHashBindingAndConfirmationGate() {
+        let p = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: nil)
+        XCTAssertTrue(p.hashMatchesContent())
+        XCTAssertTrue(p.isValidForConfirmation())
+        // v0.1.8 KAV HASH: base64url(SHA-256(v3 canonical)) for (id p1, threadedReply, s1, 100, "post X", ts, nil).
+        XCTAssertEqual(p.proposalHash, "Wk4lhnUOCRAiFMXVaroaDiv2lyHsRGJsmAJg_mjm1NY")
+        let swapped = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post EVIL", requiresConfirmation: true, createdAt: ts, sourceQuestionId: nil, proposalHash: p.proposalHash)
+        XCTAssertFalse(swapped.isValidForConfirmation())
+        let noConfirm = ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", requiresConfirmation: false, createdAt: ts, sourceQuestionId: nil, proposalHash: p.proposalHash)
+        XCTAssertFalse(noConfirm.isValidForConfirmation())
+    }
+
+    /// v0.1.8 (Echo #231350): two proposals with IDENTICAL kind/session/sequence/renderedPreview but different id
+    /// (or createdAt, or sourceQuestionId) MUST get DISTINCT hashes — otherwise a stale confirm for A confirmed a
+    /// same-content displayed B. Under v2 these collided; v3 binds id+createdAt+provenance so they don't.
+    func testSameContentDifferentIdentityHashesDiffer() {
+        let a = ActionProposal(id: "A", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: nil)
+        let bDiffId = ActionProposal(id: "B", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: nil)
+        let cDiffTime = ActionProposal(id: "A", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts.addingTimeInterval(1), sourceQuestionId: nil)
+        let dDiffProvenance = ActionProposal(id: "A", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: "q9")
+        let eEmptyProvenance = ActionProposal(id: "A", kind: .threadedReply, targetSessionId: "s1", targetSequence: 100, renderedPreview: "post X", createdAt: ts, sourceQuestionId: "")
+        XCTAssertNotEqual(a.proposalHash, bDiffId.proposalHash)        // different id
+        XCTAssertNotEqual(a.proposalHash, cDiffTime.proposalHash)      // different createdAt
+        XCTAssertNotEqual(a.proposalHash, dDiffProvenance.proposalHash)// different sourceQuestionId
+        XCTAssertNotEqual(a.proposalHash, eEmptyProvenance.proposalHash)// nil vs some("") — presence flag (Pulse #231475)
+    }
+    #endif
+
+    // MARK: - Bundle trust anchor + signed KAV + semantic validity (warden/bundle-kav-fix)
+
+    /// A semantically-VALID demo bundle; each param flips exactly one rule for the rejection tests below.
+    private func semBundle(version: String = "0.1.8", schema: String = "checkpoint_summary_sections_v1",
+                           seqStart: Int = 100, seqEnd: Int = 200, cpBundle: String = "cp_demo_1", cpSummary: String = "cp_demo_1",
+                           sessionId: String = "sess_demo_1", signingKeyId: String = "pocket-demo-phase-a", signature: String = "sig",
+                           headline: String = "h", grade: String? = "A", risks: [String] = [], blockers: [String] = [],
+                           agentId: String = "agent-a", agentSummaryText: String = "s",
+                           evId: String = "ev1", evAgent: String = "agent-a", evSnippet: String = "sn", evSession: String = "sess_demo_1", evSeq: Int = 150,
+                           secondEvidence: EvidenceRef? = nil, perAgentEvidence: [EvidenceRef]? = nil,
+                           claims: [Claim]? = nil, perAgentOverride: [AgentSummary]? = nil, date: Date? = nil) -> PocketBundle {
+        let t = date ?? ts
+        let ev = EvidenceRef(id: evId, sessionId: evSession, sequence: evSeq, agentId: evAgent, snippet: evSnippet, ts: t)
+        var top = [ev]
+        if let s = secondEvidence { top.append(s) }
+        let claimList = claims ?? [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: [evId])]
+        let ag = AgentSummary(agentId: agentId, summary: agentSummaryText, claims: claimList, evidence: perAgentEvidence ?? [ev])
+        let sum = CheckpointSummary(checkpointId: cpSummary, headline: headline, summaryBaselineSchema: schema, grade: grade, perAgent: perAgentOverride ?? [ag], risks: risks, blockers: blockers)
+        return PocketBundle(contractsVersion: version, checkpointId: cpBundle, sessionId: sessionId, sequenceStart: seqStart, sequenceEnd: seqEnd, summary: sum, evidence: top, createdAt: t, signature: signature, signingKeyId: signingKeyId)
+    }
+
+    /// FIX3 + P1.3 bounded ingress — a bundle failing ANY content rule is rejected (independent of the signature).
+    func testBundleSemanticValidity() {
+        XCTAssertEqual(semBundle().semanticIssues(), [])
+        XCTAssertTrue(semBundle().isSemanticallyValid())
+        XCTAssertTrue(semBundle(version: "0.1.7").semanticIssues().contains(.wrongContractsVersion))
+        XCTAssertTrue(semBundle(schema: "other").semanticIssues().contains(.wrongSummarySchema))
+        XCTAssertTrue(semBundle(seqStart: 300).semanticIssues().contains(.invertedSequenceRange))
+        XCTAssertTrue(semBundle(seqStart: -1, seqEnd: -1).semanticIssues().contains(.negativeSequence))
+        XCTAssertTrue(semBundle(cpSummary: "OTHER").semanticIssues().contains(.checkpointIdMismatch))
+        XCTAssertTrue(semBundle(evSession: "OTHER").semanticIssues().contains(.evidenceSessionMismatch))
+        XCTAssertTrue(semBundle(evSeq: 9999).semanticIssues().contains(.evidenceSequenceOutOfRange))
+        XCTAssertTrue(semBundle(evSnippet: "").semanticIssues().contains(.emptyRequiredField))
+        XCTAssertTrue(semBundle(evSnippet: String(repeating: "x", count: 9000)).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(secondEvidence: EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)).semanticIssues().contains(.duplicateEvidenceId))
+        XCTAssertTrue(semBundle(claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: [])]).semanticIssues().contains(.uncitedFactOrInference))
+        XCTAssertTrue(semBundle(claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: ["FOREIGN"])]).semanticIssues().contains(.foreignClaimCitation))
+        XCTAssertTrue(semBundle(claims: [Claim(id: "dup", text: "a", kind: .recommendation, evidenceIds: []), Claim(id: "dup", text: "b", kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.duplicateClaimId))
+        XCTAssertTrue(semBundle(date: Date(timeIntervalSince1970: 1e18)).semanticIssues().contains(.unsaneDate))
+        XCTAssertTrue(semBundle(date: Date(timeIntervalSince1970: 1_752_835_200.0005)).semanticIssues().contains(.subMillisecondDate))
+        XCTAssertFalse(semBundle(claims: [Claim(id: "c1", text: "x", kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.uncitedFactOrInference))  // recommendation may be uncited
+
+        // P1 re-audit#3 — strictly-positive sequences (0…0 rejected), non-empty top-level evidence, duplicate per-agent evidence.
+        XCTAssertTrue(semBundle(seqStart: 0, seqEnd: 0).semanticIssues().contains(.negativeSequence))
+        let emptyEvidence = PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: 100, sequenceEnd: 200, summary: CheckpointSummary(checkpointId: "cp_demo_1", headline: "h", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [], risks: [], blockers: []), evidence: [], createdAt: ts, signature: "sig", signingKeyId: "pocket-demo-phase-a")
+        XCTAssertTrue(emptyEvidence.semanticIssues().contains(.emptyEvidence))
+        let ev1 = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)
+        XCTAssertTrue(semBundle(perAgentEvidence: [ev1, ev1]).semanticIssues().contains(.duplicateEvidenceId))  // dup within a per-agent list
+
+        // FROZEN per-field caps (UTF-8 bytes): str<=512, agentId/evId<=128, id<=256, summary/text<=8192, snippet<=8000.
+        let over512 = String(repeating: "x", count: 513)
+        let over8192 = String(repeating: "x", count: 8193)
+        let over128 = String(repeating: "i", count: 129)
+        let over256 = String(repeating: "c", count: 257)
+        XCTAssertTrue(semBundle(signature: over512).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(grade: over512).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(risks: [over512]).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(blockers: [over512]).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(agentId: over128).semanticIssues().contains(.oversizedField))            // agent.agentId <= 128
+        XCTAssertTrue(semBundle(agentSummaryText: over8192).semanticIssues().contains(.oversizedField))   // agent.summary <= 8192
+        XCTAssertTrue(semBundle(evAgent: over128).semanticIssues().contains(.oversizedField))             // evidence.agentId <= 128
+        XCTAssertTrue(semBundle(cpBundle: over256, cpSummary: over256).semanticIssues().contains(.oversizedField)) // checkpointId <= 256
+        XCTAssertTrue(semBundle(claims: [Claim(id: over512, text: "x", kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.oversizedField))   // claim.id <= 512
+        XCTAssertTrue(semBundle(claims: [Claim(id: "c1", text: over8192, kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.oversizedField)) // claim.text <= 8192
+        // PARITY (the demo-blocking fix): fields the OLD uniform 128/8000 caps wrongly rejected are NOW accepted.
+        XCTAssertFalse(semBundle(cpBundle: String(repeating: "c", count: 200), cpSummary: String(repeating: "c", count: 200)).semanticIssues().contains(.oversizedField))         // 200-byte checkpointId
+        XCTAssertFalse(semBundle(claims: [Claim(id: "c1", text: String(repeating: "t", count: 8100), kind: .recommendation, evidenceIds: [])]).semanticIssues().contains(.oversizedField)) // 8100-byte claim.text
+        // UTF-8 BYTE count (not grapheme): 4001 × "é" = 8002 bytes > 8000 snippet cap, though String.count is only 4001.
+        XCTAssertTrue(semBundle(evSnippet: String(repeating: "é", count: 4001)).semanticIssues().contains(.oversizedField))
+        XCTAssertTrue(semBundle(evSnippet: String(repeating: "x", count: 8001)).semanticIssues().contains(.oversizedField)) // snippet <= 8000
+
+        // Round-5 identity binding.
+        let evA = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)
+        let agA = AgentSummary(agentId: "agent-a", summary: "s", claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: ["ev1"])], evidence: [evA])
+        XCTAssertTrue(semBundle(perAgentOverride: [agA, agA]).semanticIssues().contains(.duplicateAgentId))      // two agents, same agentId
+        XCTAssertTrue(semBundle(claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: ["ev1", "ev1"])]).semanticIssues().contains(.duplicateCitationId))  // repeated citation id
+        XCTAssertTrue(semBundle(agentId: "agent-b", perAgentEvidence: [evA]).semanticIssues().contains(.perAgentEvidenceForeignAgent))  // nested ev bound to its container agent
+        XCTAssertTrue(semBundle(evId: " ev1 ").semanticIssues().contains(.malformedId))                          // untrimmed evidence id
+        XCTAssertTrue(semBundle(signingKeyId: "   ").semanticIssues().contains(.malformedId))                    // whitespace-only id
+
+        // Round-5 total-work DoS budget (fail-fast; per-array caps don't bound the product): over-element (>20000) + over-byte (>1_048_576).
+        // NOTE: values track PocketBundle.maxTotalElements/maxTotalBytes — bump BOTH here whenever those caps change (this test IS an enforcing surface).
+        XCTAssertEqual(semBundle(claims: (0..<20001).map { Claim(id: "c\($0)", text: "x", kind: .recommendation, evidenceIds: []) }).semanticIssues(), [.overBudget])
+        XCTAssertEqual(semBundle(agentSummaryText: String(repeating: "x", count: 1_048_577)).semanticIssues(), [.overBudget])
+    }
+
+    /// Round-5 CONSUMER PARITY — a gateway-shaped bundle whose fields sit AT the FROZEN per-field caps (which the old
+    /// uniform 128/8000 wrongly rejected) is ACCEPTED by the phone's semantic gate, and its evidence also satisfies the
+    /// GroundedInferenceRequest frozen caps (PocketInference/InferenceTypes.swift: checkpoint/session<=256, evidence
+    /// id/agent<=128, snippet<=8000, evidence count<=32). NOTE: literal GroundedInferenceRequest construction lives in
+    /// PocketInference (out of this branch's file scope) — parity is proven by matching its exact frozen numeric caps.
+    func testConsumerParityGatewayBoundaryBundleAccepted() {
+        let id256 = String(repeating: "a", count: 256)
+        let id128 = String(repeating: "e", count: 128)
+        let str512 = String(repeating: "s", count: 512)
+        let text8192 = String(repeating: "t", count: 8192)
+        let snippet8000 = String(repeating: "n", count: 8000)
+        let head4096 = String(repeating: "h", count: 4096)
+        let ev = EvidenceRef(id: id128, sessionId: id256, sequence: 150, agentId: id128, snippet: snippet8000, ts: ts)
+        let agent = AgentSummary(agentId: id128, summary: text8192, claims: [Claim(id: str512, text: text8192, kind: .fact, evidenceIds: [id128])], evidence: [ev])
+        let sum = CheckpointSummary(checkpointId: id256, headline: head4096, summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: str512, perAgent: [agent], risks: [str512], blockers: [str512])
+        let bundle = PocketBundle(contractsVersion: "0.1.8", checkpointId: id256, sessionId: id256, sequenceStart: 100, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: str512, signingKeyId: "pocket-demo-phase-a")
+        XCTAssertEqual(bundle.semanticIssues(), [])                 // ACCEPTED (was wrongly rejected under uniform 128/8000)
+        XCTAssertTrue(bundle.isSemanticallyValid())
+        // Evidence also within GroundedInferenceRequest frozen caps (the other consumer):
+        XCTAssertLessThanOrEqual(bundle.checkpointId.utf8.count, 256)
+        XCTAssertLessThanOrEqual(bundle.sessionId.utf8.count, 256)
+        for e in bundle.evidence {
+            XCTAssertLessThanOrEqual(e.id.utf8.count, 128)
+            XCTAssertLessThanOrEqual(e.agentId.utf8.count, 128)
+            XCTAssertLessThanOrEqual(e.snippet.utf8.count, 8000)
+        }
+        XCTAssertLessThanOrEqual(bundle.evidence.count, 32)
+    }
+
+    /// P1.2 adversary A — a claim citing evidence present ONLY in per-agent evidence (NOT top-level) is a foreign citation.
+    func testSemanticRejectsPerAgentOnlyCitation() {
+        let b = semBundle(perAgentEvidence: [EvidenceRef(id: "evAgentOnly", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)],
+                          claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: ["evAgentOnly"])])
+        XCTAssertTrue(b.semanticIssues().contains(.foreignClaimCitation))
+        XCTAssertFalse(b.isSemanticallyValid())
+    }
+
+    /// P1.2 adversary B (the gate's) — a per-agent evidence id present in top-level but DIFFERING (foreign session) is rejected.
+    func testSemanticRejectsPerAgentEvidenceMismatch() {
+        let b = semBundle(perAgentEvidence: [EvidenceRef(id: "ev1", sessionId: "FOREIGN", sequence: 150, agentId: "agent-a", snippet: "sn", ts: ts)])
+        XCTAssertTrue(b.semanticIssues().contains(.perAgentEvidenceMismatch))
+        XCTAssertFalse(b.isSemanticallyValid())
+    }
+
+    #if canImport(CryptoKit)
+    private func b64url(_ d: Data) -> String {
+        d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    /// The signed pocket.bundle.v1 KAV loaded from the bundled test RESOURCE (P1.5) — no duplicated literals.
+    private func loadKAV(_ resource: String = "bundle_kav") throws -> (canonical: String, canonicalSha256Hex: String, signature: String, pubkey: String) {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: resource, withExtension: "json", subdirectory: "Fixtures"))
+        let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        let kav = obj["kav"] as! [String: Any]
+        let demoKey = obj["demoKey"] as! [String: Any]
+        return (
+            kav["canonicalBytesUtf8"] as! String,
+            kav["canonicalSha256Hex"] as! String,
+            kav["signatureBase64url"] as! String,
+            demoKey["publicKeyBase64url"] as! String
+        )
+    }
+    /// The canonical, semantically-valid demo bundle (matches the KAV fixture). Tamper params flip a signed field.
+    private func demoBundle(signature: String, headline: String = "demo briefing", snippet: String = "snippet", signingKeyId: String = "pocket-demo-phase-a", sequenceStart: Int = 100) -> PocketBundle {
+        let ev = EvidenceRef(id: "ev1", sessionId: "sess_demo_1", sequence: 150, agentId: "agent-a", snippet: snippet, ts: ts)
+        let ag = AgentSummary(agentId: "agent-a", summary: "did the thing", claims: [Claim(id: "c1", text: "a fact", kind: .fact, evidenceIds: ["ev1"])], evidence: [ev])
+        let sum = CheckpointSummary(checkpointId: "cp_demo_1", headline: headline, summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: "A", perAgent: [ag], risks: ["r1"], blockers: ["b1"])
+        return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp_demo_1", sessionId: "sess_demo_1", sequenceStart: sequenceStart, sequenceEnd: 200, summary: sum, evidence: [ev], createdAt: ts, signature: signature, signingKeyId: signingKeyId)
+    }
+
+    /// FIX2 (P1.1 + P1.5) — load the committed KAV RESOURCE: the pinned pubkey equals the fixture's, the canonical bytes
+    /// match, and the COMMITTED real-key signature verifies under the pinned key. No private key is derivable from the repo.
+    func testBundleSignedKAVFromResource() throws {
+        let kav = try loadKAV()
+        XCTAssertEqual(PocketDemoGatewayKey.publicKeyBase64url, kav.pubkey)          // pinned == fixture
+        let b = demoBundle(signature: kav.signature)
+        XCTAssertEqual(b.canonicalBundlePayload(), kav.canonical)                    // canonical matches fixture (no literal dup)
+        XCTAssertTrue(b.isSemanticallyValid())
+        XCTAssertTrue(b.hasTrustedSigningKeyId())
+        XCTAssertTrue(b.verifiesSignature())                                         // committed signature verifies under the pinned key
+    }
+
+    /// A valid signature cannot bypass semantic validation: the committed negative KAV has an inverted sequence range.
+    func testBundleRejectsCryptoValidButSemanticallyInvalidKAV() throws {
+        let kav = try loadKAV("bundle_kav_negative")
+        let b = demoBundle(signature: kav.signature, sequenceStart: 300)
+        let canonical = b.canonicalBundlePayload()
+
+        XCTAssertEqual(PocketDemoGatewayKey.publicKeyBase64url, kav.pubkey)
+        XCTAssertEqual(canonical, kav.canonical)
+        XCTAssertEqual(Data(canonical.utf8).count, 354)
+        XCTAssertEqual(SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined(), kav.canonicalSha256Hex)
+        XCTAssertEqual(kav.canonicalSha256Hex, "f6365cf012001d4e9eda366937178e14390aebfb0da29116539cae44e6cbbc86")
+        XCTAssertTrue(b.verifiesSignature())
+        XCTAssertTrue(b.semanticIssues().contains(.invertedSequenceRange))
+        XCTAssertFalse(b.isSemanticallyValid())
+    }
+
+    /// FIX1 — no committed private key is forgeable: an UNTRUSTED signingKeyId is rejected pre-crypto; a TRUSTED id signed
+    /// by a THROWAWAY key fails the pinned-key check. There is no API to pass a key.
+    func testBundleVerifyRejectsUntrustedIdAndWrongKey() throws {
+        let kav = try loadKAV()
+        XCTAssertTrue(demoBundle(signature: kav.signature).verifiesSignature())                                    // committed sig ok
+        XCTAssertFalse(demoBundle(signature: kav.signature, signingKeyId: "not-a-trusted-key").verifiesSignature()) // untrusted id: pre-crypto
+        XCTAssertFalse(demoBundle(signature: kav.signature, signingKeyId: "not-a-trusted-key").hasTrustedSigningKeyId())
+        // TRUSTED id, but signed by a THROWAWAY keypair -> fails under the pinned key
+        let attackerSig = b64url(try Curve25519.Signing.PrivateKey().signature(for: Data(demoBundle(signature: "").canonicalBundlePayload().utf8)))
+        XCTAssertFalse(demoBundle(signature: attackerSig).verifiesSignature())
+    }
+
+    /// FIX2 — tamper vectors: mutating any signed field (summary/evidence), the signingKeyId, or the array ORDER breaks
+    /// verification of the committed signature.
+    func testBundleSignatureRejectsTamper() throws {
+        let sig = try loadKAV().signature
+        XCTAssertTrue(demoBundle(signature: sig).verifiesSignature())
+        XCTAssertFalse(demoBundle(signature: sig, headline: "demo EVIL").verifiesSignature())    // summary tamper
+        XCTAssertFalse(demoBundle(signature: sig, snippet: "x").verifiesSignature())            // evidence tamper
+        XCTAssertFalse(demoBundle(signature: sig, signingKeyId: "pocket-demo-EVIL").verifiesSignature())  // keyId tamper (untrusted id)
+        // ordering is bound: two evidence items in different order produce different canonical bytes.
+        let e1 = EvidenceRef(id: "ev1", sessionId: "s", sequence: 1, agentId: "a", snippet: "1", ts: ts)
+        let e2 = EvidenceRef(id: "ev2", sessionId: "s", sequence: 2, agentId: "a", snippet: "2", ts: ts)
+        func canon(_ es: [EvidenceRef]) -> String {
+            let sum = CheckpointSummary(checkpointId: "cp", headline: "h", summaryBaselineSchema: "sch", grade: nil, perAgent: [], risks: [], blockers: [])
+            return PocketBundle(contractsVersion: "0.1.8", checkpointId: "cp", sessionId: "s", sequenceStart: 1, sequenceEnd: 2, summary: sum, evidence: es, createdAt: ts, signature: "X", signingKeyId: "k").canonicalBundlePayload()
+        }
+        XCTAssertNotEqual(canon([e1, e2]), canon([e2, e1]))
+    }
+    #endif
+}

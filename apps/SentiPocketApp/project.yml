@@ -1,0 +1,82 @@
+# XcodeGen manifest — Atlas owns this + the generated project. Reproducible from these Windows-authored
+# sources: on a Mac run `xcodegen generate` (brew install xcodegen) then open SentiPocketApp.xcodeproj.
+# Keeps the Xcode project OUT of git-conflict territory (only this yaml + Swift sources are tracked).
+name: SentiPocketApp
+options:
+  bundleIdPrefix: com.plexaura.sentipocket
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+packages:
+  PocketContracts:
+    path: ../../packages/PocketContracts
+  PocketCall:
+    path: ../../packages/PocketCall
+  PocketUI:
+    path: ../../packages/PocketUI
+  PocketReasoning:
+    path: ../../packages/PocketReasoning
+  # PocketBriefing CUT from the app target 2026-07-20 (Atlas, per Warden #252313): the rich briefing is SERVER-SIDE
+  # now (Relay's gateway reasons via a cloud LLM), so BriefingBuilder is off the Release critical path. Package stays
+  # on disk — it's the home for Echo's LATER on-device offline briefing (Gemma). Cut-from-target, NOT deleted.
+  # PocketVoice CUT from the app target 2026-07-20 (Atlas, per Pulse #251864): app STT is Apple on-device Speech
+  # (OnDeviceSpeechRecognizer), NOT PocketVoice/whisper.cpp — zero `import PocketVoice` in the app closure. The
+  # package stays on disk; re-add WITH a real import when on-device Whisper STT actually ships (needs PrivacyInfo).
+  # Relay's PocketSyncClient/PocketActionsClient are Phase-B (real gateway); not wired for the Phase-A fixture build.
+targets:
+  SentiPocketApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources
+        buildPhase: resources
+    dependencies:
+      - package: PocketContracts
+      - package: PocketCall
+      - package: PocketUI
+      - package: PocketReasoning
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Senti Pocket
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Required or iOS SIGABRTs on the first permission request (on-device Speech STT + mic barge-in/PTT).
+        NSMicrophoneUsageDescription: "Senti Pocket uses the microphone so you can barge in and answer the briefing by voice."
+        NSSpeechRecognitionUsageDescription: "Senti Pocket transcribes your speech on-device so you can interrupt a briefing and dictate a proposed action."
+        # B2 item 5 (Atlas/Forge #261850): the live-demo gateway URL — CONFIG, not hard-baked. It's an ephemeral
+        # cloudflared quick-tunnel that churns on restart; forge re-publishes + updates this value with NO code change.
+        SENTI_GATEWAY_URL: "https://experienced-disposal-urge-approved.trycloudflare.com"
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: false
+        SWIFT_VERSION: "5.9"
+  # XCUITest device/sim target (Atlas-owned per Pulse #249472) — enables the DeviceUITests to run at all.
+  # The app-under-test is wired via the `target: SentiPocketApp` dependency (XcodeGen sets the target application).
+  # Forge runs a NAMED single test until Atlas maps the -PocketUITestScenario reducer for the other 14.
+  SentiPocketAppUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: ../../packages/PocketUI/DeviceUITests
+    dependencies:
+      - target: SentiPocketApp
+      - package: PocketUI
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_VERSION: "5.9"
+schemes:
+  SentiPocketApp:
+    build:
+      targets:
+        SentiPocketApp: all
+        SentiPocketAppUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SentiPocketAppUITests
