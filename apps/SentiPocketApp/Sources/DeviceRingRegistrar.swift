@@ -54,7 +54,8 @@ final class DeviceRingRegistrar {
         let task = Task {
             // Best-effort: the client carries the Bearer + enforces no-humanId/apns; a transient failure is retried by
             // the next tokenUpdated/loginCompleted trigger. The upsert is idempotent, so re-registering is harmless.
-            try? await client.register(voipToken: token, sessionId: sessionId)
+            // `_ =` discards the Void? from `try?` so the closure is Task<Void, Never>, not Task<Void?, Never>.
+            _ = try? await client.register(voipToken: token, sessionId: sessionId)
         }
         inFlight = task
         return task
