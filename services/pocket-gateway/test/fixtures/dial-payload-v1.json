@@ -5,7 +5,8 @@
     "clockMs": 1770000000000
   },
   "cases": {
-    "rich_decision": {
+    "writekind_decision_lean": {
+      "note": "decisionYours is a WRITE-KIND -> ALWAYS a LEAN doorbell (fetch=true). Governed content (message/evidenceSeqs/confidence) is SHED from the push and hydrated via the authed GET /dial?id=. (Was rich_decision before the doorbell-security model.)",
       "input": {
         "humanId": "u",
         "sessionId": "6cf7e861",
@@ -31,18 +32,13 @@
         "who": "senti-pocket",
         "sessionId": "6cf7e861",
         "checkpointId": "cp_9",
-        "fetch": false,
-        "ts": "2026-02-02T02:40:00.000Z",
-        "message": "Ship the consolidation to master?",
-        "evidenceSeqs": [
-          315038,
-          315050
-        ],
-        "confidence": 0.9
+        "fetch": true,
+        "ts": "2026-02-02T02:40:00.000Z"
       },
-      "bytes": 326
+      "bytes": 231
     },
-    "rich_pickOption": {
+    "writekind_pickOption_lean": {
+      "note": "pickOption is a WRITE-KIND -> ALWAYS a LEAN doorbell (fetch=true). message/options/evidenceSeqs are SHED from the push and hydrated via GET /dial?id= (options NEVER ride the push now). (Was rich_pickOption before the doorbell-security model.)",
       "input": {
         "humanId": "u",
         "sessionId": "6cf7e861",
@@ -69,20 +65,51 @@
         "callerName": "Senti · atlas needs you to choose",
         "who": "senti-pocket",
         "sessionId": "6cf7e861",
+        "fetch": true,
+        "ts": "2026-02-02T02:40:00.000Z"
+      },
+      "bytes": 200
+    },
+    "rich_info": {
+      "note": "info/checkpointReady are LOW-SENSITIVITY -> RICH-eligible: governed content rides the push when it fits the 4864-byte budget (fetch=false). Proves the RICH path still works post-doorbell-security; evidenceSeqs dedup+sort applies.",
+      "input": {
+        "humanId": "u",
+        "sessionId": "6cf7e861",
+        "id": "need_4",
+        "kind": "info",
+        "callerName": "Senti · update from relay",
+        "message": "Deploy finished; all green.",
+        "context": "post-deploy summary",
+        "evidenceSeqs": [
+          520,
+          511,
+          511,
+          520
+        ],
+        "confidence": 0.8,
+        "checkpointId": "cp_12",
+        "priority": "medium"
+      },
+      "payload": {
+        "v": 1,
+        "id": "need_4",
+        "kind": "info",
+        "priority": "medium",
+        "callerName": "Senti · update from relay",
+        "who": "senti-pocket",
+        "sessionId": "6cf7e861",
+        "checkpointId": "cp_12",
         "fetch": false,
         "ts": "2026-02-02T02:40:00.000Z",
-        "message": "Which adapter?",
-        "options": [
-          "Merge now",
-          "Wait for forge",
-          "Split the PR"
-        ],
+        "message": "Deploy finished; all green.",
+        "context": "post-deploy summary",
         "evidenceSeqs": [
-          400,
-          401
-        ]
+          511,
+          520
+        ],
+        "confidence": 0.8
       },
-      "bytes": 309
+      "bytes": 324
     },
     "lean_overflow": {
       "input": {
