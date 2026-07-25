@@ -39,7 +39,10 @@ final class SignInCoordinator: ObservableObject {
     private var loginTask: Task<Void, Never>?
 
     init(login: @escaping () async throws -> Void,
-         isLoggedIn: @escaping () -> Bool = { SentiNativeAuth.isLoggedIn },
+         // NB: default is the nonisolated `SessionTokenStore.load() != nil` (exactly what SentiNativeAuth.isLoggedIn
+         // computes) — referencing the @MainActor `SentiNativeAuth.isLoggedIn` from this nonisolated default-arg
+         // context is a concurrency error (caught on the Mac build).
+         isLoggedIn: @escaping () -> Bool = { SessionTokenStore.load() != nil },
          signOut: @escaping () -> Void = { SessionTokenStore.delete() }) {
         self.login = login
         self.isLoggedIn = isLoggedIn
