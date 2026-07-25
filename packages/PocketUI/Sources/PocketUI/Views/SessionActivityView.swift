@@ -166,12 +166,12 @@ private struct ActionRow: View {
         VStack(alignment: .leading, spacing: 8) {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .firstTextBaseline) {
-                    actor
+                    actorLabel
                     Spacer(minLength: 10)
                     target
                 }
                 VStack(alignment: .leading, spacing: 4) {
-                    actor
+                    actorLabel
                     target
                 }
             }
@@ -190,8 +190,8 @@ private struct ActionRow: View {
         .contentShape(Rectangle())
     }
 
-    private var actor: some View {
-        Text(action.actor).font(.headline)
+    private var actorLabel: some View {
+        Text(action.actor).font(.headline)   // `action.actor` is a String field (fine); the bare `actor` VIEW property collided with Swift's contextual keyword
     }
 
     private var target: some View {
