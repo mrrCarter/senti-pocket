@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- PrivacyInfo.xcprivacy — Apple privacy manifest (Atlas, per Forge PR #81 / the PocketVoice-cut re-add trigger).
+     Required for App Store submission once on-device Whisper STT (PocketDialVoice) accesses the microphone.
+     HONEST posture: Senti Pocket does NOT collect or track. Speech is transcribed ON-DEVICE (whisper.cpp), never
+     sent off-device for the STT itself. No tracking, no data linked to identity, no third-party SDKs collecting data. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- We do NOT track users across apps/websites. -->
+    <key>NSPrivacyTracking</key>
+    <false/>
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+    <!-- No data types collected: the mic audio is transcribed on-device and never leaves for STT; the governed write
+         posts only the user's explicitly-confirmed message (functional, not "collection" in Apple's sense). -->
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+    <!-- Required-reason APIs actually used. -->
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <dict>
+            <!-- UserDefaults (CA92.1 = the app's own settings/config, e.g. the gateway URL config value). -->
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>CA92.1</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

@@ -16,6 +16,13 @@ packages:
     path: ../../packages/PocketUI
   PocketReasoning:
     path: ../../packages/PocketReasoning
+  # PocketDialVoice RE-ADDED to the app target 2026-07-25 (Atlas, per Forge #319232/PR #81): on-device Whisper STT
+  # ACTUALLY SHIPS now (LiveDialVoice: speak=AVSpeech, listen=whisper.cpp, injects DialReasoner) — this is the exact
+  # "re-add WITH a real import when on-device Whisper STT ships (needs PrivacyInfo)" trigger the PocketVoice-cut note
+  # called out below. Whisper reads the mic → PrivacyInfo.xcprivacy added (NSMicrophone reason API) + the mic-usage
+  # string already present. SEQUENCING: this wiring lands WITH/AFTER PR #81 (the package it depends on).
+  PocketDialVoice:
+    path: ../../packages/PocketDialVoice
   # PocketBriefing CUT from the app target 2026-07-20 (Atlas, per Warden #252313): the rich briefing is SERVER-SIDE
   # now (Relay's gateway reasons via a cloud LLM), so BriefingBuilder is off the Release critical path. Package stays
   # on disk — it's the home for Echo's LATER on-device offline briefing (Gemma). Cut-from-target, NOT deleted.
@@ -36,6 +43,7 @@ targets:
       - package: PocketCall
       - package: PocketUI
       - package: PocketReasoning
+      - package: PocketDialVoice
     info:
       path: Sources/Info.plist
       properties:
