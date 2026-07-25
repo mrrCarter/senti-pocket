@@ -1,5 +1,6 @@
 #if canImport(SwiftUI)
 import SwiftUI
+import PocketContracts   // ParsedSessionTimestamp (SessionAtlasTypes) — used in timestamp(_:)
 
 public struct SessionListView: View {
     private let state: SessionListPresentationState

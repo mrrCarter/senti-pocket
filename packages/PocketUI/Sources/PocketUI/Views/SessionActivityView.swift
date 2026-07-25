@@ -1,5 +1,6 @@
 #if canImport(SwiftUI)
 import SwiftUI
+import PocketContracts   // ParsedSessionTimestamp (SessionAtlasTypes) — SessionActionRowPresentation.timestamp
 
 public struct SessionActivityView: View {
     private let state: SessionActivityPresentationState

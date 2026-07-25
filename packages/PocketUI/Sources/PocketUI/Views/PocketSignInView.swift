@@ -84,12 +84,19 @@ public struct PocketSignInView: View {
             .pocketCard()
 
         case .signedIn:
-            Label("Signed in securely", systemImage: "checkmark.shield")
-                .font(.headline)
-                .foregroundStyle(PocketPalette.accent)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .pocketCard()
-                .accessibilityIdentifier("pocket.signin.signed-in")
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Signed in securely", systemImage: "checkmark.shield")
+                    .font(.headline)
+                    .foregroundStyle(PocketPalette.accent)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("pocket.signin.signed-in")
+                // Atlas-greenlit local sign-out (Pulse): clears local credentials + protected cache on THIS device.
+                // Honest scope — NO server-side session-revocation claim (the copy says "on this device").
+                Button("Sign out on this device") { send(.signOut) }
+                    .font(.subheadline.weight(.semibold))
+                    .accessibilityIdentifier("pocket.signin.sign-out")
+            }
+            .pocketCard()
 
         case .reauthenticationRequired:
             actionCard(
