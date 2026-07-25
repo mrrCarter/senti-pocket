@@ -7,6 +7,7 @@
 // (knownSessionIdsFor(humanId)) — a client can never name an arbitrary target session.
 // Token model (per Echo's AIdenID research): atk_ = workload/project token; the phone uses a human-bound,
 // audience/resource-scoped token minted via /v1/sessions/exchange (DPoP-bound). deps.verifyToken owns that check.
+import { randomUUID } from 'node:crypto';
 import { executeAction, findLandedByProposal } from './actions.mjs';
 import { withLock } from './store.mjs';
 import { extractCheckpoint } from './extract.mjs';
@@ -19,6 +20,7 @@ import { renderDeck } from './deck/templates.mjs';
 import { narrateDeck } from './deck/narration.mjs';
 import { buildStoryboard, assembleDeckVideo } from './deck/video.mjs';
 import { createDialRegistry } from './dial-registry.mjs';
+import { mapSignalToPushInput } from './need-carter-dial.mjs';
 import { groundingIdsFromBundle, keepGrounded, isGrounded } from './grounding-gate.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
@@ -429,6 +431,66 @@ export function createGateway(deps) {
     return json(dispatched ? 200 : 502, dispatched ? { dialId, dispatched: true } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' });
   }
 
+  // POST /dial/ring-owner — the EXPLICIT ring path (sl ring-owner / an agent's MCP tool). The caller DESCRIBES a need
+  // (question + kind + session context); RELAY builds the canonical NeedCarterSignal server-side (opaque GATEWAY-generated
+  // id, so a caller cannot choose the store key), maps it to the RICH dial input + the storedSignal (PR-B2), and dispatches
+  // via the SAME pushBackend as /dial — so a LEAN ring hydrates via GET /dial?id=. SECURITY: the ring TARGET humanId is
+  // ctx.humanId (verified auth), NEVER the body (confused-deputy); requestedBy is DISPLAY only. AUTHORS NOTHING (it rings;
+  // the answered-call write keeps its own governed confirm). Fail-closed: no backend -> 501, non-member -> 403, malformed
+  // pickOption -> 400, invalid/below-floor signal -> 422. This is the PRODUCER that feeds PR-B2's storedSignal store-write.
+  async function handleRingOwner(req, ctx) {
+    if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
+    if (typeof deps.pushBackend !== 'function') return json(501, { error: 'dial backend not configured', reason: 'dial-not-configured' });
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    const question = typeof body.question === 'string' ? body.question.trim() : '';
+    if (!question) return json(400, { error: 'question required' });
+    if (Buffer.byteLength(question, 'utf8') > 4096) return json(413, { error: 'question exceeds 4096 bytes' });
+    const ctxIn = body.context && typeof body.context === 'object' ? body.context : {};
+    const sessionId = typeof ctxIn.sessionId === 'string' ? ctxIn.sessionId : '';
+    if (!sessionId) return json(400, { error: 'context.sessionId required' });
+    // pickOption is atomic with its options — reject an empty/absent set up front as a client error (else it fails closed
+    // downstream in buildDialPayload as a 502, the wrong status for a caller mistake).
+    if (body.kind === 'pickOption' && (!Array.isArray(body.options) || body.options.length === 0)) {
+      return json(400, { error: 'pickOption requires at least one option' });
+    }
+    // Membership: only ring about a session this human belongs to (humanId-keyed, same gate as /dial + the read endpoints).
+    let known = [];
+    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this user' });
+    // Build the canonical NeedCarterSignal server-side. id = GATEWAY-generated opaque (caller must NOT choose the store
+    // key). confidence defaults to 1.0 (an explicit ask clears the ring floor). createdAt = Unix-epoch SECONDS (seam (c)
+    // contract: atlas's NeedCarterSignal custom-decodes Unix-seconds-or-absent -> Date). question + whatWeNeed are
+    // best-effort scrubbed before they leave via the push (normalizeSignal re-bounds them to DIAL_LIMITS downstream).
+    const kind = body.kind === 'pickOption'
+      ? { kind: 'pickOption', options: body.options }
+      : (typeof body.kind === 'string' ? body.kind : 'info');
+    const nowMs = (() => { const iso = typeof deps.now === 'function' ? deps.now() : new Date().toISOString(); const ms = Date.parse(iso); return Number.isFinite(ms) ? ms : Date.now(); })();
+    const signal = {
+      id: 'need_' + randomUUID(),
+      kind,
+      question: scrubText(question).text.slice(0, 4096),
+      context: {
+        sessionId,
+        ...(typeof ctxIn.checkpointId === 'string' && ctxIn.checkpointId ? { checkpointId: ctxIn.checkpointId } : {}),
+        whatWeNeed: typeof ctxIn.whatWeNeed === 'string' ? scrubText(ctxIn.whatWeNeed).text.slice(0, 2048) : '',
+      },
+      confidence: typeof body.confidence === 'number' && Number.isFinite(body.confidence) ? body.confidence : 1.0,
+      ...(Array.isArray(body.evidenceSeqs) ? { evidenceSeqs: body.evidenceSeqs } : {}),
+      requestedBy: typeof body.requestedBy === 'string' && body.requestedBy ? body.requestedBy.slice(0, 128) : (deps.agent || 'an agent'),
+      createdAt: Math.floor(nowMs / 1000), // Unix-epoch SECONDS (seam (c) contract)
+    };
+    // mapSignalToPushInput enforces the confused-deputy guard (target humanId from ctx, never the signal) + the ring floor.
+    const mapped = mapSignalToPushInput(signal, { humanId: ctx.humanId });
+    if (!mapped.ring) return json(422, { error: 'signal not rung', reason: mapped.reason, ...(mapped.error ? { detail: mapped.error } : {}) });
+    let out;
+    try { out = await deps.pushBackend({ ...mapped.input, storedSignal: mapped.storedSignal }); }
+    catch { return json(502, { error: 'dial backend error', reason: 'dispatch-failed' }); }
+    const dispatched = !!(out && out.dispatched);
+    const dialId = (out && typeof out.dialId === 'string' ? out.dialId : null) || mapped.input.id;
+    return json(dispatched ? 200 : 502, dispatched ? { dialId, dispatched: true, kind: mapped.kind.slug } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' });
+  }
+
   // POST /dial/register — bind THIS device's VoIP token to a session the human belongs to (the onVoipToken(hex) seam,
   // forge PR #40). The registry is dispatch-substrate for /dial: it AUTHORS NOTHING and holds no key. humanId comes from
   // the VERIFIED token (ctx.humanId), NEVER the body — a caller can only register a device under their OWN identity,
@@ -501,6 +563,7 @@ export function createGateway(deps) {
         if (method === 'POST' && path === '/tts') return await handleTts(req, ctx);
         if (method === 'POST' && path === '/deck') return await handleDeck(req, ctx);
         if (method === 'POST' && path === '/dial') return await handleDial(req, ctx);
+        if (method === 'POST' && path === '/dial/ring-owner') return await handleRingOwner(req, ctx);
         if (method === 'GET' && path === '/dial') return await handleDialFetch(req, ctx);
         if (method === 'POST' && path === '/dial/register') return await handleDialRegister(req, ctx);
         return json(404, { error: 'not found' });

@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "note": "Shared KAV (relay producer <-> atlas Swift decoder, one source of truth). For each case: mapSignalToPushInput(input, {humanId}).storedSignal MUST deep-equal expectedStoredSignal (relay side); atlas's NeedCarterSignal decoder decodes each expectedStoredSignal and asserts the decoded field values (Swift side). Neither drifts.",
+    "createdAtEpoch": "unix-seconds",
+    "invariants": [
+      "kind wire = Swift synthesized enum Codable: {go:{}} / {decisionYours:{}} / {pickOption:{_0:[...]}} / {info:{}} / {checkpointReady:{}}",
+      "evidenceSeqs is ALWAYS present ([] when empty) — Swift [Int] is non-optional (Warden #83 BUG 1)",
+      "createdAt = Unix-epoch SECONDS Int (1784370900 = 2026-07-16); atlas decodes via Date(timeIntervalSince1970:)",
+      "checkpointId is omitted when absent (Swift String? optional)"
+    ]
+  },
+  "cases": [
+    {
+      "name": "decisionYours-rich",
+      "humanId": "human-mrrcarter",
+      "input": { "id": "need_1", "kind": { "decisionYours": {} }, "question": "Ship the consolidation to master?", "context": { "sessionId": "6cf7e861", "checkpointId": "cp_9", "whatWeNeed": "master merge go" }, "confidence": 0.9, "evidenceSeqs": [315038, 315050], "requestedBy": "claude-warden", "createdAt": 1784370900 },
+      "expectedStoredSignal": { "id": "need_1", "kind": { "decisionYours": {} }, "question": "Ship the consolidation to master?", "context": { "sessionId": "6cf7e861", "checkpointId": "cp_9", "whatWeNeed": "master merge go" }, "confidence": 0.9, "evidenceSeqs": [315038, 315050], "requestedBy": "claude-warden", "createdAt": 1784370900 }
+    },
+    {
+      "name": "go-no-evidence-no-checkpoint",
+      "humanId": "human-mrrcarter",
+      "input": { "id": "need_2", "kind": { "go": {} }, "question": "GO on the deploy?", "context": { "sessionId": "6cf7e861", "whatWeNeed": "deploy go" }, "confidence": 1.0, "requestedBy": "detector", "createdAt": 1784370900 },
+      "expectedStoredSignal": { "id": "need_2", "kind": { "go": {} }, "question": "GO on the deploy?", "context": { "sessionId": "6cf7e861", "whatWeNeed": "deploy go" }, "confidence": 1, "evidenceSeqs": [], "requestedBy": "detector", "createdAt": 1784370900 }
+    },
+    {
+      "name": "pickOption-with-options",
+      "humanId": "human-mrrcarter",
+      "input": { "id": "need_3", "kind": { "pickOption": { "_0": ["Merge now", "Wait for forge"] } }, "question": "Which path?", "context": { "sessionId": "6cf7e861", "whatWeNeed": "choose" }, "confidence": 0.8, "requestedBy": "atlas", "createdAt": 1784370900 },
+      "expectedStoredSignal": { "id": "need_3", "kind": { "pickOption": { "_0": ["Merge now", "Wait for forge"] } }, "question": "Which path?", "context": { "sessionId": "6cf7e861", "whatWeNeed": "choose" }, "confidence": 0.8, "evidenceSeqs": [], "requestedBy": "atlas", "createdAt": 1784370900 }
+    }
+  ]
+}
