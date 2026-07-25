@@ -338,6 +338,48 @@ test('crash recovery: in-flight reservation + landed post => retry FINALIZES via
   assert.equal(state.replies, 0, 'crash recovery must NOT re-post');
 });
 
+// ── GET /dial?id= — LEAN-ring hydration (PR-B2): serve the full stored NeedCarterSignal the app decodes ──────────
+const dialVerify = async (h) => {
+  const a = h && (h.authorization || h.Authorization);
+  if (a === 'Bearer dial') return { humanId: 'consumer-123', scopes: ['pocket:dial'] };
+  if (a === 'Bearer nodial') return { humanId: 'consumer-123', scopes: ['sessions:read'] }; // authed, but no dial scope
+  return null;
+};
+// The exact NeedCarterSignal the mapper stores + the app decodes; context.sessionId is the membership key.
+const DIAL_SIGNAL = { id: 'need_1', kind: { decisionYours: {} }, question: 'Ship the consolidation to master?', context: { sessionId: KNOWN, checkpointId: 'cp_9', whatWeNeed: 'master merge go' }, confidence: 0.9, evidenceSeqs: [315038, 315050], requestedBy: 'claude-warden', createdAt: 1784370900 };
+const fakeDialSignalStore = (rec) => ({ async get(id) { return rec && id === rec.id ? rec : undefined; } });
+
+test('GET /dial?id=: member gets the FULL stored NeedCarterSignal (the exact object the app decodes on hydrate)', async () => {
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, dialSignalStore: fakeDialSignalStore(DIAL_SIGNAL) }));
+  const r = await gw.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: { authorization: 'Bearer dial' } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body, DIAL_SIGNAL, 'the full signal is returned verbatim for hydration');
+});
+
+test('GET /dial?id=: absent/expired signal -> 410 gone (honest unavailable, never a fabricated signal)', async () => {
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, dialSignalStore: fakeDialSignalStore(DIAL_SIGNAL) }));
+  const r = await gw.handle({ method: 'GET', path: '/dial', query: { id: 'need_missing' }, headers: { authorization: 'Bearer dial' } });
+  assert.equal(r.status, 410);
+  assert.equal(r.body.reason, 'gone');
+});
+
+test('GET /dial?id=: non-member gets the SAME 410 (opaque-id: no existence oracle for a signal you cannot access)', async () => {
+  const nonMember = createGateway(baseDeps({ verifyToken: dialVerify, dialSignalStore: fakeDialSignalStore(DIAL_SIGNAL), knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
+  const r = await nonMember.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: { authorization: 'Bearer dial' } });
+  assert.equal(r.status, 410, 'non-member is indistinguishable from absent (410), not 403 — closes the id-validity oracle');
+  assert.equal(r.body.reason, 'gone');
+});
+
+test('GET /dial?id=: fail-closed on scope / auth / id / store', async () => {
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, dialSignalStore: fakeDialSignalStore(DIAL_SIGNAL) }));
+  assert.equal((await gw.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: { authorization: 'Bearer nodial' } })).status, 403, 'no pocket:dial scope -> 403');
+  assert.equal((await gw.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: {} })).status, 401, 'no auth -> 401');
+  assert.equal((await gw.handle({ method: 'GET', path: '/dial', headers: { authorization: 'Bearer dial' } })).status, 400, 'no id -> 400');
+  assert.equal((await gw.handle({ method: 'GET', path: '/dial', query: { id: 'x'.repeat(300) }, headers: { authorization: 'Bearer dial' } })).status, 400, 'over-long id -> 400 (bounded before the store round-trip)');
+  const noStore = createGateway(baseDeps({ verifyToken: dialVerify }));
+  assert.equal((await noStore.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: { authorization: 'Bearer dial' } })).status, 501, 'no dialSignalStore wired -> 501');
+});
+
 test('reconciliation binds to PROPOSAL IDENTITY, not body: an older identical-content action is never finalized (Echo P1)', async () => {
   const store = createInMemoryStore();
   const p = makeProposal({ id: 'pident', renderedPreview: 'Approved.' });

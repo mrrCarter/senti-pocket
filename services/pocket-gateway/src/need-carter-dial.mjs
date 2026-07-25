@@ -32,12 +32,13 @@
 //       dialId=signal.id for the FOLLOW-UP that threads signal.id + callerName onto the wire (coordinated w/ warden).
 //   (c) Swift's default Date Codable is a 2001-epoch Double (not ISO) -> createdAt is carried OPAQUE here; the
 //       detector's producer side needs an agreed date strategy before it emits signals.
-//   (d) WIRE COMPLETENESS (Pulse cross-audit of f2daeb7): the current APNs wire (buildDialPayload -> APNs -> Swift
-//       decode) carries ONLY id/who/priority/message/context/sessionId/ts. So kind/options/callerName/checkpointId/
-//       evidenceSeqs do NOT reach the phone yet — "jump-to evidenceSeqs" + kind-shaped caller display are NOT
-//       end-to-end facts. This mapper SURFACES those fields (gateway-local); making them live needs ONE versioned,
-//       bounded APNs DTO + a Swift decoder test preserving canonical id, caller display, checkpointId, options, and
-//       evidenceSeqs (KAV byte-parity). Until that lands, treat them as gateway-local metadata, not delivered.
+//   (d) WIRE COMPLETENESS — CLOSED by dialPayloadV1 (#77) + PR-B2. The versioned bounded APNs DTO (buildDialPayload v1)
+//       now carries id/kind/callerName/options/checkpointId/evidenceSeqs/confidence on a RICH (fetch=false) ring, and a
+//       LEAN (fetch=true) ring hydrates the full signal via the authenticated GET /dial?id= (PR-B2) off the dispatch-time
+//       dial-signal-store. mapSignalToPushInput therefore emits BOTH `input` (the rich fields, now ON the wire via
+//       pushBackend) AND `storedSignal` (the exact NeedCarterSignal the app decodes on hydrate). Atlas's Swift decoder
+//       (dialPayloadV1 + dial-hydration) decodes the same bytes (KAV parity vs #77 test/fixtures/dial-payload-v1.json).
+//       The remaining last mile is the ring-owner ROUTE that FEEDS storedSignal into dispatch (sl ring-owner / /detect-need).
 import { DIAL_PRIORITIES, DIAL_LIMITS } from './dial-registry.mjs';
 
 /** A ring fires only when the detected need clears this confidence floor (parity: NeedCarterSignal.ringConfidenceFloor). */
@@ -199,19 +200,47 @@ export function mapSignalToPushInput(signal, { humanId } = {}) {
   // ANTI-FALSE-RING: below the floor never rings (magical path's weak "maybe needed" is suppressed here).
   if (v.confidence < RING_CONFIDENCE_FLOOR) return { ring: false, reason: 'below-ring-floor' };
   const priority = dialPriorityForKind(v.kind.slug);
+  // FULL input for buildDialPayload v1 (PR-B2: the RICH delivery to the phone — these fields are now ON the wire, no
+  // longer gateway-local). id = signal.id (opaque dial id); kind slug + options + callerName + checkpointId +
+  // evidenceSeqs + confidence flow into the bounded DTO; buildDialPayload runs the 5120 RICH->LEAN ladder over them.
   const input = {
     humanId: humanId.trim(),
     sessionId: v.context.sessionId,
-    message: v.question,          // spoken on pickup (== dialFields.message)
-    context: v.context.whatWeNeed, // the "what we need" lead-in (warden's /dial bounds/scrubs downstream)
+    message: v.question,
+    context: v.context.whatWeNeed,
     priority: DIAL_PRIORITIES.includes(priority) ? priority : 'medium',
+    id: v.id,
+    kind: v.kind.slug,
+    ...(v.kind.options.length ? { options: v.kind.options } : {}),
+    callerName: callerNameForKind(v.kind.slug, v.requestedBy),
+    ...(v.context.checkpointId ? { checkpointId: v.context.checkpointId } : {}),
+    ...(v.evidenceSeqs.length ? { evidenceSeqs: v.evidenceSeqs } : {}),
+    confidence: v.confidence,
+  };
+  // The FROZEN NeedCarterSignal to STORE for GET /dial?id= hydration — the EXACT object the app decodes. kind is
+  // re-encoded to the Codable wire shape; ONLY the canonical fields are stored (no caller-supplied extras leak through).
+  // PARITY (Warden #83 HOLD, gate!=live): Swift's SYNTHESIZED Codable calls decode(forKey:) for a NON-OPTIONAL field, so
+  // a field that is optional-in-JS but non-optional-in-Swift MUST be ALWAYS emitted or Swift decode throws keyNotFound at
+  // hydrate (a dead ring the Node emit-shape tests structurally can't catch):
+  //   - evidenceSeqs: Swift `[Int]` (non-optional) -> ALWAYS emit ([] when empty; a list the pure mapper CAN default).
+  //   - checkpointId: Swift `String?` (optional) -> conditional omit is CORRECT.
+  //   - createdAt:    Swift `Date` (non-optional) -> can't be defaulted here (pure mapper, no clock); the PRODUCER always
+  //                   emits it (Unix seconds) and atlas's decoder decodeIfPresent's it (absent -> .distantPast). Kept
+  //                   conditional: `undefined` is JSON-dropped anyway, so an always-emit here would be identical.
+  const storedSignal = {
+    id: v.id,
+    kind: encodeSignalKind(v.kind),
+    question: v.question,
+    context: { sessionId: v.context.sessionId, ...(v.context.checkpointId ? { checkpointId: v.context.checkpointId } : {}), whatWeNeed: v.context.whatWeNeed },
+    confidence: v.confidence,
+    evidenceSeqs: v.evidenceSeqs, // ALWAYS emit ([] when empty) — Swift [Int] is non-optional (Warden #83 BUG 1)
+    requestedBy: v.requestedBy,
+    ...(v.createdAt !== undefined ? { createdAt: v.createdAt } : {}),
   };
   return {
     ring: true,
-    input, // <- the ONLY fields on today's APNs wire (dispatched via the existing pushBackend)
-    // GATEWAY-LOCAL (seam (d), Pulse cross-audit): surfaced for audit + the versioned-DTO FOLLOW-UP, but NOT carried
-    // on the current wire, so they do NOT reach the phone yet. Do not claim "jump-to evidenceSeqs" / kind-shaped
-    // caller display as live until seam (d)'s versioned APNs DTO + Swift decoder land.
+    input,        // -> pushBackend -> buildDialPayload v1 (RICH/LEAN ladder)
+    storedSignal, // -> createDialSignalStore.put(input.id, storedSignal) at dispatch: the GET /dial?id= hydration source
     dialFields: mapSignalToDialFields(signal).value,
     kind: v.kind,
     confidence: v.confidence,

@@ -60,6 +60,7 @@ export const storeKey = (humanId, id) => `${String(humanId).length}:${humanId}:$
  *   signingKey: any, signingKeyId: string,
  *   knownSessionIdsFor: (humanId:string)=>Promise<string[]>,
  *   bundleStore?: { listForHuman:(humanId:string,since:number)=>Promise<object[]> },
+ *   dialSignalStore?: { get:(dialId:string)=>Promise<object|undefined> },  // GET /dial?id= LEAN-ring hydration (createDialSignalStore)
  *   ttsBackend?: (text:string,opts:object)=>Promise<{audio:Buffer,format:string}>,
  *   agent?: string, now?: ()=>string, freshnessSeconds?: number,
  * }} deps
@@ -445,6 +446,38 @@ export function createGateway(deps) {
     return json(r.status, r.body);
   }
 
+  // GET /dial?id=<dialId> — hydrate a LEAN ring (dialPayloadV1 fetch=true shed ALL governed content). Returns the FULL
+  // NeedCarterSignal that /dial dispatch stored keyed by the ring's dialId (== signal.id) — the exact object the app
+  // decodes on pickup. AUTHZ: pocket:dial scope + the caller must be a MEMBER of the signal's session (the same
+  // humanId-keyed gate as /dial + the read endpoints); the ring TARGET isn't stored, so session membership IS the
+  // authorization boundary. OPAQUE-ID: the caller supplies a high-entropy dialId, NOT a session they named — so we must
+  // never leak whether an id is valid to someone who can't access it. Absent, expired, AND non-member therefore collapse
+  // to ONE 410 (gone): there is honestly no signal available to this caller, and it closes the existence oracle (distinct
+  // from /checkpoint, where the client names the session so a 403 reveals nothing). No store wired -> 501; bad id -> 400.
+  async function handleDialFetch(req, ctx) {
+    if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
+    if (!deps.dialSignalStore || typeof deps.dialSignalStore.get !== 'function') {
+      return json(501, { error: 'dial hydration not configured', reason: 'dial-signal-store-not-configured' });
+    }
+    const id = req.query && typeof req.query.id === 'string' ? req.query.id : '';
+    if (id.trim().length === 0) return json(400, { error: 'id required' });
+    if (Buffer.byteLength(id, 'utf8') > 256) return json(400, { error: 'id too long' }); // bound before a store round-trip
+    let signal;
+    try { signal = await deps.dialSignalStore.get(id); }
+    catch { return json(503, { error: 'dial hydration lookup failed', retryable: true }); }
+    // Resolve membership from the STORED signal's session (only when a signal exists). Absent signal -> skip the lookup
+    // (no session to check) -> the uniform 410 below; this also avoids a knownSessionIdsFor call per bogus-id probe.
+    let member = false;
+    const sessionId = signal && signal.context && typeof signal.context.sessionId === 'string' ? signal.context.sessionId : null;
+    if (sessionId) {
+      let known = [];
+      try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+      member = Array.isArray(known) && known.includes(sessionId);
+    }
+    if (!signal || !member) return json(410, { error: 'dial signal unavailable', reason: 'gone' }); // absent | expired | non-member -> uniform gone
+    return json(200, signal);
+  }
+
   return {
     async handle(req) {
       // handle() is the gateway's contract boundary — it must NEVER throw to an adapter (a throw becomes a runtime crash
@@ -468,6 +501,7 @@ export function createGateway(deps) {
         if (method === 'POST' && path === '/tts') return await handleTts(req, ctx);
         if (method === 'POST' && path === '/deck') return await handleDeck(req, ctx);
         if (method === 'POST' && path === '/dial') return await handleDial(req, ctx);
+        if (method === 'GET' && path === '/dial') return await handleDialFetch(req, ctx);
         if (method === 'POST' && path === '/dial/register') return await handleDialRegister(req, ctx);
         return json(404, { error: 'not found' });
       } catch {

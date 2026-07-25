@@ -9,6 +9,7 @@ import { createDynamoStore } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
 import { createDialPushBackend, createStoreDeviceRegistry } from './dial-registry.mjs';
+import { createDialSignalStore } from './dial-signal-store.mjs';
 import { createDeckVideoBackend } from './deck/deck-video-backend.mjs';
 import { lambdaHandler } from './lambda.mjs';
 
@@ -69,7 +70,11 @@ export function createProdGateway(env = {}, deps = {}) {
   // DISPATCH additionally needs deps.apnsSend (the VoIP push transport, cert-bound): absent, /dial honestly 501s
   // (dial-not-configured) while /dial/register still records tokens for when APNs is wired.
   const deviceRegistry = deps.deviceRegistry || createStoreDeviceRegistry({ store });
-  const pushBackend = deps.pushBackend || (typeof deps.apnsSend === 'function' ? createDialPushBackend({ deviceRegistry, apnsSend: deps.apnsSend }) : undefined);
+  // DIAL hydration store (PR-B2): a LEAN ring (dialPayloadV1 fetch=true) sheds all governed content; the phone re-loads
+  // the full signal via GET /dial?id=, which reads what /dial dispatch persisted here. Rides the SAME store (zero new
+  // infra), constructed UNCONDITIONALLY so GET /dial?id= serves a stored signal even before apnsSend (dispatch) is wired.
+  const dialSignalStore = createDialSignalStore({ store });
+  const pushBackend = deps.pushBackend || (typeof deps.apnsSend === 'function' ? createDialPushBackend({ deviceRegistry, apnsSend: deps.apnsSend, signalStore: dialSignalStore }) : undefined);
 
   // /deck?format=video native backend: resvg (SVG->PNG) + ffmpeg (frames->mp4), deploy-owned binaries via RESVG_BIN /
   // FFMPEG_BIN. SECURITY (Warden's SSRF/LFI gate, carried from the #61 module review): this backend EXECS resvg on
@@ -106,6 +111,7 @@ export function createProdGateway(env = {}, deps = {}) {
     bundleStore: deps.bundleStore,
     deviceRegistry,   // POST /dial/register (store-backed default; deploy may override)
     pushBackend,      // POST /dial dispatch (present only when deps.apnsSend is wired)
+    dialSignalStore,  // GET /dial?id= LEAN-ring hydration (rides the same store)
     agent: 'claude-pocket-relay',
   });
 }
