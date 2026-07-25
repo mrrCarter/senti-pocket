@@ -481,6 +481,40 @@ test('POST /dial/ring-owner: fail-open — no store wired still rings (never dro
   assert.equal(rings, 1, 'idempotency/rate-limit skipped (fail-open) — infra absence never suppresses a ring');
 });
 
+test('POST /dial/ring-owner: fail-open when acquireLock THROWS (Warden/Atlas #90 gap) — rings once, never drops', async () => {
+  let rings = 0;
+  const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
+  // a store whose acquireLock THROWS (lock infra error). withLock would have thrown -> the ring would DROP; the inline
+  // acquisition must FAIL OPEN and ring anyway (exactly once — the error is BEFORE any dispatch).
+  const store = { async get() {}, async put() {}, async acquireLock() { throw new Error('lock backend down'); }, async releaseLock() {} };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, store }));
+  const r = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'Ship?', kind: 'go', context: { sessionId: KNOWN } } });
+  assert.equal(r.status, 200, 'acquireLock error -> fail-open, the ring still dispatched');
+  assert.equal(rings, 1, 'dispatched exactly once (never dropped, never doubled)');
+});
+
+test('POST /dial/ring-owner: a releaseLock failure never double-rings (best-effort release, dispatched once)', async () => {
+  let rings = 0;
+  const m = new Map();
+  const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
+  // acquire succeeds, releaseLock THROWS AFTER the dispatch — the response must be the dispatch result, never a re-ring.
+  const store = { async get(k) { return m.get(k); }, async put(k, v) { m.set(k, v); }, async acquireLock() { return 'token'; }, async releaseLock() { throw new Error('release failed'); } };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, store }));
+  const r = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'Ship?', kind: 'go', context: { sessionId: KNOWN } } });
+  assert.equal(r.status, 200, 'a release-throw is swallowed -> the dispatch result returns');
+  assert.equal(rings, 1, 'dispatched exactly once — a release failure never re-dispatches');
+});
+
+test('POST /dial/ring-owner: 409 when the idempotency lock is already HELD (concurrent identical ring, no double-ring)', async () => {
+  let rings = 0;
+  const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
+  const store = { async get() {}, async put() {}, async acquireLock() { return null; }, async releaseLock() {} }; // held -> null
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, store }));
+  const r = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'Ship?', kind: 'go', context: { sessionId: KNOWN } } });
+  assert.equal(r.status, 409, 'lock held -> a concurrent identical ring is already in flight');
+  assert.equal(rings, 0, 'the second concurrent ring did NOT dispatch (no double-ring)');
+});
+
 test('reconciliation binds to PROPOSAL IDENTITY, not body: an older identical-content action is never finalized (Echo P1)', async () => {
   const store = createInMemoryStore();
   const p = makeProposal({ id: 'pident', renderedPreview: 'Approved.' });
