@@ -25,7 +25,7 @@ export function createInMemoryStore() {
   const locks = new Map(); // key -> owner token
   return {
     async get(key) { return records.get(key); },
-    async put(key, value) { records.set(key, value); return value; },
+    async put(key, value, _opts) { records.set(key, value); return value; }, // _opts (e.g. {ttlEpochSec}) accepted for parity; in-memory relies on the caller's LOGICAL expiry, no physical TTL
     async delete(key) { records.delete(key); },
     /** returns a fresh owner token if acquired; null if already held. */
     async acquireLock(key) { if (locks.has(key)) return null; const token = randomUUID(); locks.set(key, token); return token; },
@@ -55,7 +55,14 @@ export function createDynamoStore(cfg = {}) {
   const nowSec = () => Math.floor(now() / 1000);
   return {
     async get(key) { const r = await client.get({ TableName: table, Key: rk(key) }); return r && r.Item ? r.Item.value : undefined; },
-    async put(key, value) { await client.put({ TableName: table, Item: { ...rk(key), value } }); return value; },
+    async put(key, value, opts = {}) {
+      // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can auto-delete the record (e.g. dial-signal-store's
+      // 900s signals). Records without ttlEpochSec are durable (idempotency/emitted markers), unchanged.
+      const Item = { ...rk(key), value };
+      if (Number.isFinite(opts.ttlEpochSec)) Item.ttl = opts.ttlEpochSec;
+      await client.put({ TableName: table, Item });
+      return value;
+    },
     async delete(key) { await client.delete({ TableName: table, Key: rk(key) }); },
     async acquireLock(key) {
       const token = randomUUID();

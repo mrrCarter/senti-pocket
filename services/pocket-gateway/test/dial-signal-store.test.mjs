@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDialSignalStore, DIAL_SIGNAL_TTL_SECONDS } from '../src/dial-signal-store.mjs';
-import { createInMemoryStore } from '../src/store.mjs';
+import { createInMemoryStore, createDynamoStore } from '../src/store.mjs';
 
 const NOW = 1_770_000_000_000; // fixed clock (ms); nowSec = 1_770_000_000
 const NS = Math.floor(NOW / 1000);
@@ -86,11 +86,36 @@ test('R3: fail-closed — array, non-object, oversized, and non-serializable sig
   await assert.rejects(s.put('need_1', circular), /not JSON-serializable/);
 });
 
-test('R3: a corrupt / id-mismatched stored record reads back as unavailable (never arbitrary content)', async () => {
+test('R5: corrupt stored records read back as unavailable — id-mismatch, OVERSIZE, array, cyclic (validate SIZE+shape on read)', async () => {
   const store = createInMemoryStore();
-  await store.put('dial:sig:6:need_1', { signal: { id: 'someone-else' }, expiresAtSec: NS + 900 }); // planted mismatch
   const s = createDialSignalStore({ store, now: () => NOW });
-  assert.equal(await s.get('need_1'), undefined, 'stored signal.id != dialId -> unavailable');
+  await store.put('dial:sig:6:need_1', { signal: { id: 'someone-else' }, expiresAtSec: NS + 900 });
+  assert.equal(await s.get('need_1'), undefined, 'id mismatch -> unavailable');
+  await store.put('dial:sig:6:need_2', { signal: { id: 'need_2', blob: 'x'.repeat(9000) }, expiresAtSec: NS + 900 }); // ~9025 bytes > 8192
+  assert.equal(await s.get('need_2'), undefined, 'oversize (>8192) planted record -> unavailable (Pulse R5 witness)');
+  await store.put('dial:sig:6:need_3', { signal: ['not', 'an', 'object'], expiresAtSec: NS + 900 });
+  assert.equal(await s.get('need_3'), undefined, 'array signal -> unavailable');
+  const cyc = { id: 'need_4' }; cyc.self = cyc;
+  await store.put('dial:sig:6:need_4', { signal: cyc, expiresAtSec: NS + 900 });
+  assert.equal(await s.get('need_4'), undefined, 'cyclic / non-serializable stored record -> unavailable');
+});
+
+test('R6: over createDynamoStore, the signal record carries a top-level ttl === returned expiry (physical cleanup)', async () => {
+  const puts = [];
+  const client = { async get() { return undefined; }, async put(p) { puts.push(p); return {}; }, async delete() {} };
+  const store = createDynamoStore({ client, table: 'T', now: () => NOW });
+  const r = await createDialSignalStore({ store, now: () => NOW }).put('need_1', mkSignal());
+  const recordPut = puts.find((p) => p.Item && p.Item.sk === 'record');
+  assert.ok(recordPut, 'a signal record put happened');
+  assert.ok(Object.hasOwn(recordPut.Item, 'ttl'), 'top-level ttl attribute present (was MISSING -> retention leak)');
+  assert.equal(recordPut.Item.ttl, r.expiresAtSec, 'top-level Dynamo ttl === returned expiry');
+});
+
+test('idempotency is order-insensitive: a reordered-but-identical retry is idempotent (not a false collision)', async () => {
+  const s = createDialSignalStore({ store: createInMemoryStore(), now: () => NOW });
+  await s.put('need_1', { id: 'need_1', kind: { go: {} }, requestedBy: 'x', question: 'q' });
+  const r = await s.put('need_1', { question: 'q', requestedBy: 'x', kind: { go: {} }, id: 'need_1' }); // same content, reordered keys
+  assert.equal(r.stored, false, 'reordered identical content -> idempotent, not a fail-closed collision');
 });
 
 test('R4: fail-closed clock/config — non-finite clock + invalid ttl reject (no silent fallback)', async () => {
@@ -101,8 +126,9 @@ test('R4: fail-closed clock/config — non-finite clock + invalid ttl reject (no
   await createDialSignalStore({ store, now: () => NOW }).put('need_1', mkSignal());
   await assert.rejects(createDialSignalStore({ store, now: () => NaN }).get('need_1'), /non-finite/);
   // invalid config at construction (no silent fallback)
-  assert.throws(() => createDialSignalStore({ store: createInMemoryStore(), ttlSeconds: -5 }), /positive integer/, 'negative ttl rejected');
-  assert.throws(() => createDialSignalStore({ store: createInMemoryStore(), ttlSeconds: 1.5 }), /positive integer/);
+  assert.throws(() => createDialSignalStore({ store: createInMemoryStore(), ttlSeconds: -5 }), /positive safe integer/, 'negative ttl rejected');
+  assert.throws(() => createDialSignalStore({ store: createInMemoryStore(), ttlSeconds: 1.5 }), /positive safe integer/);
+  assert.throws(() => createDialSignalStore({ store: createInMemoryStore(), ttlSeconds: Number.MAX_VALUE }), /positive safe integer/, 'astronomic ttl rejected');
   assert.throws(() => createDialSignalStore({ store: createInMemoryStore(), now: 'not-a-fn' }), /now must be a function/);
 });
 

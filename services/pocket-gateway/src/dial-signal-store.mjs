@@ -33,6 +33,13 @@ const MAX_SIGNAL_BYTES = 8192;                 // the signal arrives bounded fro
 const sigKey = (dialId) => `dial:sig:${String(dialId).length}:${dialId}`;
 const lockKey = (dialId) => `dial:sig:lock:${String(dialId).length}:${dialId}`;
 
+/** Canonical (recursively key-sorted) JSON, so a reordered-but-identical retry compares equal (idempotent, not a false collision). */
+function canonicalStringify(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonicalStringify).join(',') + ']';
+  return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonicalStringify(v[k])).join(',') + '}';
+}
+
 /** ONE JSON-safe deep-cloned plain-object snapshot (getters evaluated once). Rejects arrays / non-plain / non-serializable. */
 function snapshotSignal(signal) {
   if (signal === null || typeof signal !== 'object' || Array.isArray(signal)) throw new Error('dial signal store: signal must be a plain object');
@@ -52,7 +59,7 @@ export function createDialSignalStore({ store, now = () => Date.now(), ttlSecond
     throw new Error('createDialSignalStore requires a { get, put, acquireLock, releaseLock } store (writes are lock-serialized)');
   }
   if (typeof now !== 'function') throw new Error('createDialSignalStore: now must be a function');
-  if (!(Number.isInteger(ttlSeconds) && ttlSeconds > 0)) throw new Error('createDialSignalStore: ttlSeconds must be a positive integer'); // R4: no silent fallback
+  if (!(Number.isSafeInteger(ttlSeconds) && ttlSeconds > 0 && ttlSeconds <= 604800)) throw new Error('createDialSignalStore: ttlSeconds must be a positive safe integer <= 604800 (7d)'); // R4 + no astronomic expiry
   const ttl = ttlSeconds;
   const nowSec = () => { const ms = now(); if (!Number.isFinite(ms)) throw new Error('dial signal store: clock returned a non-finite value'); return Math.floor(ms / 1000); };
 
@@ -66,20 +73,21 @@ export function createDialSignalStore({ store, now = () => Date.now(), ttlSecond
      */
     async put(dialId, signal) {
       if (typeof dialId !== 'string' || dialId.trim().length === 0) throw new Error('dial signal store: dialId required');
-      const { snap, json, bytes } = snapshotSignal(signal);          // R3
+      const { snap, bytes } = snapshotSignal(signal);                // R3
       if (bytes > MAX_SIGNAL_BYTES) throw new Error(`dial signal store: signal exceeds ${MAX_SIGNAL_BYTES} bytes`);
       if (snap.id !== dialId) throw new Error('dial signal store: signal.id must equal dialId (no id substitution)'); // R2
+      const canon = canonicalStringify(snap);                        // order-insensitive content identity for idempotency
       const ns = nowSec();                                            // R4: throws on non-finite clock
       // SERIALIZE the full read/compare/write under a per-dialId lock (Pulse R2 TOCTOU): two concurrent dispatches for one
       // id can never both write/ring. The lock loser gets locked:false -> fail closed (never a silent last-writer substitution).
       const outcome = await withLock(store, lockKey(dialId), async () => {
         const existing = await store.get(sigKey(dialId));
         if (existing && typeof existing === 'object' && Number.isFinite(existing.expiresAtSec) && ns < existing.expiresAtSec) {
-          if (JSON.stringify(existing.signal) === json) return { stored: false, expiresAtSec: existing.expiresAtSec }; // idempotent retry -> ACTUAL retained expiry
+          if (canonicalStringify(existing.signal) === canon) return { stored: false, expiresAtSec: existing.expiresAtSec }; // idempotent (order-insensitive) retry -> ACTUAL retained expiry
           throw new Error('dial signal store: dialId already holds different content within TTL (fail-closed collision)'); // R2 substitution
         }
         const expiresAtSec = ns + ttl;
-        await store.put(sigKey(dialId), { signal: snap, expiresAtSec, dialId }); // overwrite absent/expired -> R1 no deadlock
+        await store.put(sigKey(dialId), { signal: snap, expiresAtSec, dialId }, { ttlEpochSec: expiresAtSec }); // R1 overwrite absent/expired + R6 top-level Dynamo ttl for cleanup
         return { stored: true, expiresAtSec };
       });
       if (!outcome.locked) throw new Error('dial signal store: write lock unavailable for dialId (concurrent dispatch) — fail closed');
@@ -96,8 +104,11 @@ export function createDialSignalStore({ store, now = () => Date.now(), ttlSecond
       if (!rec || typeof rec !== 'object' || !Number.isFinite(rec.expiresAtSec)) return undefined;
       if (nowSec() >= rec.expiresAtSec) return undefined;             // R1a: expired AT the boundary (>=)
       const s = rec.signal;
-      if (s === null || typeof s !== 'object' || Array.isArray(s) || s.id !== dialId) return undefined; // R3: corrupt/mismatched -> unavailable
-      try { return JSON.parse(JSON.stringify(s)); } catch { return undefined; } // R3: deep clone -> no reference leak
+      if (s === null || typeof s !== 'object' || Array.isArray(s) || s.id !== dialId) return undefined; // corrupt/mismatched shape or id -> unavailable
+      let json;
+      try { json = JSON.stringify(s); } catch { return undefined; } // R5: non-serializable / cyclic stored record -> unavailable
+      if (typeof json !== 'string' || Buffer.byteLength(json, 'utf8') > MAX_SIGNAL_BYTES) return undefined; // R5: oversize corrupt record -> unavailable (validate SIZE on read, not just shape)
+      return JSON.parse(json); // single serialization: deep clone from the SAME json we validated -> no reference leak, no measure/return divergence
     },
   };
 }
