@@ -65,6 +65,13 @@ final class DialSignalClientTests: XCTestCase {
         XCTAssertEqual(req?.httpMethod, "GET")
     }
 
+    // The COMMON expired-ring path: relay's handleDialFetch emits a uniform 410 (Gone) for absent|expired|non-member.
+    func test_fetchDial_throws_notFound_on_410_gone() async {
+        let client = makeClient { (self.http($0.url!, 410), Data("{}".utf8)) }
+        await assertThrows(client, expected: .notFound)
+    }
+
+    // 404 kept as defense (only fires on a routing bug) — also maps to the graceful .notFound.
     func test_fetchDial_throws_notFound_on_404() async {
         let client = makeClient { (self.http($0.url!, 404), Data("{}".utf8)) }
         await assertThrows(client, expected: .notFound)
