@@ -43,10 +43,16 @@ enum DialHydrationClientError: LocalizedError, Equatable {
 final class DialHydrationClient {
     private let apiBaseURL: URL
     private let urlSession: URLSession
+    private let tokenProvider: () -> String?
 
-    init(apiBaseURL: URL, urlSession: URLSession = .shared) {
+    /// `tokenProvider` defaults to the real Keychain session token (SessionTokenStore) but is injectable so the
+    /// fetch is hermetically testable (adopted from forge's DialSignalClient #97 — the one improvement to fold in).
+    init(apiBaseURL: URL,
+         urlSession: URLSession = .shared,
+         tokenProvider: @escaping () -> String? = { SessionTokenStore.load() }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
+        self.tokenProvider = tokenProvider
     }
 
     /// The single seam. Hand it a decoded receive state, get a renderable ring:
@@ -67,7 +73,7 @@ final class DialHydrationClient {
     /// Fetch the FULL NeedCarterSignal over the authenticated GET /dial?id= and merge it onto the push core. The merge
     /// is the security gate: a signal whose id/session/checkpoint doesn't match the push is refused, never rendered.
     private func fetchAndMerge(id: String, core: RingCore) async throws -> RenderableRing {
-        guard let token = SessionTokenStore.load(), !token.isEmpty else { throw DialHydrationClientError.notLoggedIn }
+        guard let token = tokenProvider(), !token.isEmpty else { throw DialHydrationClientError.notLoggedIn }
         guard var comps = URLComponents(url: apiBaseURL, resolvingAgainstBaseURL: true) else {
             throw DialHydrationClientError.network("bad gateway base url")
         }
