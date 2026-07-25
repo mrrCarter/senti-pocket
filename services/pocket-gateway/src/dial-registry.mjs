@@ -251,6 +251,10 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
       }
     }
     // Fan out; dispatched iff AT LEAST ONE device acked. Per-device failure is isolated (one dead token never fails the ring).
+    // WIRE CONTRACT (deploy-owned apnsSend): `payload` is the BARE dial DTO — the injected apnsSend MUST deliver its fields
+    // at the TOP LEVEL of the device's PKPushPayload.dictionaryPayload (alongside `aps`), NOT nested under a `payload`/`data`
+    // key. The app reads id/kind/… top-level; nesting => top-level `id` absent => every ring decodes .rejected, silently.
+    // See app.mjs deps.apnsSend JSDoc + part-b criterion #6 (app-side enveloped round-trip test).
     let delivered = 0;
     for (const d of devices) {
       try { const r = await apnsSend({ voipToken: d.voipToken, platform: d.platform || 'apns', payload }); if (r && r.delivered) delivered += 1; }
