@@ -18,6 +18,12 @@ struct SentiPocketApp: App {
     /// DI seams (hydrate via the authed DialHydrationClient / runDial via LiveDialVoice+PhoneWriteAdapter+orchestrator).
     @StateObject private var dialHost = DialHost()
     #endif
+    #if !DEBUG
+    /// The login GATE (Atlas, 322268 — closes the gate≠live gap): makes SentiNativeAuth LIVE. Signed-out →
+    /// PocketSignInView; signed-in → the authed PhoneRootView. Every authed client (hydrate/reason/write) is
+    /// unreachable until a REAL token is stored (warden gate #1). DEBUG stays on the fixture flow (no real auth).
+    @StateObject private var signIn = SignInCoordinator(login: SentiPocketApp.makeLogin())
+    #endif
 
     var body: some Scene {
         WindowGroup {
@@ -32,9 +38,34 @@ struct SentiPocketApp: App {
         #if DEBUG
         RootAppView(model: model)
         #else
-        PhoneRootView()   // B2: the REAL coordinator + phone-write flow (kills the old static RootView List)
+        // WARDEN gate #1 (322268): the authed surfaces are unreachable until a REAL token is stored.
+        if signIn.isAuthenticated {
+            PhoneRootView()   // B2: the REAL coordinator + phone-write flow (kills the old static RootView List)
+        } else {
+            PocketSignInView(phase: signIn.phase, send: signIn.send)
+        }
         #endif
     }
+
+    #if !DEBUG
+    /// Build the REAL device-flow login closure (gate #2: never fake a token). The auth-API base is SENTI_API_URL if
+    /// set, else the gateway (which proxies /api/v1/auth/cli/… in the demo) — @claude-pocket-relay confirms which on PR.
+    private static func makeLogin() -> () async throws -> Void {
+        let base = authBaseURL()
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.1"
+        return { try await SentiNativeAuth(apiBaseURL: base, appVersion: version).login() }
+    }
+
+    /// The auth device-flow base: SENTI_API_URL if configured, else SENTI_GATEWAY_URL, else the current tunnel. Kept
+    /// separate from the gateway resolver so auth can move to its own host without a code change.
+    private static func authBaseURL() -> URL {
+        let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
+        let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_API_URL") as? String)
+            ?? (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)
+        let raw = (configured?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? fallback
+        return URL(string: raw) ?? URL(string: fallback)!
+    }
+    #endif
 }
 
 /// B2 composition root (warden #261831): the real reasoning coordinator + the phone-write flow, wired to the
