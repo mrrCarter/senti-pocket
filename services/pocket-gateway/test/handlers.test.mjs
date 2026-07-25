@@ -380,6 +380,61 @@ test('GET /dial?id=: fail-closed on scope / auth / id / store', async () => {
   assert.equal((await noStore.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: { authorization: 'Bearer dial' } })).status, 501, 'no dialSignalStore wired -> 501');
 });
 
+// ── POST /dial/ring-owner — the EXPLICIT ring producer (PR-B3): describe a need -> canonical signal -> dispatch ──
+test('POST /dial/ring-owner: builds a canonical signal + dispatches (rich fields + storedSignal carried; target from AUTH)', async () => {
+  let captured;
+  const pushBackend = async (input) => { captured = input; return { dispatched: true, dialId: input.id }; };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend }));
+  const r = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'Ship the consolidation to master?', kind: 'decisionYours', context: { sessionId: KNOWN, whatWeNeed: 'master merge go' }, evidenceSeqs: [315038], requestedBy: 'claude-warden' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.dispatched, true);
+  assert.equal(r.body.kind, 'decisionYours');
+  assert.ok(typeof r.body.dialId === 'string' && r.body.dialId.startsWith('need_'), 'gateway-generated opaque dial id');
+  assert.equal(captured.humanId, 'consumer-123', 'ring target from verified auth (confused-deputy)');
+  assert.equal(captured.kind, 'decisionYours');
+  assert.equal(captured.callerName, 'Senti · claude-warden needs your decision');
+  assert.deepEqual(captured.evidenceSeqs, [315038]);
+  assert.equal(captured.storedSignal.id, captured.id, 'storedSignal.id == input.id (== the store key)');
+  assert.deepEqual(captured.storedSignal.evidenceSeqs, [315038]);
+  assert.equal(typeof captured.storedSignal.createdAt, 'number');
+  assert.ok(captured.storedSignal.createdAt > 1_600_000_000 && captured.storedSignal.createdAt < 5_000_000_000, 'createdAt is Unix SECONDS, not ms');
+});
+
+test('POST /dial/ring-owner: SECURITY — target humanId from auth, never the body (confused-deputy)', async () => {
+  let captured;
+  const pushBackend = async (input) => { captured = input; return { dispatched: true, dialId: input.id }; };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend }));
+  await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'q', kind: 'go', humanId: 'human-attacker', context: { sessionId: KNOWN, humanId: 'human-attacker', whatWeNeed: 'x' } } });
+  assert.equal(captured.humanId, 'consumer-123', 'body/context-supplied humanId ignored; verified auth wins');
+});
+
+test('POST /dial/ring-owner: pickOption carries options into the dispatched input + storedSignal (Codable wire)', async () => {
+  let captured;
+  const pushBackend = async (input) => { captured = input; return { dispatched: true, dialId: input.id }; };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend }));
+  const r = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'Which path?', kind: 'pickOption', options: ['Merge now', 'Wait'], context: { sessionId: KNOWN, whatWeNeed: 'choose' }, requestedBy: 'atlas' } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(captured.options, ['Merge now', 'Wait']);
+  assert.deepEqual(captured.storedSignal.kind, { pickOption: { _0: ['Merge now', 'Wait'] } });
+  assert.equal(captured.callerName, 'Senti · atlas needs you to choose');
+});
+
+test('POST /dial/ring-owner: fail-closed — scope / auth / question / sessionId / membership / below-floor / pickOption / backend', async () => {
+  const pushBackend = async (input) => ({ dispatched: true, dialId: input.id });
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend }));
+  const ring = (body, auth = 'Bearer dial') => gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: auth ? { authorization: auth } : {}, body });
+  assert.equal((await ring({ question: 'q', context: { sessionId: KNOWN } }, 'Bearer nodial')).status, 403, 'no pocket:dial -> 403');
+  assert.equal((await ring({ question: 'q', context: { sessionId: KNOWN } }, null)).status, 401, 'no auth -> 401');
+  assert.equal((await ring({ context: { sessionId: KNOWN } })).status, 400, 'no question -> 400');
+  assert.equal((await ring({ question: 'q' })).status, 400, 'no context.sessionId -> 400');
+  assert.equal((await ring({ question: 'which?', kind: 'pickOption', context: { sessionId: KNOWN } })).status, 400, 'pickOption without options -> 400');
+  assert.equal((await ring({ question: 'q', kind: 'go', confidence: 0.3, context: { sessionId: KNOWN } })).status, 422, 'below ring floor -> 422');
+  const nonMember = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, knownSessionIdsFor: async () => ['00000000-0000-0000-0000-000000000000'] }));
+  assert.equal((await nonMember.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'q', context: { sessionId: KNOWN } } })).status, 403, 'non-member -> 403');
+  const noBackend = createGateway(baseDeps({ verifyToken: dialVerify }));
+  assert.equal((await noBackend.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'q', context: { sessionId: KNOWN } } })).status, 501, 'no pushBackend -> 501');
+});
+
 test('reconciliation binds to PROPOSAL IDENTITY, not body: an older identical-content action is never finalized (Echo P1)', async () => {
   const store = createInMemoryStore();
   const p = makeProposal({ id: 'pident', renderedPreview: 'Approved.' });

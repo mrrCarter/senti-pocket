@@ -30,8 +30,11 @@
 //   (b) dial-id source: Swift dialFields() uses signal.id; my buildDialPayload computes computeDialId(...). Today's
 //       path dispatches through the existing pushBackend (id = computeDialId); mapSignalToDialFields exposes
 //       dialId=signal.id for the FOLLOW-UP that threads signal.id + callerName onto the wire (coordinated w/ warden).
-//   (c) Swift's default Date Codable is a 2001-epoch Double (not ISO) -> createdAt is carried OPAQUE here; the
-//       detector's producer side needs an agreed date strategy before it emits signals.
+//   (c) RESOLVED: createdAt wire = Unix-epoch SECONDS (Int). The mapper carries it OPAQUE; the PRODUCER
+//       (POST /dial/ring-owner / the detector) sets it = Math.floor(nowMs/1000), always present. Atlas's NeedCarterSignal
+//       custom-decodes Unix-seconds-or-absent -> Date (atlas/createdAt-unix-decode), so the sane Unix wire — NOT Swift's
+//       2001-secondsSinceReferenceDate default — is the contract. Fixture 1784370900 (= 2026-07-16). Absent is decoder
+//       belt-and-suspenders; the producer wire is always-present Unix seconds.
 //   (d) WIRE COMPLETENESS — CLOSED by dialPayloadV1 (#77) + PR-B2. The versioned bounded APNs DTO (buildDialPayload v1)
 //       now carries id/kind/callerName/options/checkpointId/evidenceSeqs/confidence on a RICH (fetch=false) ring, and a
 //       LEAN (fetch=true) ring hydrates the full signal via the authenticated GET /dial?id= (PR-B2) off the dispatch-time

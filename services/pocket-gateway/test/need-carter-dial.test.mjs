@@ -5,6 +5,7 @@
 // on a malformed signal, and robustness across the kind wire shapes (seam (a)).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   RING_CONFIDENCE_FLOOR, NEED_CARTER_KINDS, kebabSlug, dialPriorityForKind, callerNameForKind,
   parseSignalKind, encodeSignalKind, normalizeSignal, signalClearsRingFloor,
@@ -173,6 +174,20 @@ test('mapSignalToPushInput: absent optionals — checkpointId/options omitted, b
   // omitted -> an evidence-less ring is a dead doorbell. The stored signal MUST ALWAYS carry it ([] when empty).
   assert.deepEqual(r.storedSignal.evidenceSeqs, [], 'storedSignal ALWAYS emits evidenceSeqs ([] when empty) — non-optional Swift field');
   assert.ok(!('createdAt' in r.storedSignal), 'createdAt omitted when absent (producer always emits Unix-sec; atlas decoder decodeIfPresent tolerates)');
+});
+
+// ── shared KAV fixture: relay producer <-> atlas Swift decoder, one source of truth (no drift) ────────────────────
+test('storedSignal matches the shared NeedCarterSignal KAV fixture (byte-parity vs atlas decoder)', () => {
+  const kav = JSON.parse(readFileSync(new URL('./fixtures/need-carter-signal-v1.json', import.meta.url), 'utf8'));
+  assert.ok(kav.cases.length >= 3, 'fixture carries the rich / no-evidence / pickOption cases');
+  for (const c of kav.cases) {
+    const r = mapSignalToPushInput(c.input, { humanId: c.humanId });
+    assert.equal(r.ring, true, `${c.name}: rings`);
+    // relay side of the KAV: the exact bytes atlas's NeedCarterSignal decoder consumes. evidenceSeqs is ALWAYS present
+    // ([] when empty — Warden #83 BUG 1); createdAt is Unix-epoch seconds; kind is the Swift synthesized wire shape.
+    assert.deepEqual(r.storedSignal, c.expectedStoredSignal, `${c.name}: storedSignal == KAV expectedStoredSignal`);
+    assert.deepEqual(r.storedSignal.evidenceSeqs, c.expectedStoredSignal.evidenceSeqs, `${c.name}: evidenceSeqs present (never omitted)`);
+  }
 });
 
 test('mapSignalToPushInput: SECURITY — target humanId comes from AUTH, never the signal (confused-deputy)', () => {
