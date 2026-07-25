@@ -50,6 +50,9 @@ final class NeedCarterSignalTests: XCTestCase {
     // Decode relay's gateway storedSignal wire (PR-B2 #83): createdAt = UNIX-epoch INT, evidenceSeqs OMITTED.
     // This is the exact shape GET /dial?id= returns; my custom Codable must decode it (Swift's default would skew
     // createdAt by 31yrs on a Unix int, and THROW on the missing non-optional evidenceSeqs/createdAt).
+    // NOTE: the AUTHORITATIVE cross-language parity guard is now NeedCarterSignalKAVTests, which decodes relay's
+    // ACTUAL committed fixture (need-carter-signal-v1.json) so the two sides can't drift. This inline case stays as
+    // a fast, hermetic smoke test of the same decode path.
     func test_decodes_relay_wire_unix_epoch_and_omitted_optionals() throws {
         let wire = """
         {"id":"need_1","kind":{"decisionYours":{}},"question":"Ship the consolidation to master?",
