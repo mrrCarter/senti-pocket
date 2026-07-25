@@ -107,13 +107,21 @@ test('buildDialPayload v1: identity FAIL-CLOSED (blank/overbound/control id|sess
   assert.equal(buildDialPayload({ humanId: 'u', sessionId: '6cf7e861', id: 'need_1', kind: 'go', message: 'm' }, NOW).id, 'need_1');
 });
 
-test('buildDialPayload v1: EVERY shared fixture is reproduced byte-for-byte (KAV parity for forge decode)', () => {
-  assert.ok(Object.keys(fixtures.cases).length >= 4, 'fixtures present');
+test('buildDialPayload v1: EVERY shared fixture reproduced byte-for-byte + declared bytes locked (KAV parity for forge)', () => {
+  assert.ok(Object.keys(fixtures.cases).length >= 5, 'fixtures present (incl max_core)');
   for (const [name, c] of Object.entries(fixtures.cases)) {
     const got = buildDialPayload(c.input, fixtures.meta.clockMs);
     assert.deepEqual(got, c.payload, `fixture ${name} reproduced exactly (drift -> regenerate the fixture)`);
-    assert.ok(Buffer.byteLength(JSON.stringify(got), 'utf8') <= DIAL_PUSHKIT_CAP, `fixture ${name} <= 5120 (PushKit cap)`);
+    const bytes = Buffer.byteLength(JSON.stringify(got), 'utf8');
+    assert.equal(bytes, c.bytes, `fixture ${name} declared byte count === actual (R6 metadata lock; catches serialization drift)`);
+    assert.ok(bytes <= DIAL_PUSHKIT_CAP, `fixture ${name} <= 5120 (PushKit cap)`);
   }
+  // R6: the max-core case proves the WORST-CASE core (exact 128-byte identities + 128 astral display codepoints) fits as LEAN.
+  const mc = fixtures.cases.max_core;
+  assert.ok(mc, 'max_core fixture present');
+  assert.equal(mc.payload.fetch, true, 'max_core is LEAN (all governed shed)');
+  assert.equal('message' in mc.payload, false, 'max_core is core-only');
+  assert.ok(mc.bytes <= DIAL_PAYLOAD_MAX_BYTES, `max_core core (${mc.bytes}B) <= ${DIAL_PAYLOAD_MAX_BYTES} budget`);
 });
 
 test('pushBackend: a resolved device with invalid identity -> fail-closed invalid-dial-payload (never a garbage ring)', async () => {
@@ -142,6 +150,15 @@ test('R1: evidenceSeqs are COMPLETE — 65 stay 65 (deduped/sorted, never capped
   assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: [9007199254740993] }, NOW), /positive safe integer/, 'unsafe int64 -> fail closed (no numeric corruption)');
   assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: [-1] }, NOW), /positive safe integer/);
   assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: [1.5] }, NOW), /positive safe integer/);
+});
+
+test('R5: PRESENT non-array evidenceSeqs/options/checkpointId fail closed; ONLY undefined is absent', () => {
+  assert.equal('evidenceSeqs' in buildDialPayload({ sessionId: 's', message: 'm' }, NOW), false, 'absent (undefined) evidenceSeqs -> omitted');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: '315' }, NOW), /must be an array/, 'string evidenceSeqs rejected (was silently [])');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: { 0: 315 } }, NOW), /must be an array/, 'object evidenceSeqs rejected');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', evidenceSeqs: null }, NOW), /must be an array/, 'null evidenceSeqs rejected (present-invalid, not absent)');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'q', kind: 'pickOption', options: 'A' }, NOW), /must be an array/, 'string options rejected');
+  assert.throws(() => buildDialPayload({ sessionId: 's', message: 'm', checkpointId: null }, NOW), /checkpointId/, 'null checkpointId rejected (only undefined is absent)');
 });
 
 test('R2: kind absent -> info (legacy); PRESENT-invalid -> fail closed; message required', () => {

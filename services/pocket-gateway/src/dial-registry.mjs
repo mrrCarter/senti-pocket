@@ -74,19 +74,21 @@ function assertOpaqueId(name, v) {
   if (hasControlChar(v)) throw new Error(`dial: ${name} has control chars`);
   return v; // unaltered — an opaque value's own spaces/casing are preserved
 }
-/** Optional opaque id: absent -> undefined; PRESENT-but-invalid -> throws (fail-closed; never silently omit identity). */
-function optOpaqueId(name, v) { return (v === undefined || v === null) ? undefined : assertOpaqueId(name, v); }
+/** Optional opaque id: ONLY undefined is absent; a PRESENT value (incl null) -> assertOpaqueId (fail-closed; never silently omit identity). */
+function optOpaqueId(name, v) { return v === undefined ? undefined : assertOpaqueId(name, v); }
 /** Display string (callerName/who): codepoint-safe bound + safe fallback. Never splits a surrogate pair (R4). Display is not identity -> never fail-closed. */
 const boundDisplay = (v, max, fallback) => { const s = typeof v === 'string' ? v.trim() : ''; if (!s) return fallback; const cp = [...s]; return cp.length <= max ? s : cp.slice(0, max).join(''); };
 /** evidenceSeqs: every element MUST be a POSITIVE SAFE integer (fail-closed on unsafe/negative/non-int); de-duped + SORTED ASC. COMPLETE — never capped (R1); over-budget -> the ladder emits LEAN. */
 const normSeqs = (v) => {
-  if (!Array.isArray(v)) return [];
+  if (v === undefined) return []; // ONLY absent (undefined) -> []
+  if (!Array.isArray(v)) throw new Error('dial: evidenceSeqs must be an array (present-but-invalid fails closed)'); // R5: present null/string/object must not silently omit
   for (const n of v) if (!Number.isSafeInteger(n) || n <= 0) throw new Error('dial: evidenceSeq must be a positive safe integer (int64 beyond JS-safe range needs a versioned string wire, not numeric corruption)');
   return [...new Set(v)].sort((a, b) => a - b);
 };
 /** pickOption labels: every label MUST be a non-empty string (fail-closed). COMPLETE + UNALTERED — never capped/truncated (R1, atomic unit); over-budget -> LEAN. */
 const normOptions = (v) => {
-  if (!Array.isArray(v)) return [];
+  if (v === undefined) return []; // ONLY absent (undefined) -> [] (the pickOption-requires-options check throws downstream)
+  if (!Array.isArray(v)) throw new Error('dial: options must be an array (present-but-invalid fails closed)'); // R5: present null/string/object fails closed
   return v.map((x) => { if (typeof x !== 'string' || x.trim().length === 0) throw new Error('dial: every pickOption label must be a non-empty string'); return x; });
 };
 const serializedBytes = (obj) => Buffer.byteLength(JSON.stringify(obj), 'utf8');
