@@ -57,28 +57,91 @@ export function validateRegistration(body) {
   return { ok: true, value: { voipToken, sessionId, platform } };
 }
 
+// ── dialPayloadV1 — the versioned, bounded APNs ring wire (spec v0.6 @ C:\tmp\dialPayloadV1-spec, Pulse SPEC +1) ──
+// PushKit VoIP caps the ENTIRE push at 5120 bytes; we target our serialized payload at 5120 minus an envelope reserve.
+export const DIAL_PUSHKIT_CAP = 5120;               // Apple PushKit VoIP total-payload hard cap (bytes)
+const DIAL_ENVELOPE_RESERVE = 256;                  // headroom for the APNs aps envelope + framing wrapping our JSON
+export const DIAL_PAYLOAD_MAX_BYTES = DIAL_PUSHKIT_CAP - DIAL_ENVELOPE_RESERVE; // 4864: budget our serialized payload fits under
+export const DIAL_KINDS = Object.freeze(['go', 'decisionYours', 'pickOption', 'info', 'checkpointReady']);
+const DIAL_ID_MAX = 128, DIAL_CALLER_MAX = 128; // identity byte-bound + display codepoint-bound. options + evidenceSeqs are NEVER capped/truncated (R1: complete or LEAN).
+// Reject Unicode Cc controls in an opaque identity: C0 (< 0x20) + DEL (0x7f) + C1 (0x80-0x9f). charCodeAt avoids control-char regex literals.
+const hasControlChar = (s) => { for (let i = 0; i < s.length; i += 1) { const c = s.charCodeAt(i); if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true; } return false; };
+
+/** Opaque identity validator (id/sessionId/checkpointId): NON-BLANK (not whitespace-only), UTF-8 <= max, no Cc controls. Throws (fail-closed); value returned UNALTERED (never trimmed/truncated). */
+function assertOpaqueId(name, v) {
+  if (typeof v !== 'string' || v.trim().length === 0) throw new Error(`dial: ${name} required (opaque, non-blank)`);
+  if (utf8(v) > DIAL_ID_MAX) throw new Error(`dial: ${name} exceeds ${DIAL_ID_MAX} bytes`);
+  if (hasControlChar(v)) throw new Error(`dial: ${name} has control chars`);
+  return v; // unaltered — an opaque value's own spaces/casing are preserved
+}
+/** Optional opaque id: ONLY undefined is absent; a PRESENT value (incl null) -> assertOpaqueId (fail-closed; never silently omit identity). */
+function optOpaqueId(name, v) { return v === undefined ? undefined : assertOpaqueId(name, v); }
+/** Display string (callerName/who): codepoint-safe bound + safe fallback. Never splits a surrogate pair (R4). Display is not identity -> never fail-closed. */
+const boundDisplay = (v, max, fallback) => { const s = typeof v === 'string' ? v.trim() : ''; if (!s) return fallback; const cp = [...s]; return cp.length <= max ? s : cp.slice(0, max).join(''); };
+/** evidenceSeqs: every element MUST be a POSITIVE SAFE integer (fail-closed on unsafe/negative/non-int); de-duped + SORTED ASC. COMPLETE — never capped (R1); over-budget -> the ladder emits LEAN. */
+const normSeqs = (v) => {
+  if (v === undefined) return []; // ONLY absent (undefined) -> []
+  if (!Array.isArray(v)) throw new Error('dial: evidenceSeqs must be an array (present-but-invalid fails closed)'); // R5: present null/string/object must not silently omit
+  for (const n of v) if (!Number.isSafeInteger(n) || n <= 0) throw new Error('dial: evidenceSeq must be a positive safe integer (int64 beyond JS-safe range needs a versioned string wire, not numeric corruption)');
+  return [...new Set(v)].sort((a, b) => a - b);
+};
+/** pickOption labels: every label MUST be a non-empty string (fail-closed). COMPLETE + UNALTERED — never capped/truncated (R1, atomic unit); over-budget -> LEAN. */
+const normOptions = (v) => {
+  if (v === undefined) return []; // ONLY absent (undefined) -> [] (the pickOption-requires-options check throws downstream)
+  if (!Array.isArray(v)) throw new Error('dial: options must be an array (present-but-invalid fails closed)'); // R5: present null/string/object fails closed
+  return v.map((x) => { if (typeof x !== 'string' || x.trim().length === 0) throw new Error('dial: every pickOption label must be a non-empty string'); return x; });
+};
+const serializedBytes = (obj) => Buffer.byteLength(JSON.stringify(obj), 'utf8');
+
 /**
- * The deterministic push payload the phone decodes (forge decode() reads {id, who, priority}; always-presentable). The
- * deploy's pushBackend builds this from warden's /dial fields + the resolved device, so id/who/priority are consistent
- * and a dialId is stable. message = caller intent (unscrubbed by design); context = session-echo (warden already
- * scrubs + bounds it in /dial before it reaches here).
- * @param {{humanId, sessionId, message, context?, priority?, who?}} f
+ * Build the DialPayloadV1 the phone decodes. CORE (v/id/kind/priority/callerName/who/sessionId/checkpointId?/fetch/ts)
+ * is always present + bounded (always fits). GOVERNED content (message/options/context/evidenceSeqs/confidence) is
+ * included only when the whole payload fits DIAL_PAYLOAD_MAX_BYTES; else the deterministic RICH->LEAN ladder sheds it:
+ *   fits -> fetch=false (complete, renderable)  |  drop confidence (non-governed) -> still fetch=false  |
+ *   else fetch=true LEAN: ALL governed content dropped, core-only; phone hydrates via the authenticated GET (no partial-speak).
+ * Identity is OPAQUE + FAIL-CLOSED (throws on blank/overbound/control; never truncated). A pickOption with no options is
+ * malformed -> throws. `id` override (opaque) is used verbatim (signal-originated); absent -> computeDialId (legacy /dial).
+ * @param {{humanId?, sessionId, message?, context?, priority?, who?, id?, kind?, callerName?, options?, checkpointId?, evidenceSeqs?, confidence?}} f
  * @param {number} nowMs  injected clock (deterministic)
  */
 export function buildDialPayload(f = {}, nowMs = 0) {
+  const sessionId = assertOpaqueId('sessionId', typeof f.sessionId === 'string' ? f.sessionId : '');
+  const checkpointId = optOpaqueId('checkpointId', f.checkpointId); // present-but-invalid throws (never silently omitted)
+  // R2: message is REQUIRED (a fetch=false payload must carry a validated question). The FULL message rides the payload;
+  // the ladder sheds it WHOLE (LEAN) if over budget; NEVER truncated (spec D).
   const message = typeof f.message === 'string' ? f.message : '';
+  if (message.trim().length === 0) throw new Error('dial: message required');
   const priority = DIAL_PRIORITIES.includes(f.priority) ? f.priority : 'medium';
-  const who = (typeof f.who === 'string' ? f.who.trim() : '').slice(0, DIAL_LIMITS.WHO) || 'senti-pocket';
-  const context = typeof f.context === 'string' && f.context.length ? f.context.slice(0, DIAL_LIMITS.CONTEXT) : undefined;
-  return {
-    id: computeDialId(f.humanId, f.sessionId, message, nowMs),
-    who,
-    priority,
-    message,
+  const who = boundDisplay(f.who, DIAL_LIMITS.WHO, 'senti-pocket');
+  // R2: kind ABSENT -> "info" (documented legacy default); PRESENT-but-invalid -> fail closed.
+  let kind;
+  if (f.kind === undefined || f.kind === null) kind = 'info';
+  else if (DIAL_KINDS.includes(f.kind)) kind = f.kind;
+  else throw new Error('dial: unknown kind (present-but-invalid fails closed)');
+  const callerName = boundDisplay(f.callerName, DIAL_CALLER_MAX, 'Senti needs you');
+  const id = f.id !== undefined ? assertOpaqueId('id', f.id) : computeDialId(f.humanId, sessionId, message, nowMs);
+  const context = typeof f.context === 'string' && f.context.length ? f.context : undefined; // governed — ladder drops it WHOLE if over budget, never truncated (spec D)
+  const options = kind === 'pickOption' ? normOptions(f.options) : [];
+  if (kind === 'pickOption' && options.length === 0) throw new Error('dial: pickOption requires >=1 option (atomic with the question)');
+  const evidenceSeqs = normSeqs(f.evidenceSeqs);
+  const confidence = typeof f.confidence === 'number' && Number.isFinite(f.confidence) ? Math.max(0, Math.min(1, f.confidence)) : undefined;
+  const ts = new Date(nowMs).toISOString();
+
+  const core = { v: 1, id, kind, priority, callerName, who, sessionId, ...(checkpointId ? { checkpointId } : {}), fetch: false, ts };
+  const governed = {
+    ...(message ? { message } : {}),
+    ...(options.length ? { options } : {}),
     ...(context ? { context } : {}),
-    sessionId: typeof f.sessionId === 'string' ? f.sessionId : '',
-    ts: new Date(nowMs).toISOString(),
+    ...(evidenceSeqs.length ? { evidenceSeqs } : {}),
   };
+  // RICH: core + governed + confidence.
+  let rich = { ...core, ...governed, ...(confidence !== undefined ? { confidence } : {}) };
+  if (serializedBytes(rich) <= DIAL_PAYLOAD_MAX_BYTES) return rich;
+  // Drop confidence (NON-governed, debug-only) — stays fetch=false.
+  rich = { ...core, ...governed };
+  if (serializedBytes(rich) <= DIAL_PAYLOAD_MAX_BYTES) return rich;
+  // LEAN: fetch=true, ALL governed content shed; core-only. The phone hydrates via the authenticated GET (no partial-speak).
+  return { ...core, fetch: true };
 }
 
 /**
@@ -150,7 +213,9 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
     ).slice(0, cap);
     if (devices.length === 0) return { dispatched: false, reason: 'no-device-token' };
     if (typeof apnsSend !== 'function') return { dispatched: false, reason: 'push-transport-not-configured' };
-    const payload = buildDialPayload({ humanId, sessionId, message, context, priority }, clock());
+    let payload;
+    try { payload = buildDialPayload({ humanId, sessionId, message, context, priority }, clock()); }
+    catch { return { dispatched: false, reason: 'invalid-dial-payload' }; } // fail-closed: blank/overbound/control identity never rings
     // Fan out; dispatched iff AT LEAST ONE device acked. Per-device failure is isolated (one dead token never fails the ring).
     let delivered = 0;
     for (const d of devices) {
