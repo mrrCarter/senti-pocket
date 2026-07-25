@@ -89,6 +89,9 @@ targets:
       - target: SentiPocketApp
       - package: PocketContracts
       - package: PocketUI
+      # PocketCall: DialCoordinatorTests imports it + references PocketCall.DialOutcome. Was missing → the test target
+      # failed to LINK (undefined symbol, caught on the MacinCloud build — no build-CI had caught this pre-existing gap).
+      - package: PocketCall
     settings:
       base:
         GENERATE_INFOPLIST_FILE: true
