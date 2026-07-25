@@ -19,7 +19,7 @@ import { renderDeck } from './deck/templates.mjs';
 import { narrateDeck } from './deck/narration.mjs';
 import { buildStoryboard, assembleDeckVideo } from './deck/video.mjs';
 import { createDialRegistry } from './dial-registry.mjs';
-import { groundingIdsFromBundle } from './grounding-gate.mjs';
+import { groundingIdsFromBundle, keepGrounded, isGrounded } from './grounding-gate.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 
@@ -209,13 +209,12 @@ export function createGateway(deps) {
     const segments = rawSegments
       .map((seg) => {
         const s = seg && typeof seg === 'object' ? seg : {};
-        const claimed = Array.isArray(s.evidenceIds) ? s.evidenceIds : [];
-        const evidenceIds = [...new Set(claimed.filter((id) => groundedEvidenceIds.includes(id)))]; // drop hallucinated cites
+        const evidenceIds = keepGrounded(s.evidenceIds, groundedEvidenceIds); // drop hallucinated cites (shared honesty gate)
         const source = typeof s.taggedText === 'string' ? s.taggedText : (typeof s.text === 'string' ? s.text : '');
         const { tagged, plain } = splitTagged(source); // audio-tagged (ElevenLabs) + plain (AVSpeech/OpenAI-TTS)
         return { text: plain, taggedText: tagged, evidenceIds };
       })
-      .filter((seg) => seg.evidenceIds.length > 0 && seg.text); // grounding-first: only grounded segments cross
+      .filter(isGrounded); // grounding-first (shared gate): visible text (trim) + >=1 grounded cite — was seg.text-truthy, which kept whitespace-only segments (parity with gemma-backend/brief-pipeline #69/#70)
     // `grounded:false` (no segment survived) is an HONEST "no reasoned briefing grounded in this checkpoint"
     // signal — the caller labels it (never a fabricated brief), same discipline as /answer's unavailable.
     return json(200, { segments, grounded: segments.length > 0, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion });
