@@ -70,11 +70,25 @@ async function fetchWithTimeout(doFetch, url, init, timeoutMs) {
 }
 
 /**
+ * The origin key used to vet a voiceUrl against the trusted set (SSRF defense-in-depth for createPocketTTSBackend).
+ * http(s)/ws(s) -> URL.origin (scheme://host:port). Non-special schemes (e.g. hf://, s3://) have an opaque "null"
+ * origin, so key on scheme//host (hf://voices/* all share hf://voices). Returns null for a non-string / unparseable
+ * value, which is therefore never trusted.
+ */
+function voiceUrlOrigin(u) {
+  if (typeof u !== 'string' || !u) return null;
+  let parsed;
+  try { parsed = new URL(u); } catch { return null; }
+  if (parsed.origin && parsed.origin !== 'null') return parsed.origin;
+  return parsed.host ? `${parsed.protocol}//${parsed.host}` : null;
+}
+
+/**
  * FREE, LOCAL TTS via kyutai pocket-tts `serve` (POST /tts, multipart form, audio/wav out). No API key, no per-char
  * cost — a 100M model on CPU (~8x realtime). SAME ttsBackend(text, opts) -> { audio, format } contract as
  * createElevenLabsBackend, so it's a drop-in swap selected by the composition root. pocket-tts has no native tone
  * control, so `tone` selects a pre-cloned per-tone voice from `toneVoices` when provided (our free "audio tags").
- * @param {{ baseUrl?:string, fetch?:Function, defaultVoiceUrl?:string, toneVoices?:Record<string,string>, timeoutMs?:number }} cfg
+ * @param {{ baseUrl?:string, fetch?:Function, defaultVoiceUrl?:string, toneVoices?:Record<string,string>, timeoutMs?:number, allowedVoiceUrlOrigins?:string[] }} cfg
  * @returns ttsBackend(text, {tone,voiceUrl}) -> { audio: Buffer, format:'wav' }
  */
 export function createPocketTTSBackend(cfg = {}) {
@@ -83,13 +97,26 @@ export function createPocketTTSBackend(cfg = {}) {
   if (typeof doFetch !== 'function') throw new Error('no fetch implementation available');
   const toneVoices = cfg.toneVoices || {}; // { urgent:<voice_url>, calm:<voice_url>, warm:<voice_url> } — free tone approximation
   const timeoutMs = Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs > 0 ? cfg.timeoutMs : 10_000; // hard cap: a hung pocket-tts serve fails closed, never hangs the ring/brief
+  // SSRF defense-in-depth: the pocket-tts serve FETCHES voice_url server-side, so a caller-controlled voiceUrl is an
+  // SSRF vector. Deploy-configured voiceUrls (toneVoices, defaultVoiceUrl) are trusted by origin; a CALLER-supplied
+  // opts.voiceUrl is forwarded ONLY if its origin matches one of those (or an explicit cfg.allowedVoiceUrlOrigins) —
+  // else it is ignored (falls back to the tone/default voice). The guard lives HERE so it holds even if a future
+  // handler forwards opts.voiceUrl (today handleTts forwards only voiceId/tone, never a URL).
+  const trustedVoiceOrigins = new Set(
+    [cfg.defaultVoiceUrl, ...Object.values(toneVoices), ...(cfg.allowedVoiceUrlOrigins || [])]
+      .map(voiceUrlOrigin)
+      .filter(Boolean),
+  );
 
   return async function ttsBackend(text, opts = {}) {
     const t = String(text ?? '');
     if (!t) throw new Error('text required');
-    // A cloned per-tone voice stands in for ElevenLabs tone tags (pocket-tts has no prosody control); explicit
-    // opts.voiceUrl wins, then the tone→voice map, then a configured default (else the server's built-in voice).
-    const voiceUrl = opts.voiceUrl || toneVoices[String(opts.tone || '').toLowerCase()] || cfg.defaultVoiceUrl;
+    // A cloned per-tone voice stands in for ElevenLabs tone tags (pocket-tts has no prosody control). A CALLER
+    // opts.voiceUrl wins ONLY if its origin is config-trusted (the SSRF guard above); else the tone→voice map, then
+    // a configured default (else the server's built-in voice). An untrusted caller voiceUrl is dropped, never fetched.
+    const configVoice = toneVoices[String(opts.tone || '').toLowerCase()] || cfg.defaultVoiceUrl;
+    const callerVoice = opts.voiceUrl && trustedVoiceOrigins.has(voiceUrlOrigin(opts.voiceUrl)) ? opts.voiceUrl : undefined;
+    const voiceUrl = callerVoice || configVoice;
     const form = new FormData();
     form.append('text', t);
     if (voiceUrl) form.append('voice_url', voiceUrl);
