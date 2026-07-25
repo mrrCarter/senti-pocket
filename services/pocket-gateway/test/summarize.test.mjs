@@ -27,6 +27,30 @@ test('summarize produces a frozen-schema CheckpointSummary', () => {
   assert.deepEqual(s.perAgent.map((a) => a.agentId), ['claude-pocket-relay', 'claude-warden']);
 });
 
+test('checkpoint no-noise: heartbeat/view events are PROVENANCE-counted but NEVER summarized/cited/fed-to-LLM (Atlas re-eval)', () => {
+  const NOISE_EXPORT = {
+    session: { id: SID }, // no title -> headline uses the count fallback so we can assert the SEMANTIC count
+    events: [
+      { sequenceId: 200, event: 'session_message', agent: { id: 'claude-pocket-relay' }, payload: { text: 'real message one' }, ts: '2026-07-18T12:00:00Z' },
+      { sequenceId: 201, event: 'session_listener_heartbeat', agent: { id: 'claude-pocket-relay' }, payload: { text: 'HEARTBEAT NOISE must not be cited' }, ts: '2026-07-18T12:00:01Z' },
+      { sequenceId: 202, event: 'session_view', agent: { id: 'claude-warden' }, payload: { text: 'view receipt noise' }, ts: '2026-07-18T12:00:02Z' },
+      { sequenceId: 203, event: 'session_message', agent: { id: 'claude-warden' }, payload: { text: 'real message two' }, ts: '2026-07-18T12:00:03Z' },
+    ],
+  };
+  const NOISE_CKPT = { checkpointId: 'cp_noise_1', sessionId: SID, startSequence: 200, endSequence: 203, summarySections: { window: { eventCount: 4 } } };
+  const raw = buildRawCheckpoint(NOISE_CKPT, NOISE_EXPORT).rawCheckpoint;
+  assert.equal(raw.events.length, 4, 'PROVENANCE: extract counts ALL 4 events (completeness gate untouched)');
+  const s = summarize(raw, NOISE_CKPT);
+  const evidence = s.perAgent.flatMap((a) => a.evidence);
+  const claims = s.perAgent.flatMap((a) => a.claims);
+  assert.deepEqual(evidence.map((e) => e.sequence).sort((a, b) => a - b), [200, 203], 'only the 2 real messages are cited; heartbeat(201)+view(202) excluded');
+  const noise = /HEARTBEAT NOISE|view receipt/;
+  assert.ok(!evidence.some((e) => noise.test(e.snippet)), 'noise payload never becomes a snippet');
+  assert.ok(!claims.some((c) => noise.test(c.text)), 'noise payload never becomes a claim');
+  assert.match(s.perAgent.find((a) => a.agentId === 'claude-pocket-relay').summary, /1 msg/, 'relay counted 1 SEMANTIC msg (heartbeat excluded), not 2');
+  assert.match(s.headline, /2 events from 2 agents/, 'headline count = semantic (2), not total (4)');
+});
+
 test('every AgentSummary evidence cites a REAL event sequence (grounded), bounded per agent', () => {
   const s = summarize(rc(), CKPT);
   const realSeqs = new Set(EXPORT.events.map((e) => e.sequenceId));
