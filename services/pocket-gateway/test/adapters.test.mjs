@@ -90,6 +90,21 @@ test('tts backend throws on provider error / empty audio / missing voice / missi
   assert.throws(() => createElevenLabsBackend({ fetch: emptyFetch }), /apiKey required/);
 });
 
+test('tts backend: a hung ElevenLabs call is aborted after timeoutMs -> fail-closed (parity with pocket-tts; never hangs the ring/brief)', async () => {
+  // a fetch that only settles when its abort signal fires — simulates a hung/slow provider
+  const hungFetch = (url, init) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')));
+  });
+  const tts = createElevenLabsBackend({ apiKey: 'k', fetch: hungFetch, defaultVoiceId: 'v', timeoutMs: 25 });
+  await assert.rejects(() => tts('brief me'), /abort/i);
+  // happy path still passes the abort signal through + clears the timer on resolve (no leaked timer, no interference)
+  let sawSignal = false;
+  const okFetch = async (_u, init) => { sawSignal = init?.signal instanceof AbortSignal; return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2]).buffer }; };
+  const ok = await createElevenLabsBackend({ apiKey: 'k', fetch: okFetch, defaultVoiceId: 'v', timeoutMs: 25 })('hi');
+  assert.equal(sawSignal, true, 'abort signal wired even on the happy path');
+  assert.ok(Buffer.isBuffer(ok.audio) && ok.audio.length === 2);
+});
+
 // ---------- DynamoDB store (fake client modeling conditions + TTL + reserved-word validation) ----------
 function throwCond() { const e = new Error('conditional'); e.name = 'ConditionalCheckFailedException'; throw e; }
 // DynamoDB rejects a BARE reserved word (owner, ttl, ...) in an expression unless aliased via ExpressionAttributeNames.
