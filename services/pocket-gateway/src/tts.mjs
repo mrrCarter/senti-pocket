@@ -54,11 +54,26 @@ export function createElevenLabsBackend(cfg = {}) {
 }
 
 /**
+ * fetch with a hard timeout: aborts the request after timeoutMs so a hung or slow TTS server can never stall the
+ * ring or the brief. On timeout the underlying fetch rejects (AbortError) and the caller fails closed — never an
+ * open hang. An injected fetch that ignores the signal still resolves normally; real fetch honors it.
+ */
+async function fetchWithTimeout(doFetch, url, init, timeoutMs) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    return await doFetch(url, { ...init, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * FREE, LOCAL TTS via kyutai pocket-tts `serve` (POST /tts, multipart form, audio/wav out). No API key, no per-char
  * cost — a 100M model on CPU (~8x realtime). SAME ttsBackend(text, opts) -> { audio, format } contract as
  * createElevenLabsBackend, so it's a drop-in swap selected by the composition root. pocket-tts has no native tone
  * control, so `tone` selects a pre-cloned per-tone voice from `toneVoices` when provided (our free "audio tags").
- * @param {{ baseUrl?:string, fetch?:Function, defaultVoiceUrl?:string, toneVoices?:Record<string,string> }} cfg
+ * @param {{ baseUrl?:string, fetch?:Function, defaultVoiceUrl?:string, toneVoices?:Record<string,string>, timeoutMs?:number }} cfg
  * @returns ttsBackend(text, {tone,voiceUrl}) -> { audio: Buffer, format:'wav' }
  */
 export function createPocketTTSBackend(cfg = {}) {
@@ -66,6 +81,7 @@ export function createPocketTTSBackend(cfg = {}) {
   const doFetch = cfg.fetch || globalThis.fetch;
   if (typeof doFetch !== 'function') throw new Error('no fetch implementation available');
   const toneVoices = cfg.toneVoices || {}; // { urgent:<voice_url>, calm:<voice_url>, warm:<voice_url> } — free tone approximation
+  const timeoutMs = Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs > 0 ? cfg.timeoutMs : 10_000; // hard cap: a hung pocket-tts serve fails closed, never hangs the ring/brief
 
   return async function ttsBackend(text, opts = {}) {
     const t = String(text ?? '');
@@ -76,7 +92,7 @@ export function createPocketTTSBackend(cfg = {}) {
     const form = new FormData();
     form.append('text', t);
     if (voiceUrl) form.append('voice_url', voiceUrl);
-    const res = await doFetch(`${baseUrl}/tts`, { method: 'POST', body: form });
+    const res = await fetchWithTimeout(doFetch, `${baseUrl}/tts`, { method: 'POST', body: form }, timeoutMs);
     if (!res || !res.ok) throw new Error('pocket-tts error ' + (res && res.status));
     const audio = Buffer.from(await res.arrayBuffer());
     if (audio.length === 0) throw new Error('pocket-tts returned empty audio');

@@ -35,3 +35,18 @@ test('fail-closed: empty text / provider error / empty audio all throw (never a 
   await assert.rejects(createPocketTTSBackend({ fetch: async () => ({ ok: false, status: 502 }) })('x'), /502/);
   await assert.rejects(createPocketTTSBackend({ fetch: okFetch })('x'), /empty audio/);
 });
+
+test('hard timeout: a hung pocket-tts serve is aborted -> fail-closed (never hangs the ring/brief)', async () => {
+  // a fetch that never resolves unless its abort signal fires — simulates a hung/slow serve
+  const hungFetch = (url, init) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(new Error('The operation was aborted')));
+  });
+  const tts = createPocketTTSBackend({ fetch: hungFetch, timeoutMs: 25 });
+  await assert.rejects(() => tts('brief me', {}), /abort/i);
+  // and the happy path still passes the signal through without interfering (timer cleared on resolve)
+  let sawSignal = false;
+  const okFetch = async (_u, init) => { sawSignal = init?.signal instanceof AbortSignal; return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1]).buffer }; };
+  const ok = await createPocketTTSBackend({ fetch: okFetch, timeoutMs: 25 })('hi');
+  assert.equal(sawSignal, true, 'signal is wired even on the happy path');
+  assert.equal(ok.format, 'wav');
+});
