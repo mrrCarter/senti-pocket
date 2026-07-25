@@ -5,7 +5,8 @@ import XCTest
 /// Locks SentiCallManager.decode's CallKit-ring DISPLAY choice (part-b minor): prefer the nicer `callerName` over
 /// the terse `who`, then fall back. The push fields are display-only — none of these drive the governed write
 /// (that's the hydrated ring, via DialCoordinator), so this is a UX assertion, not a consent one.
-final class SentiCallDecodeTests: XCTestCase {
+@MainActor
+final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainActor, so its static decode() is too
 
     func test_decode_prefers_callerName_over_who() {
         let call = SentiCallManager.decode([
