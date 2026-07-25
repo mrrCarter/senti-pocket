@@ -152,12 +152,11 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
         let dict = payload.dictionaryPayload
         // Report the incoming call (inside `ring`) BEFORE completion() — the iOS 13+ requirement.
         ring(Self.decode(dict))
-        // ALSO surface the full DialReceiveState (LEAN core / RICH renderable) via the SAME KAV-locked decoder the
-        // gateway parity test binds — reuse DialReceive.receive, never a 2nd decoder. Governed content stays behind the
-        // authed GET (hydrate on answer); this only carries the ring shape + relay's dialId to the coordinator.
-        if let dialId = dict["id"] as? String,
-           let data = try? JSONSerialization.data(withJSONObject: dict) {
-            onDialReceived?(DialReceive.receive(data), dialId)
+        // ALSO surface the full DialReceiveState for the coordinator to hydrate on answer, via the extracted+tested
+        // receiveState() so the ENVELOPED-push round-trip has coverage (relay's find). Reuses the KAV-locked
+        // DialReceive.receive — never a 2nd decoder. Governed content stays behind the authed GET.
+        if let (state, dialId) = Self.receiveState(from: dict) {
+            onDialReceived?(state, dialId)
         }
         completion()
     }
@@ -165,6 +164,17 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
     /// Fail-safe decode of relay's dial-registry `buildDialPayload` wire → always a presentable call (a malformed push
     /// still rings — never a silently-dropped delivery; the orchestrator re-validates the full episode on answer).
     /// Wire: `{ id:'dial_…', who, priority(low|medium|high|urgent), message, context?, sessionId, ts }`.
+    /// Decode the ENVELOPED VoIP push dict (APNs `{ aps:{…}, <dial DTO TOP-LEVEL> }`) → the DialReceiveState + relay's
+    /// dialId, via the SAME KAV-locked DialReceive.receive (#96). The dial fields are read TOP-LEVEL (the `aps` envelope
+    /// is ignored by the Codable). DEPLOY CONTRACT (relay): apnsSend MUST place the dial DTO top-level, NOT nested — if
+    /// top-level `id` is absent (a nested/malformed envelope) this returns nil, so the coordinator simply has no state
+    /// for that ring (declines on answer) rather than a silent wrong-decode.
+    static func receiveState(from dict: [AnyHashable: Any]) -> (state: DialReceiveState, dialId: String)? {
+        guard let dialId = dict["id"] as? String,
+              let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+        return (DialReceive.receive(data), dialId)
+    }
+
     static func decode(_ payload: [AnyHashable: Any]) -> IncomingDecisionCall {
         let dialId = (payload["id"] as? String) ?? ""                       // relay's 'dial_…' correlation id (not a UUID)
         let message = (payload["message"] as? String) ?? ""
