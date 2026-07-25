@@ -2,32 +2,29 @@
 import XCTest
 @testable import SentiPocketApp
 
-/// Locks SentiCallManager.decode's CallKit-ring DISPLAY choice (part-b minor): prefer the nicer `callerName` over
-/// the terse `who`, then fall back. The push fields are display-only — none of these drive the governed write
-/// (that's the hydrated ring, via DialCoordinator), so this is a UX assertion, not a consent one.
+/// Locks SentiCallManager's decode (CallKit-ring DISPLAY) + receiveState (the DialReceiveState surfaced at push-receive).
+/// The push fields are display-only — none drive the governed write (that's the hydrated ring via DialCoordinator).
 @MainActor
-final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainActor, so its static decode() is too
+final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainActor, so its static decode()/receiveState() are too
+
+    // MARK: - decode display (part-b minor)
 
     func test_decode_prefers_callerName_over_who() {
         let call = SentiCallManager.decode([
-            "id": "dial_1",
-            "callerName": "claude-warden needs your decision",
-            "who": "senti-pocket",
-            "message": "",              // write-kinds ship LEAN → message shed; must NOT crash the display
-            "priority": "high"
+            "id": "dial_1", "callerName": "claude-warden needs your decision", "who": "senti-pocket",
+            "message": "", "priority": "high"
         ])
         XCTAssertEqual(call.dialId, "dial_1")
         XCTAssertEqual(call.callerDisplayName, "claude-warden needs your decision")
         XCTAssertEqual(call.priority, "high")
-        XCTAssertEqual(call.message, "")   // sanity: a LEAN write-kind carries no push message
+        XCTAssertEqual(call.message, "")   // a LEAN write-kind carries no push message
     }
 
     func test_decode_falls_back_who_then_default() {
         let noName = SentiCallManager.decode(["id": "dial_2", "who": "senti-pocket", "message": "", "priority": "low"])
-        XCTAssertEqual(noName.callerDisplayName, "senti-pocket")   // no callerName → who
-
+        XCTAssertEqual(noName.callerDisplayName, "senti-pocket")
         let bare = SentiCallManager.decode(["id": "dial_3", "message": "", "priority": "medium"])
-        XCTAssertEqual(bare.callerDisplayName, "Senti — decision needed")   // no callerName/who/message → default
+        XCTAssertEqual(bare.callerDisplayName, "Senti — decision needed")
     }
 
     func test_decode_invalid_priority_defaults_medium() {
@@ -35,35 +32,69 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
         XCTAssertEqual(call.priority, "medium")
     }
 
-    // relay's find: the DEVICE receives an APNs-ENVELOPED dict { aps:{…}, <dial DTO top-level> }. receiveState must
-    // serialize that + decode the top-level dial fields (aps ignored) → the LEAN write-kind ring. This is the
-    // dict→Data→DialReceive.receive round-trip #96 (bare JSON) does NOT cover.
-    func test_receiveState_from_enveloped_push_decodes_top_level_writekind_as_needsHydration() {
-        let dict: [AnyHashable: Any] = [
-            "aps": ["content-available": 1],
-            "v": 1, "id": "dial_1", "kind": "decisionYours", "fetch": true,
-            "priority": "high", "callerName": "claude-warden", "who": "senti-pocket",
-            "sessionId": "6cf7e861", "ts": "2026-07-25T20:00:00Z"
-        ]
-        guard let (state, dialId) = SentiCallManager.receiveState(from: dict) else {
-            return XCTFail("enveloped push should decode")
+    // MARK: - receiveState: the ENVELOPED device round-trip (part-b criterion #6, relay's shared fixture)
+
+    /// Walk up from this source file to relay's committed gateway fixtures (zero-copy, single source of truth).
+    private func loadFixture(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
+        var dir = URL(fileURLWithPath: "\(file)").deletingLastPathComponent()
+        for _ in 0..<8 {
+            let candidate = dir.appendingPathComponent("services/pocket-gateway/test/fixtures/\(name)")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                let data = try Data(contentsOf: candidate)
+                return try (JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            }
+            dir.deleteLastPathComponent()
         }
-        XCTAssertEqual(dialId, "dial_1")
-        guard case .needsHydration(let id, _) = state else {
-            return XCTFail("a LEAN write-kind must be .needsHydration, got \(state)")
-        }
-        XCTAssertEqual(id, "dial_1")   // top-level dial fields decoded; the `aps` envelope is ignored
+        XCTFail("fixture \(name) not found walking up from \(file) — needs relay's committed gateway fixture", file: file, line: line)
+        return [:]
     }
 
-    // The DEPLOY-CONTRACT precondition: if the deploy NESTS the DTO ({aps, payload:{…}}) instead of top-level,
-    // top-level `id` is absent → nil (no ring stored), NOT a silent wrong-decode. Pins apnsSend top-level placement.
-    func test_receiveState_nil_when_dto_nested_not_top_level() {
-        let nested: [AnyHashable: Any] = ["aps": ["content-available": 1], "payload": ["v": 1, "id": "dial_1", "fetch": true]]
-        XCTAssertNil(SentiCallManager.receiveState(from: nested))
+    /// POSITIVE (test b): the deploy wraps the BARE buildDialPayload DTO as { aps, ...dial-fields-TOP-LEVEL }. For every
+    /// #96 KAV case, receiveState must serialize + decode that envelope → dialId == payload.id and state == (fetch ?
+    /// .needsHydration : .renderable). Covers rich_info (fetch=false → .renderable), which the inline LEAN test did not.
+    func test_receiveState_enveloped_roundtrip_covers_all_KAV_cases() throws {
+        let env = try loadFixture("dial-push-envelope-v1.json")
+        let src = try loadFixture("dial-payload-v1.json")
+        guard let aps = env["apsEnvelope"] as? [String: Any] else { return XCTFail("envelope fixture missing apsEnvelope") }
+        guard let cases = src["cases"] as? [String: Any], !cases.isEmpty else { return XCTFail("source KAV cases missing") }
+        for (name, raw) in cases {
+            guard let c = raw as? [String: Any], let payload = c["payload"] as? [String: Any] else {
+                return XCTFail("case \(name): missing payload")
+            }
+            var enveloped: [AnyHashable: Any] = payload   // dial fields spread TOP-LEVEL...
+            enveloped["aps"] = aps                         // ...alongside the aps envelope (the real device shape)
+            guard let (state, dialId) = SentiCallManager.receiveState(from: enveloped) else {
+                return XCTFail("case \(name): enveloped push should decode")
+            }
+            XCTAssertEqual(dialId, payload["id"] as? String, "case \(name): dialId")
+            let fetch = (payload["fetch"] as? Bool) ?? false
+            if fetch {
+                guard case .needsHydration = state else { return XCTFail("case \(name): fetch=true must be .needsHydration, got \(state)") }
+            } else {
+                guard case .renderable = state else { return XCTFail("case \(name): fetch=false must be .renderable, got \(state)") }
+            }
+        }
     }
 
-    // warden #5b (atlas + relay independently): data(withJSONObject:) raises an NSException — NOT a Swift error, so
-    // try? would NOT catch it → CRASH on a malformed push. isValidJSONObject guards it to the fail-safe nil.
+    /// NEGATIVE (test b): nesting the DTO under a wrong-placement key ({aps, payload:<DTO>}) → top-level id absent →
+    /// nil (no ring stored). The naive apnsSend that nests under the field literally named `payload` would silently
+    /// drop EVERY ring in production — this catches it. Keys single-sourced from the fixture's wrongPlacementKeys.
+    func test_receiveState_nil_when_dto_nested_under_wrong_key() throws {
+        let env = try loadFixture("dial-push-envelope-v1.json")
+        let src = try loadFixture("dial-payload-v1.json")
+        guard let aps = env["apsEnvelope"] as? [String: Any],
+              let wrongKeys = env["wrongPlacementKeys"] as? [String],
+              let anyCase = (src["cases"] as? [String: Any])?.values.first as? [String: Any],
+              let payload = anyCase["payload"] as? [String: Any] else { return XCTFail("fixtures missing fields") }
+        XCTAssertFalse(wrongKeys.isEmpty)
+        for k in wrongKeys {
+            let nested: [AnyHashable: Any] = ["aps": aps, k: payload]
+            XCTAssertNil(SentiCallManager.receiveState(from: nested), "nesting under \(k) must yield nil (no top-level id)")
+        }
+    }
+
+    // THROW-GUARD (warden #5b; atlas + relay independently): data(withJSONObject:) raises an NSException — NOT a Swift
+    // error, so try? would NOT catch it → CRASH on a malformed push. isValidJSONObject guards it to the fail-safe nil.
     func test_receiveState_nil_on_nonconforming_dict_no_crash() {
         let bad: [AnyHashable: Any] = ["id": "dial_x", "createdAt": Date()]  // Date is not JSON-serializable
         XCTAssertNil(SentiCallManager.receiveState(from: bad))               // fail-safe nil, NEVER a crash
