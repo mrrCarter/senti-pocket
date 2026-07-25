@@ -52,3 +52,34 @@ export function createElevenLabsBackend(cfg = {}) {
     return { audio, format: PCM_LABELS[outputFormat] || outputFormat };
   };
 }
+
+/**
+ * FREE, LOCAL TTS via kyutai pocket-tts `serve` (POST /tts, multipart form, audio/wav out). No API key, no per-char
+ * cost — a 100M model on CPU (~8x realtime). SAME ttsBackend(text, opts) -> { audio, format } contract as
+ * createElevenLabsBackend, so it's a drop-in swap selected by the composition root. pocket-tts has no native tone
+ * control, so `tone` selects a pre-cloned per-tone voice from `toneVoices` when provided (our free "audio tags").
+ * @param {{ baseUrl?:string, fetch?:Function, defaultVoiceUrl?:string, toneVoices?:Record<string,string> }} cfg
+ * @returns ttsBackend(text, {tone,voiceUrl}) -> { audio: Buffer, format:'wav' }
+ */
+export function createPocketTTSBackend(cfg = {}) {
+  const baseUrl = String(cfg.baseUrl || 'http://127.0.0.1:8000').replace(/\/+$/, '');
+  const doFetch = cfg.fetch || globalThis.fetch;
+  if (typeof doFetch !== 'function') throw new Error('no fetch implementation available');
+  const toneVoices = cfg.toneVoices || {}; // { urgent:<voice_url>, calm:<voice_url>, warm:<voice_url> } — free tone approximation
+
+  return async function ttsBackend(text, opts = {}) {
+    const t = String(text ?? '');
+    if (!t) throw new Error('text required');
+    // A cloned per-tone voice stands in for ElevenLabs tone tags (pocket-tts has no prosody control); explicit
+    // opts.voiceUrl wins, then the tone→voice map, then a configured default (else the server's built-in voice).
+    const voiceUrl = opts.voiceUrl || toneVoices[String(opts.tone || '').toLowerCase()] || cfg.defaultVoiceUrl;
+    const form = new FormData();
+    form.append('text', t);
+    if (voiceUrl) form.append('voice_url', voiceUrl);
+    const res = await doFetch(`${baseUrl}/tts`, { method: 'POST', body: form });
+    if (!res || !res.ok) throw new Error('pocket-tts error ' + (res && res.status));
+    const audio = Buffer.from(await res.arrayBuffer());
+    if (audio.length === 0) throw new Error('pocket-tts returned empty audio');
+    return { audio, format: 'wav' }; // 24kHz mono WAV
+  };
+}
