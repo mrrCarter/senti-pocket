@@ -18,6 +18,7 @@ function toneToSettings(tone) {
 export function createElevenLabsBackend(cfg = {}) {
   const { apiKey, baseUrl = 'https://api.elevenlabs.io', defaultVoiceId } = cfg;
   const doFetch = cfg.fetch || globalThis.fetch;
+  const timeoutMs = Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs > 0 ? cfg.timeoutMs : 10_000; // hard cap: a hung/slow ElevenLabs call fails closed, never hangs the ring/brief (parity with createPocketTTSBackend)
   if (!apiKey) throw new Error('ElevenLabs apiKey required (server-side only)');
   if (typeof doFetch !== 'function') throw new Error('no fetch implementation available');
 
@@ -37,7 +38,7 @@ export function createElevenLabsBackend(cfg = {}) {
       : outputFormat.startsWith('ulaw') ? 'audio/basic'
       : 'audio/pcm';
     const url = `${baseUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=${encodeURIComponent(outputFormat)}`;
-    const res = await doFetch(url, {
+    const res = await fetchWithTimeout(doFetch, url, {
       method: 'POST',
       headers: { 'xi-api-key': apiKey, 'content-type': 'application/json', accept },
       body: JSON.stringify({
@@ -45,7 +46,7 @@ export function createElevenLabsBackend(cfg = {}) {
         model_id: opts.modelId || 'eleven_flash_v2_5',
         voice_settings: toneToSettings(opts.tone),
       }),
-    });
+    }, timeoutMs);
     if (!res || !res.ok) throw new Error('elevenlabs error ' + (res && res.status));
     const audio = Buffer.from(await res.arrayBuffer());
     if (audio.length === 0) throw new Error('elevenlabs returned empty audio');
