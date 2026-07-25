@@ -18,7 +18,7 @@ final class SignInCoordinatorTests: XCTestCase {
 
     private func makeCoordinator(
         probe: LoginProbe,
-        login: (@escaping () async throws -> Void)? = nil
+        login: (() async throws -> Void)? = nil   // optional closures are already escaping — no @escaping here
     ) -> SignInCoordinator {
         let defaultLogin: () async throws -> Void = { probe.loginCalls += 1; probe.storedToken = true }
         let coord = SignInCoordinator(
