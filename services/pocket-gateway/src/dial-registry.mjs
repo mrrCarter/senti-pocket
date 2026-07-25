@@ -187,20 +187,28 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
 /**
  * The registry-backed pushBackend IMPL that warden's POST /dial calls. Matches his exact contract:
  *   pushBackend({message, context, priority, sessionId, humanId}) -> {dispatched, dialId?, reason?}
+ * PR-B2 (backward-compatible): ALSO accepts the RICH dialPayloadV1 fields (id/kind/callerName/options/checkpointId/
+ * evidenceSeqs/confidence) buildDialPayload threads onto the wire, plus `storedSignal` — the full NeedCarterSignal to
+ * persist for GET /dial?id= hydration. Legacy /dial callers pass NONE of these and behave EXACTLY as before (kind
+ * defaults to info, id = computeDialId, no store-write).
  * It RESOLVES the device(s) from the registry my /dial/register populates, builds the deterministic payload, and fans
  * out to the injected APNs sender. Honest + fail-closed at every gap (never a fake dispatch):
  *   no registry -> dial-not-configured | lookup throws -> registry-lookup-failed | 0 devices -> no-device-token
  *   (== warden's /dial test expectation) | no apnsSend -> push-transport-not-configured | all sends fail -> all-deliveries-failed
- * dialId is computeDialId (so warden's out.dialId is deterministic + consistent). The REAL APNs network call is the
- * injected apnsSend (deploy wires the VoIP cert) — this module never fakes delivery; `dispatched` is true ONLY when at
- * least one device actually acked.
- * @param {{ deviceRegistry?: {lookup:Function}, apnsSend?: (a:{voipToken,platform,payload})=>Promise<{delivered:boolean}>, now?: ()=>number, maxDevices?: number }} deps
+ * HYDRATION (PR-B2): with `storedSignal`, the full signal is persisted (keyed by payload.id == signal.id) BEFORE the
+ * ring. A LEAN ring (payload.fetch===true shed ALL governed content) is a dead doorbell without it -> the store-write
+ * FAILS CLOSED for LEAN (signal-store-not-configured / signal-store-write-failed, no ring). A RICH ring is self-contained
+ * -> its store-write is best-effort (a GET-consistency/audit copy) and NEVER blocks the ring.
+ * dialId is the built payload's id (signal-originated when supplied, else computeDialId). The REAL APNs network call is
+ * the injected apnsSend (deploy wires the VoIP cert) — this module never fakes delivery; `dispatched` is true ONLY when
+ * at least one device actually acked.
+ * @param {{ deviceRegistry?: {lookup:Function}, apnsSend?: (a:{voipToken,platform,payload})=>Promise<{delivered:boolean}>, now?: ()=>number, maxDevices?: number, signalStore?: {put:Function} }} deps
  * @returns {(input:object)=>Promise<{dispatched:boolean, dialId?:string, reason?:string, delivered?:number, devices?:number}>}
  */
-export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevices = 20 } = {}) {
+export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevices = 20, signalStore } = {}) {
   const clock = typeof now === 'function' ? now : () => Date.now();
   const cap = Number.isInteger(maxDevices) && maxDevices > 0 ? maxDevices : 20;
-  return async function pushBackend({ message, context, priority, sessionId, humanId } = {}) {
+  return async function pushBackend({ message, context, priority, sessionId, humanId, id, kind, callerName, options, checkpointId, evidenceSeqs, confidence, storedSignal } = {}) {
     if (!deviceRegistry || typeof deviceRegistry.lookup !== 'function') return { dispatched: false, reason: 'dial-not-configured' };
     let devices;
     try { devices = await deviceRegistry.lookup({ humanId, sessionId }); }
@@ -214,8 +222,22 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
     if (devices.length === 0) return { dispatched: false, reason: 'no-device-token' };
     if (typeof apnsSend !== 'function') return { dispatched: false, reason: 'push-transport-not-configured' };
     let payload;
-    try { payload = buildDialPayload({ humanId, sessionId, message, context, priority }, clock()); }
+    // RICH dialPayloadV1 fields flow through when present (ring-owner path); absent -> legacy defaults (kind=info, computed id).
+    try { payload = buildDialPayload({ humanId, sessionId, message, context, priority, id, kind, callerName, options, checkpointId, evidenceSeqs, confidence }, clock()); }
     catch { return { dispatched: false, reason: 'invalid-dial-payload' }; } // fail-closed: blank/overbound/control identity never rings
+    // HYDRATION store-write (PR-B2): persist the full signal so the phone can GET /dial?id= it. A LEAN ring shed ALL
+    // governed content -> it MUST hydrate -> FAIL CLOSED if it can't persist (never a dead doorbell); a RICH ring is
+    // self-contained -> best-effort (a GET-consistency/audit copy). Written AFTER all pre-ring checks so a ring that will
+    // never fire leaves no orphan record; written BEFORE fan-out so a LEAN ring never reaches the phone unhydratable.
+    if (storedSignal !== undefined) {
+      const lean = payload.fetch === true;
+      if (!signalStore || typeof signalStore.put !== 'function') {
+        if (lean) return { dispatched: false, reason: 'signal-store-not-configured' };
+      } else {
+        try { await signalStore.put(payload.id, storedSignal); }
+        catch { if (lean) return { dispatched: false, reason: 'signal-store-write-failed' }; }
+      }
+    }
     // Fan out; dispatched iff AT LEAST ONE device acked. Per-device failure is isolated (one dead token never fails the ring).
     let delivered = 0;
     for (const d of devices) {

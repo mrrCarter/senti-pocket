@@ -116,19 +116,61 @@ test('normalizeSignal: fail-closed on each missing/mistyped load-bearing field',
 });
 
 // ── mapSignalToPushInput: dispatch mapping + RELAY security guarantees ────────────────────────────────────────
-test('mapSignalToPushInput: valid signal above floor -> exactly warden pushBackend input shape', () => {
+test('mapSignalToPushInput: valid signal above floor -> RICH warden pushBackend input + frozen storedSignal (PR-B2)', () => {
   const r = mapSignalToPushInput(signal({ kind: 'decisionYours', confidence: 0.9, requestedBy: 'claude-warden' }), { humanId: 'human-mrrcarter' });
   assert.equal(r.ring, true);
-  assert.deepEqual(Object.keys(r.input).sort(), ['context', 'humanId', 'message', 'priority', 'sessionId']);
+  // input now carries the RICH dialPayloadV1 fields (PR-B2: on the wire via buildDialPayload). decisionYours has no options -> no options key.
+  assert.deepEqual(Object.keys(r.input).sort(), ['callerName', 'checkpointId', 'confidence', 'context', 'evidenceSeqs', 'humanId', 'id', 'kind', 'message', 'priority', 'sessionId']);
   assert.deepEqual(r.input, {
     humanId: 'human-mrrcarter',
     sessionId: '6cf7e861',
     message: 'Ship the consolidation to master?',
     context: 'master merge go',
     priority: 'high',
+    id: 'need_1',
+    kind: 'decisionYours',
+    callerName: 'Senti · claude-warden needs your decision',
+    checkpointId: 'cp_9',
+    evidenceSeqs: [315038, 315050],
+    confidence: 0.9,
   });
+  // storedSignal is the EXACT NeedCarterSignal the app decodes on GET /dial?id= hydration: kind re-encoded to the Codable
+  // wire shape, ONLY canonical fields (no caller-supplied extras), id == the ring's dialId (what dial-signal-store keys on).
+  assert.deepEqual(r.storedSignal, {
+    id: 'need_1',
+    kind: { decisionYours: {} },
+    question: 'Ship the consolidation to master?',
+    context: { sessionId: '6cf7e861', checkpointId: 'cp_9', whatWeNeed: 'master merge go' },
+    confidence: 0.9,
+    evidenceSeqs: [315038, 315050],
+    requestedBy: 'claude-warden',
+    createdAt: 1_784_370_900,
+  });
+  assert.equal(r.storedSignal.id, r.input.id, 'storedSignal.id == input.id (== the ring dialId the store keys on)');
   assert.deepEqual(r.evidenceSeqs, [315038, 315050], 'evidenceSeqs carried for audit + jump-to');
   assert.equal(r.dialFields.callerName, 'Senti · claude-warden needs your decision');
+});
+
+test('mapSignalToPushInput: pickOption carries options into input + re-encodes storedSignal.kind to the Codable wire', () => {
+  const s = signal({ confidence: 0.9, requestedBy: 'atlas', kindWire: encodeSignalKind({ slug: 'pickOption', options: ['Merge now', 'Wait'] }) });
+  const r = mapSignalToPushInput(s, { humanId: 'human-mrrcarter' });
+  assert.equal(r.ring, true);
+  assert.deepEqual(r.input.options, ['Merge now', 'Wait'], 'options ride the wire for a pickOption ring');
+  assert.equal(r.input.kind, 'pickOption');
+  assert.equal(r.input.callerName, 'Senti · atlas needs you to choose');
+  assert.deepEqual(r.storedSignal.kind, { pickOption: { _0: ['Merge now', 'Wait'] } }, 'storedSignal re-encodes pickOption to the shape atlas decodes');
+});
+
+test('mapSignalToPushInput: optional fields OMITTED when absent (no checkpointId / evidenceSeqs / options / createdAt keys)', () => {
+  const bare = { id: 'need_2', kind: encodeSignalKind('go'), question: 'GO?', context: { sessionId: 'sess-1', whatWeNeed: 'ship it' }, confidence: 0.9, requestedBy: 'detector' };
+  const r = mapSignalToPushInput(bare, { humanId: 'human-mrrcarter' });
+  assert.equal(r.ring, true);
+  assert.ok(!('checkpointId' in r.input), 'no input.checkpointId key when absent');
+  assert.ok(!('evidenceSeqs' in r.input), 'no input.evidenceSeqs key when absent');
+  assert.ok(!('options' in r.input), 'no input.options key for a non-pickOption kind');
+  assert.ok(!('checkpointId' in r.storedSignal.context), 'storedSignal.context has no checkpointId key when absent');
+  assert.ok(!('evidenceSeqs' in r.storedSignal), 'storedSignal has no evidenceSeqs key when absent');
+  assert.ok(!('createdAt' in r.storedSignal), 'storedSignal has no createdAt key when absent');
 });
 
 test('mapSignalToPushInput: SECURITY — target humanId comes from AUTH, never the signal (confused-deputy)', () => {

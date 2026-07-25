@@ -279,6 +279,74 @@ test('pushBackend: fan-out — one dead token never fails the ring; all-fail is 
   assert.equal(r.dialId, computeDialId('u', 's', 'm', NOW));
 });
 
+// ---- pushBackend PR-B2: rich-field passthrough + GET /dial?id= hydration store-write --------------------------------
+const fakeSignalStore = () => { const m = new Map(); return { async put(id, sig) { m.set(id, sig); return { stored: true, expiresAtSec: 0 }; }, async get(id) { return m.get(id); } }; };
+
+test('pushBackend PR-B2: RICH ring threads rich fields onto the payload + stores the full signal (hydration copy)', async () => {
+  const reg = fakeRegistry();
+  await reg.register({ humanId: 'u', sessionId: '6cf7e861', voipToken: 'tok', platform: 'apns' });
+  const sent = [];
+  const sig = fakeSignalStore();
+  const storedSignal = { id: 'need_1', kind: { decisionYours: {} }, question: 'Ship it?', context: { sessionId: '6cf7e861', whatWeNeed: 'go' }, confidence: 0.9, requestedBy: 'claude-warden' };
+  const pb = createDialPushBackend({ deviceRegistry: reg, apnsSend: async (a) => { sent.push(a); return { delivered: true }; }, now: () => NOW, signalStore: sig });
+  const out = await pb({ message: 'Ship it?', context: 'go', priority: 'high', sessionId: '6cf7e861', humanId: 'u', id: 'need_1', kind: 'decisionYours', callerName: 'Senti · claude-warden needs your decision', evidenceSeqs: [315038], confidence: 0.9, storedSignal });
+  assert.equal(out.dispatched, true);
+  assert.equal(out.dialId, 'need_1', 'signal-originated id becomes the dialId (== the store key)');
+  const p = sent[0].payload;
+  assert.equal(p.fetch, false, 'small signal -> RICH (self-contained)');
+  assert.equal(p.kind, 'decisionYours');
+  assert.equal(p.callerName, 'Senti · claude-warden needs your decision');
+  assert.deepEqual(p.evidenceSeqs, [315038], 'rich fields reach the wire (were dropped pre-PR-B2)');
+  assert.deepEqual(await sig.get('need_1'), storedSignal, 'full signal stored under the dialId for GET /dial?id=');
+});
+
+test('pushBackend PR-B2: LEAN ring FAILS CLOSED when the signal cannot be persisted (no dead doorbell)', async () => {
+  const reg = fakeRegistry();
+  await reg.register({ humanId: 'u', sessionId: 's', voipToken: 'tok', platform: 'apns' });
+  const bigMsg = 'Q'.repeat(4000), bigCtx = 'C'.repeat(2000); // over budget -> buildDialPayload emits LEAN (fetch=true)
+  const storedSignal = { id: 'need_big', kind: { info: {} }, question: bigMsg, context: { sessionId: 's', whatWeNeed: bigCtx }, confidence: 0.9, requestedBy: 'detector' };
+  const base = { message: bigMsg, context: bigCtx, sessionId: 's', humanId: 'u', id: 'need_big', kind: 'info', storedSignal };
+  let sent = 0;
+  const apnsSend = async () => { sent += 1; return { delivered: true }; };
+  // (a) store-write THROWS -> a LEAN ring must fail closed BEFORE the phone is rung
+  const throwingStore = { async put() { throw new Error('dynamo down'); }, async get() {} };
+  assert.deepEqual(await createDialPushBackend({ deviceRegistry: reg, apnsSend, now: () => NOW, signalStore: throwingStore })(base),
+    { dispatched: false, reason: 'signal-store-write-failed' });
+  assert.equal(sent, 0, 'a LEAN ring that could not persist NEVER reached the phone');
+  // (b) NO signalStore wired at all + LEAN -> fail closed (no hydration source)
+  assert.equal((await createDialPushBackend({ deviceRegistry: reg, apnsSend, now: () => NOW })(base)).reason, 'signal-store-not-configured');
+  // (c) store OK -> the LEAN ring fires AND the full (untruncated) signal is persisted for hydration
+  const sig = fakeSignalStore();
+  const outOk = await createDialPushBackend({ deviceRegistry: reg, apnsSend, now: () => NOW, signalStore: sig })(base);
+  assert.equal(outOk.dispatched, true);
+  assert.equal(sent, 1, 'exactly one ring after a successful persist');
+  assert.equal((await sig.get('need_big')).question, bigMsg, 'full untruncated signal stored for GET /dial?id= hydration');
+});
+
+test('pushBackend PR-B2: RICH ring rings anyway when the best-effort store-write fails (self-contained payload)', async () => {
+  const reg = fakeRegistry();
+  await reg.register({ humanId: 'u', sessionId: 's', voipToken: 'tok', platform: 'apns' });
+  const storedSignal = { id: 'need_1', kind: { go: {} }, question: 'GO?', context: { sessionId: 's', whatWeNeed: 'ship' }, confidence: 0.9, requestedBy: 'detector' };
+  let sent = 0;
+  const throwingStore = { async put() { throw new Error('dynamo down'); }, async get() {} };
+  const out = await createDialPushBackend({ deviceRegistry: reg, apnsSend: async () => { sent += 1; return { delivered: true }; }, now: () => NOW, signalStore: throwingStore })(
+    { message: 'GO?', sessionId: 's', humanId: 'u', id: 'need_1', kind: 'go', storedSignal });
+  assert.equal(out.dispatched, true, 'RICH ring is self-contained -> a store hiccup never blocks it');
+  assert.equal(sent, 1, 'the phone still got the complete RICH push');
+});
+
+test('pushBackend PR-B2: legacy /dial path (no storedSignal) rings with NO store-write (backward-compatible)', async () => {
+  const reg = fakeRegistry();
+  await reg.register({ humanId: 'u', sessionId: 's', voipToken: 'tok', platform: 'apns' });
+  let putCalls = 0;
+  const spyStore = { async put() { putCalls += 1; return { stored: true }; }, async get() {} };
+  const out = await createDialPushBackend({ deviceRegistry: reg, apnsSend: async () => ({ delivered: true }), now: () => NOW, signalStore: spyStore })(
+    { message: 'ship it?', sessionId: 's', humanId: 'u' });
+  assert.equal(out.dispatched, true);
+  assert.equal(putCalls, 0, 'no storedSignal -> the store is never written (legacy behavior preserved)');
+  assert.equal(out.dialId, computeDialId('u', 's', 'ship it?', NOW), 'legacy computed dialId unchanged');
+});
+
 test('createStoreDeviceRegistry: register (atomic put) + lookup over the KV store; latest-wins single device v1', async () => {
   const m = new Map();
   const store = { async get(k) { return m.get(k); }, async put(k, v) { m.set(k, v); return v; } };
