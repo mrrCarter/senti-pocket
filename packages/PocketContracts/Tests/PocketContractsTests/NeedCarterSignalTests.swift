@@ -46,4 +46,30 @@ final class NeedCarterSignalTests: XCTestCase {
         guard case .pickOption(let labels) = back.kind else { return XCTFail("kind lost in round-trip") }
         XCTAssertEqual(labels, ["Merge now", "Wait for forge", "Split the PR"])
     }
+
+    // Decode relay's gateway storedSignal wire (PR-B2 #83): createdAt = UNIX-epoch INT, evidenceSeqs OMITTED.
+    // This is the exact shape GET /dial?id= returns; my custom Codable must decode it (Swift's default would skew
+    // createdAt by 31yrs on a Unix int, and THROW on the missing non-optional evidenceSeqs/createdAt).
+    func test_decodes_relay_wire_unix_epoch_and_omitted_optionals() throws {
+        let wire = """
+        {"id":"need_1","kind":{"decisionYours":{}},"question":"Ship the consolidation to master?",
+         "context":{"sessionId":"6cf7e861","checkpointId":"cp_9","whatWeNeed":"master merge go"},
+         "confidence":0.9,"requestedBy":"claude-warden","createdAt":1784370900}
+        """
+        let s = try JSONDecoder().decode(NeedCarterSignal.self, from: Data(wire.utf8))
+        XCTAssertEqual(s.id, "need_1")
+        guard case .decisionYours = s.kind else { return XCTFail("kind decode") }
+        XCTAssertEqual(s.evidenceSeqs, [])                                   // omitted → default [], not a throw
+        XCTAssertEqual(s.createdAt, Date(timeIntervalSince1970: 1_784_370_900))  // Unix int → correct Date (no 2001 skew)
+        XCTAssertEqual(s.context.checkpointId, "cp_9")
+    }
+
+    func test_decodes_wire_with_createdAt_absent_entirely() throws {
+        // relay omits createdAt when absent; a non-optional Date default would throw — we default to .distantPast.
+        let wire = #"{"id":"need_2","kind":{"go":{}},"question":"GO?","context":{"sessionId":"s","whatWeNeed":"ship"},"confidence":0.9,"requestedBy":"detector"}"#
+        let s = try JSONDecoder().decode(NeedCarterSignal.self, from: Data(wire.utf8))
+        XCTAssertEqual(s.createdAt, .distantPast)                            // absent → sentinel, never a decode throw
+        XCTAssertEqual(s.evidenceSeqs, [])
+    }
+
 }

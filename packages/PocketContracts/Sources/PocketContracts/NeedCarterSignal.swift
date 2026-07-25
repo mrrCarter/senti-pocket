@@ -74,6 +74,47 @@ public struct NeedCarterSignal: Codable, Equatable, Sendable, Identifiable {
         self.requestedBy = requestedBy; self.createdAt = createdAt
     }
 
+    // Custom Codable ONLY to make the wire cross-language-correct with relay's gateway storedSignal (PR-B2 #83).
+    // Two parity fixes vs Swift's synthesized default (Atlas finding on #83):
+    //   • createdAt: the gateway sends UNIX-epoch seconds (or OMITS it when absent). Swift's default Date Codable is
+    //     secondsSinceReferenceDate (2001 epoch) — a 31-year skew — and a missing non-optional key THROWS. So we
+    //     decode createdAt from a Unix-epoch Int/Double, or default to .distantPast when absent (hydration doesn't
+    //     read it), and ENCODE it back as Unix-epoch seconds (the sane cross-language choice, keeping relay's wire).
+    //   • evidenceSeqs: the gateway OMITS it when empty → decode-default to [] rather than throw.
+    // Every other field uses the same keys the synthesized codec did, so the kind/context/etc. wire is unchanged.
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, question, context, confidence, evidenceSeqs, requestedBy, createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        kind = try c.decode(NeedCarterKind.self, forKey: .kind)
+        question = try c.decode(String.self, forKey: .question)
+        context = try c.decode(NeedCarterContext.self, forKey: .context)
+        confidence = try c.decode(Double.self, forKey: .confidence)
+        evidenceSeqs = try c.decodeIfPresent([Int].self, forKey: .evidenceSeqs) ?? []
+        requestedBy = try c.decode(String.self, forKey: .requestedBy)
+        // Unix-epoch seconds (Int or Double), or absent → .distantPast (createdAt is not read at hydrate time).
+        if let secs = try c.decodeIfPresent(Double.self, forKey: .createdAt) {
+            createdAt = Date(timeIntervalSince1970: secs)
+        } else {
+            createdAt = .distantPast
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(question, forKey: .question)
+        try c.encode(context, forKey: .context)
+        try c.encode(confidence, forKey: .confidence)
+        try c.encode(evidenceSeqs, forKey: .evidenceSeqs)
+        try c.encode(requestedBy, forKey: .requestedBy)
+        try c.encode(createdAt.timeIntervalSince1970, forKey: .createdAt)   // Unix-epoch seconds (matches relay's wire)
+    }
+
     /// The fields the answer-side orchestrator needs — maps this superset DOWN to forge's DialRequest shape
     /// (dialId, message, callerName, priority) WITHOUT importing PocketCall (contracts stays dependency-free).
     /// The app's SentiCallManager builds a DialRequest from these.
