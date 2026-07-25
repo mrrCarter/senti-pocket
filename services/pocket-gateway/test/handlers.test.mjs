@@ -435,6 +435,52 @@ test('POST /dial/ring-owner: fail-closed — scope / auth / question / sessionId
   assert.equal((await noBackend.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'q', context: { sessionId: KNOWN } } })).status, 501, 'no pushBackend -> 501');
 });
 
+// ── PR-B4: idempotency + soft rate-limit on POST /dial/ring-owner (Warden #86 follow-up) ─────────────────────────
+test('POST /dial/ring-owner: idempotent — an identical retry returns the SAME dialId and rings ONCE (content-hash)', async () => {
+  let rings = 0;
+  const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend }));
+  const body = { question: 'Ship it?', kind: 'go', context: { sessionId: KNOWN, whatWeNeed: 'go' } };
+  const r1 = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body });
+  const r2 = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body });
+  assert.equal(r1.status, 200); assert.equal(r2.status, 200);
+  assert.equal(rings, 1, 'the identical retry did NOT ring a second time');
+  assert.equal(r2.body.dialId, r1.body.dialId, 'same dialId returned on the replay');
+  assert.equal(r2.body.idempotent, true, 'the replay is flagged idempotent');
+});
+
+test('POST /dial/ring-owner: an explicit idempotencyKey dedupes even across different content', async () => {
+  let rings = 0;
+  const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend }));
+  const r1 = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'First?', kind: 'go', idempotencyKey: 'op-1', context: { sessionId: KNOWN } } });
+  const r2 = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'Different question?', kind: 'decisionYours', idempotencyKey: 'op-1', context: { sessionId: KNOWN } } });
+  assert.equal(rings, 1, 'same idempotencyKey -> exactly one ring, even with different content');
+  assert.equal(r2.body.dialId, r1.body.dialId);
+  assert.equal(r2.body.idempotent, true);
+});
+
+test('POST /dial/ring-owner: soft per-human ring rate-limit -> 429 over the window budget', async () => {
+  const pushBackend = async (input) => ({ dispatched: true, dialId: input.id });
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, ringRateMax: 2 }));
+  const ring = (q) => gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: q, kind: 'go', context: { sessionId: KNOWN } } });
+  assert.equal((await ring('one?')).status, 200);
+  assert.equal((await ring('two?')).status, 200);
+  const third = await ring('three?');
+  assert.equal(third.status, 429, '3rd distinct ring in the window is rate-limited');
+  assert.equal(third.body.reason, 'rate-limited');
+  assert.ok(Number.isFinite(third.body.retryAfterSec), 'carries a retryAfterSec');
+});
+
+test('POST /dial/ring-owner: fail-open — no store wired still rings (never drop a genuine ring)', async () => {
+  let rings = 0;
+  const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, store: undefined }));
+  const r = await gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'Ship?', kind: 'go', context: { sessionId: KNOWN } } });
+  assert.equal(r.status, 200, 'ring proceeds without a store');
+  assert.equal(rings, 1, 'idempotency/rate-limit skipped (fail-open) — infra absence never suppresses a ring');
+});
+
 test('reconciliation binds to PROPOSAL IDENTITY, not body: an older identical-content action is never finalized (Echo P1)', async () => {
   const store = createInMemoryStore();
   const p = makeProposal({ id: 'pident', renderedPreview: 'Approved.' });
