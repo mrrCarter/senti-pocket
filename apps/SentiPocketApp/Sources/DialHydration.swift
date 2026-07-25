@@ -34,7 +34,10 @@ enum DialHydration {
         guard signal.context.sessionId == core.sessionId else {
             throw DialHydrationError.contextMismatch("session \(signal.context.sessionId) != push \(core.sessionId)")
         }
-        // checkpointId: the push core may carry it (or nil); if BOTH present they must agree.
+        // checkpointId: refuse a substitution (both present + differ). The merged VALUE is taken AUTHED-ONLY from the
+        // signal below — NEVER the push — so a push that announces a checkpoint the authed signal doesn't carry can't
+        // scope a follow-up's grounding with an unauthenticated value (forge finding on #91: checkpointId flows
+        // push→RingCore→LiveDialVoice→reasoner.answerFollowUp, so the push must never source it).
         if let pushCp = core.checkpointId, let sigCp = signal.context.checkpointId, pushCp != sigCp {
             throw DialHydrationError.contextMismatch("checkpoint \(sigCp) != push \(pushCp)")
         }
@@ -50,7 +53,7 @@ enum DialHydration {
                 priority: core.priority,
                 callerName: core.callerName,
                 sessionId: core.sessionId,
-                checkpointId: core.checkpointId ?? signal.context.checkpointId
+                checkpointId: signal.context.checkpointId   // AUTHED-ONLY: the push's checkpoint is never trusted as the value
             ),
             message: signal.question,                  // the governed content, from the AUTHED fetch only
             options: options,
