@@ -61,5 +61,12 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
         let nested: [AnyHashable: Any] = ["aps": ["content-available": 1], "payload": ["v": 1, "id": "dial_1", "fetch": true]]
         XCTAssertNil(SentiCallManager.receiveState(from: nested))
     }
+
+    // warden #5b (atlas + relay independently): data(withJSONObject:) raises an NSException — NOT a Swift error, so
+    // try? would NOT catch it → CRASH on a malformed push. isValidJSONObject guards it to the fail-safe nil.
+    func test_receiveState_nil_on_nonconforming_dict_no_crash() {
+        let bad: [AnyHashable: Any] = ["id": "dial_x", "createdAt": Date()]  // Date is not JSON-serializable
+        XCTAssertNil(SentiCallManager.receiveState(from: bad))               // fail-safe nil, NEVER a crash
+    }
 }
 #endif
