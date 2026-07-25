@@ -89,6 +89,7 @@ private func speechFrames() -> [MicrophoneFrame] {
     (0..<6).compactMap { _ in try? MicrophoneFrame(samples: Array(repeating: 0.2, count: 1600), sampleRate: 16_000) }
 }
 
+@MainActor
 private func makeVoice(
     log: SpokenLog = SpokenLog(),
     synthFailing: Bool = false,
