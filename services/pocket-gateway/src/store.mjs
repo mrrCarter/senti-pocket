@@ -16,6 +16,20 @@ import { randomUUID } from 'node:crypto';
 // The TTL on the lock self-heals a crash-before-release; the record has no TTL (idempotency is durable).
 
 /**
+ * Parse the optional TTL write-option shared by put/putIfAbsent (Pulse #78 R7). ABSENT (no `ttlEpochSec` key) -> undefined
+ * (a durable record, backward-compatible for existing callers). PRESENT -> MUST be a positive SAFE integer epoch-second,
+ * read EXACTLY ONCE (getter-TOCTOU-safe); string/NaN/Infinity/nonpositive/fractional/unsafe THROW before any write, so a
+ * caller requesting expiry can never silently get a permanent record or an invalid cleanup policy.
+ */
+function resolveTtlOption(opts) {
+  if (!opts || !Object.hasOwn(opts, 'ttlEpochSec')) return undefined; // key absent -> durable
+  const v = opts.ttlEpochSec; // read EXACTLY once (getter-TOCTOU-safe)
+  if (v === undefined) return undefined; // explicit undefined counts as absent -> durable (backward-compat)
+  if (!(Number.isSafeInteger(v) && v > 0)) throw new Error('store: ttlEpochSec must be a positive safe integer (epoch seconds)');
+  return v;
+}
+
+/**
  * In-memory store — single process, so the primitives are trivially atomic. Used for dev + hermetic tests.
  * acquireLock returns an OWNER TOKEN (or null if held); releaseLock only releases if the caller still owns it
  * (fencing) — so a lock that expired and was re-acquired by another instance is never released out from under it.
@@ -25,14 +39,14 @@ export function createInMemoryStore() {
   const locks = new Map(); // key -> owner token
   return {
     async get(key) { return records.get(key); },
-    async put(key, value) { records.set(key, value); return value; },
+    async put(key, value, opts) { resolveTtlOption(opts); records.set(key, value); return value; }, // validates the ttl-option for adapter parity (rejects present-invalid); in-memory uses LOGICAL expiry, no physical TTL
     async delete(key) { records.delete(key); },
     /** returns a fresh owner token if acquired; null if already held. */
     async acquireLock(key) { if (locks.has(key)) return null; const token = randomUUID(); locks.set(key, token); return token; },
     /** fenced release: no-op unless the caller's token still owns the lock. */
     async releaseLock(key, token) { if (locks.get(key) === token) locks.delete(key); },
     /** atomic reserve: true if stored, false if the key already existed. */
-    async putIfAbsent(key, value) { if (records.has(key)) return false; records.set(key, value); return true; },
+    async putIfAbsent(key, value, opts) { resolveTtlOption(opts); if (records.has(key)) return false; records.set(key, value); return true; },
     // test/debug introspection only
     _records: records,
     _locks: locks,
@@ -55,7 +69,14 @@ export function createDynamoStore(cfg = {}) {
   const nowSec = () => Math.floor(now() / 1000);
   return {
     async get(key) { const r = await client.get({ TableName: table, Key: rk(key) }); return r && r.Item ? r.Item.value : undefined; },
-    async put(key, value) { await client.put({ TableName: table, Item: { ...rk(key), value } }); return value; },
+    async put(key, value, opts = {}) {
+      // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can auto-delete the record (e.g. dial-signal-store's
+      // 900s signals). Records without ttlEpochSec are durable (idempotency/emitted markers), unchanged.
+      const Item = { ...rk(key), value };
+      const ttl = resolveTtlOption(opts); if (ttl !== undefined) Item.ttl = ttl; // R7: present-invalid ttl throws (no silent durable downgrade)
+      await client.put({ TableName: table, Item });
+      return value;
+    },
     async delete(key) { await client.delete({ TableName: table, Key: rk(key) }); },
     async acquireLock(key) {
       const token = randomUUID();
@@ -82,7 +103,7 @@ export function createDynamoStore(cfg = {}) {
       // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can expire the item — e.g. DPoP jti replay
       // records, which must NOT be nested under `value` where TTL can't see them (Echo P1).
       const item = { ...rk(key), value };
-      if (Number.isFinite(opts.ttlEpochSec)) item.ttl = opts.ttlEpochSec;
+      const ttl = resolveTtlOption(opts); if (ttl !== undefined) item.ttl = ttl; // R7: present-invalid ttl throws (shared parser with put)
       try {
         await client.put({ TableName: table, Item: item, ConditionExpression: 'attribute_not_exists(pk)' });
         return true;
