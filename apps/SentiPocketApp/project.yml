@@ -76,15 +76,33 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: true
         SWIFT_VERSION: "5.9"
+  # App-target UNIT tests (Atlas) — the first host-app unit-test target. The app sources (DialHydration, the receive
+  # decoder, etc.) are `internal`, so tests reach them via `@testable import SentiPocketApp`; the `target: SentiPocketApp`
+  # dependency makes XcodeGen wire this as a HOSTED unit test (TEST_HOST = the app). This is the home for all future
+  # app-target unit tests — the ~1800 lines under Sources/ that had no unit-test target until now.
+  SentiPocketAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: SentiPocketApp
+      - package: PocketContracts
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_VERSION: "5.9"
 schemes:
   SentiPocketApp:
     build:
       targets:
         SentiPocketApp: all
         SentiPocketAppUITests: [test]
+        SentiPocketAppTests: [test]
     run:
       config: Debug
     test:
       config: Debug
       targets:
+        - SentiPocketAppTests
         - SentiPocketAppUITests
