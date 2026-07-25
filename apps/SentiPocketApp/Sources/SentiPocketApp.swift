@@ -30,9 +30,22 @@ struct SentiPocketApp: App {
             rootView
             #if canImport(CallKit) && canImport(PushKit)
                 .environmentObject(dialHost)   // hold + provide the host; ensures it inits + registers for VoIP at launch
+                .onAppear { wireRegistrarToLogin() }
             #endif
         }
     }
+
+    #if canImport(CallKit) && canImport(PushKit)
+    /// Wire login → the device VoIP-register: on a fresh login (SignInCoordinator.onAuthenticated) register the cached
+    /// token so a ring can be ADDRESSED to this device. With DialHost's onVoipToken adapter this covers both orderings
+    /// (token-before-login and token-after-login). Release only — DEBUG runs the fixture flow with no real auth/register.
+    @MainActor
+    private func wireRegistrarToLogin() {
+        #if !DEBUG
+        signIn.onAuthenticated = { [weak dialHost] in dialHost?.onLoginCompleted() }
+        #endif
+    }
+    #endif
 
     @ViewBuilder private var rootView: some View {
         #if DEBUG

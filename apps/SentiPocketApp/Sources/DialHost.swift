@@ -22,6 +22,7 @@ import PocketDialVoice
 final class DialHost: ObservableObject {
     let callManager = SentiCallManager()
     private let coordinator: DialCoordinator
+    private let registrar: DeviceRingRegistrar
 
     init(gatewayURL: URL = DialHost.gatewayURL()) {
         let cm = callManager
@@ -32,13 +33,26 @@ final class DialHost: ObservableObject {
             endCall: { [weak cm] uuid in cm?.end(uuid) }
         )
         self.coordinator = coord
+        // Device VoIP-register (PR 2, onto the live login #103): a ring can only be ADDRESSED to this device once the
+        // gateway knows its APNs VoIP token. Register when the token arrives/rotates (adapter 3 below) AND on login
+        // (onLoginCompleted, wired from SignInCoordinator.onAuthenticated by SentiPocketApp) — covers both orderings.
+        // sessionId = the app-PRIMARY session (same derivation as PhoneRootView) — a member session the gateway accepts.
+        let sessionId = FixtureLoader.canonicalBundle()?.sessionId ?? "6cf7e861-546a-4b9f-b937-39182a5bd395"
+        let reg = DeviceRingRegistrar(client: DeviceRingRegistrationClient(apiBaseURL: gatewayURL), sessionId: sessionId)
+        self.registrar = reg
         // Adapter 1 — store the state decoded at push-receive (governed content fetched on answer).
         callManager.onDialReceived = { coord.received($0, dialId: $1) }
         // Adapter 2 — hydrate + run off the dialId + CallKit UUID ONLY; never off IncomingDecisionCall.message.
         callManager.onAnswered = { call in
             Task { @MainActor in await coord.answered(dialId: call.dialId, callUUID: call.id) }
         }
+        // Adapter 3 — register this device's VoIP token when PKPushRegistry delivers or ROTATES it (authed POST).
+        callManager.onVoipToken = { [reg] token in _ = reg.tokenUpdated(token) }
     }
+
+    /// Register (or re-register) the device's cached VoIP token now login has persisted a Bearer. Wired from
+    /// SignInCoordinator.onAuthenticated by SentiPocketApp — the other half of the register trigger.
+    func onLoginCompleted() { registrar.loginCompleted() }
 
     /// Build + run the governed flow for a HYDRATED ring. DialRequest is built from the ring's core (authed), NEVER
     /// the push. modelURL nil until the whisper provisioner ships.
