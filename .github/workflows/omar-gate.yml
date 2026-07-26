@@ -5,6 +5,15 @@ name: Omar Gate
 # scan with codex 5.3 (gpt-5.3-codex) as the managed adjudication model, fail-closed
 # (llm_failure_policy: block), P1 severity gate. See docs/OMAR_GATE.md for the
 # pending activation steps (secret + billing + branch protection).
+#
+# Provider-outage resilience ported from sentinelayer-api's Omar workflow
+# (Omar-specific only — NONE of api's Python-app CI: no compileall/alembic/SBOM):
+#   1. Secret + Google-fallback validation with a manual baseline break-glass.
+#   2. Provider-outage break-glass — the managed lane is continue-on-error; a
+#      classifier (scripts/ci/classify_omar_provider_outage.py) decides whether a
+#      managed failure is a pure provider outage, and a deterministic fallback
+#      lane covers merge only for that classified case (or a manual baseline
+#      dispatch). Requires the SENTINELAYER_TOKEN repo secret to be set to run.
 
 on:
   pull_request:
@@ -85,20 +94,53 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require Omar service token
+      - name: Setup Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.11"
+
+      - name: Validate managed Omar secret and Google fallback secret
         shell: bash
         env:
           SENTINELAYER_TOKEN: ${{ secrets.SENTINELAYER_TOKEN }}
+          GOOGLE_OMAR_FALLBACK_KEY: ${{ secrets.GOOGLE_GEMINI_API_KEY || secrets.GOOGLE_API_KEY }}
+          BASELINE_BREAK_GLASS: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_mode == 'baseline' }}
         run: |
           set -euo pipefail
-          if [ -z "${SENTINELAYER_TOKEN:-}" ]; then
-            echo "::error::Missing SENTINELAYER_TOKEN repo secret — Omar Gate cannot authorize the scan. Add it in Settings > Secrets and variables > Actions."
-            exit 1
+          mask_secret() {
+            local value="${1:-}"
+            if [ -n "${value}" ]; then
+              echo "::add-mask::${value}"
+            fi
+          }
+          require_secret() {
+            local name="$1"
+            local value="${2:-}"
+            local purpose="${3:-}"
+            if [ -z "${value}" ]; then
+              if [ -n "${purpose}" ]; then
+                echo "::error::Missing ${name} for ${purpose}."
+              else
+                echo "::error::Missing ${name}."
+              fi
+              exit 1
+            fi
+          }
+
+          mask_secret "${SENTINELAYER_TOKEN:-}"
+          mask_secret "${GOOGLE_OMAR_FALLBACK_KEY:-}"
+
+          require_secret SENTINELAYER_TOKEN "${SENTINELAYER_TOKEN:-}" ""
+          if [ "${BASELINE_BREAK_GLASS}" = "true" ]; then
+            echo "Manual baseline break-glass selected; skipping managed provider fallback secret requirement."
+          else
+            require_secret GOOGLE_OMAR_FALLBACK_KEY "${GOOGLE_OMAR_FALLBACK_KEY:-}" "Omar Gemini fallback after OpenAI quota exhaustion"
           fi
-          echo "::add-mask::${SENTINELAYER_TOKEN}"
 
       - name: Run managed Omar Gate (codex 5.3, deep, real-LLM, fail-closed)
         id: managed_omar
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.scan_mode == 'baseline') }}
+        continue-on-error: true
         uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec # full Omar action + managed capacity fallback + public provider-error redaction
         with:
           github_token: ${{ github.token }}
@@ -116,3 +158,69 @@ jobs:
           model_fallback: gemini-2.5-flash
           use_codex: "true"
           llm_failure_policy: block
+
+      - name: Classify managed Omar failure
+        id: managed_failure
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.scan_mode == 'baseline') && steps.managed_omar.outcome == 'failure' }}
+        shell: bash
+        env:
+          MANAGED_RUN_ID: ${{ steps.managed_omar.outputs.run_id || '' }}
+        run: |
+          set -euo pipefail
+          normalized_run_id="$(echo "${MANAGED_RUN_ID}" | tr -d '\r' | xargs)"
+          if [[ ! "${normalized_run_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Managed Omar run_id is invalid or missing."
+            exit 1
+          fi
+          findings=".sentinelayer/runs/${normalized_run_id}/FINDINGS.jsonl"
+          python scripts/ci/classify_omar_provider_outage.py \
+            --findings "${findings}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Run deterministic Omar Gate fallback
+        id: baseline_omar
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scan_mode == 'baseline') || steps.managed_failure.outputs.provider_outage_break_glass == 'true' }}
+        uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec # deterministic provider-outage break-glass lane
+        with:
+          github_token: ${{ github.token }}
+          openai_api_key: ""
+          google_api_key: ""
+          llm_provider: openai
+          sentinelayer_token: ${{ secrets.SENTINELAYER_TOKEN }}
+          sentinelayer_spec_id: ${{ vars.SENTINELAYER_SPEC_ID || '' }}
+          sentinelayer_managed_llm: "false"
+          scan_mode: deep
+          severity_gate: ${{ github.event_name == 'workflow_dispatch' && inputs.severity_gate || 'P1' }}
+          model: gpt-5.3-codex
+          codex_model: gpt-5.3-codex
+          model_fallback: gemini-2.5-flash
+          use_codex: "false"
+          llm_failure_policy: deterministic_only
+
+      - name: Select Omar Gate result
+        id: omar_result
+        shell: bash
+        env:
+          MANUAL_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_mode == 'baseline' }}
+          PROVIDER_OUTAGE_BREAK_GLASS: ${{ steps.managed_failure.outputs.provider_outage_break_glass || 'false' }}
+          MANAGED_OUTCOME: ${{ steps.managed_omar.outcome || '' }}
+          MANAGED_FAILURE_REASON: ${{ steps.managed_failure.outputs.reason || 'not_classified' }}
+        run: |
+          set -euo pipefail
+          # The deterministic break-glass lane (baseline_omar) is NOT
+          # continue-on-error, so if it runs and fails the job has already
+          # failed before reaching this step. This step therefore only has to
+          # adjudicate the continue-on-error managed lane, mirroring the
+          # sentinelayer-api "Select Omar Gate result" line-496 semantics:
+          # a managed failure blocks merge unless it qualified for break-glass.
+          if [ "${MANUAL_BASELINE}" = "true" ] || [ "${PROVIDER_OUTAGE_BREAK_GLASS}" = "true" ]; then
+            echo "selected_source=baseline" >> "${GITHUB_OUTPUT}"
+            echo "Omar Gate satisfied via deterministic break-glass lane (manual_baseline='${MANUAL_BASELINE}', provider_outage_break_glass='${PROVIDER_OUTAGE_BREAK_GLASS}')."
+            exit 0
+          fi
+          if [ "${MANAGED_OUTCOME}" != "success" ]; then
+            echo "::error::Managed Omar failed and did not qualify for provider-outage break-glass (outcome='${MANAGED_OUTCOME}', reason='${MANAGED_FAILURE_REASON}')."
+            exit 1
+          fi
+          echo "selected_source=managed" >> "${GITHUB_OUTPUT}"
+          echo "Managed Omar Gate passed (outcome='${MANAGED_OUTCOME}')."
