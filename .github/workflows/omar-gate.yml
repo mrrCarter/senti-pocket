@@ -434,7 +434,7 @@ jobs:
         if: steps.trust_boundary.outputs.trusted_context == 'true'
         id: omar
         continue-on-error: true
-        uses: mrrCarter/sentinelayer-v1-action@a496be33a466c0cc3f8616d66bbd7d78f7d3c31d
+        uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec
         with:
           github_token: ${{ github.token }}
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
@@ -484,7 +484,7 @@ jobs:
       - name: Run deterministic Omar Gate fallback
         if: steps.trust_boundary.outputs.trusted_context == 'true' && steps.managed_failure.outputs.provider_outage_break_glass == 'true'
         id: baseline_omar
-        uses: mrrCarter/sentinelayer-v1-action@a496be33a466c0cc3f8616d66bbd7d78f7d3c31d
+        uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec
         with:
           github_token: ${{ github.token }}
           sentinelayer_token: ${{ steps.resolve_omar_credentials.outputs.sentinelayer_token }}
@@ -709,7 +709,7 @@ jobs:
               },
               "scan": {
                   "mode": env("OMAR_SCAN_MODE", "deep"),
-                  "action_ref": "mrrCarter/sentinelayer-v1-action@a496be33a466c0cc3f8616d66bbd7d78f7d3c31d",
+                  "action_ref": "mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec",
                   "llm_provider": env("OMAR_LLM_PROVIDER", "openai"),
                   "model": env("OMAR_MODEL", "gpt-5.3-codex"),
                   "model_fallback": env("OMAR_MODEL_FALLBACK", "gpt-4.1-mini"),
