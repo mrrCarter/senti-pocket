@@ -27,7 +27,7 @@ ALLOWED_DETERMINISTIC_GOOGLE_API_KEY_LINE = 'google_api_key: ""'
 OPENAI_PRESENT_EXPR = "secrets.OPENAI_API_KEY != ''"
 GOOGLE_PRESENT_EXPR = "(secrets.GOOGLE_GEMINI_API_KEY != '' || secrets.GOOGLE_API_KEY != '')"
 GOOGLE_ABSENT_EXPR = "secrets.GOOGLE_GEMINI_API_KEY == '' && secrets.GOOGLE_API_KEY == ''"
-ACTION_REF = "mrrCarter/sentinelayer-v1-action@a496be33a466c0cc3f8616d66bbd7d78f7d3c31d"
+ACTION_REF = "mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec"
 ALLOWED_LLM_PROVIDER_LINE = f"llm_provider: ${{{{ {OPENAI_PRESENT_EXPR} && 'openai' || ({GOOGLE_PRESENT_EXPR} && 'google' || 'openai') }}}}"
 ALLOWED_DETERMINISTIC_LLM_PROVIDER_LINE = "llm_provider: openai"
 ALLOWED_MODEL_LINE = f"model: ${{{{ {OPENAI_PRESENT_EXPR} && 'gpt-5.3-codex' || ({GOOGLE_PRESENT_EXPR} && 'gemini-2.5-flash' || 'gpt-5.3-codex') }}}}"
@@ -356,7 +356,7 @@ jobs:
       - name: Run Omar Gate
         id: omar
         continue-on-error: true
-        uses: mrrCarter/sentinelayer-v1-action@a496be33a466c0cc3f8616d66bbd7d78f7d3c31d
+        uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec
         with:
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           google_api_key: ${{ secrets.GOOGLE_GEMINI_API_KEY != '' && secrets.GOOGLE_GEMINI_API_KEY || secrets.GOOGLE_API_KEY }}
@@ -375,7 +375,7 @@ jobs:
           python3 scripts/ci/classify_omar_provider_outage.py --findings .sentinelayer/runs/run/FINDINGS.jsonl --run-summary "${summary_path}" --github-output "${GITHUB_OUTPUT}"
           echo "provider_outage_break_glass"
       - name: Run deterministic Omar Gate fallback
-        uses: mrrCarter/sentinelayer-v1-action@a496be33a466c0cc3f8616d66bbd7d78f7d3c31d
+        uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec
         with:
           sentinelayer_managed_llm: "false"
           model: gpt-5.3-codex
