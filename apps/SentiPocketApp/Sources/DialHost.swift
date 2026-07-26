@@ -66,7 +66,9 @@ final class DialHost: ObservableObject {
         let writer = PhoneWriteAdapter(PhoneWriteViewModel(sessionId: ring.core.sessionId,
                                                            client: PocketWriteClient(apiBaseURL: gatewayURL)))
         let request = DialRequest(dialId: ring.core.id,
-                                  message: ring.message,          // the AUTHED, hydrated governed content
+                                  // the AUTHED, hydrated governed content — with a pickOption ring's choices folded
+                                  // into the spoken text so the pickup READS the options, not just the question (#17).
+                                  message: dialSpokenMessage(message: ring.message, options: ring.options),
                                   callerName: ring.core.callerName,
                                   priority: ring.core.priority)
         return await DialOrchestrator(voice: voice, writer: writer).run(request)

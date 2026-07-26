@@ -23,6 +23,30 @@ final class NeedCarterSignalTests: XCTestCase {
         XCTAssertEqual(f.callerName, "Senti · claude-warden needs your decision")
     }
 
+    func test_dialFields_pickOption_speaks_the_options() {
+        // #17: a pickOption ring carries the choice labels, but the down-mapped message dropped them — so the pickup
+        // spoke "needs you to choose" + the question yet never the choices. dialFields must now READ them aloud.
+        let f = signal(kind: .pickOption(["Merge now", "Wait for forge", "Split the PR"]),
+                       confidence: 0.8, requestedBy: "claude-pocket-relay").dialFields()
+        XCTAssertEqual(
+            f.message,
+            "Ship the consolidation to master? Your options are: A, Merge now. B, Wait for forge. C, Split the PR.")
+        XCTAssertEqual(f.callerName, "Senti · claude-pocket-relay needs you to choose")
+        XCTAssertEqual(f.priority, "medium")                                 // pickOption → medium
+    }
+
+    func test_dialFields_non_pickOption_message_stays_the_bare_question() {
+        // Only pickOption folds options; every other kind's spoken message is unchanged (no stray "options are").
+        for kind in [NeedCarterKind.go, .decisionYours, .info, .checkpointReady] {
+            let f = signal(kind: kind, confidence: 0.9).dialFields()
+            XCTAssertEqual(f.message, "Ship the consolidation to master?", "kind \(kind.slug) must not fold options")
+        }
+    }
+
+    func test_dialSpokenMessage_empty_options_is_identity() {
+        XCTAssertEqual(dialSpokenMessage(message: "GO?", options: []), "GO?")
+    }
+
     func test_priority_mapping_per_kind() {
         XCTAssertEqual(NeedCarterKind.decisionYours.dialPriority, "high")
         XCTAssertEqual(NeedCarterKind.go.dialPriority, "medium")
