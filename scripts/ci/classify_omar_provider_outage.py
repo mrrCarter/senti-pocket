@@ -195,7 +195,7 @@ def classify_provider_outage(
             p2_count=0,
         )
 
-    if counts["P0"] != 1 or len(blocking) != 1:
+    if counts["P0"] < 1 or len(blocking) < 1:
         return ProviderOutageClassification(
             provider_outage_break_glass=False,
             reason="expected_exactly_one_p0_llm_failure",
@@ -205,46 +205,49 @@ def classify_provider_outage(
             p2_count=counts["P2"],
         )
 
-    finding = blocking[0]
-    category = str(finding.get("category") or "")
-    source = _finding_source(finding)
-    file_path = _finding_path(finding)
-    message = _finding_message(finding)
-    if category != "LLM Failure" or source != "system" or file_path != "<system>":
-        return ProviderOutageClassification(
-            provider_outage_break_glass=False,
-            reason="p0_is_not_system_llm_failure",
-            blocking_count=len(blocking),
-            p0_count=counts["P0"],
-            p1_count=counts["P1"],
-            p2_count=counts["P2"],
-        )
-
-    if not all(marker in message for marker in _LLM_FAILURE_MARKERS):
-        return ProviderOutageClassification(
-            provider_outage_break_glass=False,
-            reason="llm_failure_message_missing_fail_closed_markers",
-            blocking_count=len(blocking),
-            p0_count=counts["P0"],
-            p1_count=counts["P1"],
-            p2_count=counts["P2"],
-        )
-
-    if not any(marker in message for marker in _CAPACITY_MARKERS):
-        return ProviderOutageClassification(
-            provider_outage_break_glass=False,
-            reason="llm_failure_not_provider_capacity_class",
-            blocking_count=len(blocking),
-            p0_count=counts["P0"],
-            p1_count=counts["P1"],
-            p2_count=counts["P2"],
-        )
+    # Every blocking P0 must be a system LLM-failure capacity-outage sentinel. This
+    # allows a COMPOUND all-provider capacity outage (N such P0s -- e.g. OpenAI quota
+    # + Gemini-fallback quota) to break-glass to deterministic output, while ANY real
+    # code-finding P0 still blocks: a genuine finding is never waved through, even in
+    # a compound outage. Preserves #105 per-finding strictness.
+    for finding in blocking:
+        category = str(finding.get("category") or "")
+        source = _finding_source(finding)
+        file_path = _finding_path(finding)
+        message = _finding_message(finding)
+        if category != "LLM Failure" or source != "system" or file_path != "<system>":
+            return ProviderOutageClassification(
+                provider_outage_break_glass=False,
+                reason="p0_is_not_system_llm_failure",
+                blocking_count=len(blocking),
+                p0_count=counts["P0"],
+                p1_count=counts["P1"],
+                p2_count=counts["P2"],
+            )
+        if not all(marker in message for marker in _LLM_FAILURE_MARKERS):
+            return ProviderOutageClassification(
+                provider_outage_break_glass=False,
+                reason="llm_failure_message_missing_fail_closed_markers",
+                blocking_count=len(blocking),
+                p0_count=counts["P0"],
+                p1_count=counts["P1"],
+                p2_count=counts["P2"],
+            )
+        if not any(marker in message for marker in _CAPACITY_MARKERS):
+            return ProviderOutageClassification(
+                provider_outage_break_glass=False,
+                reason="llm_failure_not_provider_capacity_class",
+                blocking_count=len(blocking),
+                p0_count=counts["P0"],
+                p1_count=counts["P1"],
+                p2_count=counts["P2"],
+            )
 
     return ProviderOutageClassification(
         provider_outage_break_glass=True,
-        reason="single_system_llm_provider_outage",
-        blocking_count=1,
-        p0_count=1,
+        reason="single_system_llm_provider_outage" if counts["P0"] == 1 else "compound_system_llm_provider_outage",
+        blocking_count=len(blocking),
+        p0_count=counts["P0"],
         p1_count=0,
         p2_count=0,
     )
