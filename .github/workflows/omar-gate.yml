@@ -1,10 +1,19 @@
 name: Omar Gate
 
-# Senti Pocket Omar Gate — set up the same way as the SentinelLayer org repos:
-# the reusable mrrCarter/sentinelayer-v1-action (pinned SHA) runs a real-LLM deep
-# scan with codex 5.3 (gpt-5.3-codex) as the managed adjudication model, fail-closed
-# (llm_failure_policy: block), P1 severity gate. See docs/OMAR_GATE.md for the
-# pending activation steps (secret + billing + branch protection).
+# Senti Pocket Omar Gate — upgraded to replicate the PROVEN-WORKING OIDC
+# token-exchange pattern from mrrCarter/create-sentinelayer (the only repo whose
+# Omar Gate currently passes on protected refs). The omar_gate job now performs a
+# GitHub OIDC id-token -> SentinelLayer short-lived-token exchange
+# (resolve_omar_credentials, copied verbatim from create-sentinelayer) and feeds
+# the exchanged token to the managed deep scan (codex 5.3 / gpt-5.3-codex,
+# fail-closed, P1 severity gate).
+#
+# ACTIVATION REQUIREMENT (owner action, not a code change): the exchange only runs
+# when the repo-level Actions *variables* OMAR_TOKEN_EXCHANGE_URL and
+# OMAR_TOKEN_EXCHANGE_AUDIENCE are set (same as create-sentinelayer). On protected
+# refs, with OMAR_ALLOW_STATIC_SECRETS defaulting to 'false', the gate fails-closed
+# until those variables are configured and the SentinelLayer backend is allowlisted
+# to accept senti-pocket's OIDC identity. See omar-exchange-summary.md.
 
 on:
   pull_request:
@@ -46,6 +55,12 @@ concurrency:
   group: omar-gate-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Carried over from the working create-sentinelayer reference so the pinned
+# JavaScript actions run on the Node 24 runtime. Not part of the OIDC exchange;
+# safe to drop if undesired.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   omar_precheck:
     name: Omar Gate Precheck
@@ -85,34 +100,297 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require Omar service token
+      # --- resolve_omar_credentials: copied VERBATIM from create-sentinelayer's
+      # omar-gate.yml (lines 146-374). The security-critical env block, GitHub OIDC
+      # id-token request, token-exchange POST, response-schema/pinned-pubkey/
+      # audience/issuer/TTL/response-binding validation, and static-secret
+      # enforcement are unchanged. The ONLY adaptation is the removal of the
+      # `if: steps.trust_boundary.outputs.trusted_context == 'true'` guard, because
+      # senti-pocket handles fork-guarding in the separate omar_precheck job (this
+      # entire job only runs when needs.omar_precheck.outputs.allow_scan == 'true').
+      - name: Resolve Omar credential mode
+        id: resolve_omar_credentials
         shell: bash
         env:
           SENTINELAYER_TOKEN: ${{ secrets.SENTINELAYER_TOKEN }}
+          OMAR_TOKEN_EXCHANGE_URL: ${{ vars.OMAR_TOKEN_EXCHANGE_URL || '' }}
+          OMAR_TOKEN_EXCHANGE_AUDIENCE: ${{ vars.OMAR_TOKEN_EXCHANGE_AUDIENCE || '' }}
+          OMAR_TOKEN_EXCHANGE_ISSUER: ${{ vars.OMAR_TOKEN_EXCHANGE_ISSUER || '' }}
+          OMAR_TOKEN_EXCHANGE_MAX_TTL_SECONDS: ${{ vars.OMAR_TOKEN_EXCHANGE_MAX_TTL_SECONDS || '3600' }}
+          OMAR_TOKEN_EXCHANGE_PINNED_PUBKEY_SHA256: ${{ vars.OMAR_TOKEN_EXCHANGE_PINNED_PUBKEY_SHA256 || '' }}
+          OMAR_REQUIRE_PINNED_PUBKEY_ON_PROTECTED_REF: ${{ vars.OMAR_REQUIRE_PINNED_PUBKEY_ON_PROTECTED_REF || 'true' }}
+          OMAR_REQUIRE_RESPONSE_BINDING_ON_PROTECTED_REF: ${{ vars.OMAR_REQUIRE_RESPONSE_BINDING_ON_PROTECTED_REF || 'true' }}
+          OMAR_TOKEN_EXCHANGE_ALLOWED_HOSTS: ${{ vars.OMAR_TOKEN_EXCHANGE_ALLOWED_HOSTS || 'api.sentinelayer.com' }}
+          OMAR_TOKEN_EXCHANGE_ALLOWED_PATHS: ${{ vars.OMAR_TOKEN_EXCHANGE_ALLOWED_PATHS || '/v1/token/exchange/sentinelayer' }}
+          OMAR_REQUIRE_OIDC_ON_PROTECTED_REF: ${{ vars.OMAR_REQUIRE_OIDC_ON_PROTECTED_REF || 'true' }}
+          OMAR_ALLOW_STATIC_SECRETS: ${{ vars.OMAR_ALLOW_STATIC_SECRETS || 'false' }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           set -euo pipefail
-          if [ -z "${SENTINELAYER_TOKEN:-}" ]; then
-            echo "::error::Missing SENTINELAYER_TOKEN repo secret — Omar Gate cannot authorize the scan. Add it in Settings > Secrets and variables > Actions."
+          mode="static-secrets"
+          credential_env_name="SENTINELAYER_TOKEN"
+          resolved_credential="${!credential_env_name}"
+          exchange_url="$(echo "${OMAR_TOKEN_EXCHANGE_URL}" | xargs || true)"
+          exchange_audience="$(echo "${OMAR_TOKEN_EXCHANGE_AUDIENCE}" | xargs || true)"
+          event_name="${GITHUB_EVENT_NAME}"
+          ref_protected="$(echo "${GITHUB_REF_PROTECTED}" | tr '[:upper:]' '[:lower:]' | xargs || true)"
+          allow_static="$(echo "${OMAR_ALLOW_STATIC_SECRETS:-false}" | tr '[:upper:]' '[:lower:]' | xargs || true)"
+          require_pinned="$(echo "${OMAR_REQUIRE_PINNED_PUBKEY_ON_PROTECTED_REF}" | tr '[:upper:]' '[:lower:]' | xargs || true)"
+          require_response_binding_on_protected="$(echo "${OMAR_REQUIRE_RESPONSE_BINDING_ON_PROTECTED_REF}" | tr '[:upper:]' '[:lower:]' | xargs || true)"
+          pinned_pubkey="$(echo "${OMAR_TOKEN_EXCHANGE_PINNED_PUBKEY_SHA256}" | xargs || true)"
+          if [ -z "${exchange_url}" ] || [ -z "${exchange_audience}" ]; then
+            if [ "${allow_static}" != "true" ]; then
+              if [ "${ref_protected}" = "true" ]; then
+                echo "::error::OIDC exchange is required for Omar Gate on protected refs. Configure OMAR_TOKEN_EXCHANGE_URL and OMAR_TOKEN_EXCHANGE_AUDIENCE, or set OMAR_ALLOW_STATIC_SECRETS=true only as a documented emergency fallback until exchange is provisioned."
+              else
+                echo "::error::OIDC exchange is required for Omar Gate on ${event_name} events. Configure OMAR_TOKEN_EXCHANGE_URL and OMAR_TOKEN_EXCHANGE_AUDIENCE, or set OMAR_ALLOW_STATIC_SECRETS=true for emergency static fallback."
+              fi
+              exit 1
+            fi
+            if [ "${ref_protected}" = "true" ]; then
+              echo "::warning::Protected ref is using explicit OMAR_ALLOW_STATIC_SECRETS=true fallback because Omar OIDC exchange is not configured. Provision OMAR_TOKEN_EXCHANGE_URL and OMAR_TOKEN_EXCHANGE_AUDIENCE, then unset OMAR_ALLOW_STATIC_SECRETS."
+            fi
+          fi
+          if [ -n "${exchange_url}" ] && [ -n "${exchange_audience}" ]; then
+            if ! echo "${exchange_url}" | grep -Eq '^https://'; then
+              echo "::error::OMAR_TOKEN_EXCHANGE_URL must use https://."
+              exit 1
+            fi
+            exchange_host="$(node -e "try { const u = new URL(process.argv[1]); process.stdout.write(String(u.hostname || '').toLowerCase()); } catch { process.exit(1); }" "${exchange_url}" || true)"
+            exchange_path="$(node -e "try { const u = new URL(process.argv[1]); process.stdout.write(String(u.pathname || '/')); } catch { process.exit(1); }" "${exchange_url}" || true)"
+            if [ -z "${exchange_host}" ] || [ -z "${exchange_path}" ]; then
+              echo "::error::OMAR_TOKEN_EXCHANGE_URL is not a valid absolute URL."
+              exit 1
+            fi
+            host_allowed="false"
+            IFS=',' read -r -a allowed_hosts <<< "${OMAR_TOKEN_EXCHANGE_ALLOWED_HOSTS}"
+            for host in "${allowed_hosts[@]}"; do
+              candidate="$(echo "${host}" | tr '[:upper:]' '[:lower:]' | xargs)"
+              if [ -n "${candidate}" ] && [ "${candidate}" = "${exchange_host}" ]; then
+                host_allowed="true"
+                break
+              fi
+            done
+            if [ "${host_allowed}" != "true" ]; then
+              echo "::error::OMAR_TOKEN_EXCHANGE_URL host '${exchange_host}' is not allowlisted. Allowed hosts: ${OMAR_TOKEN_EXCHANGE_ALLOWED_HOSTS}."
+              exit 1
+            fi
+            path_allowed="false"
+            IFS=',' read -r -a allowed_paths <<< "${OMAR_TOKEN_EXCHANGE_ALLOWED_PATHS}"
+            for allowed_path in "${allowed_paths[@]}"; do
+              candidate_path="$(echo "${allowed_path}" | xargs)"
+              if [ -n "${candidate_path}" ] && [ "${candidate_path}" = "${exchange_path}" ]; then
+                path_allowed="true"
+                break
+              fi
+            done
+            if [ "${path_allowed}" != "true" ]; then
+              echo "::error::OMAR_TOKEN_EXCHANGE_URL path '${exchange_path}' is not allowlisted. Allowed paths: ${OMAR_TOKEN_EXCHANGE_ALLOWED_PATHS}."
+              exit 1
+            fi
+            if [ "${ref_protected}" = "true" ] && [ "${require_pinned}" != "false" ] && [ -z "${pinned_pubkey}" ]; then
+              echo "::error::Pinned public key is required for Omar token exchange on protected refs. Set OMAR_TOKEN_EXCHANGE_PINNED_PUBKEY_SHA256."
+              exit 1
+            fi
+            curl_pinned_arg=""
+            if [ -n "${pinned_pubkey}" ]; then
+              if echo "${pinned_pubkey}" | grep -q '^sha256//'; then
+                curl_pinned_arg="--pinnedpubkey ${pinned_pubkey}"
+              else
+                curl_pinned_arg="--pinnedpubkey sha256//${pinned_pubkey}"
+              fi
+            fi
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+              echo "::error::OIDC exchange is configured but GitHub OIDC request context is unavailable."
+              exit 1
+            fi
+            oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${exchange_audience}"
+            oidc_response="$(curl -fsS --retry 2 --retry-delay 1 --retry-all-errors --connect-timeout 5 --max-time 20 \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${oidc_url}")"
+            oidc_token="$(echo "${oidc_response}" | jq -r '.value // empty')"
+            if [ -z "${oidc_token}" ]; then
+              echo "::error::OIDC exchange failed: missing id_token value in GitHub OIDC response."
+              exit 1
+            fi
+            exchange_nonce="$(printf '%s|%s|%s|%s' "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_SHA}" "$(date +%s%N)" | sha256sum | awk '{print $1}')"
+            exchange_payload="$(jq -n \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              --arg run_id "${GITHUB_RUN_ID}" \
+              --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+              --arg ref "${GITHUB_REF}" \
+              --arg sha "${GITHUB_SHA}" \
+              --arg exchange_nonce "${exchange_nonce}" \
+              '{repository: $repository, run_id: $run_id, run_attempt: $run_attempt, ref: $ref, sha: $sha, exchange_nonce: $exchange_nonce}')"
+            exchange_headers="$(mktemp)"
+            exchange_body="$(mktemp)"
+            exchange_status="$(curl -sS --retry 2 --retry-delay 1 --retry-all-errors --connect-timeout 5 --max-time 20 \
+              -D "${exchange_headers}" \
+              -o "${exchange_body}" \
+              -w "%{http_code}" \
+              ${curl_pinned_arg} \
+              -H "Authorization: Bearer ${oidc_token}" \
+              -H "Content-Type: application/json" \
+              -d "${exchange_payload}" \
+              "${exchange_url}")"
+            if [ "${exchange_status}" != "200" ]; then
+              echo "::error::OIDC exchange failed with status ${exchange_status}."
+              exchange_error_code="$(jq -r '.error_code // .code // empty' "${exchange_body}" 2>/dev/null || true)"
+              exchange_request_id="$(jq -r '.request_id // .requestId // empty' "${exchange_body}" 2>/dev/null || true)"
+              if [ -n "${exchange_error_code}" ] || [ -n "${exchange_request_id}" ]; then
+                echo "::error::exchange_error_code=${exchange_error_code:-<none>} exchange_request_id=${exchange_request_id:-<none>}"
+              fi
+              exit 1
+            fi
+            content_type="$(grep -i '^content-type:' "${exchange_headers}" | tail -n 1 | cut -d':' -f2- | xargs || true)"
+            if ! echo "${content_type}" | grep -qi '^application/json'; then
+              echo "::error::OIDC exchange response content-type must be application/json (received '${content_type:-<none>}')."
+              exit 1
+            fi
+            if ! jq -e 'type=="object" and (.sentinelayer_token|type=="string" and length>0) and (.expires_at|type=="string" and length>0) and (.issuer|type=="string" and length>0) and (.audience|type=="string" and length>0)' "${exchange_body}" >/dev/null 2>&1; then
+              echo "::error::OIDC exchange response schema invalid or missing required fields."
+              exchange_error_code="$(jq -r '.error_code // .code // empty' "${exchange_body}" 2>/dev/null || true)"
+              exchange_request_id="$(jq -r '.request_id // .requestId // empty' "${exchange_body}" 2>/dev/null || true)"
+              if [ -n "${exchange_error_code}" ] || [ -n "${exchange_request_id}" ]; then
+                echo "::error::exchange_error_code=${exchange_error_code:-<none>} exchange_request_id=${exchange_request_id:-<none>}"
+              fi
+              exit 1
+            fi
+            resolved_credential="$(jq -r '.sentinelayer_token' "${exchange_body}")"
+            exchange_issuer="$(jq -r '.issuer' "${exchange_body}")"
+            exchange_audience_resp="$(jq -r '.audience' "${exchange_body}")"
+            exchange_expires_at="$(jq -r '.expires_at' "${exchange_body}")"
+            response_repository="$(jq -r '.repository // empty' "${exchange_body}")"
+            response_run_id="$(jq -r '.run_id // empty' "${exchange_body}")"
+            response_sha="$(jq -r '.sha // empty' "${exchange_body}")"
+            response_nonce="$(jq -r '.exchange_nonce // empty' "${exchange_body}")"
+            if [ -n "${exchange_audience}" ] && [ "${exchange_audience_resp}" != "${exchange_audience}" ]; then
+              echo "::error::OIDC exchange audience mismatch. expected=${exchange_audience} actual=${exchange_audience_resp}."
+              exit 1
+            fi
+            expected_issuer="$(echo "${OMAR_TOKEN_EXCHANGE_ISSUER}" | xargs || true)"
+            if [ -n "${expected_issuer}" ] && [ "${exchange_issuer}" != "${expected_issuer}" ]; then
+              echo "::error::OIDC exchange issuer mismatch. expected=${expected_issuer} actual=${exchange_issuer}."
+              exit 1
+            fi
+            expires_epoch="$(date -u -d "${exchange_expires_at}" +%s 2>/dev/null || true)"
+            if [ -z "${expires_epoch}" ]; then
+              echo "::error::OIDC exchange expires_at is invalid: ${exchange_expires_at}."
+              exit 1
+            fi
+            now_epoch="$(date +%s)"
+            ttl_seconds="$((expires_epoch - now_epoch))"
+            max_ttl="$(echo "${OMAR_TOKEN_EXCHANGE_MAX_TTL_SECONDS}" | xargs || true)"
+            case "${max_ttl}" in ''|*[!0-9]*) echo "::error::Invalid OMAR_TOKEN_EXCHANGE_MAX_TTL_SECONDS value: ${max_ttl}" ; exit 1 ;; esac
+            if [ "${ttl_seconds}" -le 0 ]; then
+              echo "::error::OIDC exchange token is already expired (ttl=${ttl_seconds})."
+              exit 1
+            fi
+            if [ "${ttl_seconds}" -gt "${max_ttl}" ]; then
+              echo "::error::OIDC exchange token TTL ${ttl_seconds}s exceeds maximum ${max_ttl}s."
+              exit 1
+            fi
+            # Enforce response binding checks on ALL refs, not only
+            # protected. Unprotected contexts are still subject to token
+            # forgery / replay if the binding isn't validated. Opt-out via
+            # OMAR_REQUIRE_RESPONSE_BINDING_ON_PROTECTED_REF=false remains as
+            # an emergency escape hatch but applies globally now, and is
+            # deprecated — remove in a future release.
+            if [ "${require_response_binding_on_protected}" != "false" ]; then
+              if [ -z "${response_repository}" ] || [ -z "${response_run_id}" ] || [ -z "${response_sha}" ] || [ -z "${response_nonce}" ]; then
+                echo "::error::OIDC exchange response binding fields are required (repository, run_id, sha, exchange_nonce)."
+                exit 1
+              fi
+              if [ "${response_repository}" != "${GITHUB_REPOSITORY}" ]; then
+                echo "::error::OIDC exchange repository binding mismatch. expected=${GITHUB_REPOSITORY} actual=${response_repository}."
+                exit 1
+              fi
+              if [ "${response_run_id}" != "${GITHUB_RUN_ID}" ]; then
+                echo "::error::OIDC exchange run_id binding mismatch. expected=${GITHUB_RUN_ID} actual=${response_run_id}."
+                exit 1
+              fi
+              if [ "${response_sha}" != "${GITHUB_SHA}" ]; then
+                echo "::error::OIDC exchange sha binding mismatch. expected=${GITHUB_SHA} actual=${response_sha}."
+                exit 1
+              fi
+              if [ "${response_nonce}" != "${exchange_nonce}" ]; then
+                echo "::error::OIDC exchange nonce binding mismatch."
+                exit 1
+              fi
+            fi
+            mode="oidc-exchange"
+          fi
+          require_oidc="$(echo "${OMAR_REQUIRE_OIDC_ON_PROTECTED_REF}" | tr '[:upper:]' '[:lower:]' | xargs || true)"
+          if [ "${mode}" = "static-secrets" ] && [ "${ref_protected}" = "true" ] && [ "${require_oidc}" != "false" ] && [ "${allow_static}" != "true" ]; then
+            echo "::error::Static-secret Omar mode is blocked on protected refs. Configure OMAR_TOKEN_EXCHANGE_URL and OMAR_TOKEN_EXCHANGE_AUDIENCE."
             exit 1
           fi
-          echo "::add-mask::${SENTINELAYER_TOKEN}"
+          echo "::add-mask::${resolved_credential}"
+          echo "sentinelayer_token=${resolved_credential}" >> "${GITHUB_OUTPUT}"
+          echo "credential_mode=${mode}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## Omar Credential Mode"
+            echo "- mode: \`${mode}\`"
+            if [ -n "${exchange_url}" ] && [ -n "${exchange_audience}" ]; then
+              echo "- exchange_url: \`${exchange_url}\`"
+              echo "- exchange_audience: \`${exchange_audience}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run managed Omar Gate (codex 5.3, deep, real-LLM, fail-closed)
-        id: managed_omar
-        uses: mrrCarter/sentinelayer-v1-action@c61fb388e9769449c6cbe0062805d46b484a47ec # full Omar action + managed capacity fallback + public provider-error redaction
+        id: omar
+        uses: mrrCarter/sentinelayer-v1-action@a496be33a466c0cc3f8616d66bbd7d78f7d3c31d
         with:
           github_token: ${{ github.token }}
-          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          google_api_key: ${{ secrets.GOOGLE_GEMINI_API_KEY || secrets.GOOGLE_API_KEY }}
-          llm_provider: openai
-          comment_tag: managed
-          sentinelayer_token: ${{ secrets.SENTINELAYER_TOKEN }}
-          sentinelayer_spec_id: ${{ vars.SENTINELAYER_SPEC_ID || '' }}
-          sentinelayer_managed_llm: "true"
+          sentinelayer_token: ${{ steps.resolve_omar_credentials.outputs.sentinelayer_token }}
+          sentinelayer_managed_llm: ${{ steps.resolve_omar_credentials.outputs.sentinelayer_token != '' }}
           scan_mode: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_mode || 'deep' }}
           severity_gate: ${{ github.event_name == 'workflow_dispatch' && inputs.severity_gate || 'P1' }}
           model: gpt-5.3-codex
           codex_model: gpt-5.3-codex
-          model_fallback: gemini-2.5-flash
-          use_codex: "true"
+          use_codex: "false"
           llm_failure_policy: block
+
+      - name: Enforce Omar Gate threshold
+        id: omar_gate_decision
+        shell: bash
+        env:
+          OMAR_RUN_ID: ${{ steps.omar.outputs.run_id || '' }}
+          OMAR_GATE_STATUS: ${{ steps.omar.outputs.gate_status || '' }}
+          OMAR_P0: ${{ steps.omar.outputs.p0_count || '0' }}
+          OMAR_P1: ${{ steps.omar.outputs.p1_count || '0' }}
+          OMAR_P2: ${{ steps.omar.outputs.p2_count || '0' }}
+          OMAR_P3: ${{ steps.omar.outputs.p3_count || '0' }}
+          SEVERITY_GATE: ${{ github.event_name == 'workflow_dispatch' && inputs.severity_gate || 'P1' }}
+        run: |
+          set -euo pipefail
+          gate_status="$(echo "${OMAR_GATE_STATUS}" | tr -d '\r' | xargs || true)"
+          p0="$(echo "${OMAR_P0}" | tr -d '\r' | xargs || true)"
+          p1="$(echo "${OMAR_P1}" | tr -d '\r' | xargs || true)"
+          p2="$(echo "${OMAR_P2}" | tr -d '\r' | xargs || true)"
+          p3="$(echo "${OMAR_P3}" | tr -d '\r' | xargs || true)"
+          for value in "${p0}" "${p1}" "${p2}" "${p3}"; do
+            case "${value}" in ''|*[!0-9]*) echo "::error::Invalid Omar severity count output: ${value}" ; exit 1 ;; esac
+          done
+          if [ -n "${OMAR_RUN_ID}" ] && ! echo "${OMAR_RUN_ID}" | grep -Eq '^[A-Za-z0-9_-]{8,128}$'; then
+            echo "::error::Invalid Omar run_id output: ${OMAR_RUN_ID}"
+            exit 1
+          fi
+          case "${gate_status}" in ''|pass|passed|blocked|fail|failed) ;; *) echo "::error::Invalid Omar gate_status output: ${gate_status}" ; exit 1 ;; esac
+          {
+            echo "## Omar Gate"
+            echo "- run_id: \`${OMAR_RUN_ID}\`"
+            echo "- gate_status: \`${gate_status:-<none>}\`"
+            echo "- findings: \`P0=${p0} P1=${p1} P2=${p2} P3=${p3}\`"
+            echo "- severity_gate: \`${SEVERITY_GATE}\`"
+            echo "- merge_threshold: \`P0=0, P1=0\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${gate_status}" ] && [ "${gate_status}" != "passed" ] && [ "${gate_status}" != "pass" ]; then
+            echo "::error::Omar Gate did not pass (gate_status='${gate_status}'). Blocking merge."
+            exit 1
+          fi
+          if [ "${p0}" -gt 0 ] || [ "${p1}" -gt 0 ]; then
+            echo "::error::Omar Gate blocked: P0=${p0}, P1=${p1}. Threshold requires P0=0 and P1=0."
+            exit 1
+          fi
+          echo "Omar Gate passed: P0=${p0} P1=${p1} P2=${p2} P3=${p3} (gate_status='${gate_status:-<none>}')."
