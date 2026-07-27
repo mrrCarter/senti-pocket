@@ -23,6 +23,11 @@ packages:
   # string already present. SEQUENCING: this wiring lands WITH/AFTER PR #81 (the package it depends on).
   PocketDialVoice:
     path: ../../packages/PocketDialVoice
+  # PocketVoice DECLARED (not linked by the app target) so the TEST target can import WhisperModelDescriptor for the
+  # locator drift-catcher (forge/warden #114 nit). The app target's `dependencies:` do NOT list it — the app links
+  # PocketVoice only transitively via PocketDialVoice; this declaration just makes the SentiPocketAppTests dep valid.
+  PocketVoice:
+    path: ../../packages/PocketVoice
   # PocketBriefing CUT from the app target 2026-07-20 (Atlas, per Warden #252313): the rich briefing is SERVER-SIDE
   # now (Relay's gateway reasons via a cloud LLM), so BriefingBuilder is off the Release critical path. Package stays
   # on disk — it's the home for Echo's LATER on-device offline briefing (Gemma). Cut-from-target, NOT deleted.
@@ -92,6 +97,10 @@ targets:
       # PocketCall: DialCoordinatorTests imports it + references PocketCall.DialOutcome. Was missing → the test target
       # failed to LINK (undefined symbol, caught on the MacinCloud build — no build-CI had caught this pre-existing gap).
       - package: PocketCall
+      # PocketVoice: TEST-ONLY. WhisperModelLocatorTests asserts the locator's pinned byteCount/fileName ==
+      # WhisperModelDescriptor.baseEnglish (drift-catcher, forge/warden #114 nit). The APP target still links PocketVoice
+      # only transitively (via PocketDialVoice) — only this test target imports it, to keep the literal mirror honest.
+      - package: PocketVoice
     settings:
       base:
         GENERATE_INFOPLIST_FILE: true
