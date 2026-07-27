@@ -216,6 +216,9 @@ export function mapSignalToPushInput(signal, { humanId } = {}) {
     kind: v.kind.slug,
     ...(v.kind.options.length ? { options: v.kind.options } : {}),
     callerName: callerNameForKind(v.kind.slug, v.requestedBy),
+    // NB: `who` is intentionally NOT threaded here. Per DialPayloadV1, `who` is the ring SOURCE ('senti-pocket'), NOT the
+    // requesting agent — the agent identity is `requestedBy`, kept AUTHED (hydrated via GET /dial?id=), never on the
+    // unauthenticated push (avoids a caller-spoof seam). The spoken caller is derived app-side from the authed callerName.
     ...(v.context.checkpointId ? { checkpointId: v.context.checkpointId } : {}),
     ...(v.evidenceSeqs.length ? { evidenceSeqs: v.evidenceSeqs } : {}),
     confidence: v.confidence,
