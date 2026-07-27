@@ -17,6 +17,8 @@ _Part of the unified "demo everything in the stack" walkthrough. One story: a te
 4. **Dictate + confirm.** Say *"my reply is rotate the token and hold the deploy."* The phone reads it back verbatim and asks you to say **confirm**. Only an explicit dictated reply **and** an explicit confirm authorize a write — voice-GO === tap-GO.
 5. **It posts as you.** Your decision lands as a governed `humanMessage` in the **same** session the ring was about — authored as you (human-mrrcarter), hash-bound, ed25519-signed receipt, read-back-verified. On-screen invariant: `ring.sessionId === writeback.sessionId`.
 
+> **Readiness — Track-A (now) vs Track-B (~30 min infra):** Steps 1-3 plus the governed-write invariant (`ring.sessionId === writeback.sessionId`, real ed25519, idempotent by `(principal, proposal.id)`, non-member → 403) demo **hermetically today** — the sim rings and *speaks* the brief; with no side-loaded Whisper model, capture is nil so it briefs-and-**declines** (nothing posts). The **live voice capture** in steps 4-5 (dictate → confirm → post from the phone) runs only on **Track-B** (Whisper model side-load + APNs VoIP cert + api#753 Deploy-to-ECS). See the operator runbook (**#118**) for the authoritative Track-A / Track-B demarcation so the story and the readiness stay in sync.
+
 **What to look for (the honesty spine — this is the moat, not the voice):**
 - Nothing posts without your explicit dictated reply + confirm; decline / hang-up / unclear → **nothing** posted or queued.
 - The write is the SAME governed path a human tap uses — real crypto, no faked wedge; a retry never double-posts (idempotent by `(principal, proposal.id)`); a non-member target → 403.
