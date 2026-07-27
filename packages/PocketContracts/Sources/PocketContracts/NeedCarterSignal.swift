@@ -39,6 +39,32 @@ public enum NeedCarterKind: Codable, Equatable, Sendable {
         case .checkpointReady: return "checkpoint-ready"
         }
     }
+
+    /// The concrete choice labels a `pickOption` ring carries (empty for every other kind). Drives both the spoken
+    /// options folded into the pickup message AND the rendered chips, so the two presentations never diverge.
+    public var spokenOptions: [String] {
+        if case .pickOption(let labels) = self { return labels }
+        return []
+    }
+}
+
+/// Fold a ring's choice options into its spoken message so a `pickOption` pickup READS the options aloud, not just
+/// the question — the kind carries the choice labels but the bare `question` dropped them, so Carter heard "needs
+/// you to choose" + the question yet never the choices (Atlas, #17). Returns `message` unchanged when there are no
+/// options. Shared by BOTH the contract down-map (`dialFields`) and the app's answer-side composition
+/// (`DialHost.run`), so the spoken and rendered paths present options identically.
+public func dialSpokenMessage(message: String, options: [String]) -> String {
+    guard !options.isEmpty else { return message }
+    let spoken = options.enumerated()
+        .map { index, label in "\(optionLetter(index)), \(label)" }
+        .joined(separator: ". ")
+    return "\(message) Your options are: \(spoken)."
+}
+
+/// A, B, C … Z for the first 26 options, then the 1-based ordinal (a ring never carries that many; stay total).
+private func optionLetter(_ index: Int) -> String {
+    let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    return index < alphabet.count ? String(alphabet[index]) : "\(index + 1)"
 }
 
 /// Where the crew is, so Pocket can answer Carter's follow-ups by digging the exact session/checkpoint.
@@ -118,8 +144,14 @@ public struct NeedCarterSignal: Codable, Equatable, Sendable, Identifiable {
     /// The fields the answer-side orchestrator needs — maps this superset DOWN to forge's DialRequest shape
     /// (dialId, message, callerName, priority) WITHOUT importing PocketCall (contracts stays dependency-free).
     /// The app's SentiCallManager builds a DialRequest from these.
+    ///
+    /// `message` folds a pickOption ring's choices in via `dialSpokenMessage`, so a pickup READS the options aloud
+    /// instead of only the question (Atlas, #17); every other kind's message stays the bare question.
     public func dialFields() -> (dialId: String, message: String, callerName: String, priority: String) {
-        (dialId: id, message: question, callerName: Self.callerName(kind: kind, requestedBy: requestedBy), priority: kind.dialPriority)
+        (dialId: id,
+         message: dialSpokenMessage(message: question, options: kind.spokenOptions),
+         callerName: Self.callerName(kind: kind, requestedBy: requestedBy),
+         priority: kind.dialPriority)
     }
 
     /// A ring fires only when the detected need clears this confidence floor (explicit path = 1.0, always clears).
