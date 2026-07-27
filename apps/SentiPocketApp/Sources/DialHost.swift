@@ -16,8 +16,9 @@ import PocketDialVoice
 //
 // FOOTGUN-SAFE (warden's load-bearing gate): the write-driving content is ONLY ever the HYDRATED RenderableRing —
 // the coordinator never receives IncomingDecisionCall, and `run` builds DialRequest from the hydrated ring's core,
-// so the unauthenticated push fields can't reach the write by construction. `modelURL` is nil until the whisper
-// provisioner ships → listen() degrades to "" → the orchestrator declines (briefs but can't capture) — nothing posts.
+// so the unauthenticated push fields can't reach the write by construction. `modelURL` comes from
+// WhisperModelLocator.resolve() (option A, on-device Whisper); when the model isn't provisioned it resolves to nil
+// → listen() degrades to "" → the orchestrator briefs but can't capture — nothing posts (the same fail-safe as before).
 @MainActor
 final class DialHost: ObservableObject {
     let callManager = SentiCallManager()
@@ -55,14 +56,15 @@ final class DialHost: ObservableObject {
     func onLoginCompleted() { registrar.loginCompleted() }
 
     /// Build + run the governed flow for a HYDRATED ring. DialRequest is built from the ring's core (authed), NEVER
-    /// the push. modelURL nil until the whisper provisioner ships.
+    /// the push. modelURL is resolved by WhisperModelLocator (App Support side-load / bundle); it nil-degrades
+    /// (brief-only, no capture) when the model isn't provisioned — so a missing model never blocks a dial.
     static func run(_ ring: RenderableRing, gatewayURL: URL) async -> DialOutcome {
         let reasoner = ProviderDialReasoner(
             provider: GatewayReasoningProvider(client: GatewayReasoningHTTPClient(apiBaseURL: gatewayURL)))
         let voice = LiveDialVoice(reasoner: reasoner,
                                   sessionId: ring.core.sessionId,
                                   checkpointId: ring.core.checkpointId,
-                                  modelURL: nil)
+                                  modelURL: WhisperModelLocator.resolve())
         let writer = PhoneWriteAdapter(PhoneWriteViewModel(sessionId: ring.core.sessionId,
                                                            client: PocketWriteClient(apiBaseURL: gatewayURL)))
         let request = DialRequest(dialId: ring.core.id,
