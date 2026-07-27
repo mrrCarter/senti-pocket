@@ -86,7 +86,12 @@ export function scrubPayload(payload) {
   if (payload == null) raw = '';
   else if (typeof payload === 'string') raw = payload;
   else if (typeof payload === 'object') {
-    raw = payload.text ?? payload.body ?? payload.message ?? payload.content ?? JSON.stringify(payload);
+    // A preferred field can itself be a non-string OBJECT; feeding that straight to scrubText hits the
+    // typeof!=='string' fast-path in scrubWith (L46) and egresses UNSCRUBBED (a nested token bypasses the P0
+    // scrub). Coerce a non-string pref to JSON so its content is actually scanned; fall back to the whole
+    // object only when no preferred field is present (unchanged behavior for that case).
+    const pref = payload.text ?? payload.body ?? payload.message ?? payload.content;
+    raw = typeof pref === 'string' ? pref : JSON.stringify(pref ?? payload);
   } else raw = String(payload);
   return scrubText(raw);
 }

@@ -58,9 +58,12 @@ export function scanExport(events) {
 
 const utf8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
 const clampUtf8 = (s, max, marker = '…[truncated]') => {
-  if (utf8(s) <= max) return s;
+  // Coerce to string FIRST: an object here measures String(obj)="[object Object]"=15B, and the old under-limit
+  // fast-path `return s` handed back the RAW object -> RawEvent.payload (contract = byte-bounded STRING) became a
+  // non-string, bypassing the byte clamp AND leaking nested content past it. Always return a string.
+  const str = String(s ?? '');
+  if (utf8(str) <= max) return str;
   // scalar-safe: iterate by code point so a byte-offset cut never splits a multibyte char into a U+FFFD replacement.
-  const str = String(s);
   let out = '', used = 0;
   for (const ch of str) { const cb = Buffer.byteLength(ch, 'utf8'); if (used + cb > max) break; out += ch; used += cb; }
   return out + marker;
