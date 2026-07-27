@@ -264,3 +264,33 @@ test('(P0 bounds) cyclic/deep summary is safely projected (no recursion into unk
   assert.equal(b.summary.self, undefined);
   assert.equal(b.summary.perAgent[0].extra, undefined);
 });
+
+// --- Echo P0 object-egress: a non-string payload field must NOT bypass the scrub or the byte clamp ---
+// (relay/scrub-clamp-nonstring-egress: scrubPayload coerces a non-string pref to JSON; clampUtf8 String()-coerces
+// in the under-limit fast-path so RawEvent.payload is always a bounded string. Warden idle-audit find, repro'd.)
+test('scrubPayload scrubs a token nested in a non-string payload field (object-egress)', () => {
+  const fakeGh = 'ghp_' + 'A'.repeat(20); // github-token rule; assembled so no literal token lives in source
+  for (const field of ['text', 'body', 'message', 'content']) {
+    const { text, redactions } = scrubPayload({ [field]: { note: `secret ${fakeGh}` } });
+    assert.equal(typeof text, 'string', `${field}: scrubbed output must be a string`);
+    assert.ok(!text.includes(fakeGh), `${field}: nested token must be redacted`);
+    assert.ok(redactions.length > 0, `${field}: expected at least one redaction`);
+  }
+});
+
+test('toRawEvent payload is always a bounded STRING even for a non-string field', () => {
+  const fakeGh = 'ghp_' + 'B'.repeat(20);
+  const { rawEvent } = toRawEvent({ sequenceId: 5, event: 'm', payload: { text: { note: fakeGh } } });
+  assert.equal(typeof rawEvent.payload, 'string', 'RawEvent.payload must be a string, not a raw object');
+  assert.ok(!JSON.stringify(rawEvent.payload).includes(fakeGh), 'nested token must not egress via toRawEvent');
+});
+
+test('toRawEvent enforces MAX_PAYLOAD_BYTES on a large non-string payload field', () => {
+  // A 500KB nested object previously measured as String(obj)="[object Object]"=15B -> clamp bypassed, blob egressed.
+  const { rawEvent } = toRawEvent({ sequenceId: 7, event: 'm', payload: { text: { blob: 'x'.repeat(500000) } } });
+  assert.equal(typeof rawEvent.payload, 'string', 'payload must be a string');
+  assert.ok(
+    Buffer.byteLength(rawEvent.payload, 'utf8') <= LIMITS.MAX_PAYLOAD_BYTES,
+    'payload must be within MAX_PAYLOAD_BYTES',
+  );
+});
