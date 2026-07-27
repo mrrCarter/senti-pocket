@@ -56,6 +56,16 @@ final class DialOrchestratorTests: XCTestCase {
         XCTAssertEqual(w.cancelCalls, 0)
     }
 
+    // BEAT 4: the call OPENS by naming who's asking (the AUTHED callerName), never a bare "Decision needed."
+    func testBrief_opensWithTheAuthedCaller_beat4() async {
+        let v = MockVoice(["my reply is ok", "confirm"])
+        let request = DialRequest(dialId: "dial_x", message: "The token looks compromised.",
+                                  callerName: "Senti · claude-atlas needs your decision", priority: "high")
+        _ = await DialOrchestrator(voice: v, writer: MockWriter(result: .posted)).run(request)
+        XCTAssertEqual(v.spoken.first, "Senti · claude-atlas needs your decision. The token looks compromised.")
+        XCTAssertEqual(v.spoken.first?.hasPrefix("Decision needed"), false)   // never the bare generic open
+    }
+
     // CRITICAL: an explicit decline NEVER authorizes the write.
     func testDecline_neverPosts() async {
         let w = MockWriter()
