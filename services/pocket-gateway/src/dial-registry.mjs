@@ -157,6 +157,27 @@ export function buildDialPayload(f = {}, nowMs = 0) {
 }
 
 /**
+ * Wrap a DialPayloadV1 into the PKPushPayload.dictionaryPayload the deploy's apnsSend MUST deliver: the dial DTO fields at
+ * the TOP LEVEL, with the APNs `aps` envelope as a SIBLING key — NEVER nesting the DTO under a payload/data wrapper. This is
+ * the EXECUTABLE form of the load-bearing wire contract documented on app.mjs deps.apnsSend: SentiCallKit.receiveState reads
+ * `dict["id"]`/who/callerName/… TOP-LEVEL and IGNORES `aps`; if the DTO is nested, top-level `id` is absent -> the decode
+ * returns nil -> EVERY ring silently declines (a dead doorbell with green everything). A deploy apnsSend that delivers
+ * `buildVoipPushDictionary(payload)` verbatim CANNOT get the envelope shape wrong — the one seam with zero in-repo coverage
+ * (the gateway suite exercises a FAKE apnsSend that only captures `payload`, so it can't catch a real-transport nesting bug).
+ * `aps` defaults to a minimal VoIP-safe envelope; a deploy may override/extend it (its content is ignored by the app decode).
+ * @param {object} payload  the bare DialPayloadV1 from buildDialPayload
+ * @param {object} [aps]     APNs `aps` envelope fields, merged over the default (its content is decode-irrelevant)
+ * @returns {object} the dictionaryPayload delivered to the device: { ...payload (TOP-LEVEL), aps }
+ */
+export function buildVoipPushDictionary(payload, aps = {}) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('buildVoipPushDictionary: payload object required');
+  if (typeof payload.id !== 'string' || payload.id.length === 0) throw new Error('buildVoipPushDictionary: payload.id (top-level identity) required — a nested/blank id is a dead ring');
+  if (aps == null || typeof aps !== 'object' || Array.isArray(aps)) throw new Error('buildVoipPushDictionary: aps must be an object');
+  // Dial DTO fields spread at the TOP LEVEL; `aps` a SIBLING (decode-ignored). The DTO is NEVER placed under a wrapper key.
+  return { ...payload, aps: { ...aps } };
+}
+
+/**
  * The /dial/register handler logic over an injected deviceRegistry. Pure of transport: returns {status, body} so the
  * handlers.mjs wire is a thin adapter (auth + scope check, then call this). Kept OUT of handlers.mjs to avoid colliding
  * with warden's concurrent /dial route edits — the wire is a 3-line addition alongside his route.
