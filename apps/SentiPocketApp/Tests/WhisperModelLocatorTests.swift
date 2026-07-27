@@ -1,5 +1,6 @@
 import XCTest
 @testable import SentiPocketApp
+import PocketVoice   // TEST-ONLY: assert the locator's pinned literals stay == WhisperModelDescriptor.baseEnglish
 
 /// Unit tests for the DIALS capture-path model resolver (option A). Cover the graceful-degrade + selection logic
 /// deterministically with small temp files; the real 147.9MB-model positive path is Mac/device-verified separately
@@ -37,16 +38,36 @@ final class WhisperModelLocatorTests: XCTestCase {
         XCTAssertNil(WhisperModelLocator.firstUsable(in: [link], expectedByteCount: 1024))
     }
 
-    func test_resolve_returns_nil_when_the_model_is_not_provisioned() {
-        // Fresh test host: no side-loaded model at Application Support, no bundled resource → graceful degrade (nil),
-        // i.e. exactly the old `modelURL: nil` behavior — a missing model never crashes or blocks a dial.
-        XCTAssertNil(WhisperModelLocator.resolve())
+    func test_resolve_returns_nil_when_the_model_is_not_provisioned() throws {
+        // HERMETIC (forge #114 nit): inject an EMPTY Application Support + a bundle with no ggml resource, so this
+        // can't false-fail once a real 147MB model is side-loaded on the test host. Graceful degrade (nil) = exactly
+        // the old `modelURL: nil` behavior — a missing model never crashes or blocks a dial.
+        let dir = try makeTempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let fm = TempAppSupportFileManager(appSupport: dir)
+        let noResourceBundle = Bundle(for: WhisperModelLocatorTests.self)   // test bundle: no ggml-base.en.bin
+        XCTAssertNil(WhisperModelLocator.resolve(fileManager: fm, bundle: noResourceBundle))
     }
 
-    func test_pinned_constants_match_the_fetched_verified_model() {
-        // Byte-exact to the model fetched + sha256-verified on MacinCloud (a03779c8…6d002, 147_964_211 bytes),
-        // which equals PocketVoice.WhisperModelDescriptor.baseEnglish.
-        XCTAssertEqual(WhisperModelLocator.modelFileName, "ggml-base.en.bin")
+    func test_pinned_constants_match_the_whisper_descriptor() {
+        // Drift-catcher (forge/warden #114 nit): the locator's literals MUST stay == PocketVoice's descriptor. If
+        // baseEnglish is ever repointed, THIS fails — instead of the locator silently rejecting the new correct model
+        // as wrong-size (→ brief-only degrade with green tests). The app target keeps the literals (no PocketVoice
+        // import); only this test asserts the mirror.
+        XCTAssertEqual(WhisperModelLocator.modelFileName, WhisperModelDescriptor.baseEnglish.fileName)
+        XCTAssertEqual(WhisperModelLocator.expectedByteCount, WhisperModelDescriptor.baseEnglish.byteCount)
+        // Still pinned to the known-good fetched + sha256-verified model (a03779c8…6d002, 147_964_211 bytes).
         XCTAssertEqual(WhisperModelLocator.expectedByteCount, 147_964_211)
+    }
+}
+
+/// A FileManager whose Application Support directory is a caller-supplied temp dir, so `resolve()` can be tested
+/// hermetically — with no dependence on the real test-host container (which could hold a side-loaded model).
+private final class TempAppSupportFileManager: FileManager, @unchecked Sendable {
+    private let appSupport: URL
+    init(appSupport: URL) { self.appSupport = appSupport; super.init() }
+    override func url(for directory: FileManager.SearchPathDirectory, in domain: FileManager.SearchPathDomainMask,
+                      appropriateFor url: URL?, create shouldCreate: Bool) throws -> URL {
+        if directory == .applicationSupportDirectory { return appSupport }
+        return try super.url(for: directory, in: domain, appropriateFor: url, create: shouldCreate)
     }
 }
