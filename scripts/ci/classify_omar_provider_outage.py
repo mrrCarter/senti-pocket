@@ -198,7 +198,7 @@ def classify_provider_outage(
     if counts["P0"] < 1 or len(blocking) < 1:
         return ProviderOutageClassification(
             provider_outage_break_glass=False,
-            reason="expected_exactly_one_p0_llm_failure",
+            reason="expected_at_least_one_p0_llm_failure",
             blocking_count=len(blocking),
             p0_count=counts["P0"],
             p1_count=counts["P1"],
