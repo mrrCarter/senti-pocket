@@ -83,6 +83,14 @@ final class PhoneWriteViewModel: ObservableObject {
     }
 
     private func post(_ proposal: ActionProposal, _ confirmation: GovernedWriteConfirmation) {
+        // Persist the confirmed intent BEFORE the send so a crash / app-kill during the `.sending` window can't
+        // silently drop a Carter-confirmed governed write — the durable-outbox guarantee must cover the in-flight
+        // window, not only the offline catches (the exact "in-memory only → lost on kill" gap OutboxStore exists to
+        // close). The SAME proposal id is persisted + restored + resent verbatim, so the gateway's (principal,
+        // proposal.id) crash-recovery dedups a restart-retry — never a double-post (prior-posted → same receipt;
+        // in-flight/unknown → 409 reconcile, never a blind re-post). Every terminal path below (applyRenderGate /
+        // refused / cancel) clears the outbox, so a success/refusal leaves nothing queued.
+        OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation))
         state = .sending
         Task { [weak self] in
             guard let self else { return }
@@ -91,14 +99,12 @@ final class PhoneWriteViewModel: ObservableObject {
                 let receipt = try await self.client.execute(proposal: proposal, confirmation: confirmation)
                 self.applyRenderGate(receipt)
             } catch PocketWriteError.network(let detail) {
-                // OFFLINE: the POST couldn't reach the gateway → PENDING, retryable. PERSIST the confirmed intent so
-                // it survives an app kill (durable outbox); NEVER "sent".
-                OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation))
+                // OFFLINE: the POST couldn't reach the gateway → PENDING, retryable. The confirmed intent was already
+                // persisted at the top of post() (durable outbox), so it survives an app kill; NEVER "sent".
                 self.state = .pending("Offline — your message is queued and will send when you reconnect. (\(detail))")
             } catch PocketWriteError.retryable(let detail) {
                 // TRANSIENT gateway response (busy / in-progress / temporarily unavailable) — NOT terminal. Queue +
-                // retry exactly like offline; the write may still land, so we must never refuse it.
-                OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation))
+                // retry like offline; the write may still land, so never refuse it (intent already persisted, top of post()).
                 self.state = .pending("The gateway is busy — queued, tap Retry. (\(detail))")
             } catch PocketWriteError.notPosted(let why) {
                 // The gateway returned a receipt that is NOT a verified posted (pending/failed) → never sent.
