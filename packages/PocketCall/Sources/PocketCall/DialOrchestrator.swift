@@ -74,9 +74,13 @@ public final class DialOrchestrator {
     /// Drive one answered decision call to a terminal outcome. Honors Task cancellation (a hangup cancels the run
     /// Task) as a decline that leaves nothing posted/queued. NEVER posts without an explicit dictated reply + confirm.
     public func run(_ request: DialRequest) async -> DialOutcome {
-        // 1. BRIEF: speak the decision needing his call.
+        // 1. BRIEF: open by telling him WHO's asking (beat 4), then the decision. `callerName` is the AUTHED,
+        //    hydrated caller identity (NeedCarterSignal.callerName → "Senti · <requestedBy> needs your decision" /
+        //    "… needs you to choose" / "… needs a GO"), so it already names the requesting agent + the ask — no bare
+        //    "Decision needed." and no unauthenticated push field in the spoken line. (A future literal "This is
+        //    <agent>." would thread the authed `requestedBy` onto DialRequest; this uses what the ring already carries.)
         if Task.isCancelled { return .declined("hung up before briefing") }
-        await voice.speak("Decision needed. \(request.message)")
+        await voice.speak("\(request.callerName). \(request.message)")
 
         // 2. CONVERSE: grounded Q&A until an EXPLICIT reply-marker. A marker-less utterance is ALWAYS answered,
         //    NEVER posted — the marker is the ONLY path from speech to a governed write. No reply → nothing posted.
