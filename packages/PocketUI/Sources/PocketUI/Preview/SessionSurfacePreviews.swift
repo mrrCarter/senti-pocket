@@ -116,97 +116,131 @@ private enum SessionSurfacePreviewFixture {
     }
 }
 
+private struct SessionSurfacePreviewShell<Content: View>: View {
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("STATIC PREVIEW · NOT LIVE")
+                .font(.caption.bold())
+                .foregroundStyle(Color.black)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(Color.yellow)
+                .accessibilityIdentifier("pocket.preview.not-live")
+
+            content
+        }
+    }
+}
+
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Sign in — signed out") {
-    NavigationStack {
-        PocketSignInView(phase: .signedOut, send: { _ in })
+    SessionSurfacePreviewShell {
+        NavigationStack {
+            PocketSignInView(phase: .signedOut, send: { _ in })
+        }
     }
 }
 
 @available(iOS 17.0, macOS 14.0, *)
 #Preview("Sign in — signed in, accessibility") {
-    NavigationStack {
-        PocketSignInView(phase: .signedIn, send: { _ in })
-    }
-    .dynamicTypeSize(.accessibility3)
-}
-
-@available(iOS 17.0, macOS 14.0, *)
-#Preview("Sessions — live") {
-    if let page = SessionSurfacePreviewFixture.sessionPage {
+    SessionSurfacePreviewShell {
         NavigationStack {
-            SessionListView(
-                state: SessionListPresentationState(
-                    page: page,
-                    provenance: .network(lastUpdated: SessionSurfacePreviewFixture.referenceDate)
-                ),
-                send: { _ in }
-            )
-        }
-    } else {
-        Text("Session preview fixture could not be decoded.")
-    }
-}
-
-@available(iOS 17.0, macOS 14.0, *)
-#Preview("Sessions — offline, accessibility") {
-    if let page = SessionSurfacePreviewFixture.sessionPage {
-        NavigationStack {
-            SessionListView(
-                state: SessionListPresentationState(
-                    page: page,
-                    provenance: .cache(
-                        cachedAt: SessionSurfacePreviewFixture.referenceDate,
-                        authenticationExpired: false
-                    )
-                ),
-                send: { _ in }
-            )
+            PocketSignInView(phase: .signedIn, send: { _ in })
         }
         .dynamicTypeSize(.accessibility3)
-    } else {
-        Text("Session preview fixture could not be decoded.")
     }
 }
 
 @available(iOS 17.0, macOS 14.0, *)
-#Preview("Activity — offline copy") {
-    if let events = SessionSurfacePreviewFixture.eventPage,
-       let actions = SessionSurfacePreviewFixture.actionPage {
-        NavigationStack {
-            SessionActivityView(
-                state: SessionActivityPresentationState(
-                    sessionId: SessionSurfacePreviewFixture.sessionID,
-                    eventPage: events,
-                    actionPage: actions,
-                    provenance: .cache(
-                        cachedAt: SessionSurfacePreviewFixture.referenceDate,
-                        authenticationExpired: false
-                    )
-                ),
-                send: { _ in }
-            )
+#Preview("Sessions — simulated network") {
+    SessionSurfacePreviewShell {
+        if let page = SessionSurfacePreviewFixture.sessionPage {
+            NavigationStack {
+                SessionListView(
+                    state: SessionListPresentationState(
+                        page: page,
+                        provenance: .network(lastUpdated: SessionSurfacePreviewFixture.referenceDate)
+                    ),
+                    send: { _ in }
+                )
+            }
+        } else {
+            Text("Session preview fixture could not be decoded.")
         }
-    } else {
-        Text("Activity preview fixture could not be decoded.")
     }
 }
 
 @available(iOS 17.0, macOS 14.0, *)
-#Preview("Room checkpoints — membership authorized") {
-    if let page = SessionSurfacePreviewFixture.checkpointPage {
-        NavigationStack {
-            SessionCheckpointListView(
-                state: SessionCheckpointListPresentationState(
-                    sessionId: SessionSurfacePreviewFixture.sessionID,
-                    page: page,
-                    provenance: .network(lastUpdated: SessionSurfacePreviewFixture.referenceDate)
-                ),
-                send: { _ in }
-            )
+#Preview("Sessions — simulated offline, accessibility") {
+    SessionSurfacePreviewShell {
+        if let page = SessionSurfacePreviewFixture.sessionPage {
+            NavigationStack {
+                SessionListView(
+                    state: SessionListPresentationState(
+                        page: page,
+                        provenance: .cache(
+                            cachedAt: SessionSurfacePreviewFixture.referenceDate,
+                            authenticationExpired: false
+                        )
+                    ),
+                    send: { _ in }
+                )
+            }
+            .dynamicTypeSize(.accessibility3)
+        } else {
+            Text("Session preview fixture could not be decoded.")
         }
-    } else {
-        Text("Checkpoint preview fixture could not be decoded.")
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, *)
+#Preview("Activity — simulated offline copy") {
+    SessionSurfacePreviewShell {
+        if let events = SessionSurfacePreviewFixture.eventPage,
+           let actions = SessionSurfacePreviewFixture.actionPage {
+            NavigationStack {
+                SessionActivityView(
+                    state: SessionActivityPresentationState(
+                        sessionId: SessionSurfacePreviewFixture.sessionID,
+                        eventPage: events,
+                        actionPage: actions,
+                        provenance: .cache(
+                            cachedAt: SessionSurfacePreviewFixture.referenceDate,
+                            authenticationExpired: false
+                        )
+                    ),
+                    send: { _ in }
+                )
+            }
+        } else {
+            Text("Activity preview fixture could not be decoded.")
+        }
+    }
+}
+
+@available(iOS 17.0, macOS 14.0, *)
+#Preview("Room checkpoints — simulated membership authorization") {
+    SessionSurfacePreviewShell {
+        if let page = SessionSurfacePreviewFixture.checkpointPage {
+            NavigationStack {
+                SessionCheckpointListView(
+                    state: SessionCheckpointListPresentationState(
+                        sessionId: SessionSurfacePreviewFixture.sessionID,
+                        page: page,
+                        provenance: .network(lastUpdated: SessionSurfacePreviewFixture.referenceDate)
+                    ),
+                    send: { _ in }
+                )
+            }
+        } else {
+            Text("Checkpoint preview fixture could not be decoded.")
+        }
     }
 }
 #endif
