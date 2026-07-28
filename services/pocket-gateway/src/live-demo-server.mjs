@@ -14,8 +14,9 @@
 import { execFileSync } from 'node:child_process';
 import { createPrivateKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { createLiveDemoServer } from './live-demo.mjs';
+import { createLiveDemoServer, createDemoBearerGuard } from './live-demo.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
+import { createCartesiaBackend } from './cartesia-backend.mjs';
 
 const apiBaseUrl = process.env.SENTI_API_BASE_URL || 'https://api.sentinelayer.com';
 const port = Number(process.env.PORT || 8787);
@@ -58,7 +59,30 @@ const gemma = gemmaBaseUrl
   ? createGemmaBackend({ baseUrl: gemmaBaseUrl, model: process.env.GEMMA_MODEL || 'gemma3', apiKey: process.env.GEMMA_API_KEY, fetch: globalThis.fetch })
   : undefined;
 
-const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor, signingKey, reason: gemma && gemma.reason, brief: gemma && gemma.brief });
+// Cartesia TTS (real online voice for the login-free demo): CARTESIA_API_KEY (+ TTS_VOICE_ID) lights up /tts with a real
+// voice. Absent => /tts stays 501 (tts backend not configured). The key lives ONLY here (server-side), never on the phone.
+const ttsBackend = process.env.CARTESIA_API_KEY
+  ? createCartesiaBackend({ apiKey: process.env.CARTESIA_API_KEY, voiceId: process.env.TTS_VOICE_ID })
+  : undefined;
+
+// PUBLIC demo-capability BOUNDS. The login-free bearer ships inside a sideloaded .ipa, so it is EXTRACTABLE; it must be
+// server-bounded independent of client honesty. verifyToken(live-demo.mjs) already scopes it to pocket:voice ONLY (only
+// /tts; every other route is 403 at the scope-check before upstream). Here we add the QUANTITATIVE bounds — an absolute
+// expiry + a lifetime total-usage cap + a per-60s rate cap — enforced at the server edge by createDemoBearerGuard. ALL
+// are FAIL-CLOSED (unset => 401/429), so a misconfigured deploy denies. Set for the demo:
+//   POCKET_DEMO_BEARER               the rotated capability (also matched by verifyToken)
+//   POCKET_DEMO_BEARER_EXPIRES_UNIX  absolute wall-clock deadline (unix sec)  — REQUIRED or all demo calls 401
+//   POCKET_DEMO_BEARER_MAX_CALLS     lifetime total-usage cap                 — REQUIRED or all demo calls 429
+//   POCKET_DEMO_BEARER_MAX_PER_MIN   per-60s rate cap                         — REQUIRED or all demo calls 429
+const demoBearer = process.env.POCKET_DEMO_BEARER || '';
+const demoExpiresUnix = Number(process.env.POCKET_DEMO_BEARER_EXPIRES_UNIX || 0);
+const demoMaxCalls = Number(process.env.POCKET_DEMO_BEARER_MAX_CALLS || 0);
+const demoMaxPerMin = Number(process.env.POCKET_DEMO_BEARER_MAX_PER_MIN || 0);
+const demoGuard = demoBearer
+  ? createDemoBearerGuard({ expiresUnixSec: demoExpiresUnix, maxTotal: demoMaxCalls, maxPerMin: demoMaxPerMin })
+  : undefined;
+
+const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor, signingKey, reason: gemma && gemma.reason, brief: gemma && gemma.brief, ttsBackend, demoBearer, demoGuard });
 server.listen(port, () => {
   // Startup lines only — no secrets (apiBaseUrl / port / session / bin path / PUBLIC key); the gateway logs nothing per-request.
   process.stdout.write(`[live-demo] gateway :${port} -> api ${apiBaseUrl} | room ${demoSession} | sl=${slBin}\n`);
@@ -66,7 +90,14 @@ server.listen(port, () => {
   process.stdout.write(`[live-demo] receipt PUBKEY (Ed25519 x, base64url) = ${publicKeyB64url}\n`);
   process.stdout.write(`[live-demo]   the app PINS this (or GET :${port}/demo-pubkey) to verify ActionReceipt sigs — never render "sent" unless signatureState==.verified\n`);
   process.stdout.write('[live-demo] POST /actions/execute with the caller\'s SENTI user-session bearer to author as human-<you>\n');
+  // Redacted capability-bounds line (NO bearer value — only the enforced numbers), so the deployment receipt shows them.
+  process.stdout.write(demoBearer
+    ? `[live-demo] PUBLIC demo capability BOUNDED: scope=pocket:voice-ONLY · expiry=${demoExpiresUnix ? new Date(demoExpiresUnix * 1000).toISOString() : 'UNSET->fail-closed(401)'} · maxTotal=${demoMaxCalls || 'UNSET->fail-closed(429)'} · maxPerMin=${demoMaxPerMin || 'UNSET->fail-closed(429)'}\n`
+    : '[live-demo] no POCKET_DEMO_BEARER set (login-free demo capability disabled)\n');
   process.stdout.write(gemma
     ? `[live-demo] Gemma reasoning WIRED -> ${gemmaBaseUrl} (model ${gemma.model}) -> /answer + /brief live\n`
     : '[live-demo] Gemma NOT wired (set GEMMA_BASE_URL=http://localhost:11434/v1 GEMMA_MODEL=gemma3 for real Gemma /answer + /brief)\n');
+  process.stdout.write(ttsBackend
+    ? '[live-demo] Cartesia TTS WIRED (voice ' + String(process.env.TTS_VOICE_ID || '').slice(0, 8) + ') -> /tts live\n'
+    : '[live-demo] Cartesia TTS NOT wired (set CARTESIA_API_KEY + TTS_VOICE_ID for real /tts)\n');
 });
