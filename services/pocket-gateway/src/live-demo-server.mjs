@@ -12,8 +12,11 @@
 //
 // Usage: SENTI_API_BASE_URL=https://api.sentinelayer.com PORT=8787 SL_BIN=sl DEMO_SESSION_ID=<sid> node src/live-demo-server.mjs
 import { execFileSync } from 'node:child_process';
-import { createPrivateKey } from 'node:crypto';
+import { createPrivateKey, createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { createLiveDemoServer, createDemoBearerGuard } from './live-demo.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
 import { createCartesiaBackend } from './cartesia-backend.mjs';
@@ -65,22 +68,38 @@ const ttsBackend = process.env.CARTESIA_API_KEY
   ? createCartesiaBackend({ apiKey: process.env.CARTESIA_API_KEY, voiceId: process.env.TTS_VOICE_ID })
   : undefined;
 
-// PUBLIC demo-capability BOUNDS. The login-free bearer ships inside a sideloaded .ipa, so it is EXTRACTABLE; it must be
-// server-bounded independent of client honesty. verifyToken(live-demo.mjs) already scopes it to pocket:voice ONLY (only
-// /tts; every other route is 403 at the scope-check before upstream). Here we add the QUANTITATIVE bounds — an absolute
-// expiry + a lifetime total-usage cap + a per-60s rate cap — enforced at the server edge by createDemoBearerGuard. ALL
-// are FAIL-CLOSED (unset => 401/429), so a misconfigured deploy denies. Set for the demo:
+// PUBLIC demo-capability BOUNDS. The login-free bearer ships inside a sideloaded .ipa ⇒ EXTRACTABLE ⇒ server-bounded,
+// independent of client honesty. verifyToken(live-demo.mjs) scopes it to pocket:voice ONLY (only /tts; every other route
+// 403 at the scope-check before upstream). createDemoBearerGuard adds the QUANTITATIVE bounds:
 //   POCKET_DEMO_BEARER               the rotated capability (also matched by verifyToken)
-//   POCKET_DEMO_BEARER_EXPIRES_UNIX  absolute wall-clock deadline (unix sec)  — REQUIRED or all demo calls 401
-//   POCKET_DEMO_BEARER_MAX_CALLS     lifetime total-usage cap                 — REQUIRED or all demo calls 429
-//   POCKET_DEMO_BEARER_MAX_PER_MIN   per-60s rate cap                         — REQUIRED or all demo calls 429
+//   POCKET_DEMO_BEARER_EXPIRES_UNIX  absolute wall-clock deadline (unix sec)   — REQUIRED, finite>0, else 401
+//   POCKET_DEMO_BEARER_MAX_PER_MIN   per-60s ANTI-ABUSE rate cap               — REQUIRED, finite>0, else 429
+//   POCKET_DEMO_BEARER_MAX_CALLS     lifetime /tts CALL budget (restart-safe)  — REQUIRED, finite>0, else 429
+//   POCKET_DEMO_BEARER_MAX_CHARS     lifetime /tts CHARACTER budget            — REQUIRED, finite>0, else 429
+// The call+char budget is persisted per capability fingerprint under POCKET_DEMO_USAGE_DIR (default ~/.pocket-demo-usage)
+// so it survives restart and is NOT reset by relaunch. A new bearer (new fingerprint) starts fresh.
 const demoBearer = process.env.POCKET_DEMO_BEARER || '';
+const demoFingerprint = demoBearer ? createHash('sha256').update(demoBearer).digest('hex').slice(0, 16) : '';
+const usageDir = process.env.POCKET_DEMO_USAGE_DIR || join(process.env.HOME || '.', '.pocket-demo-usage');
+if (demoBearer) { try { mkdirSync(usageDir, { recursive: true, mode: 0o700 }); } catch { /* best-effort */ } }
 const demoExpiresUnix = Number(process.env.POCKET_DEMO_BEARER_EXPIRES_UNIX || 0);
-const demoMaxCalls = Number(process.env.POCKET_DEMO_BEARER_MAX_CALLS || 0);
 const demoMaxPerMin = Number(process.env.POCKET_DEMO_BEARER_MAX_PER_MIN || 0);
+const demoMaxCalls = Number(process.env.POCKET_DEMO_BEARER_MAX_CALLS || 0);
+const demoMaxChars = Number(process.env.POCKET_DEMO_BEARER_MAX_CHARS || 0);
 const demoGuard = demoBearer
-  ? createDemoBearerGuard({ expiresUnixSec: demoExpiresUnix, maxTotal: demoMaxCalls, maxPerMin: demoMaxPerMin })
+  ? createDemoBearerGuard({ expiresUnixSec: demoExpiresUnix, maxPerMin: demoMaxPerMin, maxTotalCalls: demoMaxCalls, maxTotalChars: demoMaxChars, fingerprint: demoFingerprint, persistDir: usageDir })
   : undefined;
+
+// DEPLOYMENT BINDING: a content digest of the RUNNING containment source, so a receipt can prove the live process is
+// exactly the reviewed commit's bytes (not a divergent/patched process). sha256 over the two containment files as loaded.
+const srcDir = dirname(fileURLToPath(import.meta.url));
+let srcDigest = 'unknown';
+try {
+  srcDigest = createHash('sha256')
+    .update(readFileSync(join(srcDir, 'live-demo.mjs')))
+    .update(readFileSync(join(srcDir, 'live-demo-server.mjs')))
+    .digest('hex').slice(0, 16);
+} catch { /* */ }
 
 const { server, publicKeyB64url } = createLiveDemoServer({ apiBaseUrl, fetch: globalThis.fetch, run, knownSessionIdsFor, signingKey, reason: gemma && gemma.reason, brief: gemma && gemma.brief, ttsBackend, demoBearer, demoGuard });
 server.listen(port, () => {
@@ -88,12 +107,15 @@ server.listen(port, () => {
   process.stdout.write(`[live-demo] gateway :${port} -> api ${apiBaseUrl} | room ${demoSession} | sl=${slBin}\n`);
   process.stdout.write(`[live-demo] LOCAL runtime · in-memory idempotency · DEV ed25519 receipt key [${keyMode}] (real sig, NOT prod KMS)\n`);
   process.stdout.write(`[live-demo] receipt PUBKEY (Ed25519 x, base64url) = ${publicKeyB64url}\n`);
-  process.stdout.write(`[live-demo]   the app PINS this (or GET :${port}/demo-pubkey) to verify ActionReceipt sigs — never render "sent" unless signatureState==.verified\n`);
+  process.stdout.write(`[live-demo] RUNNING containment src sha256[:16] = ${srcDigest}  (deployment binding: must match the reviewed commit)\n`);
   process.stdout.write('[live-demo] POST /actions/execute with the caller\'s SENTI user-session bearer to author as human-<you>\n');
-  // Redacted capability-bounds line (NO bearer value — only the enforced numbers), so the deployment receipt shows them.
-  process.stdout.write(demoBearer
-    ? `[live-demo] PUBLIC demo capability BOUNDED: scope=pocket:voice-ONLY · expiry=${demoExpiresUnix ? new Date(demoExpiresUnix * 1000).toISOString() : 'UNSET->fail-closed(401)'} · maxTotal=${demoMaxCalls || 'UNSET->fail-closed(429)'} · maxPerMin=${demoMaxPerMin || 'UNSET->fail-closed(429)'}\n`
-    : '[live-demo] no POCKET_DEMO_BEARER set (login-free demo capability disabled)\n');
+  // Redacted capability-bounds line (NO bearer value — fingerprint + enforced numbers only) for the deployment receipt.
+  if (demoBearer) {
+    const st = demoGuard.stats();
+    process.stdout.write(`[live-demo] PUBLIC demo capability BOUNDED (fp ${demoFingerprint}): scope=pocket:voice-ONLY · expiry=${st.expSec ? new Date(st.expSec * 1000).toISOString() : 'INVALID->fail-closed(401)'} · rate/min=${st.perMin || 'INVALID->fail-closed(429)'} · maxCalls=${st.totCalls || 'INVALID->fail-closed(429)'} · maxChars=${st.totChars || 'INVALID->fail-closed(429)'} · used={calls:${st.used.calls},chars:${st.used.chars}} persisted=${st.usagePath}\n`);
+  } else {
+    process.stdout.write('[live-demo] no POCKET_DEMO_BEARER set (login-free demo capability disabled)\n');
+  }
   process.stdout.write(gemma
     ? `[live-demo] Gemma reasoning WIRED -> ${gemmaBaseUrl} (model ${gemma.model}) -> /answer + /brief live\n`
     : '[live-demo] Gemma NOT wired (set GEMMA_BASE_URL=http://localhost:11434/v1 GEMMA_MODEL=gemma3 for real Gemma /answer + /brief)\n');

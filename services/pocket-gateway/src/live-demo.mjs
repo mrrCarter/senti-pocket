@@ -13,6 +13,7 @@
 // the SAME gated code path as prod (app.mjs); only the three bindings above differ.
 import http from 'node:http';
 import { createPublicKey } from 'node:crypto';
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { createGateway } from './handlers.mjs';
 import { createInMemoryStore } from './store.mjs';
 import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
@@ -22,40 +23,72 @@ import { generateSigningKeypair } from './bundle.mjs';
 const MAX_BODY = 256 * 1024;
 const isJsonContentType = (v) => typeof v === 'string' && v.split(';')[0].trim().toLowerCase() === 'application/json';
 
+// A publicly-extractable capability's bounds must be FINITE + POSITIVE or they are meaningless. Number(env) yields NaN
+// for junk and Infinity for "1e999"; both slip past naive `<=0` / `>` checks and ADMIT (fail-OPEN). So every numeric
+// bound is coerced here: non-finite or non-positive => 0, and 0 is treated everywhere as fail-CLOSED (deny).
+const finPos = (x) => (Number.isFinite(x) && x > 0) ? x : 0;
+const nonNeg = (x) => (Number.isFinite(x) && x >= 0) ? Math.floor(x) : 0;
+
+// Restart-safe usage store for the demo capability, keyed by capability fingerprint. In-memory counters reset on
+// restart and multiply per instance — so the lifetime call/char BUDGET is persisted to disk (single demo instance),
+// atomic via write-temp + rename. A NEW capability (new fingerprint) starts fresh; the SAME capability's spend persists.
+function loadUsage(path) {
+  try { const j = JSON.parse(readFileSync(path, 'utf8')); return { calls: nonNeg(j.calls), chars: nonNeg(j.chars) }; }
+  catch { return { calls: 0, chars: 0 }; }
+}
+function saveUsage(path, usage) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ calls: nonNeg(usage.calls), chars: nonNeg(usage.chars), updatedAt: usage.updatedAt || 0 }), { mode: 0o600 });
+  renameSync(tmp, path); // atomic replace on POSIX
+}
+
 /**
- * Bounds the PUBLIC login-free demo bearer. That capability is embedded in a sideloaded .ipa, so it is EXTRACTABLE by
- * anyone who has the app — it must therefore be tightly contained at the SERVER, independent of any client honesty:
- *   - an ABSOLUTE server-enforced expiry (a wall-clock deadline, NOT "we'll revoke it manually"),
- *   - a hard TOTAL-usage cap (a lifetime call budget for the capability),
- *   - a per-60s RATE cap.
- * ALL defaults are FAIL-CLOSED (0 => already expired / already exhausted) so a MISCONFIGURED deploy denies rather than
- * over-grants. State is in-memory (single demo instance). `admit()` is called ONLY when the demo bearer matched, and
- * returns { ok:true } to proceed or { ok:false, status, error, retryAfterSec? } to reject at the edge (zero upstream).
- * @param {{ expiresUnixSec?:number, maxTotal?:number, maxPerMin?:number, now?:Function }} opts
+ * Bounds the PUBLIC login-free demo bearer (embedded in a sideloaded .ipa ⇒ EXTRACTABLE ⇒ must be SERVER-bounded,
+ * independent of client honesty). TWO planes, deliberately separate:
+ *   - admitRequest(): EDGE gate for EVERY demo-bearer request — absolute expiry (401) + per-60s ANTI-ABUSE rate (429).
+ *     In-memory (a short-window throttle resetting on restart is acceptable; it is NOT the budget).
+ *   - debitTts(textBytes): called ONLY for an ACCEPTED POST /tts — a RESTART-SAFE, fingerprint-keyed lifetime call+CHAR
+ *     budget (429 when exhausted). Denied / malformed / non-/tts traffic never reaches here, so abuse cannot drain the
+ *     legit /tts quota (metered separately from abuse).
+ * ALL numeric bounds are finite-positive-validated ⇒ non-finite/non-positive config is fail-CLOSED (deny), not admit.
+ * @param {{ expiresUnixSec?:number, maxPerMin?:number, maxTotalCalls?:number, maxTotalChars?:number, fingerprint?:string, persistDir?:string, now?:Function }} opts
  */
-export function createDemoBearerGuard({ expiresUnixSec = 0, maxTotal = 0, maxPerMin = 0, now = () => Date.now() } = {}) {
-  let total = 0;
-  let windowStartMs = -Infinity; // first admit() opens a fresh 60s window
+export function createDemoBearerGuard({ expiresUnixSec = 0, maxPerMin = 0, maxTotalCalls = 0, maxTotalChars = 0, fingerprint = '', persistDir = '', now = () => Date.now() } = {}) {
+  const expSec = finPos(expiresUnixSec);
+  const perMin = finPos(maxPerMin);
+  const totCalls = finPos(maxTotalCalls);
+  const totChars = finPos(maxTotalChars);
+  const usagePath = (persistDir && fingerprint) ? `${persistDir}/pocket-demo-usage-${fingerprint}.json` : '';
+  let windowStartMs = -Infinity;
   let windowCount = 0;
   return {
-    admit() {
+    // EDGE: expiry(401) + anti-abuse rate(429). Called for EVERY demo-bearer request; does NOT touch the persistent budget.
+    admitRequest() {
       const nowMs = now();
       const nowSec = Math.floor(nowMs / 1000);
-      // 1) ABSOLUTE expiry (fail-closed: unset/past => expired). Server wall-clock, not manual revocation.
-      if (!expiresUnixSec || nowSec > expiresUnixSec) return { ok: false, status: 401, error: 'demo_capability_expired' };
-      // 2) lifetime TOTAL-usage cap (fail-closed: unset/<=0 => exhausted).
-      if (maxTotal <= 0 || total >= maxTotal) return { ok: false, status: 429, error: 'demo_usage_exhausted' };
-      // 3) per-60s RATE cap (fail-closed: unset/<=0 => rate-limited). Fixed, non-overlapping 60s windows.
+      if (!expSec || nowSec >= expSec) return { ok: false, status: 401, error: 'demo_capability_expired' }; // >= : reject AT the expiry second; !expSec catches unset/NaN/Infinity(→0)
       if (nowMs - windowStartMs >= 60_000) { windowStartMs = nowMs; windowCount = 0; }
-      if (maxPerMin <= 0 || windowCount >= maxPerMin) {
+      if (!perMin || windowCount >= perMin) {
         const retryAfterSec = Math.max(1, Math.ceil((windowStartMs + 60_000 - nowMs) / 1000));
         return { ok: false, status: 429, error: 'demo_rate_limited', retryAfterSec };
       }
-      total += 1; windowCount += 1;
-      return { ok: true, remainingTotal: maxTotal - total };
+      windowCount += 1;
+      return { ok: true };
     },
-    // Non-mutating snapshot for a startup/telemetry line (carries NO secret).
-    stats() { return { total, maxTotal, maxPerMin, expiresUnixSec }; },
+    // /tts PATH: called ONLY for an accepted POST /tts, with the request's UTF-8 text byte length. Restart-safe,
+    // fingerprint-keyed lifetime call + character budget. Fail-CLOSED if unconfigured (no persistence / unset caps).
+    debitTts(textBytes) {
+      const bytes = nonNeg(textBytes);
+      if (!usagePath) return { ok: false, status: 503, error: 'demo_budget_unconfigured' };
+      if (!totCalls || !totChars) return { ok: false, status: 429, error: 'demo_usage_exhausted' };
+      const u = loadUsage(usagePath);
+      if (u.calls >= totCalls || u.chars + bytes > totChars) return { ok: false, status: 429, error: 'demo_usage_exhausted' };
+      u.calls += 1; u.chars += bytes; u.updatedAt = Math.floor(now() / 1000);
+      saveUsage(usagePath, u);
+      return { ok: true, remainingCalls: totCalls - u.calls, remainingChars: totChars - u.chars };
+    },
+    // Non-mutating snapshot for the redacted startup/telemetry line (NO secret).
+    stats() { const u = usagePath ? loadUsage(usagePath) : { calls: 0, chars: 0 }; return { expSec, perMin, totCalls, totChars, used: u, usagePath: usagePath ? true : false }; },
   };
 }
 
@@ -76,20 +109,19 @@ export function createLiveDemoGateway(opts = {}) {
   if (typeof knownSessionIdsFor !== 'function') throw new Error('createLiveDemoGateway: knownSessionIdsFor is required');
   const key = signingKey || generateSigningKeypair().privateKey; // DEV key: a REAL ed25519 signature, NOT prod KMS
 
-  // LOGIN-FREE demo bearer: a fixed rotated env bearer (POCKET_DEMO_BEARER) grants a TIGHTLY-SCOPED demo ctx WITHOUT
-  // calling the real /auth/me. Scope is pocket:voice ONLY (the /tts route) — because this capability ships PUBLICLY in a
-  // sideloaded .ipa and is extractable, it grants the MINIMUM viable surface: only text->speech. It does NOT carry
-  // sessions:read (/sync,/checkpoint,/answer,/brief,/deck), nor sessions:write (/actions/execute), nor pocket:dial
-  // (/dial*), so EVERY one of those is scope-DENIED (403) inside the gateway before any upstream call. ANY other token
-  // falls through to the real verifier unchanged. Match is EXACT and case-sensitive on the full Authorization value.
-  // Expiry / total-usage / rate bounds on this capability are enforced at the SERVER edge by createDemoBearerGuard
-  // (createLiveDemoServer) — a publicly-extractable bearer cannot rely on client honesty, so the server bounds it.
+  // LOGIN-FREE demo bearer: a fixed rotated bearer (opts.demoBearer||POCKET_DEMO_BEARER) grants a TIGHTLY-SCOPED demo
+  // ctx WITHOUT calling the real /auth/me. Scope is pocket:voice ONLY (the /tts route) — because this capability ships
+  // PUBLICLY in a sideloaded .ipa and is extractable, it grants the MINIMUM viable surface: only text->speech. It does
+  // NOT carry sessions:read (/sync,/checkpoint,/answer,/brief,/deck), nor sessions:write (/actions/execute), nor
+  // pocket:dial (/dial*), so EVERY one of those is scope-DENIED (403) inside the gateway before any upstream call. ANY
+  // other token falls through to the real verifier unchanged. Match is EXACT + case-sensitive. Expiry/rate + the
+  // lifetime call/char budget on this capability are enforced at the SERVER edge / /tts path by createDemoBearerGuard.
   const realVerifyToken = createSentiSessionVerifier({ fetch, apiBaseUrl }); // validate a REAL SENTI token via /auth/me (no secret held)
   const DEMO_CTX = Object.freeze({ humanId: 'demo-user', principal: 'pocket.demo', scopes: Object.freeze(['pocket:voice']), site: null, tokenClaims: Object.freeze({}) });
-  const demoBearerValue = opts.demoBearer || process.env.POCKET_DEMO_BEARER || ''; // SAME source the server-edge guard uses (createLiveDemoServer), so scope + bounds match one capability
+  const demoBearerValue = opts.demoBearer || process.env.POCKET_DEMO_BEARER || ''; // SAME source the server-edge guard uses, so scope + bounds describe ONE capability
   const verifyToken = async (headers) => {
     const authz = headers && (headers.authorization || headers.Authorization);
-    if (demoBearerValue && authz === 'Bearer ' + demoBearerValue) return DEMO_CTX; // ROTATED bearer (opts.demoBearer||POCKET_DEMO_BEARER); hardcoded pocket-demo is REVOKED
+    if (demoBearerValue && authz === 'Bearer ' + demoBearerValue) return DEMO_CTX; // ROTATED bearer; hardcoded pocket-demo is REVOKED
     return realVerifyToken(headers); // every OTHER token: unchanged real senti-session verifier
   };
 
@@ -116,9 +148,9 @@ export function createLiveDemoGateway(opts = {}) {
 
 /**
  * Local http server around the live-demo gateway. Auth is DELEGATED to the gateway's SENTI verifier (GET /auth/me); the
- * server only requires a Bearer header present + bounds the body BEFORE buffering (mirrors demo-server's hardening).
- * The PUBLIC demo capability (opts.demoBearer) is additionally bounded at the edge by opts.demoGuard (expiry/total/rate)
- * BEFORE gateway.handle, so a spent/expired capability never reaches upstream. Real SENTI tokens are untouched.
+ * server only requires a Bearer header present + bounds the body BEFORE buffering. The PUBLIC demo capability
+ * (opts.demoBearer) is bounded by opts.demoGuard: admitRequest() at the edge (expiry/rate) BEFORE gateway.handle, and
+ * debitTts() on an accepted POST /tts (lifetime call/char budget). Real SENTI tokens are untouched.
  * @returns {{ server:http.Server }}
  */
 export function createLiveDemoServer(opts = {}, { maxBody = MAX_BODY } = {}) {
@@ -138,11 +170,11 @@ export function createLiveDemoServer(opts = {}, { maxBody = MAX_BODY } = {}) {
     const authz = req.headers.authorization;
     if (u.pathname !== '/health' && (typeof authz !== 'string' || !authz.startsWith('Bearer '))) return send(401, { error: 'unauthorized' }, { 'www-authenticate': 'Bearer' });
 
-    // PUBLIC demo-capability BOUNDING at the edge: if the extractable demo bearer is presented, enforce its server-side
-    // absolute-expiry (401) + total-usage/rate (429) bounds BEFORE gateway.handle — so a spent/expired capability never
-    // reaches upstream. A set bearer with NO guard is fail-closed (503 unconfigured). Real SENTI tokens skip this block.
-    if (demoBearer && authz === 'Bearer ' + demoBearer) {
-      const verdict = demoGuard ? demoGuard.admit() : { ok: false, status: 503, error: 'demo_capability_unconfigured' };
+    // PUBLIC demo-capability EDGE gate: absolute expiry(401) + anti-abuse rate(429) for ANY demo-bearer request, BEFORE
+    // buffering / gateway.handle. A set bearer with no guard is fail-closed (503). Real SENTI tokens skip this block.
+    const isDemo = demoBearer && authz === 'Bearer ' + demoBearer;
+    if (isDemo) {
+      const verdict = demoGuard ? demoGuard.admitRequest() : { ok: false, status: 503, error: 'demo_capability_unconfigured' };
       if (!verdict.ok) return send(verdict.status, { error: verdict.error }, verdict.retryAfterSec ? { 'retry-after': String(verdict.retryAfterSec) } : undefined);
     }
 
@@ -158,6 +190,16 @@ export function createLiveDemoServer(opts = {}, { maxBody = MAX_BODY } = {}) {
     req.on('end', async () => {
       if (killed) return;
       const body = Buffer.concat(chunks).toString('utf8'); // BYTE-bounded above
+      // Demo /tts lifetime call+CHAR budget: debit ONLY an accepted demo-bearer POST /tts (has a text string). Denied /
+      // malformed / non-/tts traffic never debits — abuse cannot drain Carter's public quota. Debit is restart-safe.
+      if (isDemo && req.method === 'POST' && u.pathname === '/tts' && demoGuard) {
+        let textBytes = 0;
+        try { const p = JSON.parse(body); if (p && typeof p.text === 'string') textBytes = Buffer.byteLength(p.text, 'utf8'); } catch { /* handler will 400 the malformed body */ }
+        if (textBytes > 0) {
+          const deb = demoGuard.debitTts(textBytes);
+          if (!deb.ok) return send(deb.status, { error: deb.error });
+        }
+      }
       const headers = {}; for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = v;
       const query = Object.fromEntries(u.searchParams.entries());
       try {
