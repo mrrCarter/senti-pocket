@@ -73,11 +73,14 @@ targets:
         # NARROW, short-lived DEMO capability — never a real/production secret; rotation/revocation is at the gateway.
         # Empty/absent → the provider returns "" UNCHANGED and the synth's validatedBearer rejects it → Siri (safe).
         SENTI_GATEWAY_BEARER: "$(SENTI_GATEWAY_BEARER)"
-        # FOREGROUND demo-dial trigger gate (spec A, P0-3). Default OFF: with this false there is NO demo ring button and
+        # FOREGROUND demo-dial trigger gate (spec A, P0-3). Default OFF: when disabled there is NO demo ring button and
         # no way to self-ring — the reachability path is inert. A dedicated demo build/config flips this to true to expose
         # the trigger. Ring/audio/READ-ONLY even when on: without a real SessionTokenStore token it is NOT authenticated
         # LEAN /dial hydration and NOT governed writeback.
-        POCKET_DEMO_DIAL_ENABLED: false
+        # BUILD-PARAMETERIZED (mirrors SENTI_GATEWAY_BEARER above): this value is the build-setting reference
+        # $(POCKET_DEMO_DIAL_ENABLED); its committed DEFAULT is "NO" (OFF) in settings.base below. A demo build flips
+        # it ON only at BUILD time via `xcodebuild ... POCKET_DEMO_DIAL_ENABLED=YES`; it is never edited ON in source.
+        POCKET_DEMO_DIAL_ENABLED: "$(POCKET_DEMO_DIAL_ENABLED)"
     settings:
       base:
         GENERATE_INFOPLIST_FILE: false
@@ -87,6 +90,10 @@ targets:
         # (`xcodebuild SENTI_GATEWAY_BEARER=<token>`) — the real short-lived value NEVER lives in tracked source.
         # Grep-provable: no bearer literal is committed anywhere.
         SENTI_GATEWAY_BEARER: ""
+        # Build-time demo gate (spec A), companion to the bearer above. Committed DEFAULT "NO" so the committed/
+        # shipped build has the demo dial OFF (DialHost.truthy("NO")=false). Override ONLY at build time
+        # (xcodebuild POCKET_DEMO_DIAL_ENABLED=YES) to expose the demo trigger; never flipped in tracked source.
+        POCKET_DEMO_DIAL_ENABLED: "NO"
   # XCUITest device/sim target (Atlas-owned per Pulse #249472) — enables the DeviceUITests to run at all.
   # The app-under-test is wired via the `target: SentiPocketApp` dependency (XcodeGen sets the target application).
   # Forge runs a NAMED single test until Atlas maps the -PocketUITestScenario reducer for the other 14.
