@@ -14,6 +14,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let system = CountingDuplexSystem()
         let synthesizer = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
             fetch: { text, _ in try await fetch.fetch(text) },
@@ -45,6 +46,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let system = CountingDuplexSystem()
         let synthesizer = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
             fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -74,6 +76,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let fallback = RecordingFallback()
         let synthesizer = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: CountingDuplexSystem()),
             fetch: { text, _ in try await fetch.fetch(text) },
@@ -113,6 +116,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let shared = SharedPlay(exclusion: exclusion)
         let synth = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
             fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -142,6 +146,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             let system = CountingDuplexSystem()
             let synth = GatewayWAVSpeechSynthesizer(
                 endpoint: try endpoint(),
+                bearerProvider: { "session-token" },
                 fallback: RecordingFallback(),
                 leases: DuplexAudioSessionLeaseManager(system: system),
                 fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -159,6 +164,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             let system = CountingDuplexSystem()
             let synth = GatewayWAVSpeechSynthesizer(
                 endpoint: try endpoint(),
+                bearerProvider: { "session-token" },
                 fallback: RecordingFallback(),
                 leases: DuplexAudioSessionLeaseManager(system: system),
                 fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -176,6 +182,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             let play = ControlledPlay()
             let synth = GatewayWAVSpeechSynthesizer(
                 endpoint: try endpoint(),
+                bearerProvider: { "session-token" },
                 fallback: RecordingFallback(),
                 leases: DuplexAudioSessionLeaseManager(system: system),
                 fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -206,6 +213,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let system = CountingDuplexSystem()
         let synthesizer = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
             fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -230,13 +238,14 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
 
     // MARK: - Fetch hardening (P1) + payload validation (unit-level, deterministic)
 
-    func testValidateWAVContainerAcceptsRIFFWAVEAndRejectsOthers() throws {
-        XCTAssertNoThrow(try GatewayWAVSpeechSynthesizer.validateWAVContainer(fixtureWAV(200)))
+    func testRIFFWAVEMagicPrecheckAcceptsMagicAndRejectsShortOrWrongMagic() throws {
+        // Magic precheck only — confirms the RIFF/WAVE magic + a minimum length; AVAudioPlayer is the real decoder.
+        XCTAssertNoThrow(try GatewayWAVSpeechSynthesizer.precheckRIFFWAVEMagic(fixtureWAV(200)))
         // Too short (a bare 44-byte header carries no audio).
-        XCTAssertThrowsError(try GatewayWAVSpeechSynthesizer.validateWAVContainer(Data(repeating: 0, count: 40)))
+        XCTAssertThrowsError(try GatewayWAVSpeechSynthesizer.precheckRIFFWAVEMagic(Data(repeating: 0, count: 40)))
         // Right size, wrong magic.
         XCTAssertThrowsError(
-            try GatewayWAVSpeechSynthesizer.validateWAVContainer(Data(repeating: 0x41, count: 200))
+            try GatewayWAVSpeechSynthesizer.precheckRIFFWAVEMagic(Data(repeating: 0x41, count: 200))
         )
     }
 
@@ -321,7 +330,8 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         await XCTAssertThrowsVoiceError(.cancelled) { _ = try await aTask.value }
         XCTAssertFalse(playerA.isPlaying, "supersede must STOP the old player, not merely finish its continuation")
 
-        // Flush A's DEFERRED stale cancel now that B is the active player → identity-scoped no-op.
+        // Exactly one deferred cancel (A's) should be pending, and flushing it now that B is active is a no-op.
+        XCTAssertEqual(deferredCancels.count, 1, "exactly one deferred cancel (A's) must be captured before flush")
         deferredCancels.flush()
 
         XCTAssertTrue(playback.currentActivePlayer() === playerB,
@@ -359,6 +369,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let system = CountingDuplexSystem()
         let synth = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: RecordingFallback(),
             leases: DuplexAudioSessionLeaseManager(system: system),
             fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -373,7 +384,8 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         await stopGate.open() // unblock the barrier → settle resumes and must decide the result
 
         await XCTAssertThrowsVoiceError(.cancelled) { _ = try await speak.value }
-        XCTAssertEqual(system.deactivateCount, 1, "cleanup still runs exactly once even when cancelled during settle")
+        XCTAssertEqual(system.deactivateCount, 1,
+                       "the lease is deactivated exactly once even when cancelled during settle")
     }
 
     // MARK: - (P1) owned-task drain registry → cooperative cancel terminates & empties the registry
@@ -385,6 +397,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let system = CountingDuplexSystem()
         let synthesizer = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
             fetch: { text, _ in try await fetch.fetch(text) },
@@ -414,6 +427,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let system = CountingDuplexSystem()
         let synthesizer = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
             fetch: { text, _ in try await fetch.fetch(text) },
@@ -469,6 +483,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
     func testSuccessfulBriefingReportsCartesiaGatewayTelemetry() async throws {
         let synth = GatewayWAVSpeechSynthesizer(
             endpoint: try endpoint(),
+            bearerProvider: { "session-token" },
             fallback: RecordingFallback(),
             leases: DuplexAudioSessionLeaseManager(system: CountingDuplexSystem()),
             fetch: { _, _ in Data(repeating: 0, count: 128) },
@@ -654,6 +669,74 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         }
     }
 
+    // MARK: - (P0 auth) malformed bearer (whitespace / control chars) never reaches the wire (URLProtocol-proven)
+
+    func testMalformedBearerNeverReachesTheWire() async throws {
+        let cases: [(bearer: String, label: String)] = [
+            (" ", "space"),
+            ("\t", "tab"),
+            ("\r\n", "CRLF"),
+            ("tok\u{01}en", "control-char"),
+        ]
+        for testCase in cases {
+            CapturingURLProtocol.reset(responseBody: fixtureWAV(120))
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [CapturingURLProtocol.self]
+            await XCTAssertThrowsVoiceError(.insecureGateway) {
+                _ = try await GatewayWAVSpeechSynthesizer.performFetch(
+                    text: "hello",
+                    endpoint: try XCTUnwrap(URL(string: "https://gw.example.test")),
+                    bearer: testCase.bearer,
+                    session: URLSession(configuration: configuration)
+                )
+            }
+            XCTAssertNil(CapturingURLProtocol.lastCaptured(),
+                         "\(testCase.label) bearer must be rejected pre-egress — ZERO network requests")
+        }
+    }
+
+    // MARK: - (P1 transport) response MIME → only the WAV contract (audio/wav | application/octet-stream)
+
+    func testValidateResponseEnforcesWAVContractMIME() throws {
+        let expected = try XCTUnwrap(URL(string: "https://gw.example.test/tts"))
+        // Allowed: both contract types, and a parameterized (charset) variant.
+        XCTAssertNoThrow(try GatewayWAVSpeechSynthesizer.validateResponse(
+            httpResponse(url: expected, status: 200, contentType: "audio/wav"), expectedURL: expected))
+        XCTAssertNoThrow(try GatewayWAVSpeechSynthesizer.validateResponse(
+            httpResponse(url: expected, status: 200, contentType: "application/octet-stream"), expectedURL: expected))
+        XCTAssertNoThrow(try GatewayWAVSpeechSynthesizer.validateResponse(
+            httpResponse(url: expected, status: 200, contentType: "audio/wav; charset=binary"), expectedURL: expected))
+        // Absent MIME is rejected.
+        XCTAssertThrowsError(try GatewayWAVSpeechSynthesizer.validateResponse(
+            httpResponse(url: expected, status: 200, contentType: nil), expectedURL: expected))
+        // Wrong MIME is rejected.
+        XCTAssertThrowsError(try GatewayWAVSpeechSynthesizer.validateResponse(
+            httpResponse(url: expected, status: 200, contentType: "text/html"), expectedURL: expected))
+    }
+
+    // MARK: - (P1 transport) the no-redirect delegate refuses to follow a 3xx redirect
+
+    func testNoRedirectTaskDelegateRefusesRedirect() async throws {
+        let delegate = NoRedirectTaskDelegate.shared
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: try XCTUnwrap(URL(string: "https://gw.example.test/tts")))
+        let redirect = try XCTUnwrap(HTTPURLResponse(
+            url: try XCTUnwrap(URL(string: "https://gw.example.test/tts")),
+            statusCode: 302,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Location": "https://evil.example.test/"]
+        ))
+        let proposed = URLRequest(url: try XCTUnwrap(URL(string: "https://evil.example.test/")))
+        let followed: URLRequest? = await withCheckedContinuation { continuation in
+            delegate.urlSession(
+                session, task: task, willPerformHTTPRedirection: redirect, newRequest: proposed
+            ) { continuation.resume(returning: $0) }
+        }
+        task.cancel()
+        XCTAssertNil(followed, "the no-redirect delegate must refuse to follow a redirect (resolves nil)")
+    }
+
     // MARK: - Helpers
 
     private func endpoint() throws -> URL {
@@ -720,10 +803,12 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
     private func httpResponse(
         url: URL,
         status: Int,
-        contentLength: Int? = nil
+        contentLength: Int? = nil,
+        contentType: String? = "application/octet-stream" // a valid WAV-contract MIME by default
     ) -> HTTPURLResponse {
         var headers: [String: String] = [:]
         if let contentLength { headers["Content-Length"] = "\(contentLength)" }
+        if let contentType { headers["Content-Type"] = contentType }
         return HTTPURLResponse(
             url: url,
             statusCode: status,
@@ -968,7 +1053,7 @@ private final class FixedWAVURLProtocol: URLProtocol, @unchecked Sendable {
                   url: url,
                   statusCode: 200,
                   httpVersion: "HTTP/1.1",
-                  headerFields: ["Content-Length": "\(Self.body.count)"]
+                  headerFields: ["Content-Length": "\(Self.body.count)", "Content-Type": "application/octet-stream"]
               ) else {
             client?.urlProtocol(self, didFailWithError: VoiceError.gatewayRejected(0))
             return
@@ -1091,6 +1176,8 @@ private final class DeferredCanceller: @unchecked Sendable {
         lock.withLock { pending.append(work) }
     }
 
+    var count: Int { lock.withLock { pending.count } }
+
     @MainActor
     func flush() {
         let works = lock.withLock { () -> [@MainActor @Sendable () -> Void] in
@@ -1151,7 +1238,7 @@ private final class CapturingURLProtocol: URLProtocol, @unchecked Sendable {
                   url: url,
                   statusCode: 200,
                   httpVersion: "HTTP/1.1",
-                  headerFields: ["Content-Length": "\(payload.count)"]
+                  headerFields: ["Content-Length": "\(payload.count)", "Content-Type": "application/octet-stream"]
               ) else {
             client?.urlProtocol(self, didFailWithError: VoiceError.gatewayRejected(0))
             return
@@ -1204,7 +1291,7 @@ private final class OverflowURLProtocol: URLProtocol, @unchecked Sendable {
                   url: url,
                   statusCode: 200,
                   httpVersion: "HTTP/1.1",
-                  headerFields: ["Content-Length": "\(advertised)"]
+                  headerFields: ["Content-Length": "\(advertised)", "Content-Type": "application/octet-stream"]
               ) else {
             client?.urlProtocol(self, didFailWithError: VoiceError.gatewayRejected(0))
             return

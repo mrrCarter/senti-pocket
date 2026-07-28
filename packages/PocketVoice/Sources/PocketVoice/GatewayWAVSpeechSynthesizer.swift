@@ -98,12 +98,11 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     }
 
     /// Test seam: inject the bearer provider, network fetch, WAV playback, playback-stop, and lease manager so the
-    /// lifecycle can be driven deterministically without a live gateway or a real audio device. The default
-    /// provider returns a non-empty bearer so lifecycle tests reach the fetch seam (the missing-credential path is
-    /// exercised by passing a nil/empty provider explicitly).
+    /// lifecycle can be driven deterministically without a live gateway or a real audio device. `bearerProvider`
+    /// has NO default — every caller passes one explicitly, so the synth carries no bearer literal of its own.
     init(
         endpoint: URL,
-        bearerProvider: @escaping @Sendable () async -> String? = { "test-bearer" },
+        bearerProvider: @escaping @Sendable () async -> String?,
         fallback: any SpeechSynthesizer,
         session: URLSession = URLSession(configuration: .ephemeral),
         leases: DuplexAudioSessionLeaseManager = .shared,
@@ -209,13 +208,12 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         let started = ContinuousClock.now
         do {
             try requireCurrent(requestID: request.id, generation: generation)
-            // Resolve the gateway credential. No credential → ship NOTHING (zero network); the catch below
+            // Resolve + VALIDATE the gateway credential at the transport boundary. A nil / empty / whitespace-only
+            // / control-char bearer is REJECTED (never trimmed) → ship NOTHING (zero network); the catch below
             // degrades to the on-device fallback, which returns ITS OWN metrics — never a fake Cartesia success.
-            let bearer = await bearerProvider()
+            let rawBearer = await bearerProvider()
             try requireCurrent(requestID: request.id, generation: generation)
-            guard let bearer, !bearer.isEmpty else {
-                throw VoiceError.insecureGateway
-            }
+            let bearer = try Self.validatedBearer(rawBearer)
             let wav = try await fetch(request.text, bearer)
             // After the fetch await: a stop()/supersede that changed the generation means we must NEVER play,
             // never acquire a lease, and never degrade to the fallback (latest-wins, generation-guarded).
@@ -387,6 +385,21 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
 
     // MARK: - Gateway fetch (ephemeral, no-redirect, https-pinned, pre-egress-validated, size-capped, WAV-only)
 
+    /// Centralized transport-boundary credential validator. A valid bearer is a non-empty token with NO whitespace
+    /// (space / tab / CR / LF / Unicode whitespace) and NO control characters. A malformed credential is REJECTED
+    /// (never trimmed or normalized — the app supplies an unchanged valid token); this keeps an all-whitespace
+    /// "credential" and CR/LF header-injection from ever reaching the wire.
+    static func validatedBearer(_ bearer: String?) throws -> String {
+        guard let bearer, !bearer.isEmpty else {
+            throw VoiceError.insecureGateway
+        }
+        let forbidden = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+        guard bearer.unicodeScalars.allSatisfy({ !forbidden.contains($0) }) else {
+            throw VoiceError.insecureGateway
+        }
+        return bearer
+    }
+
     static func performFetch(
         text: String,
         endpoint: URL,
@@ -394,8 +407,10 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         session: URLSession,
         maxBytes: Int = maxWAVBytes
     ) async throws -> Data {
+        // PRE-EGRESS (defense-in-depth): reject a malformed credential and a bad URL BEFORE any network call, so
+        // the Authorization header is only ever built from a validated bearer.
+        let bearer = try validatedBearer(bearer)
         let ttsURL = endpoint.appendingPathComponent("tts")
-        // PRE-EGRESS: validate the URL we are about to authenticate to BEFORE the Bearer ever leaves the device.
         try validateInitialRequestURL(ttsURL)
         var request = URLRequest(
             url: ttsURL,
@@ -425,7 +440,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
                 throw VoiceError.synthesisFailed("gateway WAV exceeded \(maxBytes) bytes")
             }
         }
-        try validateWAVContainer(data)
+        try precheckRIFFWAVEMagic(data)
         return data
     }
 
@@ -444,7 +459,8 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     }
 
     /// HTTP + transport validation: 200, real HTTP response, the FINAL response URL is the exact endpoint we
-    /// posted to (see `isExactExpectedURL`), and the advertised `Content-Length` is within the cap.
+    /// posted to (see `isExactExpectedURL`), the response MIME is the WAV contract, and the advertised
+    /// `Content-Length` is within the cap.
     static func validateResponse(_ response: URLResponse, expectedURL: URL, maxBytes: Int = maxWAVBytes) throws {
         guard let http = response as? HTTPURLResponse else {
             throw VoiceError.gatewayRejected(0)
@@ -455,11 +471,27 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         guard let finalURL = http.url, isExactExpectedURL(finalURL, expectedURL: expectedURL) else {
             throw VoiceError.insecureGateway
         }
+        try validateResponseMIME(http)
         if http.expectedContentLength != NSURLSessionTransferSizeUnknown,
            http.expectedContentLength > Int64(maxBytes) {
             throw VoiceError.synthesisFailed(
                 "gateway advertised \(http.expectedContentLength) bytes; over the \(maxBytes)-byte cap"
             )
+        }
+    }
+
+    /// The WAV contract accepts ONLY `audio/wav` or the documented `application/octet-stream` (a trailing
+    /// `; charset=…`/parameter is ignored); an absent or any other media type is rejected.
+    static func validateResponseMIME(_ http: HTTPURLResponse) throws {
+        guard let rawContentType = http.value(forHTTPHeaderField: "Content-Type") else {
+            throw VoiceError.synthesisFailed("gateway response is missing a Content-Type")
+        }
+        let mediaType = rawContentType
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)[0]
+            .trimmingCharacters(in: .whitespaces)
+            .lowercased()
+        guard mediaType == "audio/wav" || mediaType == "application/octet-stream" else {
+            throw VoiceError.synthesisFailed("gateway returned unexpected MIME '\(mediaType)'")
         }
     }
 
@@ -483,9 +515,11 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
             && final.percentEncodedQuery == expected.percentEncodedQuery
     }
 
-    /// Payload validation: a real RIFF/WAVE container (positive audio duration is asserted in `WAVPlayback` where
-    /// `AVAudioPlayer` decodes it).
-    static func validateWAVContainer(_ data: Data) throws {
+    /// RIFF/WAVE MAGIC PRECHECK — a cheap sanity gate, NOT a full container validation: it confirms only the
+    /// "RIFF"…"WAVE" magic and a minimum length. `AVAudioPlayer` in `WAVPlayback` is the real decoder and the
+    /// authority on a valid, positive-duration payload; the RIFF chunk size and the `fmt `/`data` chunks are NOT
+    /// parsed here.
+    static func precheckRIFFWAVEMagic(_ data: Data) throws {
         // A canonical WAV header is 44 bytes: "RIFF" <uint32 size> "WAVE" ...; below that there is no audio.
         guard data.count > 44 else {
             throw VoiceError.synthesisFailed("gateway returned \(data.count) bytes; expected a WAV payload")
