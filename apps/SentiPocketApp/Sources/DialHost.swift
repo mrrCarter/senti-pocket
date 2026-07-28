@@ -4,6 +4,7 @@ import PocketCall
 import PocketContracts
 import PocketReasoning
 import PocketDialVoice
+import PocketVoice
 
 // DialHost — the app-lifetime composition wiring for DIALS (Forge, onAnswered hookup part-b). Owns the
 // SentiCallManager (its PKPushRegistry delegate must live the whole app) + the DialCoordinator, and installs the
@@ -64,7 +65,8 @@ final class DialHost: ObservableObject {
         let voice = LiveDialVoice(reasoner: reasoner,
                                   sessionId: ring.core.sessionId,
                                   checkpointId: ring.core.checkpointId,
-                                  modelURL: WhisperModelLocator.resolve())
+                                  modelURL: WhisperModelLocator.resolve(),
+                                  synthesizer: GatewayWAVSpeechSynthesizer(endpoint: gatewayURL))
         let writer = PhoneWriteAdapter(PhoneWriteViewModel(sessionId: ring.core.sessionId,
                                                            client: PocketWriteClient(apiBaseURL: gatewayURL)))
         let request = DialRequest(dialId: ring.core.id,
