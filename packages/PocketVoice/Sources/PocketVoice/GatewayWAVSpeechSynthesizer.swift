@@ -11,12 +11,24 @@ import Foundation
 /// gateway does not implement. Our gateway returns a single `HTTP 200` RIFF/WAV body (`application/octet-stream`),
 /// so we buffer the whole response and hand it to `AVAudioPlayer`.
 ///
+/// - Important: This transport is **demo-only** — not the durable production speech-client contract. It defaults
+///   to the login-free demo bearer (`pocket-demo`) and a whole-WAV body; the canonical production gateway
+///   authenticates with the logged-in **session** bearer and its composition defaults to raw **PCM** streamed
+///   through `GatewayStreamingSpeechSynthesizer`. The `bearer` and `expectedFormat` are injectable (see `init`)
+///   precisely so those demo assumptions are explicit rather than hard-coded as universal.
+///
 /// Lifecycle mirrors `GatewayStreamingSpeechSynthesizer`: an owned in-flight `activeTask`, a monotone
 /// `lifecycleGeneration` + `activeRequestID` (`claimLifecycle`/`isCurrent`/`clearLifecycleIfCurrent`), an
 /// `isCurrent` re-check after every `await`, a `withTaskCancellationHandler` around the owned task, and a single
 /// exact-once cleanup barrier that STOPS both backends (WAV playback + siri fallback) and releases the duplex
 /// audio-session lease before it settles — so a stopped/superseded briefing can never play, never re-speak via
 /// the fallback, and never overlap a newer briefing across backends.
+///
+/// stop()/supersede are PROMPT and BOUNDED: they invalidate the generation, run the audio/lease teardown via the
+/// cleanup barrier, and move the cancelled owned task into a `draining` registry that keeps it owned/observable
+/// until it terminates — WITHOUT awaiting it. A cancellation-uncooperative fetch therefore can never make
+/// stop()/supersede hang; the generation guard guarantees any late-resolving fetch produces no audio, no
+/// fallback, and no lease.
 ///
 /// Audio routing reuses the SAME `DuplexAudioSessionLeaseManager` that `AVSpeechSynthesizerAdapter` uses, so the
 /// WAV plays through the `.playAndRecord` / `.defaultToSpeaker` duplex session (audible on the loudspeaker, mic
@@ -32,6 +44,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
 
     private let endpoint: URL
     private let bearer: String
+    private let expectedFormat: GatewayResponseFormat
     private let fallback: any SpeechSynthesizer
     private let session: URLSession
     private let leases: DuplexAudioSessionLeaseManager
@@ -46,6 +59,10 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     private var activeLease: DuplexAudioSessionLease?
     private var cleanupBarrier: CleanupBarrier?
     private var cleanupFailures = GatewayAudioSessionCleanupFailures()
+    /// Cancelled-but-not-yet-terminated owned tasks. stop()/supersede move a cancelled task here (keyed by a
+    /// drain id) instead of awaiting it, so teardown stays prompt/bounded while the task stays owned/observable;
+    /// each entry removes itself when its task finally resolves.
+    private var draining: [UUID: Task<Void, Never>] = [:]
 
     /// Cap on both the advertised `Content-Length` and the actual received body — a WAV briefing is a few hundred
     /// KB; anything past 10 MiB is rejected (and degrades to the on-device fallback).
@@ -54,6 +71,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     public init(
         endpoint: URL,
         bearer: String = "pocket-demo",
+        expectedFormat: GatewayResponseFormat = .wav,
         fallback: any SpeechSynthesizer = AVSpeechSynthesizerAdapter(),
         session: URLSession? = nil
     ) {
@@ -63,6 +81,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         let playback = Task { @MainActor in WAVPlayback() }
         self.endpoint = endpoint
         self.bearer = bearer
+        self.expectedFormat = expectedFormat
         self.fallback = fallback
         self.session = resolvedSession
         self.leases = .shared
@@ -71,6 +90,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
                 text: text,
                 endpoint: endpoint,
                 bearer: bearer,
+                format: expectedFormat,
                 session: resolvedSession
             )
         }
@@ -83,6 +103,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     init(
         endpoint: URL,
         bearer: String = "pocket-demo",
+        expectedFormat: GatewayResponseFormat = .wav,
         fallback: any SpeechSynthesizer,
         session: URLSession = URLSession(configuration: .ephemeral),
         leases: DuplexAudioSessionLeaseManager = .shared,
@@ -92,6 +113,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     ) {
         self.endpoint = endpoint
         self.bearer = bearer
+        self.expectedFormat = expectedFormat
         self.fallback = fallback
         self.session = session
         self.leases = leases
@@ -106,8 +128,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         try cleanupFailures.requireNoPendingError()
 
         let generation = claimLifecycle(requestID: request.id)
-        activeTask?.cancel()
-        activeTask = nil
+        supersedeActiveTask() // cancel + retain-for-drain the previous owned task (never awaited)
         let preflightCleanup = await awaitCleanupBarrier()
         do {
             try requireCurrent(requestID: request.id, generation: generation)
@@ -137,10 +158,9 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     public func stop() async {
         _ = claimLifecycle(requestID: nil)
         activeRequestID = nil
-        activeTask?.cancel()
-        activeTask = nil
+        supersedeActiveTask() // cancel + retain-for-drain; NEVER block stop() on a (possibly uncooperative) fetch
         // Await the exact-once barrier so WAV playback + siri fallback are stopped and the lease is released
-        // BEFORE stop() returns.
+        // BEFORE stop() returns. This teardown is prompt and bounded and does NOT depend on the fetch task.
         _ = await awaitCleanupBarrier()
     }
 
@@ -150,6 +170,35 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
 
     func currentRequestID() -> UUID? {
         activeRequestID
+    }
+
+    /// Test hook: number of cancelled owned tasks still draining (owned/observable but not yet terminated).
+    func drainingTaskCount() -> Int {
+        draining.count
+    }
+
+    // MARK: - Owned-task drain registry (cancel promptly, retain until terminated, never await in stop/supersede)
+
+    /// Cancel the in-flight owned task and MOVE it into the `draining` registry so it stays owned/observable until
+    /// it terminates — WITHOUT awaiting it here. This keeps stop()/supersede prompt and bounded even when the
+    /// in-flight fetch is cancellation-uncooperative; the generation guard guarantees the late task is silent.
+    private func supersedeActiveTask() {
+        guard let owned = activeTask else { return }
+        activeTask = nil
+        owned.cancel()
+        retainForDrain(owned)
+    }
+
+    private func retainForDrain(_ task: Task<SpeechPlaybackMetrics, Error>) {
+        let drainID = UUID()
+        draining[drainID] = Task { [weak self] in
+            _ = try? await task.value // wait for the cancelled owned task to ACTUALLY terminate
+            await self?.finishDraining(drainID) // then drop the handle → registry empties (observable termination)
+        }
+    }
+
+    private func finishDraining(_ id: UUID) {
+        draining[id] = nil
     }
 
     // MARK: - Owned in-flight briefing (fetch -> play, degrading to the current-request-only fallback)
@@ -162,7 +211,8 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         do {
             try requireCurrent(requestID: request.id, generation: generation)
             let wav = try await fetch(request.text)
-            // After the fetch await: a stop()/supersede that changed the generation means we must NEVER play.
+            // After the fetch await: a stop()/supersede that changed the generation means we must NEVER play,
+            // never acquire a lease, and never degrade to the fallback (latest-wins, generation-guarded).
             try requireCurrent(requestID: request.id, generation: generation)
             // requireCurrent -> acquire -> record are suspension-free, so a superseder either loses the generation
             // check here (no lease taken) or observes `activeLease` set and releases it through the barrier.
@@ -171,16 +221,11 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
             let firstAudioAt = try await play(wav)
             try requireCurrent(requestID: request.id, generation: generation)
             return SpeechPlaybackMetrics(
-                // Telemetry: the closest ACCURATE existing cases in VoiceTypes (no invented cases). This backend is
-                // Cartesia-via-full-WAV-AVAudioPlayer; VoiceTypes ships only `.avSpeechOffline` (on-device, wrong)
-                // and `.elevenLabsGateway` (network gateway premium) -> the gateway case is correct in CATEGORY,
-                // its vendor label is a known misnomer. `firstAudioAt` is captured synchronously when
-                // `AVAudioPlayer.play()` is scheduled (no delegate callback), so `.pcmFirstBufferScheduled` (a
-                // "scheduled at play" proxy) fits the mechanism where `.avSpeechDidStartCallback` (a delegate
-                // callback we do not use) does not. The exact fix is dedicated enum cases in VoiceTypes.swift,
-                // which is out of this change's scope.
-                backend: .elevenLabsGateway,
-                firstAudioMeasurement: .pcmFirstBufferScheduled,
+                // Telemetry: dedicated, accurate cases for this backend. This is Cartesia-via-full-WAV-AVAudioPlayer,
+                // and `firstAudioAt` is captured synchronously when `AVAudioPlayer.play()` is scheduled (there is no
+                // delegate start-callback), so `.avAudioPlayerPlaybackScheduled` names the mechanism exactly.
+                backend: .cartesiaGateway,
+                firstAudioMeasurement: .avAudioPlayerPlaybackScheduled,
                 firstAudioMilliseconds: started.duration(to: firstAudioAt).voiceMilliseconds,
                 totalMilliseconds: started.duration(to: .now).voiceMilliseconds,
                 characterCount: request.text.count,
@@ -215,6 +260,9 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
                 throw VoiceError.cancelled
             }
             let cleanupError = await awaitCleanupBarrier()
+            // Terminal window: the barrier has already run exactly once (both backends stopped, lease released).
+            // From here we only DECIDE the result — never a second cleanup. A supersede/stop (no longer current)
+            // OR a parent-task cancellation that landed DURING settle must be reported as cancelled, not success.
             guard isCurrent(requestID: request.id, generation: generation) else {
                 throw VoiceError.cancelled
             }
@@ -223,6 +271,9 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
             if let cleanupError {
                 cleanupFailures.consume(cleanupError)
                 throw cleanupError
+            }
+            if Task.isCancelled {
+                throw VoiceError.cancelled
             }
             return metrics
         case .failure(let error):
@@ -332,6 +383,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         text: String,
         endpoint: URL,
         bearer: String,
+        format: GatewayResponseFormat = .wav,
         session: URLSession
     ) async throws -> Data {
         let ttsURL = endpoint.appendingPathComponent("tts")
@@ -346,6 +398,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         request.httpMethod = "POST"
         request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(format.acceptHeader, forHTTPHeaderField: "Accept")
         request.httpBody = try JSONEncoder().encode(TTSRequestBody(text: text))
 
         let (bytes, response) = try await session.bytes(
@@ -363,12 +416,13 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
                 throw VoiceError.synthesisFailed("gateway WAV exceeded \(maxWAVBytes) bytes")
             }
         }
-        try validateWAVContainer(data)
+        try validateBody(data, format: format)
         return data
     }
 
-    /// HTTP + transport validation: 200, real HTTP response, the FINAL response URL is the exact https host+path we
-    /// posted to (rejects a redirect/host swap), and the advertised `Content-Length` is within the cap.
+    /// HTTP + transport validation: 200, real HTTP response, the FINAL response URL is byte-for-byte the exact
+    /// https endpoint we posted to (rejects a redirect / host swap / port / query / path mutation / injected
+    /// userinfo), and the advertised `Content-Length` is within the cap.
     static func validateResponse(_ response: URLResponse, expectedURL: URL) throws {
         guard let http = response as? HTTPURLResponse else {
             throw VoiceError.gatewayRejected(0)
@@ -376,10 +430,7 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
         guard http.statusCode == 200 else {
             throw VoiceError.gatewayRejected(http.statusCode)
         }
-        guard let finalURL = http.url,
-              finalURL.scheme?.lowercased() == "https",
-              finalURL.host?.lowercased() == expectedURL.host?.lowercased(),
-              finalURL.path == expectedURL.path else {
+        guard let finalURL = http.url, isExactExpectedURL(finalURL, expectedURL: expectedURL) else {
             throw VoiceError.insecureGateway
         }
         if http.expectedContentLength != NSURLSessionTransferSizeUnknown,
@@ -387,6 +438,41 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
             throw VoiceError.synthesisFailed(
                 "gateway advertised \(http.expectedContentLength) bytes; over the \(maxWAVBytes)-byte cap"
             )
+        }
+    }
+
+    /// The FINAL response URL must be the endpoint we posted to, compared exactly: `https`, exact host, exact port
+    /// (both absent = the scheme default), exact path, exact query (both absent as expected), and NO userinfo. Any
+    /// redirect, host swap, port/query/path mutation, or injected credentials is rejected.
+    static func isExactExpectedURL(_ finalURL: URL, expectedURL: URL) -> Bool {
+        guard let final = URLComponents(url: finalURL, resolvingAgainstBaseURL: false),
+              let expected = URLComponents(url: expectedURL, resolvingAgainstBaseURL: false),
+              let finalHost = final.host, !finalHost.isEmpty,
+              let expectedHost = expected.host, !expectedHost.isEmpty else {
+            return false
+        }
+        // Reject any credentials embedded in the final URL.
+        guard final.user == nil, final.password == nil else { return false }
+        guard final.scheme?.lowercased() == "https", expected.scheme?.lowercased() == "https" else { return false }
+        return finalHost.lowercased() == expectedHost.lowercased()
+            && final.port == expected.port
+            && final.path == expected.path
+            && final.query == expected.query
+    }
+
+    /// Payload validation for the expected response format. WAV (the demo default) must be a real RIFF/WAVE
+    /// container (positive audio duration is asserted in `WAVPlayback` where `AVAudioPlayer` decodes it).
+    static func validateBody(_ data: Data, format: GatewayResponseFormat) throws {
+        switch format {
+        case .wav:
+            try validateWAVContainer(data)
+        case .rawPCM:
+            // Parity with the production streaming expectation. This demo WAV client cannot PLAY a bare PCM
+            // stream (AVAudioPlayer needs a container), so a caller selecting `.rawPCM` will fetch these bytes and
+            // then degrade to the on-device fallback — real PCM playback is `GatewayStreamingSpeechSynthesizer`'s.
+            guard !data.isEmpty, data.count.isMultiple(of: 2) else {
+                throw VoiceError.synthesisFailed("gateway returned \(data.count) bytes; expected 16-bit PCM")
+            }
         }
     }
 
@@ -418,15 +504,39 @@ public actor GatewayWAVSpeechSynthesizer: SpeechSynthesizer {
     }
 }
 
-private struct TTSRequestBody: Encodable {
+/// The response body shape this DEMO client expects from the gateway's `POST /tts`.
+///
+/// - Important: `.wav` (the demo default) is the only shape this `AVAudioPlayer`-backed client can play. `.rawPCM`
+///   exists so a call site can DECLARE the canonical production expectation (the production speech path streams
+///   raw PCM via `GatewayStreamingSpeechSynthesizer`); this demo client fetches PCM but cannot play it and
+///   degrades to the on-device fallback. It selects the outgoing `Accept` header and the payload validation.
+public enum GatewayResponseFormat: String, Sendable, Equatable {
+    /// A complete RIFF/WAVE body returned as `application/octet-stream` (the login-free demo gateway shape).
+    case wav
+    /// Raw little-endian 16-bit PCM (the production streaming shape) — advertised for parity, not playable here.
+    case rawPCM
+
+    var acceptHeader: String {
+        switch self {
+        case .wav: return "audio/wav, application/octet-stream"
+        case .rawPCM: return "audio/pcm"
+        }
+    }
+}
+
+struct TTSRequestBody: Encodable {
     let text: String
 }
 
 /// Main-actor bridge around `AVAudioPlayer`: creates + plays the WAV on the main run loop (so the delegate
 /// callbacks are delivered) and turns the `AVAudioPlayerDelegate` completion into an `async` result. The play
-/// continuation is wrapped in `withTaskCancellationHandler`, so parent-Task cancellation stops the audio.
+/// continuation is wrapped in `withTaskCancellationHandler`, and cancellation is IDENTITY-SCOPED to the exact
+/// player it was created for — an older playback's late cancellation can never stop a newer player.
+///
+/// `internal` (not `private`) only so the deterministic cross-generation cancellation regression test can drive
+/// it directly; it is not part of the package's public surface.
 @MainActor
-private final class WAVPlayback: NSObject, AVAudioPlayerDelegate {
+final class WAVPlayback: NSObject, AVAudioPlayerDelegate {
     private struct Active {
         let player: AVAudioPlayer
         let firstAudioAt: ContinuousClock.Instant
@@ -434,6 +544,11 @@ private final class WAVPlayback: NSObject, AVAudioPlayerDelegate {
     }
 
     private var active: Active?
+
+    /// Upper bound on decoded playback so a tiny payload that decodes to a very long duration can never
+    /// monopolize the call/lease. A pickup briefing is a handful of seconds; anything past this demo cap is
+    /// rejected (and degrades to the on-device fallback).
+    static let maxPlaybackSeconds: TimeInterval = 120
 
     /// Play `wav` to completion, returning the instant playback was scheduled. Suspends until the delegate reports
     /// finish / decode-error, `stop()` supersedes it, or the awaiting Task is cancelled.
@@ -452,6 +567,11 @@ private final class WAVPlayback: NSObject, AVAudioPlayerDelegate {
         guard player.duration > 0 else {
             throw VoiceError.synthesisFailed("WAV decoded to a zero-duration payload")
         }
+        guard player.duration <= Self.maxPlaybackSeconds else {
+            throw VoiceError.synthesisFailed(
+                "WAV decoded to \(player.duration)s; over the \(Self.maxPlaybackSeconds)s demo cap"
+            )
+        }
         player.delegate = self
 
         return try await withTaskCancellationHandler {
@@ -466,13 +586,26 @@ private final class WAVPlayback: NSObject, AVAudioPlayerDelegate {
                 active = Active(player: player, firstAudioAt: .now, continuation: continuation)
             }
         } onCancel: {
-            Task { @MainActor in self.stop() }
+            // Identity-scoped: stop ONLY this invocation's player, and only if it is still the active one.
+            Task { @MainActor in self.cancel(player: player) }
         }
+    }
+
+    /// Identity-scoped cancellation: stop playback only if `player` is STILL the active player. An older
+    /// playback's cancellation that fires AFTER a newer playback has started is a no-op — latest-wins.
+    func cancel(player: AVAudioPlayer) {
+        guard let current = active, current.player === player else { return }
+        stop()
     }
 
     func stop() {
         active?.player.stop()
         finish(.failure(VoiceError.cancelled))
+    }
+
+    /// Test hook: the currently active `AVAudioPlayer`, if any (used to observe cross-generation identity).
+    func currentActivePlayer() -> AVAudioPlayer? {
+        active?.player
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {

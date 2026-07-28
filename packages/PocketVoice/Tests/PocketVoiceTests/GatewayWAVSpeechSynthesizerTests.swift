@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import XCTest
 @testable import PocketVoice
@@ -190,9 +191,15 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         }
     }
 
-    // MARK: - (f) end-call (explicit stop) during playback → audio stops AND the briefing is never re-spoken
+    // MARK: - (f) explicit stop() during playback → audio stops, lease released once, briefing never re-spoken
+    //
+    // Scope note (honesty): this proves ONLY the synthesizer-level contract of `stop()` — it interrupts the
+    // in-flight WAV playback, runs the playback-stop, releases the lease exactly once, and never re-speaks via the
+    // fallback. It does NOT drive CallKit or the phone writer, so it proves neither live call teardown nor
+    // "no write on end-call". The real live-teardown / no-write assertion lands as a DialHost `onEnded` wiring
+    // app-integration test (a separate change, not in this file).
 
-    func testEndCallDuringPlaybackStopsAudioAndNeverReSpeaks() async throws {
+    func testStopStopsAudioAndDoesNotReSpeak() async throws {
         let play = ControlledPlay()
         let stopPlayback = StopPlaybackSpy()
         let fallback = RecordingFallback()
@@ -205,19 +212,19 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             play: { data in try await play.play(data) },
             stopPlayback: { await stopPlayback.stop() }
         )
-        let request = try SpeechSynthesisRequest(text: "briefing when the caller hangs up")
+        let request = try SpeechSynthesisRequest(text: "briefing interrupted by stop()")
 
         let speak = Task { try await synthesizer.speak(request) }
         try await play.waitForStart()
-        await synthesizer.stop() // the caller ends the call mid-briefing
+        await synthesizer.stop() // explicit stop mid-briefing
 
         await XCTAssertThrowsVoiceError(.cancelled) { _ = try await speak.value }
         let cancelledCount = await play.cancelledCountNow()
         let stopCalls = await stopPlayback.countNow()
         let fallbackSpeaks = await fallback.speakCountNow()
-        XCTAssertEqual(cancelledCount, 1, "an end-call must interrupt the in-flight WAV playback")
+        XCTAssertEqual(cancelledCount, 1, "stop() must interrupt the in-flight WAV playback")
         XCTAssertGreaterThanOrEqual(stopCalls, 1, "stop() must run the WAV playback-stop before returning")
-        XCTAssertEqual(fallbackSpeaks, 0, "an end-call must be silent — never re-speak the briefing (no write, no audio)")
+        XCTAssertEqual(fallbackSpeaks, 0, "a stopped briefing must be silent — never re-speak via the fallback")
         XCTAssertEqual(system.deactivateCount, 1, "the lease is released exactly once before stop() returns")
     }
 
@@ -287,10 +294,303 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         XCTAssertEqual(body, FixedWAVURLProtocol.body)
     }
 
+    // MARK: - (P0) identity-scoped cancellation → a stale OLD cancel never stops a newer player
+
+    // Drives the real `WAVPlayback` (real `AVAudioPlayer`s): start playback A, supersede it with playback B, then
+    // fire A's cancellation AFTER B has started. With identity-scoped cancel this is a no-op; the pre-fix
+    // untracked `stop()` would have evicted/stopped B (the newer player).
+    @MainActor
+    func testStaleCancelDoesNotStopNewerPlayback() async throws {
+        let playback = WAVPlayback()
+        let wav = Self.pcmWAV(seconds: 30) // long enough not to finish during the test; under the 120s cap
+
+        // Start playback A and capture its player.
+        let aTask = Task { try await playback.play(wav) }
+        let playerA = try await Self.waitForActivePlayer(on: playback, differentFrom: nil)
+
+        // Start playback B: it supersedes A (A's continuation resumes cancelled) and becomes the active player.
+        let bTask = Task { try await playback.play(wav) }
+        let playerB = try await Self.waitForActivePlayer(on: playback, differentFrom: playerA)
+        XCTAssertTrue(playerA !== playerB, "each play() must create a distinct AVAudioPlayer instance")
+
+        // A was superseded → its awaiting task observes cancellation.
+        await XCTAssertThrowsVoiceError(.cancelled) { _ = try await aTask.value }
+
+        // The OLD playback's cancellation fires AFTER the NEW playback has started. Identity-scoped → no-op.
+        playback.cancel(player: playerA)
+
+        XCTAssertTrue(playback.currentActivePlayer() === playerB,
+                      "a stale cancel of the older player must not evict the newer active player")
+        XCTAssertTrue(playerB.isPlaying,
+                      "the newer playback must keep playing after a stale cancel of the older player")
+
+        // Cleanup: a real stop ends B; the orphaned (superseded, not stopped) A player is stopped directly.
+        playerA.stop()
+        playback.stop()
+        await XCTAssertThrowsVoiceError(.cancelled) { _ = try await bTask.value }
+        XCTAssertFalse(playerB.isPlaying, "stop() must end the active playback")
+    }
+
+    // MARK: - (P1) bounded decoded duration → a tiny payload that decodes very long is rejected before playback
+
+    @MainActor
+    func testPlaybackRejectsDurationOverDemoCap() async throws {
+        let playback = WAVPlayback()
+        let overlong = Self.pcmWAV(seconds: 121) // > the 120s demo cap, but ~1.9 MB (under the byte cap)
+        do {
+            _ = try await playback.play(overlong)
+            XCTFail("an over-long WAV must be rejected before playback starts")
+        } catch let error as VoiceError {
+            guard case .synthesisFailed = error else {
+                return XCTFail("expected .synthesisFailed for an over-long WAV, got \(error)")
+            }
+        }
+        XCTAssertNil(playback.currentActivePlayer(), "a rejected over-long WAV must never become the active player")
+    }
+
+    // MARK: - (P1) settle cancellation → a parent-task cancel DURING settle is reported as cancelled, not success
+
+    func testCancellationDuringSettleReportsCancelledNotSuccess() async throws {
+        let stopGate = StopGate() // blocks the cleanup barrier's stopPlayback so we can cancel mid-settle
+        let system = CountingDuplexSystem()
+        let synth = GatewayWAVSpeechSynthesizer(
+            endpoint: try endpoint(),
+            fallback: RecordingFallback(),
+            leases: DuplexAudioSessionLeaseManager(system: system),
+            fetch: { _ in Data(repeating: 0, count: 128) },
+            play: { _ in ContinuousClock.now }, // plays successfully & instantly → settle(.success)
+            stopPlayback: { await stopGate.stop() } // barrier suspends here during settle
+        )
+        let speak = Task { try await synth.speak(try SpeechSynthesisRequest(text: "cancel during settle")) }
+
+        // Wait until the SETTLE barrier is blocked in stopPlayback (the preflight barrier already passed).
+        try await stopGate.waitForBlocking()
+        speak.cancel()      // parent cancellation lands DURING settle, after a successful play
+        await stopGate.open() // unblock the barrier → settle resumes and must decide the result
+
+        await XCTAssertThrowsVoiceError(.cancelled) { _ = try await speak.value }
+        XCTAssertEqual(system.deactivateCount, 1, "cleanup still runs exactly once even when cancelled during settle")
+    }
+
+    // MARK: - (P1) owned-task drain registry → cooperative cancel terminates & empties the registry
+
+    func testStopDrainRegistryEmptiesWhenCancelledFetchTerminates() async throws {
+        let fetch = CooperativeFetch() // honors cancellation → the owned task actually terminates
+        let play = SpyPlay()
+        let fallback = RecordingFallback()
+        let system = CountingDuplexSystem()
+        let synthesizer = GatewayWAVSpeechSynthesizer(
+            endpoint: try endpoint(),
+            fallback: fallback,
+            leases: DuplexAudioSessionLeaseManager(system: system),
+            fetch: { text in try await fetch.fetch(text) },
+            play: { data in try await play.play(data) },
+            stopPlayback: {}
+        )
+        let speak = Task { try await synthesizer.speak(try SpeechSynthesisRequest(text: "briefing")) }
+        try await fetch.waitForCallCount(1)
+        await synthesizer.stop() // cancels the cooperative fetch → owned task terminates
+
+        await XCTAssertThrowsVoiceError(.cancelled) { _ = try await speak.value }
+        // The cancelled owned task was retained for drain and, being cooperative, terminates → registry empties.
+        try await waitForDrainingEmpty(on: synthesizer)
+        let plays = await play.callCountNow()
+        let fallbackSpeaks = await fallback.speakCountNow()
+        XCTAssertEqual(plays, 0, "a stopped briefing never plays")
+        XCTAssertEqual(fallbackSpeaks, 0, "a stopped briefing never re-speaks via the fallback")
+        XCTAssertEqual(system.activateCount, 0, "no lease is taken when the fetch is stopped before playback")
+    }
+
+    // MARK: - (P1) drain registry → stop() returns promptly on a NON-cooperative fetch; late resolution is silent
+
+    func testStopReturnsPromptlyThenLateNonCooperativeFetchStaysSilent() async throws {
+        let fetch = ControlledFetch() // non-cooperative: only resolves on an explicit resumeNext
+        let play = SpyPlay()
+        let fallback = RecordingFallback()
+        let system = CountingDuplexSystem()
+        let synthesizer = GatewayWAVSpeechSynthesizer(
+            endpoint: try endpoint(),
+            fallback: fallback,
+            leases: DuplexAudioSessionLeaseManager(system: system),
+            fetch: { text in try await fetch.fetch(text) },
+            play: { data in try await play.play(data) },
+            stopPlayback: {}
+        )
+        let speak = Task { try await synthesizer.speak(try SpeechSynthesisRequest(text: "briefing")) }
+        try await fetch.waitForCallCount(1)
+
+        // stop() must NOT block on the cancellation-uncooperative fetch: it returns once the audio/lease teardown
+        // is done. Run it in a Task and assert it completes within a bounded budget (no hang).
+        let stopDone = BoolFlag()
+        let stopTask = Task { await synthesizer.stop(); await stopDone.set() }
+        var returnedPromptly = false
+        for _ in 0..<2_000_000 {
+            if await stopDone.isSet() { returnedPromptly = true; break }
+            await Task.yield()
+        }
+        _ = await stopTask.value
+        XCTAssertTrue(returnedPromptly, "stop() must return promptly and never block on a non-cooperative fetch")
+
+        // The cancelled fetch is still suspended and OWNED (draining) — not dropped.
+        let drainingCount = await synthesizer.drainingTaskCount()
+        XCTAssertEqual(drainingCount, 1,
+                       "the cancelled non-cooperative fetch stays owned/observable in the drain registry")
+
+        // Release the fetch LATE: the generation guard keeps it silent — no play, no fallback, no lease.
+        await fetch.resumeNext(with: .success(Data(repeating: 0, count: 128)))
+        await XCTAssertThrowsVoiceError(.cancelled) { _ = try await speak.value }
+        try await waitForDrainingEmpty(on: synthesizer) // it eventually terminates → registry empties
+        let plays = await play.callCountNow()
+        let fallbackSpeaks = await fallback.speakCountNow()
+        XCTAssertEqual(plays, 0, "a late fetch after stop must never play")
+        XCTAssertEqual(fallbackSpeaks, 0, "a late fetch after stop must never re-speak via fallback")
+        XCTAssertEqual(system.activateCount, 0, "a late fetch after stop must never acquire a lease")
+        XCTAssertEqual(system.deactivateCount, 0)
+    }
+
+    // MARK: - (P1) telemetry → real, accurate enum cases (raw value + Codable round-trip) and used by the metrics
+
+    func testNewTelemetryEnumCasesRawValueAndCodableRoundTrip() throws {
+        XCTAssertEqual(SpeechSynthesisBackend.cartesiaGateway.rawValue, "cartesiaGateway")
+        XCTAssertEqual(FirstAudioMeasurement.avAudioPlayerPlaybackScheduled.rawValue, "avAudioPlayerPlaybackScheduled")
+
+        let backend = try JSONDecoder().decode(
+            SpeechSynthesisBackend.self,
+            from: JSONEncoder().encode(SpeechSynthesisBackend.cartesiaGateway)
+        )
+        XCTAssertEqual(backend, .cartesiaGateway)
+
+        let measurement = try JSONDecoder().decode(
+            FirstAudioMeasurement.self,
+            from: JSONEncoder().encode(FirstAudioMeasurement.avAudioPlayerPlaybackScheduled)
+        )
+        XCTAssertEqual(measurement, .avAudioPlayerPlaybackScheduled)
+    }
+
+    func testSuccessfulBriefingReportsCartesiaGatewayTelemetry() async throws {
+        let synth = GatewayWAVSpeechSynthesizer(
+            endpoint: try endpoint(),
+            fallback: RecordingFallback(),
+            leases: DuplexAudioSessionLeaseManager(system: CountingDuplexSystem()),
+            fetch: { _ in Data(repeating: 0, count: 128) },
+            play: { _ in ContinuousClock.now },
+            stopPlayback: {}
+        )
+        let metrics = try await synth.speak(try SpeechSynthesisRequest(text: "briefing"))
+        XCTAssertEqual(metrics.backend, .cartesiaGateway)
+        XCTAssertEqual(metrics.firstAudioMeasurement, .avAudioPlayerPlaybackScheduled)
+    }
+
+    // MARK: - (P1) exact-URL validation → same-host port/query/path/userinfo mutations are rejected
+
+    func testValidateResponseRejectsSameHostPortQueryPathAndUserinfoMutation() throws {
+        let expected = try XCTUnwrap(URL(string: "https://gw.example.test/tts"))
+        func reject(_ urlString: String) throws {
+            let url = try XCTUnwrap(URL(string: urlString))
+            XCTAssertThrowsError(
+                try GatewayWAVSpeechSynthesizer.validateResponse(
+                    httpResponse(url: url, status: 200), expectedURL: expected
+                )
+            ) { XCTAssertEqual($0 as? VoiceError, .insecureGateway, "should reject \(urlString)") }
+        }
+        try reject("https://gw.example.test:8443/tts")  // mutated port
+        try reject("https://gw.example.test/tts?x=1")   // added query
+        try reject("https://gw.example.test/tts/evil")  // mutated path
+        // Injected userinfo is asserted at the comparison layer (HTTPURLResponse may normalize credentials away).
+        XCTAssertFalse(
+            GatewayWAVSpeechSynthesizer.isExactExpectedURL(
+                try XCTUnwrap(URL(string: "https://user:pass@gw.example.test/tts")), expectedURL: expected
+            ),
+            "a final URL carrying userinfo must be rejected"
+        )
+        // Missing host is rejected.
+        XCTAssertFalse(
+            GatewayWAVSpeechSynthesizer.isExactExpectedURL(
+                try XCTUnwrap(URL(string: "https:/tts")), expectedURL: expected
+            ),
+            "a final URL missing its host must be rejected"
+        )
+        // Control: the exact same-host, no-port, no-query, no-userinfo URL is accepted.
+        XCTAssertTrue(GatewayWAVSpeechSynthesizer.isExactExpectedURL(expected, expectedURL: expected))
+        XCTAssertNoThrow(
+            try GatewayWAVSpeechSynthesizer.validateResponse(
+                httpResponse(url: expected, status: 200, contentLength: 1_024), expectedURL: expected
+            )
+        )
+    }
+
+    // MARK: - (Honesty) demo-only transport → POST shape (URL/method/auth/body) + injectable bearer & WAV format
+
+    func testDemoPOSTShapeAndDefaultWAVFormatHandling() async throws {
+        CapturingURLProtocol.reset(responseBody: fixtureWAV(120))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CapturingURLProtocol.self]
+
+        let body = try await GatewayWAVSpeechSynthesizer.performFetch(
+            text: "hello world",
+            endpoint: try XCTUnwrap(URL(string: "https://gw.example.test")),
+            bearer: "live-session-token", // injected (non-default) bearer proves the seam
+            format: .wav,
+            session: URLSession(configuration: configuration)
+        )
+
+        let captured = try XCTUnwrap(CapturingURLProtocol.capturedNow())
+        XCTAssertEqual(captured.url?.absoluteString, "https://gw.example.test/tts")
+        XCTAssertEqual(captured.method, "POST")
+        XCTAssertEqual(captured.authorization, "Bearer live-session-token")
+        XCTAssertEqual(captured.accept, "audio/wav, application/octet-stream")
+        let json = try JSONSerialization.jsonObject(with: try XCTUnwrap(captured.body)) as? [String: Any]
+        XCTAssertEqual(json?["text"] as? String, "hello world", "the POST body must carry the briefing text")
+        XCTAssertEqual(body, CapturingURLProtocol.responseBodyNow(), "the WAV body is validated and returned")
+    }
+
     // MARK: - Helpers
 
     private func endpoint() throws -> URL {
         try XCTUnwrap(URL(string: "https://gw.example.test"))
+    }
+
+    private func waitForDrainingEmpty(
+        on synthesizer: GatewayWAVSpeechSynthesizer,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        for _ in 0..<1_000_000 {
+            if await synthesizer.drainingTaskCount() == 0 { return }
+            await Task.yield()
+        }
+        XCTFail("the drain registry never emptied", file: file, line: line)
+        throw HarnessError.didNotArrive
+    }
+
+    @MainActor
+    private static func waitForActivePlayer(
+        on playback: WAVPlayback,
+        differentFrom previous: AVAudioPlayer?
+    ) async throws -> AVAudioPlayer {
+        for _ in 0..<1_000_000 {
+            if let player = playback.currentActivePlayer(), player !== previous {
+                return player
+            }
+            await Task.yield()
+        }
+        throw HarnessError.didNotArrive
+    }
+
+    /// A valid silent 8 kHz / 16-bit mono PCM WAV of the requested duration (real container `AVAudioPlayer` decodes).
+    static func pcmWAV(seconds: Double) -> Data {
+        let sampleRate = 8_000, bitsPerSample = 16, channels = 1
+        let frames = Int(Double(sampleRate) * seconds)
+        let dataSize = frames * channels * bitsPerSample / 8
+        var d = Data()
+        func le32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+        func le16(_ v: UInt16) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+        d.append(contentsOf: Array("RIFF".utf8)); le32(UInt32(36 + dataSize)); d.append(contentsOf: Array("WAVE".utf8))
+        d.append(contentsOf: Array("fmt ".utf8)); le32(16); le16(1); le16(UInt16(channels)); le32(UInt32(sampleRate))
+        le32(UInt32(sampleRate * channels * bitsPerSample / 8))
+        le16(UInt16(channels * bitsPerSample / 8)); le16(UInt16(bitsPerSample))
+        d.append(contentsOf: Array("data".utf8)); le32(UInt32(dataSize)); d.append(Data(repeating: 0, count: dataSize))
+        return d
     }
 
     private func waitForCurrentRequest(
@@ -566,4 +866,166 @@ private final class FixedWAVURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {}
+}
+
+// A cancellation-aware fetch fake: its suspended fetch RESUMES with a CancellationError when the owning task is
+// cancelled, so a stopped/superseded owned task actually terminates (used for the drain-registry-empties test).
+private actor CooperativeFetch {
+    private(set) var callCount = 0
+    private var waiters: [CheckedContinuation<Data, Error>] = []
+    private var cancelled = false
+
+    func fetch(_ text: String) async throws -> Data {
+        callCount += 1
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                store(continuation)
+            }
+        } onCancel: {
+            Task { await self.cancelAll() }
+        }
+    }
+
+    private func store(_ continuation: CheckedContinuation<Data, Error>) {
+        if cancelled {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        waiters.append(continuation)
+    }
+
+    private func cancelAll() {
+        cancelled = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending { continuation.resume(throwing: CancellationError()) }
+    }
+
+    func callCountNow() -> Int { callCount }
+
+    func waitForCallCount(_ expected: Int) async throws {
+        for _ in 0..<1_000_000 {
+            if callCount >= expected { return }
+            await Task.yield()
+        }
+        throw HarnessError.didNotArrive
+    }
+}
+
+// Blocks the cleanup barrier's stopPlayback on its Nth invocation until `open()` is called, so a test can inject
+// a parent-task cancellation while settle is suspended inside the barrier. speak() runs the barrier twice for a
+// clean success — once at preflight, once at settle — so `blockAtCall: 2` lets preflight pass and blocks settle.
+private actor StopGate {
+    private let blockAtCall: Int
+    private var opened = false
+    private var callCount = 0
+    private var blocking = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(blockAtCall: Int = 2) { self.blockAtCall = blockAtCall }
+
+    func stop() async {
+        callCount += 1
+        guard callCount >= blockAtCall else { return }
+        blocking = true
+        if opened { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        opened = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending { continuation.resume() }
+    }
+
+    func waitForBlocking() async throws {
+        for _ in 0..<1_000_000 {
+            if blocking { return }
+            await Task.yield()
+        }
+        throw HarnessError.didNotArrive
+    }
+}
+
+private actor BoolFlag {
+    private var value = false
+    func set() { value = true }
+    func isSet() -> Bool { value }
+}
+
+// Captures the outgoing request (URL / method / Authorization / Accept / body) and returns a fixed WAV, so a
+// test can assert the exact POST shape the demo transport puts on the wire.
+private final class CapturingURLProtocol: URLProtocol, @unchecked Sendable {
+    struct Captured: Sendable {
+        let url: URL?
+        let method: String?
+        let authorization: String?
+        let accept: String?
+        let body: Data?
+    }
+
+    private static let lock = NSLock()
+    private static var captured: Captured?
+    private static var responseBody = Data()
+
+    static func reset(responseBody: Data) {
+        lock.withLock {
+            captured = nil
+            self.responseBody = responseBody
+        }
+    }
+
+    static func capturedNow() -> Captured? { lock.withLock { captured } }
+    static func responseBodyNow() -> Data { lock.withLock { responseBody } }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let body = Self.readBody(from: request)
+        Self.lock.withLock {
+            Self.captured = Captured(
+                url: request.url,
+                method: request.httpMethod,
+                authorization: request.value(forHTTPHeaderField: "Authorization"),
+                accept: request.value(forHTTPHeaderField: "Accept"),
+                body: body
+            )
+        }
+        let payload = Self.responseBodyNow()
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Length": "\(payload.count)"]
+              ) else {
+            client?.urlProtocol(self, didFailWithError: VoiceError.gatewayRejected(0))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: payload)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    private static func readBody(from request: URLRequest) -> Data? {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        let bufferSize = 4_096
+        var buffer = [UInt8](repeating: 0, count: bufferSize)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: bufferSize)
+            if read <= 0 { break }
+            data.append(buffer, count: read)
+        }
+        return data
+    }
 }
