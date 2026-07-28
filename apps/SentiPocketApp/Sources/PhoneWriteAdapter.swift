@@ -48,6 +48,7 @@ final class PhoneWriteAdapter: DialEpisodeWriter {
             case .sent:                    return .posted
             case .pending(let message):    return .pending(message)
             case .reconciling(let message): return .pending(message)   // authorized + retained/reconcilable — NOT "not posted"
+            case .unavailable(let message): return .pending(message)   // retained (held for a configured launch) — not "not posted"
             case .refused(let message):    return .refused(message)
             case .composing:               return .refused("write returned to composing without posting")
             case .sending, .confirming:    continue   // transient — keep awaiting the terminal state
@@ -61,6 +62,7 @@ final class PhoneWriteAdapter: DialEpisodeWriter {
         case .sent:                     return .posted
         case .pending(let message):     return .pending(message)
         case .reconciling(let message): return .pending(message)
+        case .unavailable(let message): return .pending(message)   // retained — never a false "not posted"
         case .sending:                  return .pending("Sending — your confirmed message is retained.")
         case .refused(let message):     return .refused(message)
         case .composing, .confirming:   return .refused("write state stream ended before a terminal result")

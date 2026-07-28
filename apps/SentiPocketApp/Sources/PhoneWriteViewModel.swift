@@ -22,6 +22,10 @@ enum PhoneWriteState: Equatable {
     case reconciling(String)       // AUTHORIZED write whose network attempt was INTERRUPTED (cancelled) before a
                                    // terminal gateway result — the confirmed intent is DURABLY retained + reconcilable;
                                    // NOT "sent", NOT a durable offline .pending, and NOT erasable by a later cancel.
+    case unavailable(String)       // a previously-authorized intent restored while NO gateway is configured — RETAINED
+                                   // (durable + in-memory) but it will NOT send until a configured launch. NOT
+                                   // connectivity-pending (no false "will send when you reconnect"), NO reconnect-retry,
+                                   // and hangup/cancel PRESERVE it (never orphan/delete/wire it). (Pulse round-9.)
     case refused(String)           // rejected / non-posted / signature-not-verified — NEVER "sent"
 }
 
@@ -43,12 +47,20 @@ final class PhoneWriteViewModel: ObservableObject {
     init(sessionId: String, client: PocketWriteClient) {
         self.sessionId = sessionId
         self.client = client
-        // Restore a confirmed-but-unsent write from a previous session (durable outbox) so an offline write survives
-        // an app kill. It's already human-confirmed — surfaced as PENDING + retryable; NEVER auto-fired here (retry
-        // is an explicit user tap or an app-driven reconnect), NEVER shown as sent.
+        // Restore a confirmed-but-unsent write from a previous session (durable outbox) so an offline write survives an
+        // app kill. Retain BOTH in-memory + durable ownership; NEVER auto-fired here, NEVER shown as sent. Present it
+        // HONESTLY by endpoint readiness (Pulse round-9):
+        //  • CONFIGURED client → ordinary explicit-retry .pending (connectivity — retry resends on reconnect).
+        //  • UNCONFIGURED (nil) client → .unavailable: retained, but a nil endpoint can't be repaired by a reconnect, so
+        //    it will NOT send until a configured launch. NO false "will send when you reconnect", NO reconnect-retry;
+        //    hangup/cancel PRESERVE it (never orphan/delete/wire it), and a later configured launch restores it as .pending.
         if let persisted = OutboxStore.load() {
             pendingIntent = (persisted.proposal, persisted.confirmation)
-            state = .pending("A message you confirmed earlier is queued — it will send when you reconnect.")
+            if client.isConfigured {
+                state = .pending("A message you confirmed earlier is queued — it will send when you reconnect.")
+            } else {
+                state = .unavailable("A message you confirmed earlier is held. No gateway is configured, so it will not send until the app is launched with a valid gateway.")
+            }
         }
     }
 
@@ -78,6 +90,7 @@ final class PhoneWriteViewModel: ObservableObject {
     /// unknown may have landed server-side — it cannot be retracted).
     func cancel() {
         if case .reconciling = state { return }   // an interrupted authorized attempt is retained, never erased
+        if case .unavailable = state { return }   // Pulse round-9: never orphan/delete a retained intent held for a configured launch
         if let id = currentProposalId { OutboxStore.clear(proposalId: id) }
         pendingIntent = nil
         state = .composing
@@ -90,7 +103,7 @@ final class PhoneWriteViewModel: ObservableObject {
     func cancelIfUnsubmitted() {
         switch state {
         case .composing, .confirming: cancel()
-        case .sending, .pending, .sent, .refused, .reconciling: break   // authorized/terminal/reconciling — retain
+        case .sending, .pending, .sent, .refused, .reconciling, .unavailable: break   // authorized/terminal/held — retain
         }
     }
 

@@ -22,6 +22,14 @@ final class PhoneWriteWindowTests: XCTestCase {
         func read() -> Data? { nil }
         func remove() {}
     }
+    /// In-memory storage that COUNTS write() calls — proves a nil-gateway confirm attempts NO durable write.
+    final class SpyOutboxStorage: OutboxStorage {
+        private var data: Data?
+        private(set) var writeCount = 0
+        func write(_ d: Data) -> Bool { writeCount += 1; data = d; return true }
+        func read() -> Data? { data }
+        func remove() { data = nil }
+    }
 
     override func setUp() {
         super.setUp()
@@ -63,7 +71,8 @@ final class PhoneWriteWindowTests: XCTestCase {
                                  _ msg: String = "task did not complete in time") async -> T? {
         let box = Box<T>()
         let exp = expectation(description: msg)
-        Task { box.value = await task.value; exp.fulfill() }
+        let waiter = Task { box.value = await task.value; exp.fulfill() }
+        defer { waiter.cancel() }   // P2: don't leave the waiter awaiting after we return (best-effort)
         await fulfillment(of: [exp], timeout: timeout)
         return box.value
     }
@@ -97,14 +106,15 @@ final class PhoneWriteWindowTests: XCTestCase {
         override class func canonicalRequest(for r: URLRequest) -> URLRequest { r }
         override func startLoading() {
             Self.lock.lock(); Self._started = true; Self.lock.unlock()
-            while true {
+            let deadline = Date().addingTimeInterval(30)   // P2: HARD deadline — never block a URLSession thread forever
+            while Date() < deadline {
                 Self.lock.lock(); let r = Self._released; Self.lock.unlock()
                 if r { break }
                 Thread.sleep(forTimeInterval: 0.005)
             }
             client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
         }
-        override func stopLoading() {}
+        override func stopLoading() { Self.release() }   // P2: if the session cancels the request, unblock startLoading
     }
     private func blockingClient() -> PocketWriteClient {
         BlockingProtocol.reset()
@@ -235,6 +245,69 @@ final class PhoneWriteWindowTests: XCTestCase {
         if case .refused = vm.state {} else { XCTFail("stays refused (not a delayed .pending)") }
     }
 
+    // Empty-outbox + nil-gateway confirm → storage.write is NEVER called (Pulse round-9: refuse before save).
+    func test_empty_outbox_nil_gateway_confirm_writes_zero() {
+        let spy = SpyOutboxStorage(); OutboxStore.storage = spy   // empty
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: PocketWriteClient(apiBaseURL: nil))
+        vm.draft("Rotate the token"); vm.confirm()   // nil gateway → refuse BEFORE any save
+        guard case .refused = vm.state else { return XCTFail("nil-gateway confirm → refused") }
+        XCTAssertEqual(spy.writeCount, 0, "no durable write was attempted for a nil-gateway confirm")
+        XCTAssertNil(OutboxStore.load())
+    }
+
+    // MARK: - Restored authorized intent honesty (Pulse round-9 P1)
+
+    // seed A → NIL-client init → RETAINED-UNAVAILABLE (NOT a false connectivity .pending); A intact; 0 token/request.
+    func test_restored_intent_with_nil_gateway_is_unavailable_not_pending() {
+        OutboxStore.save(intent("A — an earlier authorized write"))
+        let aId = OutboxStore.load()!.proposal.id
+        RequestCountingProtocol.reset(); var tokenReads = 0
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [RequestCountingProtocol.self]
+        let nilClient = PocketWriteClient(apiBaseURL: nil, urlSession: URLSession(configuration: cfg),
+                                          tokenProvider: { tokenReads += 1; return "valid-fake-token" })
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: nilClient)
+
+        guard case .unavailable = vm.state else { return XCTFail("nil-gateway restore → .unavailable, never connectivity .pending") }
+        XCTAssertEqual(OutboxStore.load()?.proposal.id, aId, "A is intact (retained)")
+        XCTAssertEqual(tokenReads, 0, "no token read on restore")
+        XCTAssertEqual(RequestCountingProtocol.count, 0, "no request on restore")
+    }
+
+    // From .unavailable: retry is a no-op and hangup/cancel PRESERVE it — never orphan/delete/wire. A stays intact.
+    func test_unavailable_retry_and_hangup_preserve_and_never_wire() async {
+        OutboxStore.save(intent("A"))
+        let aId = OutboxStore.load()!.proposal.id
+        RequestCountingProtocol.reset(); var tokenReads = 0
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [RequestCountingProtocol.self]
+        let nilClient = PocketWriteClient(apiBaseURL: nil, urlSession: URLSession(configuration: cfg),
+                                          tokenProvider: { tokenReads += 1; return "tok" })
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: nilClient)
+        guard case .unavailable = vm.state else { return XCTFail("precondition: .unavailable") }
+
+        vm.retryPending()            // no-op (retryPending guards .pending) — never wires a nil endpoint
+        vm.cancelIfUnsubmitted()     // hangup — PRESERVE
+        vm.cancel()                  // explicit cancel — PRESERVE (never orphan/delete)
+        for _ in 0..<6 { await Task.yield() }
+
+        guard case .unavailable = vm.state else { return XCTFail("stays .unavailable — retry/hangup/cancel preserve it") }
+        XCTAssertEqual(OutboxStore.load()?.proposal.id, aId, "A intact — never orphaned/deleted")
+        XCTAssertEqual(tokenReads, 0, "never read a token")
+        XCTAssertEqual(RequestCountingProtocol.count, 0, "never wired a request")
+    }
+
+    // A second nil launch stays honest (.unavailable), and a CONFIGURED launch restores A as retryable .pending.
+    func test_second_nil_launch_unavailable_then_configured_launch_pending() {
+        OutboxStore.save(intent("A"))
+        _ = PhoneWriteViewModel(sessionId: "6cf7e861", client: PocketWriteClient(apiBaseURL: nil))   // 1st nil launch
+        let vm2 = PhoneWriteViewModel(sessionId: "6cf7e861", client: PocketWriteClient(apiBaseURL: nil))   // 2nd nil launch
+        guard case .unavailable = vm2.state else { return XCTFail("a second nil launch stays honest .unavailable") }
+        XCTAssertNotNil(OutboxStore.load(), "A still retained across nil launches")
+
+        let vmCfg = PhoneWriteViewModel(sessionId: "6cf7e861", client: PocketWriteClient(apiBaseURL: URL(string: "https://safe.example")!))
+        guard case .pending = vmCfg.state else { return XCTFail("a configured launch restores A as retryable .pending") }
+        XCTAssertNotNil(OutboxStore.load(), "A still retained for the configured retry")
+    }
+
     // A FAILED persist (no durable ownership) → the write does NOT POST.
     func test_failed_persistence_does_not_post() async {
         OutboxStore.storage = FailingOutboxStorage()
@@ -273,10 +346,12 @@ final class PhoneWriteWindowTests: XCTestCase {
     // cancels the adapter/orchestrator observer. The result MUST be a RETAINED .pending — NEVER .refused/not-posted —
     // and the durable outbox is retained. Releasing the request then resolves the terminal outcome (reconciling).
     func test_cancel_after_authorize_with_blocking_post_is_retained_never_refused() async {
+        defer { BlockingProtocol.release() }   // P2: UNCONDITIONAL — even if an assertion fails early, unblock the URLSession thread
         let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: blockingClient())
         let adapter = PhoneWriteAdapter(vm)
         await adapter.draft("Rotate the token")
         let confirmTask = Task { await adapter.confirmAndPost() }
+        defer { confirmTask.cancel() }   // P2: ensure the observer task is cancelled on any exit
 
         await spin({ BlockingProtocol.started }, "the POST never went in-flight")   // authorized + POST blocked
         XCTAssertNotNil(OutboxStore.load(), "authorized in-flight write is retained")
