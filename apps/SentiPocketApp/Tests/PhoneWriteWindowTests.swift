@@ -67,6 +67,34 @@ final class PhoneWriteWindowTests: XCTestCase {
         override func startLoading() { client?.urlProtocol(self, didFailWithError: URLError(.cancelled)) }
         override func stopLoading() {}
     }
+    /// BLOCKS an in-flight request until `release()`, then fails it cancelled — so a POST can be held mid-flight while a
+    /// hangup cancels the adapter/orchestrator observer.
+    final class BlockingProtocol: URLProtocol {
+        static let lock = NSLock()
+        private static var _started = false
+        private static var _released = false
+        static func reset() { lock.lock(); _started = false; _released = false; lock.unlock() }
+        static var started: Bool { lock.lock(); defer { lock.unlock() }; return _started }
+        static func release() { lock.lock(); _released = true; lock.unlock() }
+        override class func canInit(with r: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for r: URLRequest) -> URLRequest { r }
+        override func startLoading() {
+            Self.lock.lock(); Self._started = true; Self.lock.unlock()
+            while true {
+                Self.lock.lock(); let r = Self._released; Self.lock.unlock()
+                if r { break }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+        }
+        override func stopLoading() {}
+    }
+    private func blockingClient() -> PocketWriteClient {
+        BlockingProtocol.reset()
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [BlockingProtocol.self]
+        return PocketWriteClient(apiBaseURL: URL(string: "https://unit.invalid")!,
+                                 urlSession: URLSession(configuration: cfg), tokenProvider: { "demo-token" })
+    }
     private func countingClient() -> (PocketWriteClient, () -> Int) {
         RequestCountingProtocol.reset()
         let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [RequestCountingProtocol.self]
@@ -198,6 +226,28 @@ final class PhoneWriteWindowTests: XCTestCase {
         vm.cancel(); vm.cancelIfUnsubmitted()         // a later cancel must NOT erase a reconciling authorized write
         guard case .reconciling = vm.state else { return XCTFail("still reconciling after a cancel") }
         XCTAssertNotNil(OutboxStore.load(), "a later cancel must not erase a reconciling authorized write")
+    }
+
+    // CANCEL-AFTER-AUTHORIZE with a BLOCKING request (Pulse round-6 #3): the POST is held in-flight while a hangup
+    // cancels the adapter/orchestrator observer. The result MUST be a RETAINED .pending — NEVER .refused/not-posted —
+    // and the durable outbox is retained. Releasing the request then resolves the terminal outcome (reconciling).
+    func test_cancel_after_authorize_with_blocking_post_is_retained_never_refused() async {
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: blockingClient())
+        let adapter = PhoneWriteAdapter(vm)
+        await adapter.draft("Rotate the token")
+        let confirmTask = Task { await adapter.confirmAndPost() }
+
+        await spin({ BlockingProtocol.started }, "the POST never went in-flight")   // authorized + POST blocked
+        XCTAssertNotNil(OutboxStore.load(), "authorized in-flight write is retained")
+
+        confirmTask.cancel()                                     // hang up: cancel the adapter/orchestrator observer
+        let result = await confirmTask.value
+        if case .pending = result {} else { XCTFail("cancel-after-authorize must be a RETAINED .pending, never .refused") }
+        XCTAssertNotNil(OutboxStore.load(), "the durable outbox is still retained after the cancel")
+
+        BlockingProtocol.release()                              // release the POST → resolves cancelled → reconciling
+        await spin({ if case .reconciling = vm.state { return true }; return false }, "never reached a terminal outcome")
+        XCTAssertNotNil(OutboxStore.load(), "the reconcilable proposal is retained through the terminal outcome")
     }
 
     // The adapter maps .reconciling to a RETAINED (.pending) result — never a false .refused/"not posted".

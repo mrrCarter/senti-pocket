@@ -65,6 +65,9 @@ final class DialCoordinator: ObservableObject {
     /// current one when clearing shared state (a stale run must never clear a replacement).
     private var generationCounter = 0
 
+    /// Test hook: how many episodes are currently retained (0 after every run + teardown has drained — no leak).
+    var episodeCount: Int { episodes.count }
+
     init(hydrate: @escaping (DialReceiveState) async throws -> RenderableRing,
          makeRun: @escaping (RenderableRing) -> DialRun,
          endCall: @escaping (UUID) -> Void) {
@@ -103,13 +106,15 @@ final class DialCoordinator: ObservableObject {
         let episode = Episode(generation: gen, dialId: dialId)
         episodes[callUUID] = episode
 
-        // Finalize: ONLY the CURRENT, non-externally-ended generation may clear the slot AND programmatically end the
-        // call. A stale/superseded run (generation moved on) or an externally-ended episode (a hangup/reset already
-        // ended the call) must NOT clear a replacement NOR end a call it no longer owns (so a stale A cannot end B).
+        // Finalize (Pulse round-6 #2): the CURRENT generation ALWAYS clears its slot — regardless of `ended` — so an
+        // external hangup/reset/failure never RETAINS the Episode → run → voice/writer indefinitely. It programmatically
+        // endCalls ONLY when NOT externally ended (a hangup/reset already ended the call; re-ending could end a
+        // replacement). A stale/superseded generation (the map moved on) clears nothing → a stale A cannot end/clear B.
         func finish(_ outcome: DialOutcome) -> DialOutcome {
-            if let ep = episodes[callUUID], ep.generation == gen, !ep.ended {
+            if let ep = episodes[callUUID], ep.generation == gen {
+                let externallyEnded = ep.ended
                 episodes[callUUID] = nil
-                endCall(callUUID)
+                if !externallyEnded { endCall(callUUID) }
             }
             return outcome
         }

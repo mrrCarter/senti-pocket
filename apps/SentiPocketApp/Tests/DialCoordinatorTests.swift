@@ -207,6 +207,7 @@ final class DialCoordinatorTests: XCTestCase {
         XCTAssertTrue(rec.runs.first!.tornDown, "hangup must tear down (stop synth+mic + writer)")
         if case .declined = out {} else { XCTFail("a cancelled run declines — nothing posted") }
         XCTAssertTrue(rec.endedCalls.isEmpty, "an EXTERNAL teardown must NOT programmatically endCall (the system already did)")
+        XCTAssertEqual(c.episodeCount, 0, "no Episode/run leak after an external end")
     }
 
     // endEpisode is IDEMPOTENT — a second end for the same UUID does not re-tear-down or double-anything.
@@ -223,6 +224,7 @@ final class DialCoordinatorTests: XCTestCase {
         await spin(until: { rec.runs.first?.tornDown == true }, "teardown never ran")
         XCTAssertEqual(rec.runs.count, 1)
         XCTAssertTrue(rec.endedCalls.isEmpty)            // never programmatically ended (external teardown)
+        XCTAssertEqual(c.episodeCount, 0, "no Episode leak after idempotent ends")
     }
 
     // MAX ONE RUN: a duplicate answer for a UUID that already has a LIVE episode is refused — no second run — and the
@@ -269,6 +271,30 @@ final class DialCoordinatorTests: XCTestCase {
         XCTAssertTrue(rec.runs.isEmpty, "a hangup during a noncooperative hydrate must create NO run")
         if case .declined = out {} else { XCTFail("declined — episode ended before run") }
         XCTAssertTrue(rec.endedCalls.isEmpty, "external teardown does not programmatically endCall")
+        XCTAssertEqual(c.episodeCount, 0, "no Episode leak even when no run was created (end-during-hydrate)")
+    }
+
+    // LEAK GUARD (Pulse round-6 #2): after an external end drains a blocked run, the Episode + run are RELEASED — the
+    // coordinator retains no episodes and the run's weak ref nils (no voice/writer held indefinitely); endCall count 0.
+    @MainActor
+    func test_external_end_releases_episode_and_run_no_leak() async {
+        let rec = Recorder(); let uuid = UUID()
+        weak var weakRun: MockRun?
+        let c = DialCoordinator(
+            hydrate: { _ in self.ring() },
+            makeRun: { r in let run = MockRun(ring: r, outcome: .posted, blocks: true); weakRun = run; return run },  // NOT retained by rec
+            endCall: { rec.endedCalls.append($0) })
+        c.received(state("need_1"), dialId: "need_1")
+        let t = Task { await c.answered(dialId: "need_1", callUUID: uuid) }
+        await spin(until: { weakRun != nil }, "run never created")
+
+        c.endEpisode(callUUID: uuid, dialId: "need_1")   // external hangup
+        _ = await t.value
+
+        await spin(until: { c.episodeCount == 0 && weakRun == nil }, "episode/run leaked after external end")
+        XCTAssertEqual(c.episodeCount, 0, "no Episode retained")
+        XCTAssertNil(weakRun, "the run (holding voice + writer) must be released — no indefinite retain")
+        XCTAssertTrue(rec.endedCalls.isEmpty, "external end does not programmatically endCall")
     }
 
     // STALE ENDED EPISODE: after A is ENDED (torn down), a NEW answer B for the same UUID is allowed; A's completion

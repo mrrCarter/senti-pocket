@@ -46,6 +46,17 @@ final class PhoneWriteAdapter: DialEpisodeWriter {
             case .sending, .confirming:    continue   // transient — keep awaiting the terminal state
             }
         }
-        return .refused("write state stream ended before a terminal result")
+        // The state stream ENDED without a terminal state — e.g. a hangup cancelled the orchestrator observer while the
+        // POST Task + durable outbox keep running INDEPENDENTLY (Pulse round-6 #3). Re-inspect the VM: an AUTHORIZED
+        // write (sending/pending/reconciling) reports a RETAINED result, NEVER .refused — ownership transferred at
+        // confirm() and is not retracted by a cancelled observer (that would FALSELY classify an authorized write).
+        switch viewModel.state {
+        case .sent:                     return .posted
+        case .pending(let message):     return .pending(message)
+        case .reconciling(let message): return .pending(message)
+        case .sending:                  return .pending("Sending — your confirmed message is retained.")
+        case .refused(let message):     return .refused(message)
+        case .composing, .confirming:   return .refused("write state stream ended before a terminal result")
+        }
     }
 }
