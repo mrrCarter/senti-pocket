@@ -323,6 +323,14 @@ export function createGateway(deps) {
     const body = readBody(req.body);
     if (!body || typeof body.text !== 'string' || body.text.length === 0) return json(400, { error: 'text required' });
     if (Buffer.byteLength(body.text, 'utf8') > 8192) return json(413, { error: 'text exceeds 8192 bytes' });
+    // PUBLIC demo capability: reserve call+bytes against the persistent lifetime budget + per-min rate AFTER all
+    // local validation and IMMEDIATELY before the provider. Reserve-before-provider; never refunded (provider spend
+    // ambiguous). A demo ctx with no reserve fn is fail-closed (503) — never an unbounded synthesis.
+    if (ctx && ctx.principal === 'pocket.demo') {
+      if (typeof deps.demoReserve !== 'function') return json(503, { error: 'demo_budget_unconfigured' });
+      const demoRes = deps.demoReserve(ctx, Buffer.byteLength(body.text, 'utf8'));
+      if (!demoRes || !demoRes.ok) return json((demoRes && demoRes.status) || 429, { error: (demoRes && demoRes.error) || 'demo_usage_exhausted' });
+    }
     // The ElevenLabs key lives ONLY in deps.ttsBackend — it never reaches the phone. Echo owns the voice model.
     let out;
     try {
