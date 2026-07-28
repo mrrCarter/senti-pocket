@@ -19,6 +19,9 @@ enum PhoneWriteState: Equatable {
     case sending
     case sent(ActionReceipt)       // render-gate PASSED: structurally-valid .posted AND signature .verified under the pin
     case pending(String)           // offline: PENDING_CONNECTIVITY — retryable, intent retained; never "sent"
+    case reconciling(String)       // AUTHORIZED write whose network attempt was INTERRUPTED (cancelled) before a
+                                   // terminal gateway result — the confirmed intent is DURABLY retained + reconcilable;
+                                   // NOT "sent", NOT a durable offline .pending, and NOT erasable by a later cancel.
     case refused(String)           // rejected / non-posted / signature-not-verified — NEVER "sent"
 }
 
@@ -71,21 +74,23 @@ final class PhoneWriteViewModel: ObservableObject {
 
     /// Abandon the draft/confirmation — a cancelled decision must leave NOTHING posted or queued. Clears the durable
     /// outbox STRICTLY by the current proposal's id (spec C) so it can never wipe a DIFFERENT confirmed pending write
-    /// that owns the single global slot.
+    /// that owns the single global slot. NEVER erases a `.reconciling` attempt (an authorized write whose outcome is
+    /// unknown may have landed server-side — it cannot be retracted).
     func cancel() {
+        if case .reconciling = state { return }   // an interrupted authorized attempt is retained, never erased
         if let id = currentProposalId { OutboxStore.clear(proposalId: id) }
         pendingIntent = nil
         state = .composing
     }
 
     /// Call-HANGUP teardown seam (spec C): cancel ONLY a PRE-SUBMIT draft (composing/confirming — nothing was
-    /// authorized, so this yields zero POST/queue). Once the write is authorized (.sending) or terminal
-    /// (.pending/.sent/.refused) this is a NO-OP: an accepted server write cannot be retracted and a durable pending
-    /// stays reconcilable, so a later hangup stops call audio but MUST NOT cancel/erase that authorized attempt.
+    /// authorized, so this yields zero POST/queue). Once the write is authorized (.sending), reconciling, or terminal
+    /// (.pending/.sent/.refused) this is a NO-OP: an accepted server write cannot be retracted and a durable
+    /// pending/reconciling attempt stays retained — a hangup stops call audio but MUST NOT cancel/erase it.
     func cancelIfUnsubmitted() {
         switch state {
         case .composing, .confirming: cancel()
-        case .sending, .pending, .sent, .refused: break   // authorized/terminal — retain the reconcilable proposal
+        case .sending, .pending, .sent, .refused, .reconciling: break   // authorized/terminal/reconciling — retain
         }
     }
 
@@ -103,14 +108,19 @@ final class PhoneWriteViewModel: ObservableObject {
     }
 
     private func post(_ proposal: ActionProposal, _ confirmation: GovernedWriteConfirmation) {
-        // Persist the confirmed intent BEFORE the send so a crash / app-kill during the `.sending` window can't
-        // silently drop a Carter-confirmed governed write — the durable-outbox guarantee must cover the in-flight
-        // window, not only the offline catches (the exact "in-memory only → lost on kill" gap OutboxStore exists to
-        // close). The SAME proposal id is persisted + restored + resent verbatim, so the gateway's (principal,
-        // proposal.id) crash-recovery dedups a restart-retry — never a double-post (prior-posted → same receipt;
-        // in-flight/unknown → 409 reconcile, never a blind re-post). Every terminal path below (applyRenderGate /
-        // refused / cancel) clears the outbox, so a success/refusal leaves nothing queued.
-        OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation))
+        // DURABLE OWNERSHIP BEFORE ANY NETWORK (Pulse): persist the confirmed intent and only send if we actually
+        // OWN the durable slot. A crash / app-kill during the `.sending` window then can't silently drop a
+        // Carter-confirmed write — the durable-outbox guarantee covers the in-flight window (the "in-memory only →
+        // lost on kill" gap). The SAME proposal id is persisted + restored + resent verbatim, so the gateway's
+        // (principal, proposal.id) crash-recovery dedups a restart-retry — never a double-post. If save() returns
+        // false — a DIFFERENT confirmed write owns the slot, OR the persist failed — we CANNOT crash-safely record
+        // this write, so we do NOT POST (honor save()==false; never send something we can't recover). A foreign
+        // owner is left intact.
+        guard OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation)) else {
+            pendingIntent = nil
+            state = .refused("Couldn't secure the outbox for this write — not sent. Another confirmed write may still be pending.")
+            return
+        }
         state = .sending
         Task { [weak self] in
             guard let self else { return }
@@ -127,13 +137,13 @@ final class PhoneWriteViewModel: ObservableObject {
                 // retry like offline; the write may still land, so never refuse it (intent already persisted, top of post()).
                 self.state = .pending("The gateway is busy — queued, tap Retry. (\(detail))")
             } catch PocketWriteError.cancelled {
-                // Spec C: the POST was cancelled (call torn down / task cancelled) BEFORE a terminal gateway result.
-                // This is NOT an offline/connectivity condition, so it must NOT surface as a durable .pending (which
-                // would falsely claim the write is queued to send). The confirmed intent stays in the durable outbox
-                // (RETAINED — reconcilable on next launch, where init() restores it as pending): we neither clear it
-                // nor claim it sent/queued here. Normal teardown does NOT cancel this (unstructured, retained) Task —
-                // this is the app-suspend guard. Live state returns to neutral; the durable outbox is the source of truth.
-                self.state = .composing
+                // Spec C / Pulse: the POST was cancelled/interrupted BEFORE a terminal gateway result. NOT an
+                // offline/connectivity condition, so it must NOT surface as a durable .pending. And since the request
+                // may have LANDED server-side, the confirmed intent is RETAINED for reconciliation. Enter the explicit
+                // RECONCILING phase: the durable outbox stays (reconciled on next launch); cancel()/cancelIfUnsubmitted()
+                // must NOT erase it; the adapter reports it as retained (never a false "not posted"). Normal teardown
+                // does NOT cancel this (detached, retained) Task — this is the app-suspend guard.
+                self.state = .reconciling("Interrupted before the gateway confirmed — your confirmed message is retained and will reconcile.")
             } catch PocketWriteError.notPosted(let why) {
                 // The gateway returned a receipt that is NOT a verified posted (pending/failed) → never sent.
                 self.pendingIntent = nil

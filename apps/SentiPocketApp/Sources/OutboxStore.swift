@@ -4,6 +4,10 @@
 // and retries after reconnect. It stores an ALREADY-CONFIRMED intent only — the human already tapped Send; a retry
 // resends the identical confirmed bytes (the gateway is idempotent by proposal id), so no re-consent is needed.
 //
+// DURABLE OWNERSHIP (Pulse review): `save` returns whether we now DURABLY own the single slot — it SERIALIZES a second
+// owner (a different confirmed write already owning the slot → refuse) AND requires a successful, verifiable persist
+// (a failed write returns false, never false ownership). Callers MUST NOT send a governed write unless save()==true.
+//
 // Dates are epoch-millis (via safeEpochMillis) so the persisted proposal round-trips MILLISECOND-exact — the
 // proposalHash stays valid when the gateway recomputes it on resend (same discipline as PocketWriteClient's wire).
 
@@ -16,49 +20,73 @@ struct PersistedWriteIntent: Codable, Sendable, Equatable {
     let confirmation: GovernedWriteConfirmation
 }
 
-enum OutboxStore {
-    private static var fileURL: URL? {
+/// The raw-bytes storage behind OutboxStore — injectable so the durable-ownership contract (a save that FAILS to
+/// persist must not claim ownership) is testable without the real filesystem. Default = Application Support file.
+protocol OutboxStorage: AnyObject {
+    func write(_ data: Data) -> Bool   // true IFF the bytes are durably persisted
+    func read() -> Data?
+    func remove()
+}
+
+/// Production storage: an atomic, protected-until-first-unlock file in Application Support.
+final class FileOutboxStorage: OutboxStorage {
+    private var fileURL: URL? {
         guard let dir = try? FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
         ) else { return nil }
         return dir.appendingPathComponent("senti-pocket-outbox.json")
     }
+    func write(_ data: Data) -> Bool {
+        guard let url = fileURL else { return false }
+        // Protected until first unlock (survives relaunch, never leaves the device). A FAILED write returns false —
+        // the caller must NOT claim durable ownership (so it must not send a write it can't crash-recover).
+        do {
+            try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            return true
+        } catch {
+            return false
+        }
+    }
+    func read() -> Data? {
+        guard let url = fileURL else { return nil }
+        return try? Data(contentsOf: url)
+    }
+    func remove() {
+        guard let url = fileURL else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
 
-    /// Persist the ONE confirmed intent. SERIALIZES a second owner (spec C): if a DIFFERENT confirmed intent already
-    /// owns the single slot, REFUSE (return false) rather than clobber it — a new write must never erase an unrelated
-    /// earlier confirmed pending write. Re-saving the SAME proposal id (idempotent) is allowed. Returns whether this
-    /// intent now owns the slot.
+enum OutboxStore {
+    /// Injectable storage (default: durable Application Support file). Tests swap a double (in-memory / failing).
+    static var storage: OutboxStorage = FileOutboxStorage()
+
+    /// Persist the ONE confirmed intent; return whether we now DURABLY own the single slot. SERIALIZES a second owner
+    /// (a DIFFERENT confirmed intent already owns the slot → refuse, never clobber) AND requires a successful,
+    /// verifiable persist (encode + write + read-back-as-ours). A failed persist returns false — NO false ownership.
+    /// Re-saving the SAME proposal id (idempotent) is allowed. Callers MUST NOT send a write unless this returns true.
     @discardableResult
     static func save(_ intent: PersistedWriteIntent) -> Bool {
-        if let existing = load(), existing.proposal.id != intent.proposal.id { return false }  // a different write owns the slot
-        guard let url = fileURL, let data = try? encoder.encode(intent) else { return false }
-        // Protected until first unlock (survives relaunch, never leaves the device); best-effort — an outbox write
-        // failing must not crash the send path (the in-memory retry still works this session).
-        try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-        return true
+        if let existing = load(), existing.proposal.id != intent.proposal.id { return false }  // a different write owns it
+        guard let data = try? encoder.encode(intent), storage.write(data) else { return false }  // encode/persist failed
+        return load()?.proposal.id == intent.proposal.id  // verify durability — it must read back as OURS
     }
 
     static func load() -> PersistedWriteIntent? {
-        guard let url = fileURL, let data = try? Data(contentsOf: url) else { return nil }
+        guard let data = storage.read() else { return nil }
         return try? decoder.decode(PersistedWriteIntent.self, from: data)
     }
 
-    /// Clear STRICTLY by matching proposal id (spec C): a no-op when the slot holds a DIFFERENT proposal. This is the
-    /// write path's clear — so a dial hangup cleaning up its OWN draft can never wipe an unrelated confirmed pending
-    /// write that owns the global slot.
+    /// Clear STRICTLY by matching proposal id: a no-op when the slot holds a DIFFERENT proposal, so a dial hangup
+    /// cleaning up its OWN draft can never wipe an unrelated confirmed pending write that owns the global slot.
     static func clear(proposalId: String) {
         guard let existing = load(), existing.proposal.id == proposalId else { return }
-        clearAll()
+        storage.remove()
     }
 
     /// Unconditional clear — a full reset (test setup/teardown, an explicit "discard everything"). The write path
     /// should prefer clear(proposalId:) so it can never erase a foreign owner.
-    static func clear() { clearAll() }
-
-    private static func clearAll() {
-        guard let url = fileURL else { return }
-        try? FileManager.default.removeItem(at: url)
-    }
+    static func clear() { storage.remove() }
 
     // Epoch-millis dates (ms-exact) so the persisted proposal's createdAt/confirmedAt round-trip identically to the
     // hash + the wire — a reloaded proposal recomputes to the SAME proposalHash on the gateway.

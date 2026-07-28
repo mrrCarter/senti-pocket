@@ -58,9 +58,6 @@ public struct CallEndEvent: Equatable, Sendable {
 final class CallEndRouter {
     /// callUUID → the resolved end event (built at ring-time so the dialId survives the call being forgotten).
     private var live: [UUID: CallEndEvent] = [:]
-    /// UUIDs the FLOW itself terminated (SentiCallManager.end) — their own completing episode must NOT be torn down
-    /// again (recursive self-cancel). The next teardown for such a UUID is swallowed.
-    private var programmaticallyEnded: Set<UUID> = []
     /// Fan a resolved end out to the owner (DialHost episode teardown). Fired at most once per call.
     var onEnd: ((CallEndEvent) -> Void)?
 
@@ -69,17 +66,16 @@ final class CallEndRouter {
         live[callUUID] = CallEndEvent(callUUID: callUUID, dialId: dialId)
     }
 
-    /// Mark a terminal end the FLOW itself initiated (SentiCallManager.end) — swallow the next teardown for this UUID
-    /// so the completing episode is not recursively self-cancelled.
+    /// The FLOW itself ended this call (SentiCallManager.end): forget it so a follow-on teardown for the same UUID is a
+    /// no-op (never re-fired) and the completing episode is not recursively self-cancelled. No growing tombstone set —
+    /// the live-map removal alone swallows any post-end teardown (a forgotten UUID fires nothing).
     func markProgrammaticEnd(callUUID: UUID) {
-        programmaticallyEnded.insert(callUUID)
         live[callUUID] = nil
     }
 
     /// The idempotent teardown. Resolves + fires the CallEndEvent exactly once, then forgets the call. A second call
-    /// for the same UUID (already forgotten) is a harmless no-op. A flow-initiated (programmatic) end is swallowed.
+    /// for the same UUID — or one after a programmatic end — finds nothing and is a harmless no-op.
     func teardown(callUUID: UUID) {
-        if programmaticallyEnded.remove(callUUID) != nil { live[callUUID] = nil; return }
         guard let event = live.removeValue(forKey: callUUID) else { return }
         onEnd?(event)
     }

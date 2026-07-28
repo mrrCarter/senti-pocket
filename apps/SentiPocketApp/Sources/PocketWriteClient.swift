@@ -56,10 +56,16 @@ enum PocketWriteError: LocalizedError, Equatable {
 final class PocketWriteClient {
     private let apiBaseURL: URL
     private let urlSession: URLSession
+    private let tokenProvider: () -> String?
 
-    init(apiBaseURL: URL, urlSession: URLSession = .shared) {
+    /// `tokenProvider` defaults to the real Keychain session token (SessionTokenStore) but is injectable so the write
+    /// flow is hermetically testable without the Keychain (same pattern as DialHydrationClient).
+    init(apiBaseURL: URL,
+         urlSession: URLSession = .shared,
+         tokenProvider: @escaping () -> String? = { SessionTokenStore.load() }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
+        self.tokenProvider = tokenProvider
     }
 
     /// Compose the humanMessage proposal for a top-level say. targetSequence is the SENTINEL 0 (mirrored + enforced
@@ -83,7 +89,7 @@ final class PocketWriteClient {
         // Spec C: a PRE-CANCELLED call short-circuits to a distinct cancellation with ZERO work (no Keychain read, no
         // URL request) — never a spurious .network→.pending. (Re-checked again just before the POST below.)
         if Task.isCancelled { throw PocketWriteError.cancelled }
-        guard let token = SessionTokenStore.load(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
+        guard let token = tokenProvider(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
         guard let url = URL(string: "/actions/execute", relativeTo: apiBaseURL) else {
             throw PocketWriteError.network("bad execute url")
         }

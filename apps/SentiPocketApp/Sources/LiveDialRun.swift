@@ -20,22 +20,24 @@ import PocketDialVoice
 @MainActor
 final class LiveDialRun: DialRun {
     private let voice: LiveDialVoice
-    private let writeModel: PhoneWriteViewModel
+    private let writer: DialEpisodeWriter
     private let orchestrator: DialOrchestrator
     private let request: DialRequest
     private var task: Task<DialOutcome, Never>?
     private var torn = false
 
+    /// `writer` is the governed PhoneWriteAdapter on the real path, or a NON-WRITING ReadOnlyDialWriter on the demo
+    /// path (read-only-by-construction) — the orchestrator + teardown are identical either way.
     init(voice: LiveDialVoice,
-         writeModel: PhoneWriteViewModel,
+         writer: DialEpisodeWriter,
          request: DialRequest,
          maxConfirmRetries: Int = 2,
          maxConversingTurns: Int = 6) {
         self.voice = voice
-        self.writeModel = writeModel
+        self.writer = writer
         self.request = request
         self.orchestrator = DialOrchestrator(voice: voice,
-                                             writer: PhoneWriteAdapter(writeModel),
+                                             writer: writer,
                                              maxConfirmRetries: maxConfirmRetries,
                                              maxConversingTurns: maxConversingTurns)
     }
@@ -53,7 +55,7 @@ final class LiveDialRun: DialRun {
     }
 
     func teardown() async {
-        await voice.stop()                 // stop synth + mic immediately (any in-flight speak/listen bails)
-        writeModel.cancelIfUnsubmitted()   // cancel ONLY a pre-submit draft; RETAIN an authorized in-flight write
+        await voice.stop()                       // stop synth + mic immediately (any in-flight speak/listen bails)
+        await writer.cancelIfUnsubmitted()       // cancel ONLY a pre-submit draft; RETAIN an authorized in-flight write
     }
 }

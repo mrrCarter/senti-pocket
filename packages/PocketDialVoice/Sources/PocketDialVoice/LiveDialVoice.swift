@@ -83,13 +83,14 @@ public final class LiveDialVoice: DialVoice {
 
     // MARK: - teardown seam (Forge app-seam, spec B)
 
-    /// Explicit async teardown: stop the synthesizer (its reviewed `stop()`) AND the microphone/recognition, and latch
-    /// `stopped` so any in-flight speak/listen/answerFollowUp bails at its next await rather than restarting speech or
-    /// capture after teardown. Idempotent. The DialHost episode controller is the single teardown owner that calls this.
+    /// Explicit async teardown: stop the synthesizer (its reviewed `stop()`), the microphone, AND the recognizer, and
+    /// latch `stopped` so any in-flight speak/listen/answerFollowUp bails at its next await rather than restarting
+    /// speech or capture after teardown. Idempotent. The DialHost episode controller is the single teardown owner.
     public func stop() async {
         stopped = true
         await synthesizer.stop()
         await microphone.stop()
+        await recognizer.cancel()   // stop any in-flight transcription/recognition too (no late transcript survives)
     }
 
     // MARK: - DialVoice
@@ -118,6 +119,8 @@ public final class LiveDialVoice: DialVoice {
     /// conversing phase — grounded-or-honest (`ProviderDialReasoner` never invents). NOT auto-invoked by `listen()`.
     @discardableResult
     public func answerFollowUp(_ question: String) async -> DialSpokenAnswer {
+        // No reasoner EGRESS after a stop(): bail BEFORE calling the (networked) reasoner if already torn down.
+        if isDown { return DialSpokenAnswer(spokenText: "", grounded: false, evidenceIds: []) }
         let answer = await reasoner.answerFollowUp(question, sessionId: sessionId, checkpointId: checkpointId)
         if isDown { return answer }   // after the (async) reasoner — do NOT speak a late answer after a stop()
         await speak(answer.spokenText)

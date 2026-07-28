@@ -90,16 +90,27 @@ final class DialCoordinator: ObservableObject {
     /// posts on a missing state or a hydration refusal — those decline with nothing posted or queued.
     @discardableResult
     func answered(dialId: String, callUUID: UUID) async -> DialOutcome {
+        // MAX ONE live run per CallKit UUID (spec B, one episode): refuse a duplicate answer for a UUID that already has
+        // a LIVE (not externally-ended) episode — do NOT start a second run and do NOT end the call (the live episode
+        // owns its own terminal end; a duplicate must never orphan it). A stale/ended episode still draining is NOT
+        // live and MAY be superseded below.
+        if let existing = episodes[callUUID], !existing.ended {
+            return .declined("call \(callUUID) already has a live episode")
+        }
+
         generationCounter += 1
         let gen = generationCounter
         let episode = Episode(generation: gen, dialId: dialId)
         episodes[callUUID] = episode
 
-        // Finalize under a generation check: only clear THIS episode's slot (a stale run must not clear a replacement),
-        // then end the call. Returns the outcome for logging/tests.
+        // Finalize: ONLY the CURRENT, non-externally-ended generation may clear the slot AND programmatically end the
+        // call. A stale/superseded run (generation moved on) or an externally-ended episode (a hangup/reset already
+        // ended the call) must NOT clear a replacement NOR end a call it no longer owns (so a stale A cannot end B).
         func finish(_ outcome: DialOutcome) -> DialOutcome {
-            if episodes[callUUID]?.generation == gen { episodes[callUUID] = nil }
-            endCall(callUUID)
+            if let ep = episodes[callUUID], ep.generation == gen, !ep.ended {
+                episodes[callUUID] = nil
+                endCall(callUUID)
+            }
             return outcome
         }
 
@@ -123,11 +134,12 @@ final class DialCoordinator: ObservableObject {
 
         let run = makeRun(ring)
         ep.run = run
-        // If a teardown raced in between the guard and here, it set `ended` + will find `run` on a re-entrant call; but
-        // to be safe, honor an end that landed before we stored `run`.
+        // A teardown that landed between the guard and here set `ended` — honor it (stop the just-built run, no run()).
         if ep.ended { run.cancel(); await run.teardown(); return finish(.declined("episode ended before run")) }
 
         let outcome = await run.run()
+        // finish() re-checks generation + ended POST-run: a run whose episode was ended/superseded WHILE running must
+        // not clear a replacement or end a call it no longer owns.
         return finish(outcome)
     }
 

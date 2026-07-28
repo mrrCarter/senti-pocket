@@ -64,11 +64,14 @@ targets:
         # cloudflared quick-tunnel that churns on restart; forge re-publishes + updates this value with NO code change.
         SENTI_GATEWAY_URL: "https://feof-sega-prominent-exclude.trycloudflare.com"
         # Pocket-TTS demo bearer (spec D, app-seam): read at RUNTIME by DialHost.gatewayBearerProvider() and handed to
-        # GatewayWAVSpeechSynthesizer so the pickup speaks in the pocket voice instead of Siri. A PUBLIC-DEMO capability,
-        # NOT a secret — but kept out of source: the EMPTY default here is intentional (a real short-lived value is
-        # injected at build time separately; never invent/commit a literal). Empty/absent → provider returns nil → the
-        # synth keeps its Siri default (that degrade is fine).
-        SENTI_GATEWAY_BEARER: ""
+        # GatewayWAVSpeechSynthesizer. REPRODUCIBLE, NO-LITERAL injection (Pulse issue 5): this Info.plist value is the
+        # build-setting REFERENCE `$(SENTI_GATEWAY_BEARER)`, whose default (settings.base below) is EMPTY. The real
+        # short-lived value is injected at BUILD time WITHOUT touching tracked source:
+        #   • env / CI:            xcodebuild ... SENTI_GATEWAY_BEARER="$SENTI_GATEWAY_BEARER"   (overrides the empty default)
+        #   • untracked xcconfig:  set SENTI_GATEWAY_BEARER = <token> in a gitignored .xcconfig fed to the build.
+        # Empty/absent → the provider returns the value UNCHANGED and the synth's validatedBearer rejects it → Siri
+        # (safe). No literal lives in tracked source; rotation/revocation is handled at the gateway, never here.
+        SENTI_GATEWAY_BEARER: "$(SENTI_GATEWAY_BEARER)"
         # FOREGROUND demo-dial trigger gate (spec A, P0-3). Default OFF: with this false there is NO demo ring button and
         # no way to self-ring — the reachability path is inert. A dedicated demo build/config flips this to true to expose
         # the trigger. Ring/audio/READ-ONLY even when on: without a real SessionTokenStore token it is NOT authenticated
@@ -78,6 +81,11 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: false
         SWIFT_VERSION: "5.9"
+        # No-literal bearer injection (Pulse issue 5): the Info.plist key SENTI_GATEWAY_BEARER references THIS
+        # user-defined build setting via $(SENTI_GATEWAY_BEARER). Default EMPTY (→ Siri, safe). Override at build time
+        # via env/CI (`xcodebuild SENTI_GATEWAY_BEARER=<token>`) or an untracked xcconfig — the real short-lived value
+        # NEVER lives in tracked source. Grep-provable: no bearer literal is committed anywhere.
+        SENTI_GATEWAY_BEARER: ""
   # XCUITest device/sim target (Atlas-owned per Pulse #249472) — enables the DeviceUITests to run at all.
   # The app-under-test is wired via the `target: SentiPocketApp` dependency (XcodeGen sets the target application).
   # Forge runs a NAMED single test until Atlas maps the -PocketUITestScenario reducer for the other 14.

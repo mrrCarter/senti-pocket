@@ -8,7 +8,7 @@ import PocketCall
 /// is byte-for-byte the tap's governed write (relay's confirmedProposalHash triple-bind applies unchanged). The
 /// adapter NEVER posts on its own; it maps the ViewModel's terminal state to a DialWriteResult (no optimistic "sent").
 @MainActor
-final class PhoneWriteAdapter: DialWriter {
+final class PhoneWriteAdapter: DialEpisodeWriter {
     private let viewModel: PhoneWriteViewModel
 
     init(_ viewModel: PhoneWriteViewModel) {
@@ -23,6 +23,11 @@ final class PhoneWriteAdapter: DialWriter {
         viewModel.cancel()
     }
 
+    /// HANGUP teardown (spec C): cancel ONLY a pre-submit draft; retain an authorized in-flight/reconciling write.
+    func cancelIfUnsubmitted() async {
+        viewModel.cancelIfUnsubmitted()
+    }
+
     /// Fire the SAME explicit-confirm authorizer as the tap, then await the write's TERMINAL state. `.sending` /
     /// `.confirming` are transient (skipped); the render-gate inside the ViewModel guarantees `.sent` only on a
     /// signature-verified `.posted` receipt, so `.posted` here is never optimistic.
@@ -33,11 +38,12 @@ final class PhoneWriteAdapter: DialWriter {
         viewModel.confirm()   // identical GovernedWriteConfirmation to the human tap (voice-GO === tap-GO)
         for await state in viewModel.$state.values {
             switch state {
-            case .sent:                 return .posted
-            case .pending(let message): return .pending(message)
-            case .refused(let message): return .refused(message)
-            case .composing:            return .refused("write returned to composing without posting")
-            case .sending, .confirming: continue   // transient — keep awaiting the terminal state
+            case .sent:                    return .posted
+            case .pending(let message):    return .pending(message)
+            case .reconciling(let message): return .pending(message)   // authorized + retained/reconcilable — NOT "not posted"
+            case .refused(let message):    return .refused(message)
+            case .composing:               return .refused("write returned to composing without posting")
+            case .sending, .confirming:    continue   // transient — keep awaiting the terminal state
             }
         }
         return .refused("write state stream ended before a terminal result")

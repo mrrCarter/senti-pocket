@@ -62,6 +62,25 @@ final class DialCoordinatorTests: XCTestCase {
         )
     }
 
+    /// A bounded spin (P2: never an unbounded yield-loop). Fails the test rather than hanging if the condition never
+    /// holds within a generous cooperative-yield budget.
+    @MainActor
+    private func spin(until cond: @escaping () -> Bool, _ message: String = "condition never held",
+                      file: StaticString = #filePath, line: UInt = #line) async {
+        for _ in 0..<10_000 { if cond() { return }; await Task.yield() }
+        XCTFail("spin timed out: \(message)", file: file, line: line)
+    }
+
+    /// A MainActor gate a test can block/release (for a noncooperative hydrate).
+    @MainActor
+    final class Gate {
+        private var cont: CheckedContinuation<Void, Never>?
+        private var opened = false
+        private(set) var entered = false
+        func wait() async { entered = true; if opened { return }; await withCheckedContinuation { cont = $0 } }
+        func open() { opened = true; cont?.resume(); cont = nil }
+    }
+
     // MARK: - Answer flow (unchanged invariants over the new makeRun seam)
 
     // CRITICAL: no stored state (a stray/duplicate answer) → declined, the governed run is NEVER built, call ends.
@@ -168,72 +187,116 @@ final class DialCoordinatorTests: XCTestCase {
         XCTAssertTrue(rec.ranRings.isEmpty)
     }
 
-    // END DURING A BLOCKED RUN: the single owned run is cancelled + torn down (stop synth+mic), drained exactly once.
+    // END DURING A BLOCKED RUN: the single owned run is cancelled + torn down (stop synth+mic), drained once. The
+    // EXTERNAL teardown must NOT programmatically endCall (the system's hangup already ended the call).
     @MainActor
     func test_end_during_blocked_run_cancels_tears_down_and_drains_once() async {
         let rec = Recorder(); let uuid = UUID()
         let c = make(rec, outcome: .posted, blocks: true, hydrate: { _ in self.ring() })
         c.received(state("need_1"), dialId: "need_1")
         let answerTask = Task { await c.answered(dialId: "need_1", callUUID: uuid) }
-        while rec.runs.isEmpty { await Task.yield() }    // let answered → hydrate → makeRun → run() reach the gate
+        await spin(until: { !rec.runs.isEmpty }, "run never started")
         XCTAssertEqual(rec.runs.first?.runCalls, 1)
 
         c.endEpisode(callUUID: uuid, dialId: "need_1")   // HANG UP mid-run
         let out = await answerTask.value
 
-        for _ in 0..<8 { await Task.yield() }            // let the teardown Task run
+        await spin(until: { rec.runs.first?.tornDown == true }, "teardown never ran")
         XCTAssertEqual(rec.runs.count, 1)                // exactly one owned run
         XCTAssertTrue(rec.runs.first!.cancelled, "hangup must cancel the run")
         XCTAssertTrue(rec.runs.first!.tornDown, "hangup must tear down (stop synth+mic + writer)")
         if case .declined = out {} else { XCTFail("a cancelled run declines — nothing posted") }
-        XCTAssertEqual(rec.endedCalls, [uuid])
+        XCTAssertTrue(rec.endedCalls.isEmpty, "an EXTERNAL teardown must NOT programmatically endCall (the system already did)")
     }
 
-    // endEpisode is IDEMPOTENT — a second end for the same UUID does not re-tear-down or double-end.
+    // endEpisode is IDEMPOTENT — a second end for the same UUID does not re-tear-down or double-anything.
     @MainActor
     func test_endEpisode_is_idempotent() async {
         let rec = Recorder(); let uuid = UUID()
         let c = make(rec, outcome: .posted, blocks: true, hydrate: { _ in self.ring() })
         c.received(state("need_1"), dialId: "need_1")
         let answerTask = Task { await c.answered(dialId: "need_1", callUUID: uuid) }
-        while rec.runs.isEmpty { await Task.yield() }
+        await spin(until: { !rec.runs.isEmpty }, "run never started")
         c.endEpisode(callUUID: uuid, dialId: "need_1")
-        c.endEpisode(callUUID: uuid, dialId: "need_1")   // second end — must be a harmless no-op
+        c.endEpisode(callUUID: uuid, dialId: "need_1")   // second end — a harmless no-op
         _ = await answerTask.value
-        for _ in 0..<8 { await Task.yield() }
+        await spin(until: { rec.runs.first?.tornDown == true }, "teardown never ran")
         XCTAssertEqual(rec.runs.count, 1)
-        XCTAssertEqual(rec.endedCalls, [uuid])           // endCall fired exactly once
+        XCTAssertTrue(rec.endedCalls.isEmpty)            // never programmatically ended (external teardown)
     }
 
-    // REPLACEMENT GENERATION: a stale episode's LATE completion must not clear a replacement episode — the replacement
-    // survives + is still tearable-down. (Same CallKit UUID is contrived, but directly exercises the generation guard.)
+    // MAX ONE RUN: a duplicate answer for a UUID that already has a LIVE episode is refused — no second run — and the
+    // live episode is NOT orphaned (it still tears down + drains).
     @MainActor
-    func test_replacement_generation_survives_stale_late_completion() async {
+    func test_max_one_run_refuses_a_duplicate_live_uuid_without_orphaning() async {
         let rec = Recorder(); let uuid = UUID()
         let c = make(rec, outcome: .posted, blocks: true, hydrate: { s in
-            // hydrate to a ring whose id echoes the requested dialId
-            if case .needsHydration(let id, let core) = s {
-                return RenderableRing(core: core, message: "m-\(id)", options: [], evidenceSeqs: [], confidence: nil)
-            }
+            if case .needsHydration(_, let core) = s { return RenderableRing(core: core, message: "m", options: [], evidenceSeqs: [], confidence: nil) }
+            return self.ring()
+        })
+        c.received(state("d1"), dialId: "d1")
+        c.received(state("d2"), dialId: "d2")
+        let t1 = Task { await c.answered(dialId: "d1", callUUID: uuid) }   // A: live, blocked
+        await spin(until: { rec.runs.count == 1 }, "A never ran")
+
+        let dup = await c.answered(dialId: "d2", callUUID: uuid)           // duplicate answer, SAME live UUID
+        if case .declined = dup {} else { XCTFail("a duplicate answer for a live UUID must decline") }
+        XCTAssertEqual(rec.runs.count, 1, "no second run — max one run per UUID")
+        XCTAssertFalse(rec.runs.first!.cancelled, "the duplicate must not disturb the live episode A")
+
+        // A is NOT orphaned: its own hangup still tears it down + drains.
+        c.endEpisode(callUUID: uuid, dialId: "d1")
+        _ = await t1.value
+        await spin(until: { rec.runs.first?.tornDown == true }, "A never torn down")
+        XCTAssertTrue(rec.runs.first!.cancelled)
+    }
+
+    // END DURING A NONCOOPERATIVE HYDRATE: a hangup while hydrate is blocked must create NO run (the post-hydrate guard
+    // sees the episode ended and declines before makeRun).
+    @MainActor
+    func test_end_during_noncooperative_hydrate_creates_no_run() async {
+        let rec = Recorder(); let uuid = UUID()
+        let gate = Gate()
+        let c = make(rec, hydrate: { _ in await gate.wait(); return self.ring() })
+        c.received(state("need_1"), dialId: "need_1")
+        let answerTask = Task { await c.answered(dialId: "need_1", callUUID: uuid) }
+        await spin(until: { gate.entered }, "hydrate never entered")
+
+        c.endEpisode(callUUID: uuid, dialId: "need_1")   // HANG UP while hydrate is blocked
+        gate.open()                                       // hydrate returns LATE (episode already ended)
+        let out = await answerTask.value
+
+        XCTAssertTrue(rec.runs.isEmpty, "a hangup during a noncooperative hydrate must create NO run")
+        if case .declined = out {} else { XCTFail("declined — episode ended before run") }
+        XCTAssertTrue(rec.endedCalls.isEmpty, "external teardown does not programmatically endCall")
+    }
+
+    // STALE ENDED EPISODE: after A is ENDED (torn down), a NEW answer B for the same UUID is allowed; A's completion
+    // must NOT clear or end the replacement B (generation guard).
+    @MainActor
+    func test_stale_ended_episode_cannot_clear_or_end_replacement() async {
+        let rec = Recorder(); let uuid = UUID()
+        let c = make(rec, outcome: .posted, blocks: true, hydrate: { s in
+            if case .needsHydration(let id, let core) = s { return RenderableRing(core: core, message: "m-\(id)", options: [], evidenceSeqs: [], confidence: nil) }
             return self.ring()
         })
         c.received(state("d1"), dialId: "d1")
         c.received(state("d2"), dialId: "d2")
 
-        let t1 = Task { await c.answered(dialId: "d1", callUUID: uuid) }   // gen1
-        while rec.runs.count < 1 { await Task.yield() }
-        let t2 = Task { await c.answered(dialId: "d2", callUUID: uuid) }   // gen2 REPLACES episodes[uuid]
-        while rec.runs.count < 2 { await Task.yield() }
+        let t1 = Task { await c.answered(dialId: "d1", callUUID: uuid) }   // A (gen1), blocked
+        await spin(until: { rec.runs.count == 1 }, "A never ran")
+        c.endEpisode(callUUID: uuid, dialId: "d1")                         // END A → A.ended (its run cancels + drains)
 
-        // gen1 completes LATE (after gen2 installed). Its finish() must NOT clear episodes[uuid] (that slot is gen2 now).
-        rec.runs[0].open()
-        _ = await t1.value
+        let t2 = Task { await c.answered(dialId: "d2", callUUID: uuid) }   // B (gen2) allowed: A is ended, not live
+        await spin(until: { rec.runs.count == 2 }, "B never ran")
 
-        // Prove gen2 survived: it is still the live episode, so a hangup now tears DOWN run2 (would no-op if cleared).
+        _ = await t1.value                                                 // A completes — must not touch B's slot
+        XCTAssertTrue(rec.endedCalls.isEmpty, "the stale A must NOT programmatically end B's call")
+
+        // Prove B survived: it is still the live episode → a hangup now tears it down (would no-op if A had cleared it).
         c.endEpisode(callUUID: uuid, dialId: "d2")
         _ = await t2.value
-        for _ in 0..<8 { await Task.yield() }
-        XCTAssertTrue(rec.runs[1].tornDown, "replacement (gen2) run must still be torn down — it was not cleared by the stale gen1")
-        XCTAssertTrue(rec.runs[1].cancelled)
+        await spin(until: { rec.runs[1].tornDown }, "B never torn down")
+        XCTAssertTrue(rec.runs[1].cancelled, "replacement B must still be tearable-down (the stale A did not clear it)")
     }
 }

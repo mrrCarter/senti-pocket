@@ -32,6 +32,7 @@ struct SentiPocketApp: App {
             #if canImport(CallKit) && canImport(PushKit)
                 .environmentObject(dialHost)   // hold + provide the host; ensures it inits + registers for VoIP at launch
                 .onAppear { wireRegistrarToLogin() }
+                .modifier(DemoDialTriggerModifier())   // config-gated (default OFF) read-only demo trigger; no button when disabled
             #endif
         }
     }
@@ -81,6 +82,33 @@ struct SentiPocketApp: App {
     }
     #endif
 }
+
+#if canImport(CallKit) && canImport(PushKit)
+/// The REAL, config-gated production entry point for the foreground demo dial (Pulse issue 2a). Shows a VISIBLE
+/// trigger ONLY when POCKET_DEMO_DIAL_ENABLED is on (default OFF → NO button). The label is HONEST: verified fixture,
+/// READ-ONLY (the demo episode is composed with a non-writing writer — a confirm posts nothing), no sign-in / no user
+/// token — it reaches the pickup VOICE only. Tapping it seeds-then-rings (received before ring) via DialHost.
+private struct DemoDialTriggerModifier: ViewModifier {
+    @EnvironmentObject private var dialHost: DialHost
+    func body(content: Content) -> some View {
+        content.safeAreaInset(edge: .bottom) {
+            if DialHost.demoDialEnabled {
+                Button { dialHost.triggerDemoDialIfEnabled() } label: {
+                    VStack(spacing: 2) {
+                        Text("Ring the demo pickup").font(.headline)
+                        Text("Verified fixture · read-only · no sign-in · reaches the voice, never writes")
+                            .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding()
+                .accessibilityIdentifier("demo-dial-trigger")
+            }
+        }
+    }
+}
+#endif
 
 /// B2 composition root (warden #261831): the real reasoning coordinator + the phone-write flow, wired to the
 /// live-demo gateway. Reasoning uses the Cached provider today (labeled sample); relay's GatewayReasoningProvider
