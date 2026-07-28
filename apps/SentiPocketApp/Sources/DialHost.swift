@@ -122,14 +122,24 @@ final class DialHost: ObservableObject {
         return true
     }
 
-    /// The demo-dial gate (spec A) — Info.plist `POCKET_DEMO_DIAL_ENABLED`, DEFAULT OFF (absent/false → disabled). A
-    /// dedicated demo build flips it on. Accepts a Bool, NSNumber, or "true"/"yes"/"1" string (xcconfig/plist injection).
+    /// Test/UI-test override for the demo gate — nil = read the launch environment / Info.plist. A UNIT test sets this
+    /// (reset in tearDown); a UI test sets the launch environment (below). Production leaves it nil → default OFF.
+    static var demoDialEnabledOverride: Bool?
+
+    /// The demo-dial gate (spec A) — DEFAULT OFF. Enabled via (in priority) a unit-test override, the launch environment
+    /// `POCKET_DEMO_DIAL_ENABLED` (a UI test / Xcode-launched build sets it), or the Info.plist build value. A SHIPPED
+    /// app has none of these set → false. A dedicated demo build flips the Info.plist value.
     static var demoDialEnabled: Bool {
+        if let o = demoDialEnabledOverride { return o }
+        if let e = ProcessInfo.processInfo.environment["POCKET_DEMO_DIAL_ENABLED"] { return truthy(e) }
         let v = Bundle.main.object(forInfoDictionaryKey: "POCKET_DEMO_DIAL_ENABLED")
         if let b = v as? Bool { return b }
         if let n = v as? NSNumber { return n.boolValue }
-        if let s = v as? String { return ["true", "yes", "1"].contains(s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+        if let s = v as? String { return truthy(s) }
         return false
+    }
+    private static func truthy(_ s: String) -> Bool {
+        ["true", "yes", "1"].contains(s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     // MARK: - Governed run construction (fail-closed on gateway config)
@@ -193,19 +203,15 @@ final class DialHost: ObservableObject {
         return { resolveBearer(Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_BEARER") as? String) }
     }
 
-    /// FAIL-CLOSED gateway URL (Pulse round-6 #1): valid ONLY if non-blank, parseable, HTTPS, with a host. There is NO
-    /// hardcoded host default — a missing/blank/unparseable/non-https config yields nil, so makeVoice sends no bearer
-    /// (Siri, zero wire) and the reasoner/write are unavailable. A credential is never paired with an unintended host.
+    /// FAIL-CLOSED gateway URL — delegates to the ONE shared GatewayEndpoint resolver (Pulse round-7 #1), which ALSO
+    /// rejects userinfo/password/query/fragment (this URL is shared with session-bearer clients). No hardcoded default.
     nonisolated static func gatewayURL(from configured: String?) -> URL? {
-        guard let raw = configured?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
-              let url = URL(string: raw), url.scheme?.lowercased() == "https",
-              let host = url.host, !host.isEmpty else { return nil }
-        return url
+        GatewayEndpoint.resolve(configured)
     }
 
     /// `nonisolated` so it's usable as the init's default arg (evaluated off the main actor) — it touches no state.
     nonisolated static func gatewayURL() -> URL? {
-        gatewayURL(from: Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)
+        GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_GATEWAY_URL"])
     }
 }
 #endif

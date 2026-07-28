@@ -32,7 +32,7 @@ struct SentiPocketApp: App {
             #if canImport(CallKit) && canImport(PushKit)
                 .environmentObject(dialHost)   // hold + provide the host; ensures it inits + registers for VoIP at launch
                 .onAppear { wireRegistrarToLogin() }
-                .modifier(DemoDialTriggerModifier())   // config-gated (default OFF) read-only demo trigger; no button when disabled
+                .modifier(DemoDialTriggerModifier(dialHost: dialHost))   // dialHost passed EXPLICITLY (no @EnvironmentObject crash)
             #endif
         }
     }
@@ -66,30 +66,32 @@ struct SentiPocketApp: App {
     /// Build the REAL device-flow login closure (gate #2: never fake a token). The auth-API base is SENTI_API_URL if
     /// set, else the gateway (which proxies /api/v1/auth/cli/… in the demo) — @claude-pocket-relay confirms which on PR.
     private static func makeLogin() -> () async throws -> Void {
-        let base = authBaseURL()
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.1"
-        return { try await SentiNativeAuth(apiBaseURL: base, appVersion: version).login() }
-    }
-
-    /// The auth device-flow base: SENTI_API_URL if configured, else SENTI_GATEWAY_URL, else the current tunnel. Kept
-    /// separate from the gateway resolver so auth can move to its own host without a code change.
-    private static func authBaseURL() -> URL {
-        let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
-        let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_API_URL") as? String)
-            ?? (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)
-        let raw = (configured?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? fallback
-        return URL(string: raw) ?? URL(string: fallback)!
+        return {
+            // Fail-closed (Pulse round-7 #1): resolve the auth base STRICTLY (SENTI_API_URL else SENTI_GATEWAY_URL) via
+            // the ONE shared resolver — no hardcoded fallback. A missing/blank/malformed config → login throws
+            // (unavailable); the device-code / session bearer is NEVER sent to a stale/reallocated tunnel.
+            guard let base = GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_API_URL", "SENTI_GATEWAY_URL"]) else {
+                throw NativeAuthError.network("no gateway configured")
+            }
+            try await SentiNativeAuth(apiBaseURL: base, appVersion: version).login()
+        }
     }
     #endif
 }
 
 #if canImport(CallKit) && canImport(PushKit)
-/// The REAL, config-gated production entry point for the foreground demo dial (Pulse issue 2a). Shows a VISIBLE
-/// trigger ONLY when POCKET_DEMO_DIAL_ENABLED is on (default OFF → NO button). The label is HONEST: verified fixture,
-/// READ-ONLY (the demo episode is composed with a non-writing writer — a confirm posts nothing), no sign-in / no user
-/// token — it reaches the pickup VOICE only. Tapping it seeds-then-rings (received before ring) via DialHost.
+/// The REAL, config-gated production entry point for the foreground demo dial. Shows a VISIBLE trigger ONLY when
+/// POCKET_DEMO_DIAL_ENABLED is on (default OFF → NO button). The label is HONEST: verified fixture, READ-ONLY (the demo
+/// episode is composed with a non-writing writer — a confirm posts nothing), no sign-in / no user token — it reaches
+/// the pickup VOICE only. Tapping it seeds-then-rings (received before ring) via DialHost.
+///
+/// Pulse round-7 #3: `dialHost` is passed EXPLICITLY (NOT @EnvironmentObject). The environmentObject is installed on
+/// the CONTENT this modifier wraps, so the modifier's own inset content is NOT a descendant of that provider — an
+/// @EnvironmentObject read here has no ancestor provider and crashes at render when the demo is enabled (default-off
+/// masked it). An explicit reference has no environment dependency.
 private struct DemoDialTriggerModifier: ViewModifier {
-    @EnvironmentObject private var dialHost: DialHost
+    let dialHost: DialHost
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .bottom) {
             if DialHost.demoDialEnabled {
@@ -121,30 +123,30 @@ struct PhoneRootView: View {
         let bundle = FixtureLoader.canonicalBundle()
         let sessionId = bundle?.sessionId ?? "6cf7e861-546a-4b9f-b937-39182a5bd395"
         let checkpointId = bundle?.checkpointId
+        let gateway = Self.gatewayURL()   // strict, fail-closed (nil when unconfigured — no hardcoded fallback)
         let cached = CachedReasoningProvider(cachedBriefing: PocketFixtures.briefingPlan,
                                              cachedEvidence: bundle?.evidence ?? [])
-        // ONLINE → real gateway reasoning (GatewayReasoningHTTPClient → relay's gated /brief+/answer, bearer session
-        // token). It reasons the moment relay's backend + a key/Gemma are live; until then /brief 501/503 → the driver
-        // surfaces .failed honestly (never a fabricated brief). OFFLINE/reconnecting → the honest Cached floor.
-        let online = GatewayReasoningProvider(client: GatewayReasoningHTTPClient(apiBaseURL: Self.gatewayURL()))
+        // ONLINE → real gateway reasoning ONLY when a valid gateway is configured; else ALWAYS the honest Cached floor.
+        // Fail-closed (Pulse round-7 #1): the session bearer is never sent to a stale/unintended host.
+        let online = gateway.map { GatewayReasoningProvider(client: GatewayReasoningHTTPClient(apiBaseURL: $0)) }
         _reasoning = StateObject(wrappedValue: RealReasoningCoordinator(
             sessionId: sessionId, checkpointId: checkpointId,
-            selectProvider: { isOnline in isOnline ? (online as ReasoningProvider) : (cached as ReasoningProvider) }))
+            selectProvider: { isOnline in
+                if isOnline, let online { return online as ReasoningProvider }
+                return cached as ReasoningProvider
+            }))
+        // The write client is fail-closed too: a nil gateway → PocketWriteClient refuses (zero wire) rather than POST
+        // to a fallback host.
         _write = StateObject(wrappedValue: PhoneWriteViewModel(
-            sessionId: sessionId,
-            client: PocketWriteClient(apiBaseURL: Self.gatewayURL())))
+            sessionId: sessionId, client: PocketWriteClient(apiBaseURL: gateway)))
     }
 
     var body: some View { PocketPhoneView(reasoning: reasoning, write: write) }
 
-    /// Item 5: the gateway URL is a CONFIG value (ephemeral cloudflared tunnel, forge re-publishes on churn), read
-    /// from Info.plist `SENTI_GATEWAY_URL` so forge re-points WITHOUT a code change. Falls back to the current tunnel.
-    private static func gatewayURL() -> URL {
-        let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
-        let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let chosen = (configured.map { $0.isEmpty ? fallback : $0 }) ?? fallback
-        return URL(string: chosen) ?? URL(string: fallback)!
+    /// The gateway URL — the ONE strict, fail-closed shared resolver (Pulse round-7 #1). nil when unconfigured → the
+    /// reasoning falls to the Cached floor and the write client refuses; there is NO hardcoded host fallback.
+    private static func gatewayURL() -> URL? {
+        GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_GATEWAY_URL"])
     }
 }
 

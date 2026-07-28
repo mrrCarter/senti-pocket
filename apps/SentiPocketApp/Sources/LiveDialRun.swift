@@ -17,18 +17,26 @@ import PocketCall
 import PocketContracts
 import PocketDialVoice
 
+/// A DialVoice with the app-seam teardown `stop()` — the run needs this to stop synth+mic+recognition on a hangup.
+/// LiveDialVoice already provides `stop()`; the protocol makes LiveDialRun testable with a stub voice.
+@MainActor
+protocol StoppableDialVoice: DialVoice {
+    func stop() async
+}
+extension LiveDialVoice: StoppableDialVoice {}
+
 @MainActor
 final class LiveDialRun: DialRun {
-    private let voice: LiveDialVoice
+    private let voice: any StoppableDialVoice
     private let writer: DialEpisodeWriter
     private let orchestrator: DialOrchestrator
     private let request: DialRequest
     private var task: Task<DialOutcome, Never>?
     private var torn = false
 
-    /// `writer` is the governed PhoneWriteAdapter on the real path, or a NON-WRITING ReadOnlyDialWriter on the demo
-    /// path (read-only-by-construction) — the orchestrator + teardown are identical either way.
-    init(voice: LiveDialVoice,
+    /// `voice` is the stoppable LiveDialVoice (or a stub in tests). `writer` is the governed PhoneWriteAdapter on the
+    /// real path, or a NON-WRITING ReadOnlyDialWriter on the demo path — the orchestrator + teardown are identical.
+    init(voice: any StoppableDialVoice,
          writer: DialEpisodeWriter,
          request: DialRequest,
          maxConfirmRetries: Int = 2,

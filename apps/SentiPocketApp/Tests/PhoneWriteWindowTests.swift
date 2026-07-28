@@ -44,11 +44,15 @@ final class PhoneWriteWindowTests: XCTestCase {
                                           confirmedAt: Date(timeIntervalSince1970: 1_784_000_000))
         return PersistedWriteIntent(proposal: p, confirmation: c)
     }
-    /// Bounded spin (P2: never an unbounded yield-loop).
+    /// Bounded spin with a WALL-CLOCK deadline (P2: never an unbounded yield-loop; fails fast if the condition stalls).
     private func spin(_ cond: @escaping () -> Bool, _ msg: String = "condition never held",
-                      file: StaticString = #filePath, line: UInt = #line) async {
-        for _ in 0..<10_000 { if cond() { return }; await Task.yield() }
-        XCTFail("spin timed out: \(msg)", file: file, line: line)
+                      timeout: TimeInterval = 5, file: StaticString = #filePath, line: UInt = #line) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if cond() { return }
+            await Task.yield()
+        }
+        XCTFail("spin timed out after \(timeout)s: \(msg)", file: file, line: line)
     }
 
     /// Counts every request the session tries to handle (canInit) — proves ZERO POST.
@@ -258,6 +262,28 @@ final class PhoneWriteWindowTests: XCTestCase {
         let result = await adapter.confirmAndPost()   // confirm → POST → cancelled → reconciling → adapter maps → pending
         if case .pending = result {} else { XCTFail("a reconciling write must map to .pending (retained), not .refused") }
         XCTAssertNotNil(OutboxStore.load(), "the reconcilable proposal is retained")
+    }
+
+    // PRE-CONFIRM cancel (Pulse round-7 #2): an armed adapter invoked from an ALREADY-canceled Task must NOT persist or
+    // POST — it cancels the unsubmitted draft and refuses. Zero outbox, zero request.
+    func test_confirmAndPost_from_an_already_canceled_task_writes_nothing() async {
+        let (client, requests) = countingClient()
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: client)
+        let adapter = PhoneWriteAdapter(vm)
+        await adapter.draft("Rotate the token")          // armed → .confirming
+        XCTAssertNil(OutboxStore.load())
+
+        let task = Task {
+            while !Task.isCancelled { await Task.yield() }   // enter confirmAndPost only AFTER cancellation lands
+            return await adapter.confirmAndPost()
+        }
+        task.cancel()
+        let result = await task.value
+
+        if case .refused = result {} else { XCTFail("an already-canceled confirm must refuse, never authorize") }
+        XCTAssertNil(OutboxStore.load(), "ZERO outbox — never persisted")
+        XCTAssertEqual(requests(), 0, "ZERO request — never POSTed")
+        guard case .composing = vm.state else { return XCTFail("the unsubmitted draft is canceled → composing") }
     }
 
     // Cancel a draft BEFORE confirm, then call the adapter: no armed draft → refuse, ZERO outbox + ZERO request.

@@ -11,13 +11,16 @@ final class DialCoordinatorTests: XCTestCase {
         let ring: RenderableRing
         let outcome: DialOutcome
         let blocks: Bool
+        /// When false, cancel() does NOT release the gate — the test controls exactly WHEN the run completes (used to
+        /// make a stale run finish DETERMINISTICALLY after a replacement is installed).
+        let releaseOnCancel: Bool
         private(set) var runCalls = 0
         private(set) var cancelled = false
         private(set) var tornDown = false
         private var gate: CheckedContinuation<Void, Never>?
         private var opened = false
-        init(ring: RenderableRing, outcome: DialOutcome, blocks: Bool) {
-            self.ring = ring; self.outcome = outcome; self.blocks = blocks
+        init(ring: RenderableRing, outcome: DialOutcome, blocks: Bool, releaseOnCancel: Bool = true) {
+            self.ring = ring; self.outcome = outcome; self.blocks = blocks; self.releaseOnCancel = releaseOnCancel
         }
         func run() async -> DialOutcome {
             runCalls += 1
@@ -25,7 +28,7 @@ final class DialCoordinatorTests: XCTestCase {
             return cancelled ? .declined("cancelled") : outcome
         }
         func open() { opened = true; gate?.resume(); gate = nil }
-        func cancel() { cancelled = true; open() }
+        func cancel() { cancelled = true; if releaseOnCancel { open() } }
         func teardown() async { tornDown = true }
     }
 
@@ -66,9 +69,10 @@ final class DialCoordinatorTests: XCTestCase {
     /// holds within a generous cooperative-yield budget.
     @MainActor
     private func spin(until cond: @escaping () -> Bool, _ message: String = "condition never held",
-                      file: StaticString = #filePath, line: UInt = #line) async {
-        for _ in 0..<10_000 { if cond() { return }; await Task.yield() }
-        XCTFail("spin timed out: \(message)", file: file, line: line)
+                      timeout: TimeInterval = 5, file: StaticString = #filePath, line: UInt = #line) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline { if cond() { return }; await Task.yield() }
+        XCTFail("spin timed out after \(timeout)s: \(message)", file: file, line: line)
     }
 
     /// A MainActor gate a test can block/release (for a noncooperative hydrate).
@@ -297,32 +301,43 @@ final class DialCoordinatorTests: XCTestCase {
         XCTAssertTrue(rec.endedCalls.isEmpty, "external end does not programmatically endCall")
     }
 
-    // STALE ENDED EPISODE: after A is ENDED (torn down), a NEW answer B for the same UUID is allowed; A's completion
-    // must NOT clear or end the replacement B (generation guard).
+    // STALE ENDED EPISODE (Pulse round-7 P2, DETERMINISTIC): A is ended but KEPT BLOCKED; B is installed; THEN A is
+    // released, so A's completion provably occurs AFTER B installs. A's stale completion must not clear/end B.
     @MainActor
-    func test_stale_ended_episode_cannot_clear_or_end_replacement() async {
+    func test_stale_A_completion_after_B_installs_cannot_clear_or_end_B() async {
         let rec = Recorder(); let uuid = UUID()
-        let c = make(rec, outcome: .posted, blocks: true, hydrate: { s in
-            if case .needsHydration(let id, let core) = s { return RenderableRing(core: core, message: "m-\(id)", options: [], evidenceSeqs: [], confidence: nil) }
-            return self.ring()
-        })
+        let c = DialCoordinator(
+            hydrate: { s in
+                if case .needsHydration(let id, let core) = s {
+                    return RenderableRing(core: core, message: "m-\(id)", options: [], evidenceSeqs: [], confidence: nil)
+                }
+                return self.ring()
+            },
+            makeRun: { r in
+                rec.ranRings.append(r)
+                let run = MockRun(ring: r, outcome: .posted, blocks: true, releaseOnCancel: false)  // stays blocked after cancel
+                rec.runs.append(run)
+                return run
+            },
+            endCall: { rec.endedCalls.append($0) })
         c.received(state("d1"), dialId: "d1")
         c.received(state("d2"), dialId: "d2")
 
         let t1 = Task { await c.answered(dialId: "d1", callUUID: uuid) }   // A (gen1), blocked
         await spin(until: { rec.runs.count == 1 }, "A never ran")
-        c.endEpisode(callUUID: uuid, dialId: "d1")                         // END A → A.ended (its run cancels + drains)
+        c.endEpisode(callUUID: uuid, dialId: "d1")                         // A.ended + cancel — A STAYS BLOCKED
 
-        let t2 = Task { await c.answered(dialId: "d2", callUUID: uuid) }   // B (gen2) allowed: A is ended, not live
+        let t2 = Task { await c.answered(dialId: "d2", callUUID: uuid) }   // B (gen2) installed
         await spin(until: { rec.runs.count == 2 }, "B never ran")
 
-        _ = await t1.value                                                 // A completes — must not touch B's slot
+        rec.runs[0].open()                                                 // A completes DETERMINISTICALLY, after B installed
+        _ = await t1.value
         XCTAssertTrue(rec.endedCalls.isEmpty, "the stale A must NOT programmatically end B's call")
+        XCTAssertEqual(c.episodeCount, 1, "B (gen2) survived — the stale A did not clear it")
 
-        // Prove B survived: it is still the live episode → a hangup now tears it down (would no-op if A had cleared it).
-        c.endEpisode(callUUID: uuid, dialId: "d2")
+        rec.runs[1].open()                                                 // B completes normally
         _ = await t2.value
-        await spin(until: { rec.runs[1].tornDown }, "B never torn down")
-        XCTAssertTrue(rec.runs[1].cancelled, "replacement B must still be tearable-down (the stale A did not clear it)")
+        XCTAssertEqual(rec.endedCalls, [uuid], "B's own normal completion ends the call exactly once")
+        XCTAssertEqual(c.episodeCount, 0, "no leak after B completes")
     }
 }

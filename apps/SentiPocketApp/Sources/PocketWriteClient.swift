@@ -54,13 +54,14 @@ enum PocketWriteError: LocalizedError, Equatable {
 
 @MainActor
 final class PocketWriteClient {
-    private let apiBaseURL: URL
+    private let apiBaseURL: URL?   // nil = no gateway configured → fail-closed (zero wire), never a hardcoded fallback host
     private let urlSession: URLSession
     private let tokenProvider: () -> String?
 
+    /// `apiBaseURL` is the strict, fail-closed resolved endpoint (nil when unconfigured — see GatewayEndpoint).
     /// `tokenProvider` defaults to the real Keychain session token (SessionTokenStore) but is injectable so the write
     /// flow is hermetically testable without the Keychain (same pattern as DialHydrationClient).
-    init(apiBaseURL: URL,
+    init(apiBaseURL: URL?,
          urlSession: URLSession = .shared,
          tokenProvider: @escaping () -> String? = { SessionTokenStore.load() }) {
         self.apiBaseURL = apiBaseURL
@@ -89,6 +90,9 @@ final class PocketWriteClient {
         // Spec C: a PRE-CANCELLED call short-circuits to a distinct cancellation with ZERO work (no Keychain read, no
         // URL request) — never a spurious .network→.pending. (Re-checked again just before the POST below.)
         if Task.isCancelled { throw PocketWriteError.cancelled }
+        // Fail-closed (Pulse round-7 #1): no configured gateway → ZERO wire; the session bearer is never sent to a
+        // stale/unintended host. (Checked BEFORE the token read so a bad config makes no request at all.)
+        guard let apiBaseURL else { throw PocketWriteError.network("no gateway configured") }
         guard let token = tokenProvider(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
         guard let url = URL(string: "/actions/execute", relativeTo: apiBaseURL) else {
             throw PocketWriteError.network("bad execute url")

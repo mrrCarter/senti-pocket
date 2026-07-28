@@ -35,6 +35,13 @@ final class PhoneWriteAdapter: DialEpisodeWriter {
         guard case .confirming = viewModel.state else {
             return .refused("no confirmable draft is armed")   // fail-safe: nothing to confirm → never posts
         }
+        // Pulse round-7 #2: the FIRST synchronous action guards cancellation. If the enclosing Task was ALREADY
+        // canceled before adapter entry (a hangup at/before confirm), do NOT persist or start the independent POST —
+        // cancel the unsubmitted draft and refuse. A pre-submit end yields ZERO POST/queue.
+        if Task.isCancelled {
+            viewModel.cancelIfUnsubmitted()
+            return .refused("canceled before confirm")
+        }
         viewModel.confirm()   // identical GovernedWriteConfirmation to the human tap (voice-GO === tap-GO)
         for await state in viewModel.$state.values {
             switch state {
