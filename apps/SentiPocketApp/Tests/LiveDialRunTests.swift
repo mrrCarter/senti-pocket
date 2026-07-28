@@ -8,6 +8,28 @@ import PocketContracts
 @MainActor
 final class LiveDialRunTests: XCTestCase {
 
+    final class InMemoryOutboxStorage: OutboxStorage {
+        private var data: Data?
+        func write(_ d: Data) -> Bool { data = d; return true }
+        func read() -> Data? { data }
+        func remove() { data = nil }
+    }
+    /// Fails every request with URLError.cancelled — simulates an interrupted in-flight POST.
+    final class CancellingProtocol: URLProtocol {
+        override class func canInit(with r: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for r: URLRequest) -> URLRequest { r }
+        override func startLoading() { client?.urlProtocol(self, didFailWithError: URLError(.cancelled)) }
+        override func stopLoading() {}
+    }
+
+    override func setUp() {
+        super.setUp()
+        OutboxStore.storage = InMemoryOutboxStorage(); OutboxStore.clear(); SessionTokenStore.delete()
+    }
+    override func tearDown() {
+        OutboxStore.clear(); OutboxStore.storage = FileOutboxStorage(); SessionTokenStore.delete(); super.tearDown()
+    }
+
     @MainActor
     final class StubVoice: StoppableDialVoice {
         private let lines: [String]; private var i = 0
@@ -91,5 +113,44 @@ final class LiveDialRunTests: XCTestCase {
         let out = await t.value
         if case .declined = out {} else { XCTFail("cancel mid-run → declined") }
         XCTAssertEqual(writer.confirmCalls, 0, "nothing posted after a mid-run cancel")
+    }
+
+    // POST-AUTHORIZE end-to-end through the REAL adapter (Pulse round-8 P2.2): a dictated + confirmed write drives the
+    // real PhoneWriteAdapter/PhoneWriteViewModel; an interrupted (cancelled) in-flight POST → RECONCILING → the run
+    // reports a RETAINED .pending and the durable outbox is retained (never declined/refused/lost).
+    func test_authorized_write_through_real_adapter_reconciles_and_retains() async {
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [CancellingProtocol.self]
+        let client = PocketWriteClient(apiBaseURL: URL(string: "https://safe.example")!,
+                                       urlSession: URLSession(configuration: cfg), tokenProvider: { "tok" })
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: client)
+        let run = LiveDialRun(voice: StubVoice(["my reply is rotate the token", "confirm"]),
+                              writer: PhoneWriteAdapter(vm), request: request())
+
+        let out = await run.run()
+        if case .pending = out {} else { return XCTFail("an interrupted authorized write → retained .pending, never declined/refused") }
+        XCTAssertNotNil(OutboxStore.load(), "the reconcilable proposal is retained in the durable outbox")
+        guard case .reconciling = vm.state else { return XCTFail("the real VM entered the reconciling phase") }
+    }
+
+    // POST-AUTHORIZE offline through the REAL adapter: a network-failed POST → the real VM's .pending (retained), and
+    // the run reports .pending — the confirmed intent stays durably queued.
+    func test_authorized_write_through_real_adapter_offline_pends_and_retains() async {
+        final class OfflineProtocol: URLProtocol {
+            override class func canInit(with r: URLRequest) -> Bool { true }
+            override class func canonicalRequest(for r: URLRequest) -> URLRequest { r }
+            override func startLoading() { client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet)) }
+            override func stopLoading() {}
+        }
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [OfflineProtocol.self]
+        let client = PocketWriteClient(apiBaseURL: URL(string: "https://safe.example")!,
+                                       urlSession: URLSession(configuration: cfg), tokenProvider: { "tok" })
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: client)
+        let run = LiveDialRun(voice: StubVoice(["my reply is rotate the token", "confirm"]),
+                              writer: PhoneWriteAdapter(vm), request: request())
+
+        let out = await run.run()
+        if case .pending = out {} else { return XCTFail("offline authorized write → retained .pending") }
+        XCTAssertNotNil(OutboxStore.load(), "the confirmed intent stays durably queued")
+        guard case .pending = vm.state else { return XCTFail("the real VM is offline-pending") }
     }
 }

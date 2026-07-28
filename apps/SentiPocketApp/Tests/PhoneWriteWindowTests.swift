@@ -1,6 +1,7 @@
 import XCTest
 @testable import SentiPocketApp
 import PocketContracts
+import PocketCall   // DialWriteResult (the adapter's result type, for the bounded-await helper)
 
 /// The WRITE-WINDOW invariants (spec C + Pulse issue 4): a dial hangup must never fake "nothing posted", never erase
 /// another proposal, and never surface a torn-down write as a durable .pending; and a write requires DURABLE ownership
@@ -53,6 +54,18 @@ final class PhoneWriteWindowTests: XCTestCase {
             await Task.yield()
         }
         XCTFail("spin timed out after \(timeout)s: \(msg)", file: file, line: line)
+    }
+
+    final class Box<T>: @unchecked Sendable { var value: T? }
+    /// BOUNDED await (Pulse round-8 P2.1): await a task's value with a hard timeout via an XCTestExpectation, so a true
+    /// regression FAILS the test (unfulfilled expectation) instead of HANGING on `await task.value`. Returns nil on timeout.
+    private func awaitBounded<T>(_ task: Task<T, Never>, timeout: TimeInterval = 5,
+                                 _ msg: String = "task did not complete in time") async -> T? {
+        let box = Box<T>()
+        let exp = expectation(description: msg)
+        Task { box.value = await task.value; exp.fulfill() }
+        await fulfillment(of: [exp], timeout: timeout)
+        return box.value
     }
 
     /// Counts every request the session tries to handle (canInit) — proves ZERO POST.
@@ -198,6 +211,30 @@ final class PhoneWriteWindowTests: XCTestCase {
         if case .refused = vm.state {} else { XCTFail("B refused — couldn't secure the outbox") }
     }
 
+    // NIL-GATEWAY WRITE HONESTY (Pulse round-8 P1): confirming a write with NO gateway configured must REFUSE
+    // SYNCHRONOUSLY — no durable outbox, no token read, no request, no transient state, and NEVER a false
+    // ".pending"/"offline queued" (a nil endpoint can't be repaired by a reconnect).
+    func test_confirm_with_no_gateway_refuses_and_persists_nothing() async {
+        RequestCountingProtocol.reset()
+        var tokenReads = 0
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [RequestCountingProtocol.self]
+        // apiBaseURL == nil (unconfigured), a valid FAKE token available, request/token spies.
+        let client = PocketWriteClient(apiBaseURL: nil, urlSession: URLSession(configuration: cfg),
+                                       tokenProvider: { tokenReads += 1; return "valid-fake-token" })
+        let vm = PhoneWriteViewModel(sessionId: "6cf7e861", client: client)
+        vm.draft("Rotate the token")     // .confirming
+        vm.confirm()                     // SYNCHRONOUS refuse — no save, no token, no request, no async task
+
+        guard case .refused = vm.state else { return XCTFail("no gateway → REFUSED, never .pending/offline-queued") }
+        XCTAssertNil(OutboxStore.load(), "no durable intent was created")
+        XCTAssertEqual(tokenReads, 0, "no token was read")
+        XCTAssertEqual(RequestCountingProtocol.count, 0, "no request was made")
+
+        for _ in 0..<6 { await Task.yield() }   // drain: prove no async task later persists/sends anything
+        XCTAssertNil(OutboxStore.load(), "still no transient persisted state")
+        if case .refused = vm.state {} else { XCTFail("stays refused (not a delayed .pending)") }
+    }
+
     // A FAILED persist (no durable ownership) → the write does NOT POST.
     func test_failed_persistence_does_not_post() async {
         OutboxStore.storage = FailingOutboxStorage()
@@ -245,7 +282,9 @@ final class PhoneWriteWindowTests: XCTestCase {
         XCTAssertNotNil(OutboxStore.load(), "authorized in-flight write is retained")
 
         confirmTask.cancel()                                     // hang up: cancel the adapter/orchestrator observer
-        let result = await confirmTask.value
+        guard let result = await awaitBounded(confirmTask, timeout: 5, "confirmAndPost after cancel") else {
+            return XCTFail("confirmAndPost did not return within 5s (a regression would hang here)")
+        }
         if case .pending = result {} else { XCTFail("cancel-after-authorize must be a RETAINED .pending, never .refused") }
         XCTAssertNotNil(OutboxStore.load(), "the durable outbox is still retained after the cancel")
 

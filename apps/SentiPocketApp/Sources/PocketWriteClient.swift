@@ -69,6 +69,11 @@ final class PocketWriteClient {
         self.tokenProvider = tokenProvider
     }
 
+    /// Endpoint READINESS (Pulse round-8) — a valid, resolved gateway is configured. The caller MUST check this at the
+    /// SYNCHRONOUS ownership boundary (before persisting/authorizing a write): a nil endpoint can never be repaired by a
+    /// reconnect, so a write against it must be refused up front (no durable intent, no token, no request).
+    var isConfigured: Bool { apiBaseURL != nil }
+
     /// Compose the humanMessage proposal for a top-level say. targetSequence is the SENTINEL 0 (mirrored + enforced
     /// on both sides). The producer init computes proposalHash from these fields; the gateway recomputes + binds it.
     static func makeHumanMessageProposal(sessionId: String, message: String, at now: Date = Date()) -> ActionProposal {

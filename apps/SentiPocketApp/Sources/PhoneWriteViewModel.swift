@@ -108,6 +108,16 @@ final class PhoneWriteViewModel: ObservableObject {
     }
 
     private func post(_ proposal: ActionProposal, _ confirmation: GovernedWriteConfirmation) {
+        // NIL-GATEWAY HONESTY (Pulse round-8) — the SYNCHRONOUS ownership boundary, guarded BEFORE any durable save.
+        // If no gateway is configured, REFUSE now: create NO durable intent (no OutboxStore.save), read NO token, make
+        // NO request, and leave NO transient persisted state. A nil endpoint can never be repaired by a reconnect, so a
+        // false ".pending"/"offline queued" would be dishonest and would leak a write that might post after a later
+        // config change. (The write path composes an unavailable/non-writing client when the endpoint is nil.)
+        guard client.isConfigured else {
+            pendingIntent = nil
+            state = .refused("No gateway is configured — the message was not sent.")
+            return
+        }
         // DURABLE OWNERSHIP BEFORE ANY NETWORK (Pulse): persist the confirmed intent and only send if we actually
         // OWN the durable slot. A crash / app-kill during the `.sending` window then can't silently drop a
         // Carter-confirmed write — the durable-outbox guarantee covers the in-flight window (the "in-memory only →
