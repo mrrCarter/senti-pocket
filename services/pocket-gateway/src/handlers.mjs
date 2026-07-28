@@ -326,20 +326,24 @@ export function createGateway(deps) {
     // PUBLIC demo capability: reserve call+bytes against the persistent lifetime budget + per-min rate AFTER all
     // local validation and IMMEDIATELY before the provider. Reserve-before-provider; never refunded (provider spend
     // ambiguous). A demo ctx with no reserve fn is fail-closed (503) — never an unbounded synthesis.
-    if (ctx && ctx.principal === 'pocket.demo') {
+    const isDemo = ctx && ctx.principal === 'pocket.demo';
+    if (isDemo) {
       if (typeof deps.demoReserve !== 'function') return json(503, { error: 'demo_budget_unconfigured' });
       const demoRes = deps.demoReserve(ctx, Buffer.byteLength(body.text, 'utf8'));
       if (!demoRes || !demoRes.ok) return json((demoRes && demoRes.status) || 429, { error: (demoRes && demoRes.error) || 'demo_usage_exhausted' });
     }
     // The ElevenLabs key lives ONLY in deps.ttsBackend — it never reaches the phone. Echo owns the voice model.
+    // Demo ctx: PIN every cost-affecting provider option (ignore client voice/model/output/tone) so an extracted
+    // bearer cannot escalate provider cost; a real session keeps its overrides. Response bytes are capped too.
     let out;
     try {
-      out = await deps.ttsBackend(body.text, {
+      out = await deps.ttsBackend(body.text, isDemo ? {} : {
         voiceId: body.voiceId, modelId: body.modelId || 'eleven_flash_v2_5',
         outputFormat: body.outputFormat || 'pcm_24000', tone: body.tone,
       });
     } catch { return json(502, { error: 'tts backend error' }); }
     if (!out || !Buffer.isBuffer(out.audio)) return json(502, { error: 'tts backend returned no audio' });
+    if (isDemo && out.audio.length > 4 * 1024 * 1024) return json(502, { error: 'tts response exceeds demo cap' });
     return {
       status: 200,
       headers: { 'content-type': 'application/octet-stream', 'x-senti-audio-format': out.format || 'pcm_s16le_24000' },
