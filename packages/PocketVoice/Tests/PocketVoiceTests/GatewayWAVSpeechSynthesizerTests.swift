@@ -16,7 +16,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
-            fetch: { text in try await fetch.fetch(text) },
+            fetch: { text, _ in try await fetch.fetch(text) },
             play: { data in try await play.play(data) },
             stopPlayback: {}
         )
@@ -47,7 +47,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
-            fetch: { _ in Data(repeating: 0, count: 128) },
+            fetch: { _, _ in Data(repeating: 0, count: 128) },
             play: { data in try await play.play(data) },
             stopPlayback: { await stopPlayback.stop() }
         )
@@ -76,7 +76,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: CountingDuplexSystem()),
-            fetch: { text in try await fetch.fetch(text) },
+            fetch: { text, _ in try await fetch.fetch(text) },
             play: { data in try await play.play(data) },
             stopPlayback: {}
         )
@@ -115,7 +115,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
-            fetch: { _ in Data(repeating: 0, count: 128) },
+            fetch: { _, _ in Data(repeating: 0, count: 128) },
             play: { data in try await shared.play(data) },
             stopPlayback: {}
         )
@@ -144,7 +144,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
                 endpoint: try endpoint(),
                 fallback: RecordingFallback(),
                 leases: DuplexAudioSessionLeaseManager(system: system),
-                fetch: { _ in Data(repeating: 0, count: 128) },
+                fetch: { _, _ in Data(repeating: 0, count: 128) },
                 play: { _ in ContinuousClock.now },
                 stopPlayback: {}
             )
@@ -161,7 +161,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
                 endpoint: try endpoint(),
                 fallback: RecordingFallback(),
                 leases: DuplexAudioSessionLeaseManager(system: system),
-                fetch: { _ in Data(repeating: 0, count: 128) },
+                fetch: { _, _ in Data(repeating: 0, count: 128) },
                 play: { _ in throw VoiceError.synthesisFailed("bad WAV") },
                 stopPlayback: {}
             )
@@ -178,7 +178,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
                 endpoint: try endpoint(),
                 fallback: RecordingFallback(),
                 leases: DuplexAudioSessionLeaseManager(system: system),
-                fetch: { _ in Data(repeating: 0, count: 128) },
+                fetch: { _, _ in Data(repeating: 0, count: 128) },
                 play: { data in try await play.play(data) },
                 stopPlayback: {}
             )
@@ -208,7 +208,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
-            fetch: { _ in Data(repeating: 0, count: 128) },
+            fetch: { _, _ in Data(repeating: 0, count: 128) },
             play: { data in try await play.play(data) },
             stopPlayback: { await stopPlayback.stop() }
         )
@@ -276,7 +276,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             _ = try await GatewayWAVSpeechSynthesizer.performFetch(
                 text: "hello",
                 endpoint: httpEndpoint,
-                bearer: "pocket-demo",
+                bearer: "session-token",
                 session: URLSession(configuration: .ephemeral)
             )
         }
@@ -288,44 +288,48 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let body = try await GatewayWAVSpeechSynthesizer.performFetch(
             text: "hello",
             endpoint: try XCTUnwrap(URL(string: "https://gw.example.test")),
-            bearer: "pocket-demo",
+            bearer: "session-token",
             session: URLSession(configuration: configuration)
         )
         XCTAssertEqual(body, FixedWAVURLProtocol.body)
     }
 
-    // MARK: - (P0) identity-scoped cancellation → a stale OLD cancel never stops a newer player
+    // MARK: - (P0/P1) supersede STOPS the old player; a deferred stale cancel of A never disturbs the newer B
 
-    // Drives the real `WAVPlayback` (real `AVAudioPlayer`s): start playback A, supersede it with playback B, then
-    // fire A's cancellation AFTER B has started. With identity-scoped cancel this is a no-op; the pre-fix
-    // untracked `stop()` would have evicted/stopped B (the newer player).
+    // Drives the real `WAVPlayback` (real `AVAudioPlayer`s) with an injected deferred-cancellation scheduler, so
+    // the delayed-onCancel race is deterministic: A's task is cancelled (its onCancel is CAPTURED, not yet run),
+    // B supersedes A — which production must STOP (not merely finish) — and only THEN is A's captured stale cancel
+    // flushed. Identity-scoped cancel makes it a no-op; the pre-fix path would have evicted/stopped the newer B.
     @MainActor
-    func testStaleCancelDoesNotStopNewerPlayback() async throws {
-        let playback = WAVPlayback()
+    func testSupersedeStopsOldPlayerAndDeferredStaleCancelSparesNewer() async throws {
+        let deferredCancels = DeferredCanceller()
+        let playback = WAVPlayback(scheduleCancel: { deferredCancels.capture($0) })
         let wav = Self.pcmWAV(seconds: 30) // long enough not to finish during the test; under the 120s cap
 
         // Start playback A and capture its player.
         let aTask = Task { try await playback.play(wav) }
         let playerA = try await Self.waitForActivePlayer(on: playback, differentFrom: nil)
+        XCTAssertTrue(playerA.isPlaying)
 
-        // Start playback B: it supersedes A (A's continuation resumes cancelled) and becomes the active player.
+        // Cancel A's task: its onCancel enqueues the identity-scoped cancel via the scheduler — captured, NOT run.
+        aTask.cancel()
+
+        // B supersedes A. Production's supersede path must STOP A's player, not just finish its continuation.
         let bTask = Task { try await playback.play(wav) }
         let playerB = try await Self.waitForActivePlayer(on: playback, differentFrom: playerA)
         XCTAssertTrue(playerA !== playerB, "each play() must create a distinct AVAudioPlayer instance")
-
-        // A was superseded → its awaiting task observes cancellation.
         await XCTAssertThrowsVoiceError(.cancelled) { _ = try await aTask.value }
+        XCTAssertFalse(playerA.isPlaying, "supersede must STOP the old player, not merely finish its continuation")
 
-        // The OLD playback's cancellation fires AFTER the NEW playback has started. Identity-scoped → no-op.
-        playback.cancel(player: playerA)
+        // Flush A's DEFERRED stale cancel now that B is the active player → identity-scoped no-op.
+        deferredCancels.flush()
 
         XCTAssertTrue(playback.currentActivePlayer() === playerB,
                       "a stale cancel of the older player must not evict the newer active player")
         XCTAssertTrue(playerB.isPlaying,
                       "the newer playback must keep playing after a stale cancel of the older player")
 
-        // Cleanup: a real stop ends B; the orphaned (superseded, not stopped) A player is stopped directly.
-        playerA.stop()
+        // Cleanup via production stop (no manual player.stop()).
         playback.stop()
         await XCTAssertThrowsVoiceError(.cancelled) { _ = try await bTask.value }
         XCTAssertFalse(playerB.isPlaying, "stop() must end the active playback")
@@ -357,7 +361,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: RecordingFallback(),
             leases: DuplexAudioSessionLeaseManager(system: system),
-            fetch: { _ in Data(repeating: 0, count: 128) },
+            fetch: { _, _ in Data(repeating: 0, count: 128) },
             play: { _ in ContinuousClock.now }, // plays successfully & instantly → settle(.success)
             stopPlayback: { await stopGate.stop() } // barrier suspends here during settle
         )
@@ -383,7 +387,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
-            fetch: { text in try await fetch.fetch(text) },
+            fetch: { text, _ in try await fetch.fetch(text) },
             play: { data in try await play.play(data) },
             stopPlayback: {}
         )
@@ -412,7 +416,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: fallback,
             leases: DuplexAudioSessionLeaseManager(system: system),
-            fetch: { text in try await fetch.fetch(text) },
+            fetch: { text, _ in try await fetch.fetch(text) },
             play: { data in try await play.play(data) },
             stopPlayback: {}
         )
@@ -420,16 +424,11 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         try await fetch.waitForCallCount(1)
 
         // stop() must NOT block on the cancellation-uncooperative fetch: it returns once the audio/lease teardown
-        // is done. Run it in a Task and assert it completes within a bounded budget (no hang).
-        let stopDone = BoolFlag()
-        let stopTask = Task { await synthesizer.stop(); await stopDone.set() }
-        var returnedPromptly = false
-        for _ in 0..<2_000_000 {
-            if await stopDone.isSet() { returnedPromptly = true; break }
-            await Task.yield()
-        }
-        _ = await stopTask.value
-        XCTAssertTrue(returnedPromptly, "stop() must return promptly and never block on a non-cooperative fetch")
+        // is done. Assert it returns within a BOUNDED timeout via an expectation, so a regression (stop() awaiting
+        // the fetch) FAILS the test rather than hanging forever on the stop task's value.
+        let stopReturned = expectation(description: "stop() returns without the fetch resolving")
+        Task { await synthesizer.stop(); stopReturned.fulfill() }
+        await fulfillment(of: [stopReturned], timeout: 5)
 
         // The cancelled fetch is still suspended and OWNED (draining) — not dropped.
         let drainingCount = await synthesizer.drainingTaskCount()
@@ -472,7 +471,7 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             endpoint: try endpoint(),
             fallback: RecordingFallback(),
             leases: DuplexAudioSessionLeaseManager(system: CountingDuplexSystem()),
-            fetch: { _ in Data(repeating: 0, count: 128) },
+            fetch: { _, _ in Data(repeating: 0, count: 128) },
             play: { _ in ContinuousClock.now },
             stopPlayback: {}
         )
@@ -510,6 +509,13 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
             ),
             "a final URL missing its host must be rejected"
         )
+        // A fragment on the final URL is rejected.
+        XCTAssertFalse(
+            GatewayWAVSpeechSynthesizer.isExactExpectedURL(
+                try XCTUnwrap(URL(string: "https://gw.example.test/tts#frag")), expectedURL: expected
+            ),
+            "a final URL carrying a fragment must be rejected"
+        )
         // Control: the exact same-host, no-port, no-query, no-userinfo URL is accepted.
         XCTAssertTrue(GatewayWAVSpeechSynthesizer.isExactExpectedURL(expected, expectedURL: expected))
         XCTAssertNoThrow(
@@ -519,9 +525,9 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         )
     }
 
-    // MARK: - (Honesty) demo-only transport → POST shape (URL/method/auth/body) + injectable bearer & WAV format
+    // MARK: - (Honesty) WAV-only demo transport → POST shape (URL/method/Content-Type/Accept/auth/body)
 
-    func testDemoPOSTShapeAndDefaultWAVFormatHandling() async throws {
+    func testDemoPOSTShapeSendsWAVAcceptContentTypeAndBearer() async throws {
         CapturingURLProtocol.reset(responseBody: fixtureWAV(120))
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CapturingURLProtocol.self]
@@ -529,19 +535,123 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
         let body = try await GatewayWAVSpeechSynthesizer.performFetch(
             text: "hello world",
             endpoint: try XCTUnwrap(URL(string: "https://gw.example.test")),
-            bearer: "live-session-token", // injected (non-default) bearer proves the seam
-            format: .wav,
+            bearer: "live-session-token", // injected bearer proves the seam
             session: URLSession(configuration: configuration)
         )
 
-        let captured = try XCTUnwrap(CapturingURLProtocol.capturedNow())
+        let captured = try XCTUnwrap(CapturingURLProtocol.lastCaptured())
         XCTAssertEqual(captured.url?.absoluteString, "https://gw.example.test/tts")
         XCTAssertEqual(captured.method, "POST")
         XCTAssertEqual(captured.authorization, "Bearer live-session-token")
+        XCTAssertEqual(captured.contentType, "application/json")
         XCTAssertEqual(captured.accept, "audio/wav, application/octet-stream")
         let json = try JSONSerialization.jsonObject(with: try XCTUnwrap(captured.body)) as? [String: Any]
         XCTAssertEqual(json?["text"] as? String, "hello world", "the POST body must carry the briefing text")
         XCTAssertEqual(body, CapturingURLProtocol.responseBodyNow(), "the WAV body is validated and returned")
+    }
+
+    // MARK: - (P0 auth) no credential → ship NOTHING; degrade to fallback; report the FALLBACK's metrics
+
+    func testMissingOrEmptyBearerShipsNothingAndReportsFallbackMetrics() async throws {
+        for bearer: String? in [nil, ""] {
+            let fetchCalls = CallCounter()
+            let fallback = RecordingFallback()
+            let system = CountingDuplexSystem()
+            let synth = GatewayWAVSpeechSynthesizer(
+                endpoint: try endpoint(),
+                bearerProvider: { bearer },
+                fallback: fallback,
+                leases: DuplexAudioSessionLeaseManager(system: system),
+                fetch: { _, _ in await fetchCalls.increment(); return Data(repeating: 0, count: 128) },
+                play: { _ in ContinuousClock.now },
+                stopPlayback: {}
+            )
+            let metrics = try await synth.speak(try SpeechSynthesisRequest(text: "briefing"))
+            let calls = await fetchCalls.countNow()
+            let fallbackSpeaks = await fallback.speakCountNow()
+            let label = bearer == nil ? "nil" : "empty"
+            XCTAssertEqual(calls, 0, "\(label) bearer: the fetch seam (network) must never be invoked")
+            XCTAssertEqual(fallbackSpeaks, 1, "\(label) bearer: must degrade to the on-device fallback (siri)")
+            XCTAssertEqual(system.activateCount, 0, "\(label) bearer: no lease is taken with no credential")
+            XCTAssertNotEqual(metrics.backend, .cartesiaGateway,
+                              "\(label) bearer: must NOT report a fake Cartesia success")
+            XCTAssertEqual(metrics.backend, .avSpeechOffline, "\(label) bearer: reports the FALLBACK's metrics")
+        }
+    }
+
+    // MARK: - (P0 auth) provider rotation → each speak resolves a fresh bearer → different Authorization headers
+
+    func testBearerProviderRotationSendsDifferentAuthorizationHeaders() async throws {
+        CapturingURLProtocol.reset(responseBody: fixtureWAV(120))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CapturingURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let ep = try XCTUnwrap(URL(string: "https://gw.example.test"))
+        let bearers = BearerBox(values: ["bearer-A", "bearer-B"])
+        let synth = GatewayWAVSpeechSynthesizer(
+            endpoint: ep,
+            bearerProvider: { await bearers.next() },
+            fallback: RecordingFallback(),
+            leases: DuplexAudioSessionLeaseManager(system: CountingDuplexSystem()),
+            fetch: { text, bearer in
+                try await GatewayWAVSpeechSynthesizer.performFetch(
+                    text: text, endpoint: ep, bearer: bearer, session: session
+                )
+            },
+            play: { _ in ContinuousClock.now },
+            stopPlayback: {}
+        )
+        _ = try await synth.speak(try SpeechSynthesisRequest(text: "first"))
+        _ = try await synth.speak(try SpeechSynthesisRequest(text: "second"))
+
+        let captured = CapturingURLProtocol.allCaptured()
+        XCTAssertEqual(captured.count, 2, "each speak resolves a fresh bearer and makes its own request")
+        XCTAssertEqual(captured[0].authorization, "Bearer bearer-A")
+        XCTAssertEqual(captured[1].authorization, "Bearer bearer-B")
+        XCTAssertNotEqual(captured[0].authorization, captured[1].authorization,
+                          "provider rotation must send different Authorization headers")
+    }
+
+    // MARK: - (P1 transport) pre-egress → a userinfo endpoint ships ZERO egress (Bearer never leaves the device)
+
+    func testInitialURLWithUserinfoShipsZeroEgress() async throws {
+        CapturingURLProtocol.reset(responseBody: fixtureWAV(120))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CapturingURLProtocol.self]
+        await XCTAssertThrowsVoiceError(.insecureGateway) {
+            _ = try await GatewayWAVSpeechSynthesizer.performFetch(
+                text: "hello",
+                endpoint: try XCTUnwrap(URL(string: "https://user:pass@gw.example.test")),
+                bearer: "session-token",
+                session: URLSession(configuration: configuration)
+            )
+        }
+        XCTAssertNil(CapturingURLProtocol.lastCaptured(),
+                     "a userinfo endpoint must be rejected pre-egress — ZERO network requests")
+    }
+
+    // MARK: - (P1 transport) actual-size overflow beyond the advertised Content-Length is rejected mid-stream
+
+    func testStreamedBodyOverflowBeyondAdvertisedContentLengthIsRejected() async throws {
+        // Advertises a small Content-Length (within the cap) but STREAMS more than the cap → the actual-size guard
+        // must fire even though the advertised size passed.
+        OverflowURLProtocol.configure(advertisedLength: 100, streamedBytes: 600)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OverflowURLProtocol.self]
+        do {
+            _ = try await GatewayWAVSpeechSynthesizer.performFetch(
+                text: "hello",
+                endpoint: try XCTUnwrap(URL(string: "https://gw.example.test")),
+                bearer: "session-token",
+                session: URLSession(configuration: configuration),
+                maxBytes: 256
+            )
+            XCTFail("a streamed body larger than the cap must be rejected")
+        } catch let error as VoiceError {
+            guard case .synthesisFailed = error else {
+                return XCTFail("expected .synthesisFailed for a streamed overflow, got \(error)")
+            }
+        }
     }
 
     // MARK: - Helpers
@@ -552,14 +662,17 @@ final class GatewayWAVSpeechSynthesizerTests: XCTestCase {
 
     private func waitForDrainingEmpty(
         on synthesizer: GatewayWAVSpeechSynthesizer,
+        timeout: Duration = .seconds(5),
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
-        for _ in 0..<1_000_000 {
+        // Wall-clock bounded (not an unbounded yield budget), so a stuck registry fails the test promptly.
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
             if await synthesizer.drainingTaskCount() == 0 { return }
             await Task.yield()
         }
-        XCTFail("the drain registry never emptied", file: file, line: line)
+        XCTFail("the drain registry never emptied within \(timeout)", file: file, line: line)
         throw HarnessError.didNotArrive
     }
 
@@ -950,35 +1063,71 @@ private actor StopGate {
     }
 }
 
-private actor BoolFlag {
-    private var value = false
-    func set() { value = true }
-    func isSet() -> Bool { value }
+private actor CallCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
+    func countNow() -> Int { count }
 }
 
-// Captures the outgoing request (URL / method / Authorization / Accept / body) and returns a fixed WAV, so a
-// test can assert the exact POST shape the demo transport puts on the wire.
+private actor BearerBox {
+    private let values: [String?]
+    private var index = 0
+    init(values: [String?]) { self.values = values }
+    func next() -> String? {
+        defer { index += 1 }
+        guard index < values.count else { return values.last ?? nil }
+        return values[index]
+    }
+}
+
+// Captures the deferred identity-scoped cancellation work so the delayed-onCancel race is deterministic:
+// `capture` runs in the (nonisolated) cancellation context; `flush` runs the pending work synchronously on the
+// main actor once the test has advanced past the point that would race in production.
+private final class DeferredCanceller: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [@MainActor @Sendable () -> Void] = []
+
+    func capture(_ work: @escaping @MainActor @Sendable () -> Void) {
+        lock.withLock { pending.append(work) }
+    }
+
+    @MainActor
+    func flush() {
+        let works = lock.withLock { () -> [@MainActor @Sendable () -> Void] in
+            let snapshot = pending
+            pending.removeAll()
+            return snapshot
+        }
+        for work in works { work() }
+    }
+}
+
+// Captures each outgoing request (URL / method / Authorization / Content-Type / Accept / body) and returns a
+// fixed WAV, so a test can assert the exact POST shape the transport puts on the wire (and observe rotation
+// across multiple requests).
 private final class CapturingURLProtocol: URLProtocol, @unchecked Sendable {
     struct Captured: Sendable {
         let url: URL?
         let method: String?
         let authorization: String?
+        let contentType: String?
         let accept: String?
         let body: Data?
     }
 
     private static let lock = NSLock()
-    private static var captured: Captured?
+    private static var captured: [Captured] = []
     private static var responseBody = Data()
 
     static func reset(responseBody: Data) {
         lock.withLock {
-            captured = nil
+            captured = []
             self.responseBody = responseBody
         }
     }
 
-    static func capturedNow() -> Captured? { lock.withLock { captured } }
+    static func allCaptured() -> [Captured] { lock.withLock { captured } }
+    static func lastCaptured() -> Captured? { lock.withLock { captured.last } }
     static func responseBodyNow() -> Data { lock.withLock { responseBody } }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -987,13 +1136,14 @@ private final class CapturingURLProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         let body = Self.readBody(from: request)
         Self.lock.withLock {
-            Self.captured = Captured(
+            Self.captured.append(Captured(
                 url: request.url,
                 method: request.httpMethod,
                 authorization: request.value(forHTTPHeaderField: "Authorization"),
+                contentType: request.value(forHTTPHeaderField: "Content-Type"),
                 accept: request.value(forHTTPHeaderField: "Accept"),
                 body: body
-            )
+            ))
         }
         let payload = Self.responseBodyNow()
         guard let url = request.url,
@@ -1028,4 +1178,41 @@ private final class CapturingURLProtocol: URLProtocol, @unchecked Sendable {
         }
         return data
     }
+}
+
+// Advertises a (small) Content-Length but STREAMS a larger body, so a test can drive the actual-size cap on the
+// streamed bytes independent of the advertised length.
+private final class OverflowURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var advertisedLength = 100
+    private static var streamedBytes = 600
+
+    static func configure(advertisedLength: Int, streamedBytes: Int) {
+        lock.withLock {
+            self.advertisedLength = advertisedLength
+            self.streamedBytes = streamedBytes
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let (advertised, streamed) = Self.lock.withLock { (Self.advertisedLength, Self.streamedBytes) }
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Length": "\(advertised)"]
+              ) else {
+            client?.urlProtocol(self, didFailWithError: VoiceError.gatewayRejected(0))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: fixtureWAV(streamed)) // a valid-header WAV of `streamed` bytes
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
