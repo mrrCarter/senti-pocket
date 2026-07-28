@@ -24,11 +24,18 @@ enum OutboxStore {
         return dir.appendingPathComponent("senti-pocket-outbox.json")
     }
 
-    static func save(_ intent: PersistedWriteIntent) {
-        guard let url = fileURL, let data = try? encoder.encode(intent) else { return }
+    /// Persist the ONE confirmed intent. SERIALIZES a second owner (spec C): if a DIFFERENT confirmed intent already
+    /// owns the single slot, REFUSE (return false) rather than clobber it — a new write must never erase an unrelated
+    /// earlier confirmed pending write. Re-saving the SAME proposal id (idempotent) is allowed. Returns whether this
+    /// intent now owns the slot.
+    @discardableResult
+    static func save(_ intent: PersistedWriteIntent) -> Bool {
+        if let existing = load(), existing.proposal.id != intent.proposal.id { return false }  // a different write owns the slot
+        guard let url = fileURL, let data = try? encoder.encode(intent) else { return false }
         // Protected until first unlock (survives relaunch, never leaves the device); best-effort — an outbox write
         // failing must not crash the send path (the in-memory retry still works this session).
         try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        return true
     }
 
     static func load() -> PersistedWriteIntent? {
@@ -36,7 +43,19 @@ enum OutboxStore {
         return try? decoder.decode(PersistedWriteIntent.self, from: data)
     }
 
-    static func clear() {
+    /// Clear STRICTLY by matching proposal id (spec C): a no-op when the slot holds a DIFFERENT proposal. This is the
+    /// write path's clear — so a dial hangup cleaning up its OWN draft can never wipe an unrelated confirmed pending
+    /// write that owns the global slot.
+    static func clear(proposalId: String) {
+        guard let existing = load(), existing.proposal.id == proposalId else { return }
+        clearAll()
+    }
+
+    /// Unconditional clear — a full reset (test setup/teardown, an explicit "discard everything"). The write path
+    /// should prefer clear(proposalId:) so it can never erase a foreign owner.
+    static func clear() { clearAll() }
+
+    private static func clearAll() {
         guard let url = fileURL else { return }
         try? FileManager.default.removeItem(at: url)
     }

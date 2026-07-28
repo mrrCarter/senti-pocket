@@ -63,6 +63,17 @@ targets:
         # B2 item 5 (Atlas/Forge #261850): the live-demo gateway URL — CONFIG, not hard-baked. It's an ephemeral
         # cloudflared quick-tunnel that churns on restart; forge re-publishes + updates this value with NO code change.
         SENTI_GATEWAY_URL: "https://feof-sega-prominent-exclude.trycloudflare.com"
+        # Pocket-TTS demo bearer (spec D, app-seam): read at RUNTIME by DialHost.gatewayBearerProvider() and handed to
+        # GatewayWAVSpeechSynthesizer so the pickup speaks in the pocket voice instead of Siri. A PUBLIC-DEMO capability,
+        # NOT a secret — but kept out of source: the EMPTY default here is intentional (a real short-lived value is
+        # injected at build time separately; never invent/commit a literal). Empty/absent → provider returns nil → the
+        # synth keeps its Siri default (that degrade is fine).
+        SENTI_GATEWAY_BEARER: ""
+        # FOREGROUND demo-dial trigger gate (spec A, P0-3). Default OFF: with this false there is NO demo ring button and
+        # no way to self-ring — the reachability path is inert. A dedicated demo build/config flips this to true to expose
+        # the trigger. Ring/audio/READ-ONLY even when on: without a real SessionTokenStore token it is NOT authenticated
+        # LEAN /dial hydration and NOT governed writeback.
+        POCKET_DEMO_DIAL_ENABLED: false
     settings:
       base:
         GENERATE_INFOPLIST_FILE: false

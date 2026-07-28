@@ -69,11 +69,31 @@ final class PhoneWriteViewModel: ObservableObject {
         post(proposal, confirmation)
     }
 
-    /// Abandon the draft/confirmation — a cancelled decision must leave NOTHING posted or queued.
+    /// Abandon the draft/confirmation — a cancelled decision must leave NOTHING posted or queued. Clears the durable
+    /// outbox STRICTLY by the current proposal's id (spec C) so it can never wipe a DIFFERENT confirmed pending write
+    /// that owns the single global slot.
     func cancel() {
+        if let id = currentProposalId { OutboxStore.clear(proposalId: id) }
         pendingIntent = nil
-        OutboxStore.clear()
         state = .composing
+    }
+
+    /// Call-HANGUP teardown seam (spec C): cancel ONLY a PRE-SUBMIT draft (composing/confirming — nothing was
+    /// authorized, so this yields zero POST/queue). Once the write is authorized (.sending) or terminal
+    /// (.pending/.sent/.refused) this is a NO-OP: an accepted server write cannot be retracted and a durable pending
+    /// stays reconcilable, so a later hangup stops call audio but MUST NOT cancel/erase that authorized attempt.
+    func cancelIfUnsubmitted() {
+        switch state {
+        case .composing, .confirming: cancel()
+        case .sending, .pending, .sent, .refused: break   // authorized/terminal — retain the reconcilable proposal
+        }
+    }
+
+    /// The proposal id currently in play (the armed draft, else a persisted pending intent) — the key we clear the
+    /// single-slot outbox by, so a clear never wipes a different proposal's entry.
+    private var currentProposalId: String? {
+        if case .confirming(let p) = state { return p.id }
+        return pendingIntent?.proposal.id
     }
 
     /// Retry a PENDING (offline) intent after reconnect — resends the identical confirmed bytes.
@@ -106,18 +126,26 @@ final class PhoneWriteViewModel: ObservableObject {
                 // TRANSIENT gateway response (busy / in-progress / temporarily unavailable) — NOT terminal. Queue +
                 // retry like offline; the write may still land, so never refuse it (intent already persisted, top of post()).
                 self.state = .pending("The gateway is busy — queued, tap Retry. (\(detail))")
+            } catch PocketWriteError.cancelled {
+                // Spec C: the POST was cancelled (call torn down / task cancelled) BEFORE a terminal gateway result.
+                // This is NOT an offline/connectivity condition, so it must NOT surface as a durable .pending (which
+                // would falsely claim the write is queued to send). The confirmed intent stays in the durable outbox
+                // (RETAINED — reconcilable on next launch, where init() restores it as pending): we neither clear it
+                // nor claim it sent/queued here. Normal teardown does NOT cancel this (unstructured, retained) Task —
+                // this is the app-suspend guard. Live state returns to neutral; the durable outbox is the source of truth.
+                self.state = .composing
             } catch PocketWriteError.notPosted(let why) {
                 // The gateway returned a receipt that is NOT a verified posted (pending/failed) → never sent.
                 self.pendingIntent = nil
-                OutboxStore.clear()
+                OutboxStore.clear(proposalId: proposal.id)
                 self.state = .refused("Not sent — \(why)")
             } catch PocketWriteError.rejected(let why) {
                 self.pendingIntent = nil
-                OutboxStore.clear()
+                OutboxStore.clear(proposalId: proposal.id)
                 self.state = .refused("The gateway refused this write — \(why)")
             } catch {
                 self.pendingIntent = nil
-                OutboxStore.clear()
+                OutboxStore.clear(proposalId: proposal.id)
                 self.state = .refused("Not sent — \(error.localizedDescription)")
             }
         }
@@ -127,7 +155,8 @@ final class PhoneWriteViewModel: ObservableObject {
     /// pinned key. Anything else (unsigned / tampered / no CryptoKit) is REFUSED, never rendered as sent.
     private func applyRenderGate(_ receipt: ActionReceipt) {
         // Every path here is TERMINAL (sent or refused) — the confirmed intent is resolved, so drop the durable outbox.
-        OutboxStore.clear()
+        // Clear STRICTLY by the receipt's proposal id (spec C): a terminal for OUR write never wipes a foreign owner.
+        OutboxStore.clear(proposalId: receipt.proposalId)
         #if canImport(CryptoKit)
         switch receipt.signatureState(gatewayPublicKeyBase64url: gatewayPublicKeyPin) {
         case .verified:

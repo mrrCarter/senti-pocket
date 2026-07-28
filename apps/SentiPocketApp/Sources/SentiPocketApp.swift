@@ -13,9 +13,10 @@ struct SentiPocketApp: App {
     @StateObject private var model = PocketAppModel()
     #endif
     #if canImport(CallKit) && canImport(PushKit)
-    /// App-lifetime DIALS wiring (onAnswered hookup part-b): owns the SentiCallManager (its PKPushRegistry delegate
-    /// must live the whole app) + the DialCoordinator, and installs the push-receive/answer adapters + the governed
-    /// DI seams (hydrate via the authed DialHydrationClient / runDial via LiveDialVoice+PhoneWriteAdapter+orchestrator).
+    /// App-lifetime DIALS wiring (onAnswered hookup part-b + the app-seam teardown): owns the SentiCallManager (its
+    /// PKPushRegistry delegate must live the whole app) + the DialCoordinator, and installs the push-receive/answer/end
+    /// adapters + the governed DI seams (hydrate via the authed DialHydrationClient / makeRun via the stoppable
+    /// LiveDialRun = LiveDialVoice+PhoneWriteAdapter+DialOrchestrator).
     @StateObject private var dialHost = DialHost()
     #endif
     #if !DEBUG
