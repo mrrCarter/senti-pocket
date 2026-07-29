@@ -39,6 +39,7 @@ and "MAY" use their RFC 2119 meanings.
 | `providerEventId` | Provider delivery identity | Provider |
 | `providerSegmentId` | Segment identity within one provider delivery/file | Provider or deterministic projector derivation |
 | `turnId` | One agent/human conversational turn | Turn coordinator |
+| `voiceProfileId` | Stable public synthesis identity for one agent | Voice-profile service |
 | `requestId` | One request/error correlation | Edge entry point |
 | `traceId` / `traceparent` | Distributed trace correlation | W3C tracing boundary |
 
@@ -194,7 +195,69 @@ expected room revision, command ID, and idempotency key. The server rechecks
 authorization at execution time. A stale revision returns
 `VOICE_CONTROL_CONFLICT` and the current safe snapshot.
 
-## 8. Durable `session_voice_utterance`
+## 8. Per-agent voice profile
+
+Every agent principal MUST resolve to one active, versioned
+`AgentVoiceProfile`. A room MUST NOT collapse distinct agents onto one generic
+assistant profile. The profile is server-owned and contains:
+
+- `voiceProfileId`, `tenantId`, and `agentPrincipalId`;
+- monotonic `revision`;
+- user-facing `displayName`;
+- open, provider-neutral `synthesisProvider`;
+- opaque `providerVoiceRef`;
+- `stylePolicyId` and bounded `toneTags`;
+- optional `fallbackVoiceProfileId`;
+- effective and disabled timestamps.
+
+The public profile identity is stable even when a provider or provider voice
+changes. A profile revision is immutable after use; changes create the next
+revision. Two simultaneously active agent principals in one room MUST resolve
+to distinct effective voice profiles and distinct provider voice references
+unless Carter explicitly defines a shared-character exception.
+
+Provider credentials are not profile fields. They remain server-side and MUST
+NOT enter web/iOS state, Senti events, logs, traces, errors, or screenshots.
+An opaque provider voice reference is not authority to call that provider.
+
+An agent utterance MUST include synthesis provenance:
+
+- voice profile ID and revision;
+- synthesis provider and model;
+- `shared_room_track` or `degraded_client_tts` output mode;
+- applied bounded tone tags.
+
+Human utterances MUST NOT contain synthesis provenance. In degraded mode,
+clients receive safe fallback rendering instructions, never a premium-provider
+key. A fallback that cannot preserve the exact premium voice remains the same
+agent identity but MUST be presented as a fallback, not a byte/voice-equivalent
+render.
+
+ElevenLabs MAY be one synthesis provider when Carter provisions credit and
+server-side credentials. It is not hard-coded into the domain contract.
+
+```json
+{
+  "schemaVersion": "agent_voice_profile.v1",
+  "voiceProfileId": "voice_profile_forge",
+  "tenantId": "tenant_demo",
+  "agentPrincipalId": "agent_forge",
+  "revision": 3,
+  "displayName": "Forge",
+  "synthesisProvider": "elevenlabs",
+  "providerVoiceRef": "voice_forge_01",
+  "stylePolicyId": "agent_tone_forge.v1",
+  "toneTags": [
+    "direct",
+    "measured"
+  ],
+  "fallbackVoiceProfileId": "voice_profile_forge_ondevice",
+  "effectiveAt": "2026-07-29T07:00:00.000Z",
+  "disabledAt": null
+}
+```
+
+## 9. Durable `session_voice_utterance`
 
 Only a final utterance may use this type. Interim text MUST NOT enter Senti as
 this event.
@@ -214,11 +277,11 @@ Normative example:
   "providerSegmentId": "segment_1",
   "projectorPrincipalId": "svc_voice_projector",
   "speaker": {
-    "principalId": "human_carter",
-    "providerParticipantId": "rtk_participant_44",
-    "providerTrackId": "rtk_track_audio_44",
-    "kind": "human",
-    "role": "owner",
+    "principalId": "agent_forge",
+    "providerParticipantId": "rtk_agent_forge",
+    "providerTrackId": "rtk_track_agent_forge",
+    "kind": "agent",
+    "role": "agent",
     "bindingAuthority": "server"
   },
   "timing": {
@@ -228,7 +291,7 @@ Normative example:
     "endedAt": "2026-07-29T07:00:03.580Z"
   },
   "transcript": {
-    "text": "Let's go with RealtimeKit.",
+    "text": "I recommend RealtimeKit for the human-room spike.",
     "language": "en-US",
     "confidence": 0.98,
     "model": "provider-model-version",
@@ -246,6 +309,17 @@ Normative example:
     "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
     "turnId": "turn_01JABF",
     "causationId": "rtk_session_88"
+  },
+  "synthesis": {
+    "voiceProfileId": "voice_profile_forge",
+    "voiceProfileRevision": 3,
+    "provider": "elevenlabs",
+    "model": "configured-model",
+    "outputMode": "shared_room_track",
+    "toneTags": [
+      "direct",
+      "measured"
+    ]
   },
   "contentHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
   "recordedAt": "2026-07-29T07:00:04.000Z"
@@ -277,8 +351,10 @@ Projector invariants:
     both true and policy permits it.
 11. Corrections append a new utterance with `revisionOfUtteranceId`; the
     original remains immutable.
+12. An agent speaker requires synthesis provenance bound to that agent's active
+    voice-profile revision. A human speaker forbids it.
 
-## 9. Optional audio reference
+## 10. Optional audio reference
 
 The optional `audio` object contains:
 
@@ -293,7 +369,7 @@ It MUST NOT contain a URL, query string, bearer, provider credential, key ID
 that reveals tenant secrets, or decryption material. Access is separately
 authorized and audited.
 
-## 10. Voice entitlement
+## 11. Voice entitlement
 
 `VoiceEntitlement` is server-owned and versioned. Required product limits:
 
@@ -324,7 +400,7 @@ promotion/publication, and enabling an agent, transcription, recording, video,
 retention, or export. A decision emits telemetry with IDs and quantities but no
 transcript or credential.
 
-## 11. Immutable usage event
+## 12. Immutable usage event
 
 `VoiceUsageEvent` meters one observation:
 
@@ -340,7 +416,7 @@ Usage is append-only, idempotent by provider event plus metric identity, and
 reconciled with provider reports. Corrections are compensating events, not
 updates. Alert state at 80%, 95%, and 100% is derived.
 
-## 12. Error envelope
+## 13. Error envelope
 
 All HTTP and terminal stream errors use:
 
@@ -379,7 +455,7 @@ Canonical codes:
 provider body, stack trace, participant private data, or policy internals.
 `retryAfterMs` is `null` when retry is not advised.
 
-## 13. Resumable control and error stream
+## 14. Resumable control and error stream
 
 The browser and iOS control stream carries bounded snapshots, terminal errors,
 and heartbeats. It MUST NOT carry provider credentials, transcript text, raw
@@ -405,12 +481,12 @@ unknown gap. If the retained stream cannot satisfy resume, it emits
 `VOICE_STREAM_RESYNC_REQUIRED`; the client fetches a fresh snapshot and roster
 page, then resumes from the returned sequence.
 
-Every terminal stream error contains the exact error envelope from section 12.
+Every terminal stream error contains the exact error envelope from section 13.
 Heartbeat events contain no semantic state beyond current control revision and
 time. UI state MUST NOT turn a transport heartbeat into a successful room or
 moderation result.
 
-## 14. Webhook and transcript ordering
+## 15. Webhook and transcript ordering
 
 Provider deliveries are at-least-once and may be late or out of order.
 Authenticity, freshness/replay policy, dedupe, and parsing happen before
@@ -438,7 +514,7 @@ The projector records:
 Recovery replays from the provider or accepted-delivery store and is
 idempotent. It never depends on one in-memory process.
 
-## 15. No-loss export contract
+## 16. No-loss export contract
 
 An archive manifest contains:
 
@@ -456,7 +532,7 @@ An archive manifest contains:
 Markdown is a rendering of the manifest's blocks, not the source of truth.
 Pagination and resume MUST neither omit nor duplicate an utterance.
 
-## 16. ENGRAM projection contract
+## 17. ENGRAM projection contract
 
 Every final utterance becomes an immutable ENGRAM observation referencing the
 Senti event and stable utterance ID. Index records MAY contain lexical text,
@@ -471,7 +547,7 @@ Index failure:
 - MUST preserve the source redaction version;
 - MUST NOT claim search/recall completeness while behind.
 
-## 17. Cross-field validators
+## 18. Cross-field validators
 
 JSON Schema validates record shape. Domain validation MUST additionally reject:
 
@@ -485,12 +561,15 @@ JSON Schema validates record shape. Domain validation MUST additionally reject:
 - `provider_error` with a unit other than `error`;
 - a client-supplied actor role or speaker binding that does not match
   server-owned identity;
+- an agent utterance without synthesis provenance, or a human utterance with it;
+- two active room agents resolving to the same effective voice profile or
+  provider voice reference without an explicit product exception;
 - reuse of an owner-fenced idempotency key by a different principal or payload.
 
 These checks require comparisons or trusted server context and therefore are
 not represented as misleading shape-only constraints.
 
-## 18. Conformance gates
+## 19. Conformance gates
 
 An adapter is not conforming until independent receipts cover:
 
@@ -517,6 +596,9 @@ An adapter is not conforming until independent receipts cover:
 - foreground/background/rejoin behavior;
 - VoiceOver, keyboard, focus, dynamic type, contrast, and responsive roster;
 - stale room/participant callbacks cannot corrupt a new epoch.
+- each agent keeps a distinct stable voice/tone profile across web and iOS;
+- premium-provider loss produces a labeled, non-secret fallback without
+  changing agent identity.
 
 ### Media and resilience
 

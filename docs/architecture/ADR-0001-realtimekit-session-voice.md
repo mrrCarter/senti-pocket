@@ -149,6 +149,31 @@ The degraded edge-text mode performs STT on each client and may synthesize
 agent text locally. It must be labeled `degraded_edge_text`, report its reduced
 speaker/room semantics, and never be presented as proof of a true media agent.
 
+### Per-agent voice identity
+
+Every agent principal has a stable, distinct, server-owned
+`AgentVoiceProfile`. One generic assistant voice for all agents is not
+conforming. A profile versions:
+
+- the agent principal and public voice-profile identity;
+- synthesis provider and opaque provider voice reference;
+- style/tone policy and bounded tone tags;
+- effective/disabled timestamps;
+- an honest fallback profile.
+
+The same agent profile is resolved consistently on web and iOS. In the
+north-star path, the server uses it to publish one shared room track, so every
+listener hears the same agent, timing, and interruption result. In degraded
+client-TTS mode, clients receive only safe, non-secret fallback instructions
+and label the mode; they do not receive a premium provider credential.
+
+ElevenLabs may be configured later as an optional premium synthesis provider.
+Its account key remains server-side. Provider selection and available credit
+do not change agent identity, transcript identity, governance, or the fallback
+contract. Each durable agent utterance records the voice-profile revision,
+synthesis provider/model, output mode, and applied tone tags—never the API key
+or private provider response.
+
 The official RealtimeKit AI surface reviewed on 2026-07-29 documents
 transcription and summarization. It does not document a server bot, synthetic
 audio-track publisher, or full agent participant. A RealtimeKit composite
@@ -286,6 +311,7 @@ The entitlement controls:
 - monthly participant minutes;
 - monthly transcription minutes;
 - monthly agent minutes;
+- premium synthesis capability and provider-specific usage reconciliation;
 - monthly recording minutes;
 - recording, transcription, agent, video, and archive capabilities;
 - trial and policy expiry.
@@ -503,6 +529,7 @@ this ADR does not authorize edits to frozen `packages/PocketContracts`,
 | True server agent participant | Unproven critical gate |
 | 5k/10k hot-room capacity | Unproven load gate |
 | Durable typed voice utterance in Senti | Not built |
+| Distinct per-agent voice/tone profiles | Contracted; not implemented |
 | Voice-aware Markdown no-loss export | Not built |
 | ENGRAM voice indexing | Not built |
 | Billing | Intentionally not built |

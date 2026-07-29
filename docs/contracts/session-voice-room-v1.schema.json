@@ -8,6 +8,9 @@
       "$ref": "#/$defs/sessionVoiceUtterance"
     },
     {
+      "$ref": "#/$defs/agentVoiceProfile"
+    },
+    {
       "$ref": "#/$defs/voiceEntitlement"
     },
     {
@@ -338,6 +341,144 @@
         }
       }
     },
+    "toneTag": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40,
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "synthesisProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "voiceProfileId",
+        "voiceProfileRevision",
+        "provider",
+        "model",
+        "outputMode",
+        "toneTags"
+      ],
+      "properties": {
+        "voiceProfileId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "voiceProfileRevision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "outputMode": {
+          "type": "string",
+          "enum": [
+            "shared_room_track",
+            "degraded_client_tts"
+          ]
+        },
+        "toneTags": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/toneTag"
+          }
+        }
+      }
+    },
+    "agentVoiceProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "voiceProfileId",
+        "tenantId",
+        "agentPrincipalId",
+        "revision",
+        "displayName",
+        "synthesisProvider",
+        "providerVoiceRef",
+        "stylePolicyId",
+        "toneTags",
+        "fallbackVoiceProfileId",
+        "effectiveAt",
+        "disabledAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "agent_voice_profile.v1"
+        },
+        "voiceProfileId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "agentPrincipalId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "synthesisProvider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "providerVoiceRef": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "stylePolicyId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "toneTags": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/toneTag"
+          }
+        },
+        "fallbackVoiceProfileId": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/opaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effectiveAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "disabledAt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "sessionVoiceUtterance": {
       "type": "object",
       "additionalProperties": false,
@@ -411,13 +552,49 @@
         "revisionOfUtteranceId": {
           "$ref": "#/$defs/opaqueId"
         },
+        "synthesis": {
+          "$ref": "#/$defs/synthesisProvenance"
+        },
         "contentHash": {
           "$ref": "#/$defs/sha256"
         },
         "recordedAt": {
           "$ref": "#/$defs/timestamp"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "speaker"
+            ],
+            "properties": {
+              "speaker": {
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "agent"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "synthesis"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "synthesis"
+              ]
+            }
+          }
+        }
+      ]
     },
     "voiceCapabilities": {
       "type": "object",
