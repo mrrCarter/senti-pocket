@@ -185,6 +185,7 @@ describe("RealtimeKit signed webhook intake", () => {
         meeting: {
           id: MEETING_ID,
           title: meetingTitle(roomId),
+          sessionId: "05e57591-d89e-45c9-ae44-08dc1eaad0e0",
         },
         participant,
       },
@@ -198,6 +199,7 @@ describe("RealtimeKit signed webhook intake", () => {
         meeting: {
           id: MEETING_ID,
           title: meetingTitle(roomId),
+          sessionId: "05e57591-d89e-45c9-ae44-08dc1eaad0e0",
         },
         participant: {
           ...participant,

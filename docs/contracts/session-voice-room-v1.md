@@ -195,6 +195,10 @@ expected room revision, command ID, and idempotency key. The server rechecks
 authorization at execution time. A stale revision returns
 `VOICE_CONTROL_CONFLICT` and the current safe snapshot.
 
+For `remove`, intake MUST also bind the target's current signed provider
+session ID and connection-specific peer ID. The stable participant/custom ID is
+not a peer generation and MUST NOT substitute for this fence.
+
 ### 7.1 Durable command intake and delivery
 
 The server MUST commit the next control revision, command intent, outbox row,
@@ -234,10 +238,11 @@ The current safe implementation has these explicit mechanical bounds:
 - a 250 ms initial/coalescing delay and 250 ms continuation re-arm;
 - at most 4,096 retained commands per room epoch, after which intake returns
   backpressure instead of growing unbounded; and
-- a ten-minute terminal deadline from command creation. After that deadline,
-  a command not protected by a live execution lease becomes `unsupported` with
-  `resultCode=queue_delivery_exhausted` and
-  `providerMutationApplied=false`.
+- a ten-minute terminal deadline. An unattempted command measures from creation
+  and becomes `unsupported` with `resultCode=queue_delivery_exhausted` and
+  `providerMutationApplied=false`; an attempted but unobserved command measures
+  from attempt start and becomes `conflict` with
+  `resultCode=VOICE_CONTROL_CONFLICT`.
 
 The ten-minute watchdog covers both send-uncertain commands and commands that
 were dispatched but never completed Queue/DLQ processing. A valid DLQ envelope
@@ -246,12 +251,51 @@ Queue poison has no command identity to terminalize and is safely acknowledged
 with secret-free telemetry. These numbers are correctness bounds, not a
 latency SLO or a 5k/10k hot-room load receipt.
 
-The only enabled executor remains `UnavailableVoiceControlExecutor`. It runs
-outside the room coordinator, performs zero provider I/O, and can finalize only
-`status=unsupported`, `resultCode=executor_unavailable`, and
-`providerMutationApplied=false`. A later live executor remains blocked until it
-can freshly re-authorize through Senti, use desired-state/idempotent provider
-operations, and produce authoritative action-specific confirmation.
+The only production-composed executor remains
+`UnavailableVoiceControlExecutor`. It runs outside the room coordinator,
+performs zero provider I/O, and can finalize only `status=unsupported`,
+`resultCode=executor_unavailable`, and `providerMutationApplied=false`.
+
+The local `remove` kernel defines, but does not production-compose, two
+server-only ports:
+
+- a fresh authorizer called after Queue lease acquisition and before provider
+  I/O; unavailable, denied, revoked, or expired authority fails closed; and
+- an idempotent desired-state provider bound to the stable attempt ID and exact
+  signed peer generation.
+
+The durable remove states are:
+
+```text
+pending -> executing -> pending_observation -> desired_state_observed
+                    \                         -> conflict
+                     -> conflict
+```
+
+One nonterminal remove is allowed per exact
+`(providerSessionId, peerId)`. Retry MUST reuse the same attempt and peer; a
+replacement peer MUST produce conflict before mutation. A signed leave can
+terminalize only when meeting, provider session, participant key, and peer all
+match and `leftAt >= attemptStartedAt`. `already_absent` is a separate observed
+desired state with no provider-request claim.
+
+Every command record separates:
+
+- `providerRequestAccepted`;
+- `providerStateObserved`; and
+- `causalityProven`, which is always `false` for this RealtimeKit kernel.
+
+An accepted request remains `pending_observation`; it is not success. A
+matching leave earns `REMOVE_LEAVE_OBSERVED` and
+`desired_state_observed`, not a "confirmed" or "kick applied" label.
+`providerMutationApplied` remains only as `false` on legacy negative results
+and MUST be absent from positive observation records.
+
+A live RealtimeKit remove adapter remains prohibited: the reviewed kick API
+targets stable participant/custom IDs rather than peer ID, leaving a
+preflight-to-kick rejoin TOCTOU window. Preflight narrows but does not eliminate
+the risk of kicking a replacement peer. Eligibility requires a proven
+peer-exact mutation or a separate explicit risk acceptance and review.
 
 Posting the same `commandId` is the current actor-authorized poll: it returns
 the original `202` pending record or the original terminal failure and command
@@ -564,6 +608,16 @@ do not provide a signed delivery timestamp, so the adapter MUST NOT claim
 cryptographic age/freshness from an unsigned local receive time. Durable
 delivery dedupe plus valid lifecycle/reconciliation bounds provide replay
 control.
+
+For participant joins and leaves, the projector MUST treat
+`meeting.sessionId + participant.peerId` as the immutable connection identity
+and `customParticipantId` only as the stable participant correlation. A stale
+join MUST NOT replace or resurrect a newer/closed peer generation. A leave for
+an old peer MUST NOT clear a replacement peer or satisfy its command. Duplicate
+or conflicting delivery IDs retain the existing digest-dedupe behavior. The
+local coordinator retains at most four inactive unreferenced generations per
+participant, plus active generations and peers pinned by nonterminal removes;
+pruning MUST preserve the newest-generation high-water ordering.
 
 The projector records:
 

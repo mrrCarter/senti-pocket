@@ -115,7 +115,8 @@ moderation request it:
 2. accepts only a freshly authenticated Senti owner/admin who also has an active
    moderator admission;
 3. binds the target canonical principal to the active opaque participant key
-   and provider participant ID;
+   and provider participant ID; a `remove` also pins the exact signed
+   RealtimeKit provider-session ID and connection-specific peer ID;
 4. fences `commandId`, the owner-scoped idempotency fingerprint, payload
    fingerprint, and `expectedRevision`;
 5. pre-arms recovery and appends one durable command intent, one outbox row,
@@ -131,13 +132,15 @@ An exact retry returns the original command record; a reused command or key
 with different ownership or content conflicts.
 
 The local implementation now includes the offline-safe alarm/outbox, Queue
-consumer, execution lease, DLQ terminalizer, and terminal watchdog. Its only
-executor is `UnavailableVoiceControlExecutor`, which runs outside the room
-coordinator, performs zero provider I/O, finalizes
-`providerMutationApplied=false`, and returns `VOICE_PROVIDER_UNAVAILABLE`.
-Therefore the current revision is an ordered intent-ledger revision, not proof
-that RealtimeKit state changed. A client must not render an applied moderation
-result from the revision alone.
+consumer, execution lease, DLQ terminalizer, terminal watchdog, and a
+provider-neutral `remove` execution/observation kernel. Production composition
+still selects only `UnavailableVoiceControlExecutor`, which runs outside the
+room coordinator, performs zero provider I/O, finalizes
+`providerMutationApplied=false`, and returns `VOICE_PROVIDER_UNAVAILABLE`. The
+new kernel is exercised only through hostile test adapters; adding its source
+does not enable a RealtimeKit mutation. Therefore the current revision is an
+ordered intent-ledger revision, not proof that RealtimeKit state changed. A
+client must not render an applied moderation result from the revision alone.
 
 The target live path is asynchronous:
 
@@ -151,12 +154,12 @@ RoomGovernor: intent + revision + lease
 pre-armed alarm/outbox dispatcher
         |
         v
-at-least-once control Queue -> leased executor -> RealtimeKit desired state
-        |                                            |
-        +---------- retry / DLQ / reconcile <--------+
+at-least-once control Queue -> leased per-action kernel -> provider port
+        |                                                  |
+        +--------------- retry / DLQ / reconcile <---------+
                              |
                              v
-confirmed state + signed Senti receipt -> bounded read projection
+action-specific observation + signed Senti receipt -> bounded read projection
 ```
 
 Before accepting a command, the object durably pre-arms its alarm and commits
@@ -181,30 +184,38 @@ session/epoch room key has an independent Durable Object and outbox. A
 unproven and is not weakened by this smaller correctness receipt.
 
 A valid message that exhausts the main consumer enters a mandatory DLQ handled
-by the same Worker. It terminalizes the durable command as `unsupported` with
+by the same Worker. An unattempted command terminalizes as `unsupported` with
 `resultCode=queue_delivery_exhausted` and
-`providerMutationApplied=false`, then acknowledges idempotently. Independently,
-the room alarm applies the same false/non-mutating terminal state ten minutes
-after command creation when no execution lease remains. That watchdog covers a
-send-uncertain outage and a DLQ consumer outage, so neither leaves an eternal
-pending command. Any later Queue duplicate observes terminal state and is a
-no-op. Uncertain Queue send is logged without identifiers and rethrown, keeping
-Cloudflare's native alarm retry in addition to the pre-armed 30-second recovery
-wake-up.
+`providerMutationApplied=false`. Once a provider attempt has begun, an
+unobserved deadline or exhausted delivery is outcome uncertainty instead:
+`status=conflict`, `resultCode=VOICE_CONTROL_CONFLICT`,
+`providerStateObserved=false`, and `causalityProven=false`. The room alarm
+enforces the matching lease-aware ten-minute deadline from command creation or
+attempt start, so neither Queue/DLQ failure nor a missing observation leaves an
+eternal command. Any later Queue duplicate observes terminal or
+`pending_observation` state and is a no-op. Uncertain Queue send is logged
+without identifiers and rethrown, keeping Cloudflare's native alarm retry in
+addition to the pre-armed 30-second recovery wake-up.
 
 The asynchronous executor must freshly recheck actor authority and target
-membership through a server-to-server Senti path before provider mutation. It
-must not persist or replay the caller's bearer. Provider operations are
-set-to-desired-state transitions rather than toggles. Where the provider does
-not accept an idempotency key, a retry must observe the provider state before
-reapplying. An expired execution lease never authorizes a stale worker to
-finalize over a newer fence.
+membership through a server-to-server Senti path after acquiring its Queue
+lease and immediately before provider I/O. It must not persist or replay the
+caller's bearer. Authorization unavailable, denied, or expired fails closed;
+in particular, authority revoked between intake and execution produces zero
+provider calls. Provider operations are set-to-desired-state transitions
+rather than toggles. A retry reuses one durable attempt identity and the exact
+pinned peer generation. An expired or replaced execution fence never
+authorizes a stale worker to call or finalize over a newer fence.
 
-Provider success is not a confirmation receipt. The intended result remains
-`pending_confirmation` until authoritative provider observation matches it.
-Past a bounded window, the reconciler retries or records
-`VOICE_CONTROL_CONFLICT`; it never silently upgrades an unconfirmed command to
-success. A signed Senti receipt is projected only after provider confirmation.
+Provider acceptance is not a confirmation receipt. The three independent truth
+fields are `providerRequestAccepted`, `providerStateObserved`, and
+`causalityProven`; this RealtimeKit kernel can never set the last field true.
+After an accepted remove request, the command remains `pending_observation`
+until an authoritative exact-peer event matches it. Its only positive terminal
+is `desired_state_observed`; neither the state nor result vocabulary says
+"confirmed." Past the bounded window, the reconciler records
+`VOICE_CONTROL_CONFLICT`; it never silently upgrades an unobserved command to
+success. A later signed Senti receipt must preserve this truth ceiling.
 Audience delivery uses RealtimeKit's own participant channel and/or a cached,
 coalesced `afterRevision` pull. The Durable Object may notify only the bounded
 stage set (operational default at most eight publishers); it never loops over
@@ -220,7 +231,7 @@ The gap is action-specific:
 
 | Action | Available observation | Honest gate |
 |---|---|---|
-| `remove` | Backend kick plus signed `meeting.participantLeft` for the bound participant | May prove `kick-issued/leave-observed` in a bounded window. The documented webhook has no causal leave reason, so it cannot be labeled `kick-confirmed` without stronger provider evidence. |
+| `remove` | Signed `meeting.participantLeft` for the exact meeting, provider session, participant key, and peer generation, after attempt start | Proves only `desired_state_observed` / `REMOVE_LEAVE_OBSERVED`; causality remains false. |
 | `promote` / `demote` | Session participant detail includes `preset_name` | Conditionally confirmable only if the implementation mutates the participant preset and a live capability probe proves readback changes to the expected preset. Stage `grantAccess`/`leave` alone is a separate state and does not qualify. |
 | `mute` | Unsigned SDK `audioUpdate` only | Blocked: no signed webhook or backend live-audio readback. |
 | `deny_publish` / `allow_publish` | No reviewed authoritative live publish-state observation | Blocked until an authoritative provider surface or different provider adapter exists. |
@@ -231,6 +242,29 @@ and connection-only peer events (`PEER_CREATED`, `PEER_JOINING`,
 still uses the unavailable zero-I/O executor. A future action becomes live only
 after its own mutation and confirmation adapter passes fault, causality, and
 replay tests; one confirmable action does not waive another action's gate.
+
+RealtimeKit's signed join/left payloads distinguish the stable
+`customParticipantId` from the connection-specific `peerId`. The room ledger
+therefore maintains one ordered active peer generation per opaque participant
+key. Stale joins cannot replace a newer generation; an old peer's leave cannot
+clear the replacement; and a leave predating `attemptStartedAt` cannot satisfy
+the command. At most one nonterminal remove exists for one exact
+`(providerSessionId, peerId)` pair, while terminal history does not block a
+later rejoin with a new peer ID. The local coordinator retains at most four
+inactive, unreferenced peer generations per participant plus active generations
+and peers still pinned by nonterminal removes. This bounds reconnect churn
+without allowing an evicted stale join to become current; late usage outside
+that diagnostic history remains an estimate, never billing truth.
+
+Execution is intentionally stricter than RealtimeKit can currently provide.
+The reviewed backend kick API targets permanent participant/custom IDs, not a
+connection-specific peer ID. A preflight can compare the live peer with the
+pinned peer, but the bound peer can leave and a replacement can rejoin under
+the same custom ID between that read and the kick. That preflight-to-kick
+TOCTOU window can target the replacement. No production RealtimeKit remove
+adapter is eligible until a peer-exact mutation primitive is proven or this
+residual receives a separate explicit risk decision and review. This atom does
+neither; its production provider port remains unavailable.
 
 Finalized unsupported command identities are currently retained for eight
 days as a bounded local proof. Applied results require an explicit production
@@ -618,7 +652,7 @@ signature, wrong-session, replay, offline-honesty, or receipt guarantees.
 | Active speaker | Web and mobile active-speaker APIs/events | Supported |
 | iOS routes | iOS Core release notes cover available-device updates, device selection, earpiece/speaker and Bluetooth fixes | Supported; physical-device receipt required |
 | Signed webhooks | Raw body RSA-SHA256 in `rtk-signature`; `rtk-uuid` delivery identity; published public key endpoint | Supported for the documented event catalog |
-| Remove observation | Backend kick plus signed `meeting.participantLeft` | Conditionally supports `kick-issued/leave-observed`; causal `kick-confirmed` is not proven |
+| Remove observation | Signed `meeting.participantLeft` includes provider session, stable custom ID, and connection-specific peer ID | Exact peer absence is observable; kick causality is not |
 | Role/preset readback | Session participant detail returns `preset_name` | Conditional on proving live preset mutation/readback; stage access alone is different state |
 | Audio/publish confirmation | No documented mute/publish webhook or backend live-state readback | Blocking gap for mute/deny/allow |
 | Post-meeting transcript | Speaker-separated transcript, `meeting.transcript` webhook/REST, seven-day availability | Supported but not durable |
@@ -672,7 +706,8 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 | RealtimeKit selected for the spike | Decided |
 | Provider-neutral room/event/error/entitlement contract | Versioned and validation-tested |
 | RealtimeKit adapter/control-plane slice | Draft PR #122 is hosted-Omar green on exact reviewed head; not merged or deployed; no account/resources |
-| Durable moderation ledger/outbox | Built locally with atomic alarm+intent+outbox, bounded Queue drain, leases, DLQ/watchdog terminalization, and unavailable zero-I/O executor; live execution/confirmation remains blocked |
+| Durable moderation ledger/outbox | Built locally with atomic alarm+intent+outbox, bounded Queue drain, leases, DLQ/watchdog terminalization, and unavailable zero-I/O executor |
+| REMOVE execution/observation kernel | Built locally behind unavailable production composition: fresh-auth port, signed peer-generation fence, stable attempt retry, exact leave observation, conflict timeout, and three-field truth; live RealtimeKit execution remains blocked by missing authority adapter and non-peer-exact kick TOCTOU |
 | Worker checks | Generated types, strict TypeScript, workerd hostile tests, and Wrangler dry-run required at every handoff |
 | iOS `VoiceMediaTransport` and RealtimeKit 3.1 adapter | arm64 iOS Simulator build and 65/65 macOS tests independently green; physical-device review pending |
 | Server-bound remote iOS roster/stage identity | Not built; the SDK adapter fails closed instead of treating provider correlation IDs as Senti principals |

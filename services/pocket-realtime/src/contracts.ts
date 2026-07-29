@@ -127,9 +127,30 @@ export interface ModerationCommandRecord {
   action: VoiceModerationAction;
   targetPrincipalId: string;
   controlRevision: number;
-  status: "pending" | "unsupported";
-  providerMutationApplied: false;
-  resultCode: "executor_unavailable" | "queue_delivery_exhausted" | null;
+  status:
+    | "pending"
+    | "executing"
+    | "pending_observation"
+    | "desired_state_observed"
+    | "conflict"
+    | "unsupported";
+  providerRequestAccepted: boolean;
+  providerStateObserved: boolean;
+  causalityProven: false;
+  /**
+   * Legacy negative-result field. It remains present and false for records
+   * that never entered the remove kernel. Positive observation records omit
+   * it because an observed end state does not prove that a provider request
+   * caused that state.
+   */
+  providerMutationApplied?: false;
+  resultCode:
+    | "executor_unavailable"
+    | "queue_delivery_exhausted"
+    | "REMOVE_LEAVE_OBSERVED"
+    | "REMOVE_ALREADY_ABSENT_OBSERVED"
+    | "VOICE_CONTROL_CONFLICT"
+    | null;
   createdAt: string;
   finalizedAt: string | null;
 }
@@ -152,6 +173,8 @@ export interface WebhookEventSummary {
   digest: string;
   eventName: string;
   providerMeetingId: string;
+  providerSessionId: string | null;
+  peerId: string | null;
   customParticipantId: string | null;
   participantJoinedAt: string | null;
   participantLeftAt: string | null;

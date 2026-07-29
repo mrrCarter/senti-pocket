@@ -94,3 +94,21 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
   delay, per-room capacity, and backpressure are deterministic correctness
   bounds; they do not become a 5k/10k provider or latency receipt without a
   controlled load run.
+- Stable participant identity is not connection identity. RealtimeKit reuses
+  `customParticipantId` across rejoins while `peerId` changes, so a REMOVE must
+  pin the signed provider session plus peer generation. Protect both directions
+  of event ordering: a stale join cannot replace a newer peer, and a duplicate
+  old join cannot resurrect a peer after it closed.
+- Separate provider request acceptance, observed end state, and causality.
+  A signed exact-peer leave proves absence, not that a preceding kick caused
+  it. Use `desired_state_observed` and keep `causalityProven=false`; never hide
+  that uncertainty behind "confirmed" or an overloaded applied boolean.
+- Desired-state preflight does not create peer-exact mutation. If the provider
+  kick accepts only a stable participant/custom ID, a leave-and-rejoin between
+  preflight and kick can target the replacement. Keep the production adapter
+  unavailable until a peer-exact primitive exists or the residual receives an
+  explicit, separately reviewed risk decision.
+- Crash retry must reacquire an `executing` command, not only a `pending`
+  command. Persist one attempt identity before provider I/O, allow the same
+  attempt to reacquire a fresh fence, and reject every stale fence before
+  provider I/O.

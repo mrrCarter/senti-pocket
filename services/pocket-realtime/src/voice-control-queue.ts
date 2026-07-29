@@ -40,12 +40,15 @@ export async function handleVoiceControlQueue(
       );
       if (
         reservation.disposition === "invalid" ||
-        reservation.disposition === "terminal"
+        reservation.disposition === "terminal" ||
+        reservation.disposition === "waiting_observation"
       ) {
         logQueueDecision(
           reservation.disposition === "invalid"
             ? "voice_control_queue_unknown_command_acknowledged"
-            : "voice_control_queue_duplicate_acknowledged",
+            : reservation.disposition === "waiting_observation"
+              ? "voice_control_queue_observation_pending_acknowledged"
+              : "voice_control_queue_duplicate_acknowledged",
           message,
         );
         message.ack();

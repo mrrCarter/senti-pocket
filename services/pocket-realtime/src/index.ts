@@ -396,7 +396,8 @@ async function moderateRoom(
   }
   if (
     reservation.disposition === "revision_conflict" ||
-    reservation.disposition === "idempotency_conflict"
+    reservation.disposition === "idempotency_conflict" ||
+    reservation.disposition === "target_busy"
   ) {
     return errorResponse(
       new HttpError(
@@ -404,7 +405,9 @@ async function moderateRoom(
         reservation.disposition,
         reservation.disposition === "revision_conflict"
           ? "The voice room control revision is stale."
-          : "The command identity was reused with different content or ownership.",
+          : reservation.disposition === "target_busy"
+            ? "A remove command already controls this exact live peer."
+            : "The command identity was reused with different content or ownership.",
       ),
       traceId,
       input.requestId,

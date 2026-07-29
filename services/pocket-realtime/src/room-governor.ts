@@ -25,6 +25,7 @@ const OUTBOX_RECOVERY_MS = 30_000;
 const COMMAND_TERMINAL_DEADLINE_MS = 10 * 60 * 1_000;
 const DELIVERY_RETENTION_MS = 8 * 24 * 60 * 60 * 1_000;
 const MAX_DELIVERIES = 2_048;
+const MAX_INACTIVE_PEERS_PER_PARTICIPANT = 4;
 
 export type ProvisionReservation =
   | { disposition: "acquired"; fence: string }
@@ -88,6 +89,7 @@ export type ModerationReservation =
   | { disposition: "idempotency_conflict"; currentRevision: number }
   | { disposition: "not_authorized"; currentRevision: number }
   | { disposition: "target_not_found"; currentRevision: number }
+  | { disposition: "target_busy"; currentRevision: number }
   | { disposition: "room_not_ready"; currentRevision: number }
   | { disposition: "identity_mismatch"; currentRevision: number }
   | { disposition: "over_budget"; currentRevision: number }
@@ -99,16 +101,33 @@ export type ModerationExecutionReservation =
       fence: string;
       room: RoomRecord;
       command: ModerationCommandRecord;
+      actorPrincipalId: string;
+      targetParticipantKey: string;
       targetProviderParticipantId: string;
+      targetProviderSessionId: string | null;
+      targetPeerId: string | null;
     }
   | {
       disposition: "terminal";
+      command: ModerationCommandRecord;
+    }
+  | {
+      disposition: "waiting_observation";
       command: ModerationCommandRecord;
     }
   | { disposition: "busy" }
   | { disposition: "not_authorized" }
   | { disposition: "target_not_found" }
   | { disposition: "invalid" };
+
+export type RemoveAttemptReservation =
+  | {
+      disposition: "ready";
+      attemptId: string;
+      startedAt: string;
+    }
+  | { disposition: "invalid" }
+  | { disposition: "authorization_expired" };
 
 export type UsageResult =
   | { disposition: "ok"; room: RoomRecord; usage: RoomUsageSnapshot }
@@ -153,15 +172,31 @@ interface ModerationCommandRow {
   target_principal_id: string;
   target_participant_key: string;
   provider_participant_id: string;
+  target_provider_session_id: string | null;
+  target_peer_id: string | null;
   action: VoiceModerationAction;
   expected_revision: number;
   result_revision: number;
-  state: "pending" | "unsupported";
+  state:
+    | "pending"
+    | "executing"
+    | "pending_observation"
+    | "desired_state_observed"
+    | "conflict"
+    | "unsupported";
   execution_fence: string | null;
   execution_lease_until: number | null;
+  execution_attempt_id: string | null;
+  attempt_started_at: string | null;
+  provider_request_accepted: 0 | 1;
+  provider_state_observed: 0 | 1;
+  causality_proven: 0;
   result_code:
     | "executor_unavailable"
     | "queue_delivery_exhausted"
+    | "REMOVE_LEAVE_OBSERVED"
+    | "REMOVE_ALREADY_ABSENT_OBSERVED"
+    | "VOICE_CONTROL_CONFLICT"
     | null;
   provider_mutation_applied: 0;
   created_at: string;
@@ -188,7 +223,21 @@ interface ModerationOutboxRow {
 interface PendingCommandDeadlineRow {
   [key: string]: SqlStorageValue;
   created_at: string;
+  attempt_started_at: string | null;
+  state: ModerationCommandRow["state"];
   execution_lease_until: number | null;
+}
+
+interface ParticipantPeerRow {
+  [key: string]: SqlStorageValue;
+  provider_session_id: string;
+  peer_id: string;
+  participant_key: string;
+  joined_at: string;
+  left_at: string | null;
+  active: 0 | 1;
+  usage_counted: 0 | 1;
+  updated_at: string;
 }
 
 export class RoomGovernor extends DurableObject<RuntimeEnv> {
@@ -237,6 +286,24 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
           accumulated_ms INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS participant_peers (
+          provider_session_id TEXT NOT NULL,
+          peer_id TEXT NOT NULL,
+          participant_key TEXT NOT NULL,
+          joined_at TEXT NOT NULL,
+          left_at TEXT,
+          active INTEGER NOT NULL DEFAULT 1,
+          usage_counted INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (provider_session_id, peer_id),
+          CHECK (active IN (0, 1)),
+          CHECK (usage_counted IN (0, 1))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS participant_peers_one_active
+          ON participant_peers(participant_key)
+          WHERE active = 1;
+        CREATE INDEX IF NOT EXISTS participant_peers_by_participant
+          ON participant_peers(participant_key, active, joined_at);
         CREATE TABLE IF NOT EXISTS daily_usage (
           usage_day TEXT PRIMARY KEY,
           control_requests INTEGER NOT NULL DEFAULT 0,
@@ -259,21 +326,80 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
           target_principal_id TEXT NOT NULL,
           target_participant_key TEXT NOT NULL,
           provider_participant_id TEXT NOT NULL,
+          target_provider_session_id TEXT,
+          target_peer_id TEXT,
           action TEXT NOT NULL,
           expected_revision INTEGER NOT NULL,
           result_revision INTEGER NOT NULL,
           state TEXT NOT NULL,
           execution_fence TEXT,
           execution_lease_until INTEGER,
+          execution_attempt_id TEXT,
+          attempt_started_at TEXT,
+          provider_request_accepted INTEGER NOT NULL DEFAULT 0,
+          provider_state_observed INTEGER NOT NULL DEFAULT 0,
+          causality_proven INTEGER NOT NULL DEFAULT 0,
           result_code TEXT,
           provider_mutation_applied INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           finalized_at TEXT,
-          CHECK (state IN ('pending', 'unsupported')),
-          CHECK (provider_mutation_applied = 0)
+          CHECK (state IN (
+            'pending', 'executing', 'pending_observation',
+            'desired_state_observed', 'conflict', 'unsupported'
+          )),
+          CHECK (provider_request_accepted IN (0, 1)),
+          CHECK (provider_state_observed IN (0, 1)),
+          CHECK (causality_proven = 0),
+          CHECK (provider_mutation_applied = 0),
+          CHECK (
+            (state = 'desired_state_observed' AND provider_state_observed = 1)
+            OR
+            (state != 'desired_state_observed' AND provider_state_observed = 0)
+          ),
+          CHECK (
+            provider_request_accepted = 0 OR action = 'remove'
+          ),
+          CHECK (
+            state NOT IN ('executing', 'pending_observation', 'desired_state_observed')
+            OR action = 'remove'
+          ),
+          CHECK (
+            (state IN ('pending', 'executing', 'pending_observation')
+              AND result_code IS NULL)
+            OR
+            (state = 'desired_state_observed'
+              AND result_code IN (
+                'REMOVE_LEAVE_OBSERVED',
+                'REMOVE_ALREADY_ABSENT_OBSERVED'
+              ))
+            OR
+            (state = 'conflict' AND result_code = 'VOICE_CONTROL_CONFLICT')
+            OR
+            (state = 'unsupported'
+              AND result_code IN (
+                'executor_unavailable',
+                'queue_delivery_exhausted'
+              ))
+          ),
+          CHECK (
+            action != 'remove'
+            OR target_peer_id IS NULL
+            OR target_provider_session_id IS NOT NULL
+          )
         );
         CREATE INDEX IF NOT EXISTS moderation_commands_finalized_at
           ON moderation_commands(finalized_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS moderation_commands_active_remove_peer
+          ON moderation_commands(target_provider_session_id, target_peer_id)
+          WHERE action = 'remove'
+            AND target_peer_id IS NOT NULL
+            AND state IN ('pending', 'executing', 'pending_observation');
+        CREATE INDEX IF NOT EXISTS moderation_commands_remove_observation
+          ON moderation_commands(
+            target_provider_session_id, target_peer_id,
+            target_participant_key, state, attempt_started_at
+          )
+          WHERE action = 'remove';
         CREATE TABLE IF NOT EXISTS moderation_outbox (
           command_id TEXT PRIMARY KEY,
           room_id TEXT NOT NULL,
@@ -295,7 +421,8 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
                'pending', 0, NULL, NULL
         FROM moderation_commands AS commands
         CROSS JOIN room
-        WHERE room.singleton = 1 AND commands.state = 'pending';
+        WHERE room.singleton = 1
+          AND commands.state IN ('pending', 'executing');
       `);
       if (this.pendingCommandCount() > 0) {
         const alarm = await this.ctx.storage.getAlarm();
@@ -586,7 +713,7 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         ) {
           return { disposition: "idempotency_conflict", currentRevision };
         }
-        if (command.state === "unsupported") {
+        if (isTerminalModerationState(command.state)) {
           return {
             disposition: "replay",
             command: toModerationCommandRecord(command),
@@ -648,6 +775,22 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       ) {
         return { disposition: "target_not_found", currentRevision };
       }
+      const targetPeer =
+        input.action === "remove"
+          ? this.activePeerByParticipant(target.participant_key)
+          : null;
+      if (input.action === "remove" && !targetPeer) {
+        return { disposition: "target_not_found", currentRevision };
+      }
+      if (
+        targetPeer &&
+        this.hasNonterminalRemoveForPeer(
+          targetPeer.provider_session_id,
+          targetPeer.peer_id,
+        )
+      ) {
+        return { disposition: "target_busy", currentRevision };
+      }
       this.pruneCommands(input.now);
       if (this.commandCount() >= MAX_COMMANDS) {
         return { disposition: "command_capacity", currentRevision };
@@ -664,10 +807,17 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         `INSERT INTO moderation_commands (
            command_id, idempotency_hash, payload_hash, actor_principal_id,
            target_principal_id, target_participant_key,
-           provider_participant_id, action, expected_revision,
+           provider_participant_id, target_provider_session_id, target_peer_id,
+           action, expected_revision,
            result_revision, state, execution_fence, execution_lease_until,
-           result_code, provider_mutation_applied, created_at, finalized_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, ?, NULL)`,
+           execution_attempt_id, attempt_started_at,
+           provider_request_accepted, provider_state_observed,
+           causality_proven, result_code, provider_mutation_applied,
+           created_at, finalized_at
+         ) VALUES (
+           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+           'pending', NULL, NULL, NULL, NULL, 0, 0, 0, NULL, 0, ?, NULL
+         )`,
         input.commandId,
         input.idempotencyHash,
         input.payloadHash,
@@ -675,6 +825,8 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         input.targetPrincipalId,
         target.participant_key,
         target.provider_participant_id,
+        targetPeer?.provider_session_id ?? null,
+        targetPeer?.peer_id ?? null,
         input.action,
         input.expectedRevision,
         resultRevision,
@@ -722,9 +874,15 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       ) {
         return { disposition: "invalid" };
       }
-      if (command.state === "unsupported") {
+      if (isTerminalModerationState(command.state)) {
         return {
           disposition: "terminal",
+          command: toModerationCommandRecord(command),
+        };
+      }
+      if (command.state === "pending_observation") {
+        return {
+          disposition: "waiting_observation",
           command: toModerationCommandRecord(command),
         };
       }
@@ -761,7 +919,7 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       this.ctx.storage.sql.exec(
         `UPDATE moderation_commands
          SET execution_fence = ?, execution_lease_until = ?
-         WHERE command_id = ? AND state = 'pending'`,
+         WHERE command_id = ? AND state IN ('pending', 'executing')`,
         fence,
         nowMs + COMMAND_LEASE_MS,
         command.command_id,
@@ -772,8 +930,223 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         fence,
         room: toRoomRecord(room),
         command: toModerationCommandRecord(acquired),
+        actorPrincipalId: acquired.actor_principal_id,
+        targetParticipantKey: acquired.target_participant_key,
         targetProviderParticipantId: acquired.provider_participant_id,
+        targetProviderSessionId: acquired.target_provider_session_id,
+        targetPeerId: acquired.target_peer_id,
       };
+    });
+  }
+
+  beginRemoveAttempt(
+    commandId: string,
+    fence: string,
+    authorizationValidUntil: string,
+    now: string,
+  ): RemoveAttemptReservation {
+    return this.ctx.storage.transactionSync(() => {
+      const command = this.moderationCommandRowOrNull(commandId);
+      const nowMs = Date.parse(now);
+      const authorizationExpiryMs = Date.parse(authorizationValidUntil);
+      if (
+        !command ||
+        command.action !== "remove" ||
+        (command.state !== "pending" && command.state !== "executing") ||
+        command.execution_fence !== fence ||
+        !command.target_provider_session_id ||
+        !command.target_peer_id
+      ) {
+        return { disposition: "invalid" };
+      }
+      if (
+        !Number.isFinite(nowMs) ||
+        !Number.isFinite(authorizationExpiryMs) ||
+        authorizationExpiryMs <= nowMs
+      ) {
+        return { disposition: "authorization_expired" };
+      }
+      const attemptId = command.execution_attempt_id ?? crypto.randomUUID();
+      const startedAt = command.attempt_started_at ?? now;
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET state = 'executing', execution_attempt_id = ?,
+             attempt_started_at = ?
+         WHERE command_id = ? AND execution_fence = ?
+           AND state IN ('pending', 'executing')`,
+        attemptId,
+        startedAt,
+        commandId,
+        fence,
+      );
+      return { disposition: "ready", attemptId, startedAt };
+    });
+  }
+
+  markRemovePendingObservation(
+    commandId: string,
+    fence: string,
+    attemptId: string,
+    now: string,
+  ): ModerationCommandRecord | null {
+    return this.ctx.storage.transactionSync(() => {
+      const command = this.moderationCommandRowOrNull(commandId);
+      if (
+        command?.action === "remove" &&
+        command.execution_attempt_id === attemptId &&
+        isTerminalModerationState(command.state)
+      ) {
+        return toModerationCommandRecord(command);
+      }
+      if (
+        !command ||
+        command.action !== "remove" ||
+        command.state !== "executing" ||
+        command.execution_fence !== fence ||
+        command.execution_attempt_id !== attemptId
+      ) {
+        return null;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET state = 'pending_observation',
+             provider_request_accepted = 1,
+             execution_fence = NULL, execution_lease_until = NULL
+         WHERE command_id = ? AND state = 'executing'
+           AND execution_fence = ? AND execution_attempt_id = ?`,
+        commandId,
+        fence,
+        attemptId,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_outbox
+         SET state = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?)
+         WHERE command_id = ?`,
+        now,
+        commandId,
+      );
+      return toModerationCommandRecord(
+        this.moderationCommandRow(commandId),
+      );
+    });
+  }
+
+  finalizeRemoveDesiredStateObserved(
+    commandId: string,
+    fence: string,
+    attemptId: string,
+    resultCode:
+      | "REMOVE_LEAVE_OBSERVED"
+      | "REMOVE_ALREADY_ABSENT_OBSERVED",
+    providerRequestAccepted: boolean,
+    now: string,
+  ): ModerationCommandRecord | null {
+    return this.ctx.storage.transactionSync(() => {
+      const command = this.moderationCommandRowOrNull(commandId);
+      if (
+        command?.action === "remove" &&
+        command.execution_attempt_id === attemptId &&
+        isTerminalModerationState(command.state)
+      ) {
+        return toModerationCommandRecord(command);
+      }
+      if (
+        !command ||
+        command.action !== "remove" ||
+        command.state !== "executing" ||
+        command.execution_fence !== fence ||
+        command.execution_attempt_id !== attemptId
+      ) {
+        return null;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET state = 'desired_state_observed',
+             provider_request_accepted = ?, provider_state_observed = 1,
+             causality_proven = 0, result_code = ?,
+             execution_fence = NULL, execution_lease_until = NULL,
+             finalized_at = ?
+         WHERE command_id = ? AND state = 'executing'
+           AND execution_fence = ? AND execution_attempt_id = ?`,
+        providerRequestAccepted ? 1 : 0,
+        resultCode,
+        now,
+        commandId,
+        fence,
+        attemptId,
+      );
+      this.markOutboxTerminal(commandId, now);
+      return toModerationCommandRecord(
+        this.moderationCommandRow(commandId),
+      );
+    });
+  }
+
+  finalizeRemoveConflict(
+    commandId: string,
+    fence: string,
+    attemptId: string | null,
+    now: string,
+  ): ModerationCommandRecord | null {
+    return this.ctx.storage.transactionSync(() => {
+      const command = this.moderationCommandRowOrNull(commandId);
+      if (
+        command?.action === "remove" &&
+        (attemptId === null ||
+          command.execution_attempt_id === attemptId) &&
+        isTerminalModerationState(command.state)
+      ) {
+        return toModerationCommandRecord(command);
+      }
+      if (
+        !command ||
+        command.action !== "remove" ||
+        (command.state !== "pending" && command.state !== "executing") ||
+        command.execution_fence !== fence ||
+        (attemptId !== null && command.execution_attempt_id !== attemptId)
+      ) {
+        return null;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET state = 'conflict', provider_state_observed = 0,
+             causality_proven = 0, result_code = 'VOICE_CONTROL_CONFLICT',
+             execution_fence = NULL, execution_lease_until = NULL,
+             finalized_at = ?
+         WHERE command_id = ? AND execution_fence = ?
+           AND state IN ('pending', 'executing')`,
+        now,
+        commandId,
+        fence,
+      );
+      this.markOutboxTerminal(commandId, now);
+      return toModerationCommandRecord(
+        this.moderationCommandRow(commandId),
+      );
+    });
+  }
+
+  releaseModerationExecution(
+    commandId: string,
+    fence: string,
+  ): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const command = this.moderationCommandRowOrNull(commandId);
+      if (
+        !command ||
+        isTerminalModerationState(command.state) ||
+        command.execution_fence !== fence
+      ) {
+        return false;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET execution_fence = NULL, execution_lease_until = NULL
+         WHERE command_id = ? AND execution_fence = ?`,
+        commandId,
+        fence,
+      );
+      return true;
     });
   }
 
@@ -829,7 +1202,7 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       ) {
         return null;
       }
-      if (command.state === "unsupported") {
+      if (isTerminalModerationState(command.state)) {
         return toModerationCommandRecord(command);
       }
       const nowMs = Date.parse(now);
@@ -839,20 +1212,38 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       ) {
         return null;
       }
-      this.ctx.storage.sql.exec(
-        `UPDATE moderation_commands
-         SET state = 'unsupported', execution_fence = NULL,
-             execution_lease_until = NULL,
-             result_code = 'queue_delivery_exhausted',
-             provider_mutation_applied = 0, finalized_at = ?
-         WHERE command_id = ? AND state = 'pending'
-           AND (
-             execution_lease_until IS NULL OR execution_lease_until <= ?
-           )`,
-        now,
-        envelope.commandId,
-        nowMs,
-      );
+      if (command.state === "pending") {
+        this.ctx.storage.sql.exec(
+          `UPDATE moderation_commands
+           SET state = 'unsupported', execution_fence = NULL,
+               execution_lease_until = NULL,
+               result_code = 'queue_delivery_exhausted',
+               provider_mutation_applied = 0, finalized_at = ?
+           WHERE command_id = ? AND state = 'pending'
+             AND (
+               execution_lease_until IS NULL OR execution_lease_until <= ?
+             )`,
+          now,
+          envelope.commandId,
+          nowMs,
+        );
+      } else {
+        this.ctx.storage.sql.exec(
+          `UPDATE moderation_commands
+           SET state = 'conflict', execution_fence = NULL,
+               execution_lease_until = NULL,
+               provider_state_observed = 0, causality_proven = 0,
+               result_code = 'VOICE_CONTROL_CONFLICT', finalized_at = ?
+           WHERE command_id = ?
+             AND state IN ('executing', 'pending_observation')
+             AND (
+               execution_lease_until IS NULL OR execution_lease_until <= ?
+             )`,
+          now,
+          envelope.commandId,
+          nowMs,
+        );
+      }
       this.ctx.storage.sql.exec(
         `UPDATE moderation_outbox
          SET state = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?)
@@ -876,9 +1267,8 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
     if (reconciled > 0) {
       console.warn(
         JSON.stringify({
-          event: "voice_control_pending_commands_terminalized",
+          event: "voice_control_deadline_commands_terminalized",
           commandCount: reconciled,
-          resultCode: "queue_delivery_exhausted",
         }),
       );
     }
@@ -1040,7 +1430,8 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       .one();
     const pendingCommands = this.ctx.storage.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM moderation_commands WHERE state = 'pending'",
+        `SELECT COUNT(*) AS count FROM moderation_commands
+         WHERE state IN ('pending', 'executing', 'pending_observation')`,
       )
       .one();
     const pendingOutbox = this.ctx.storage.sql
@@ -1086,6 +1477,30 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       }));
   }
 
+  debugPeerSnapshot(): Array<{
+    providerSessionId: string;
+    peerId: string;
+    participantKey: string;
+    joinedAt: string;
+    leftAt: string | null;
+    active: boolean;
+  }> {
+    return this.ctx.storage.sql
+      .exec<ParticipantPeerRow>(
+        `SELECT * FROM participant_peers
+         ORDER BY participant_key, joined_at, peer_id`,
+      )
+      .toArray()
+      .map((row) => ({
+        providerSessionId: row.provider_session_id,
+        peerId: row.peer_id,
+        participantKey: row.participant_key,
+        joinedAt: row.joined_at,
+        leftAt: row.left_at,
+        active: row.active === 1,
+      }));
+  }
+
   private applyEvent(event: WebhookEventSummary, now: string): void {
     if (event.eventName === "meeting.ended") {
       this.ctx.storage.sql.exec(
@@ -1096,43 +1511,231 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
     }
     if (!event.customParticipantId) return;
     if (event.eventName === "meeting.participantJoined" && event.participantJoinedAt) {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO participants (participant_key, joined_at, accumulated_ms, updated_at)
-         VALUES (?, ?, 0, ?)
-         ON CONFLICT(participant_key) DO UPDATE SET
-           joined_at = excluded.joined_at,
-           updated_at = excluded.updated_at`,
-        event.customParticipantId,
-        event.participantJoinedAt,
-        now,
-      );
+      this.recordPeerJoined(event, now);
+      this.prunePeerHistory(event.customParticipantId);
     }
     if (event.eventName === "meeting.participantLeft" && event.participantLeftAt) {
-      const row = this.ctx.storage.sql
-        .exec<{ joined_at: string | null }>(
-          "SELECT joined_at FROM participants WHERE participant_key = ?",
-          event.customParticipantId,
-        )
-        .toArray()[0];
-      const joinedMs = row?.joined_at ? Date.parse(row.joined_at) : Number.NaN;
-      const leftMs = Date.parse(event.participantLeftAt);
-      const durationMs =
-        Number.isFinite(joinedMs) && Number.isFinite(leftMs)
-          ? Math.max(0, Math.min(24 * 60 * 60 * 1_000, leftMs - joinedMs))
-          : 0;
+      this.recordPeerLeft(event, now);
+      this.prunePeerHistory(event.customParticipantId);
+    }
+  }
+
+  private recordPeerJoined(
+    event: WebhookEventSummary,
+    now: string,
+  ): void {
+    if (
+      !event.customParticipantId ||
+      !event.providerSessionId ||
+      !event.peerId ||
+      !event.participantJoinedAt
+    ) {
+      return;
+    }
+    const joinedMs = Date.parse(event.participantJoinedAt);
+    if (!Number.isFinite(joinedMs)) return;
+
+    const existing = this.peerRow(event.providerSessionId, event.peerId);
+    // A provider-session peer is an immutable connection identity. Duplicate
+    // joins cannot rebind it to another participant or resurrect it after it
+    // was made historical by a leave or a newer peer generation.
+    if (existing) return;
+
+    const active = this.activePeerByParticipant(event.customParticipantId);
+    if (active) {
+      const activeJoinedMs = Date.parse(active.joined_at);
+      const samePeer =
+        active.provider_session_id === event.providerSessionId &&
+        active.peer_id === event.peerId;
+      if (samePeer) return;
+      if (
+        !Number.isFinite(activeJoinedMs) ||
+        joinedMs <= activeJoinedMs
+      ) {
+        this.upsertInactivePeer(event, now);
+        return;
+      }
       this.ctx.storage.sql.exec(
-        `INSERT INTO participants (participant_key, joined_at, accumulated_ms, updated_at)
-         VALUES (?, NULL, ?, ?)
-         ON CONFLICT(participant_key) DO UPDATE SET
-           joined_at = NULL,
-           accumulated_ms = accumulated_ms + excluded.accumulated_ms,
-           updated_at = excluded.updated_at`,
+        `UPDATE participant_peers
+         SET active = 0, updated_at = ?
+         WHERE provider_session_id = ? AND peer_id = ? AND active = 1`,
+        now,
+        active.provider_session_id,
+        active.peer_id,
+      );
+    } else {
+      const latest = this.latestPeerByParticipant(
         event.customParticipantId,
+      );
+      const latestJoinedMs = latest ? Date.parse(latest.joined_at) : NaN;
+      if (
+        latest &&
+        (!Number.isFinite(latestJoinedMs) || joinedMs <= latestJoinedMs)
+      ) {
+        this.upsertInactivePeer(event, now);
+        return;
+      }
+    }
+
+    this.ctx.storage.sql.exec(
+      `INSERT INTO participant_peers (
+         provider_session_id, peer_id, participant_key, joined_at,
+         left_at, active, usage_counted, updated_at
+       ) VALUES (?, ?, ?, ?, NULL, 1, 0, ?)
+       ON CONFLICT(provider_session_id, peer_id) DO NOTHING`,
+      event.providerSessionId,
+      event.peerId,
+      event.customParticipantId,
+      event.participantJoinedAt,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO participants (
+         participant_key, joined_at, accumulated_ms, updated_at
+       ) VALUES (?, ?, 0, ?)
+       ON CONFLICT(participant_key) DO UPDATE SET
+         joined_at = excluded.joined_at, updated_at = excluded.updated_at`,
+      event.customParticipantId,
+      event.participantJoinedAt,
+      now,
+    );
+  }
+
+  private upsertInactivePeer(
+    event: WebhookEventSummary,
+    now: string,
+  ): void {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO participant_peers (
+         provider_session_id, peer_id, participant_key, joined_at,
+         left_at, active, usage_counted, updated_at
+       ) VALUES (?, ?, ?, ?, NULL, 0, 0, ?)
+       ON CONFLICT(provider_session_id, peer_id) DO NOTHING`,
+      event.providerSessionId!,
+      event.peerId!,
+      event.customParticipantId!,
+      event.participantJoinedAt!,
+      now,
+    );
+  }
+
+  private recordPeerLeft(
+    event: WebhookEventSummary,
+    now: string,
+  ): void {
+    if (
+      !event.customParticipantId ||
+      !event.providerSessionId ||
+      !event.peerId ||
+      !event.participantLeftAt
+    ) {
+      return;
+    }
+    const peer = this.peerRow(event.providerSessionId, event.peerId);
+    if (
+      !peer ||
+      peer.participant_key !== event.customParticipantId ||
+      peer.left_at !== null
+    ) {
+      return;
+    }
+    const joinedMs = Date.parse(peer.joined_at);
+    const leftMs = Date.parse(event.participantLeftAt);
+    if (
+      !Number.isFinite(joinedMs) ||
+      !Number.isFinite(leftMs) ||
+      leftMs < joinedMs
+    ) {
+      return;
+    }
+    const durationMs = Math.max(
+      0,
+      Math.min(24 * 60 * 60 * 1_000, leftMs - joinedMs),
+    );
+    const countUsage = peer.usage_counted === 0;
+    this.ctx.storage.sql.exec(
+      `UPDATE participant_peers
+       SET left_at = ?, active = 0, usage_counted = 1, updated_at = ?
+       WHERE provider_session_id = ? AND peer_id = ?
+         AND participant_key = ?`,
+      event.participantLeftAt,
+      now,
+      event.providerSessionId,
+      event.peerId,
+      event.customParticipantId,
+    );
+    if (peer.active === 1) {
+      this.ctx.storage.sql.exec(
+        `UPDATE participants
+         SET joined_at = NULL,
+             accumulated_ms = accumulated_ms + ?,
+             updated_at = ?
+         WHERE participant_key = ?`,
+        countUsage ? durationMs : 0,
+        now,
+        event.customParticipantId,
+      );
+    } else if (countUsage) {
+      this.ctx.storage.sql.exec(
+        `UPDATE participants
+         SET accumulated_ms = accumulated_ms + ?, updated_at = ?
+         WHERE participant_key = ?`,
+        durationMs,
+        now,
+        event.customParticipantId,
+      );
+    }
+    if (countUsage) {
+      this.addParticipantUsage(
+        event.participantLeftAt,
         durationMs,
         now,
       );
-      this.addParticipantUsage(event.participantLeftAt, durationMs, now);
     }
+    this.observeRemovePeerLeft(event, now);
+  }
+
+  private observeRemovePeerLeft(
+    event: WebhookEventSummary,
+    now: string,
+  ): void {
+    const command = this.ctx.storage.sql
+      .exec<ModerationCommandRow>(
+        `SELECT * FROM moderation_commands
+         WHERE action = 'remove'
+           AND target_provider_session_id = ?
+           AND target_peer_id = ?
+           AND target_participant_key = ?
+           AND state IN ('executing', 'pending_observation')
+           AND attempt_started_at IS NOT NULL
+           AND attempt_started_at <= ?
+         ORDER BY result_revision
+         LIMIT 1`,
+        event.providerSessionId!,
+        event.peerId!,
+        event.customParticipantId!,
+        event.participantLeftAt!,
+      )
+      .toArray()[0];
+    if (!command) return;
+    this.ctx.storage.sql.exec(
+      `UPDATE moderation_commands
+       SET state = 'desired_state_observed',
+           provider_state_observed = 1, causality_proven = 0,
+           result_code = 'REMOVE_LEAVE_OBSERVED',
+           execution_fence = NULL, execution_lease_until = NULL,
+           finalized_at = ?
+       WHERE command_id = ?
+         AND state IN ('executing', 'pending_observation')
+         AND target_provider_session_id = ? AND target_peer_id = ?
+         AND attempt_started_at <= ?`,
+      now,
+      command.command_id,
+      event.providerSessionId!,
+      event.peerId!,
+      event.participantLeftAt!,
+    );
+    this.markOutboxTerminal(command.command_id, now);
   }
 
   private consumeControlRequest(now: string, maximum: number): boolean {
@@ -1204,13 +1807,15 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       `DELETE FROM moderation_outbox
        WHERE command_id IN (
          SELECT command_id FROM moderation_commands
-         WHERE state = 'unsupported' AND finalized_at < ?
+         WHERE state IN ('unsupported', 'conflict', 'desired_state_observed')
+           AND finalized_at < ?
        )`,
       cutoff,
     );
     this.ctx.storage.sql.exec(
       `DELETE FROM moderation_commands
-       WHERE state = 'unsupported' AND finalized_at < ?`,
+       WHERE state IN ('unsupported', 'conflict', 'desired_state_observed')
+         AND finalized_at < ?`,
       cutoff,
     );
   }
@@ -1246,6 +1851,101 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
           principalId,
         )
         .toArray()[0] ?? null
+    );
+  }
+
+  private activePeerByParticipant(
+    participantKey: string,
+  ): ParticipantPeerRow | null {
+    return (
+      this.ctx.storage.sql
+        .exec<ParticipantPeerRow>(
+          `SELECT * FROM participant_peers
+           WHERE participant_key = ? AND active = 1
+           ORDER BY joined_at DESC
+           LIMIT 1`,
+          participantKey,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  private latestPeerByParticipant(
+    participantKey: string,
+  ): ParticipantPeerRow | null {
+    return (
+      this.ctx.storage.sql
+        .exec<ParticipantPeerRow>(
+          `SELECT * FROM participant_peers
+           WHERE participant_key = ?
+           ORDER BY joined_at DESC, provider_session_id DESC, peer_id DESC
+           LIMIT 1`,
+          participantKey,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  private peerRow(
+    providerSessionId: string,
+    peerId: string,
+  ): ParticipantPeerRow | null {
+    return (
+      this.ctx.storage.sql
+        .exec<ParticipantPeerRow>(
+          `SELECT * FROM participant_peers
+           WHERE provider_session_id = ? AND peer_id = ?`,
+          providerSessionId,
+          peerId,
+        )
+        .toArray()[0] ?? null
+    );
+  }
+
+  private hasNonterminalRemoveForPeer(
+    providerSessionId: string,
+    peerId: string,
+  ): boolean {
+    return (
+      this.ctx.storage.sql
+        .exec<{ count: number }>(
+          `SELECT COUNT(*) AS count FROM moderation_commands
+           WHERE action = 'remove'
+             AND target_provider_session_id = ?
+             AND target_peer_id = ?
+             AND state IN ('pending', 'executing', 'pending_observation')`,
+          providerSessionId,
+          peerId,
+        )
+        .one().count > 0
+    );
+  }
+
+  private prunePeerHistory(participantKey: string): void {
+    this.ctx.storage.sql.exec(
+      `DELETE FROM participant_peers
+       WHERE rowid IN (
+         SELECT peers.rowid
+         FROM participant_peers AS peers
+         WHERE peers.participant_key = ? AND peers.active = 0
+           AND NOT EXISTS (
+             SELECT 1
+             FROM moderation_commands AS commands
+             WHERE commands.action = 'remove'
+               AND commands.target_provider_session_id =
+                 peers.provider_session_id
+               AND commands.target_peer_id = peers.peer_id
+               AND commands.state IN (
+                 'pending', 'executing', 'pending_observation'
+               )
+           )
+         ORDER BY peers.joined_at DESC,
+                  peers.provider_session_id DESC,
+                  peers.peer_id DESC
+         LIMIT -1 OFFSET ?
+       )`,
+      participantKey,
+      MAX_INACTIVE_PEERS_PER_PARTICIPANT,
     );
   }
 
@@ -1323,7 +2023,8 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
   private pendingCommandCount(): number {
     return this.ctx.storage.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM moderation_commands WHERE state = 'pending'",
+        `SELECT COUNT(*) AS count FROM moderation_commands
+         WHERE state IN ('pending', 'executing', 'pending_observation')`,
       )
       .one().count;
   }
@@ -1334,7 +2035,7 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
   ): number {
     const cutoff = new Date(nowMs - COMMAND_TERMINAL_DEADLINE_MS).toISOString();
     return this.ctx.storage.transactionSync(() => {
-      const expired = this.ctx.storage.sql
+      const unattempted = this.ctx.storage.sql
         .exec<{ command_id: string }>(
           `SELECT command_id
            FROM moderation_commands
@@ -1346,37 +2047,80 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
           nowMs,
         )
         .toArray();
-      if (expired.length === 0) return 0;
+      const attempted = this.ctx.storage.sql
+        .exec<{ command_id: string }>(
+          `SELECT command_id
+           FROM moderation_commands
+           WHERE state IN ('executing', 'pending_observation')
+             AND attempt_started_at IS NOT NULL
+             AND attempt_started_at <= ?
+             AND (
+               execution_lease_until IS NULL OR execution_lease_until <= ?
+             )`,
+          cutoff,
+          nowMs,
+        )
+        .toArray();
+      if (unattempted.length === 0 && attempted.length === 0) return 0;
 
-      this.ctx.storage.sql.exec(
-        `UPDATE moderation_commands
-         SET state = 'unsupported', execution_fence = NULL,
-             execution_lease_until = NULL,
-             result_code = 'queue_delivery_exhausted',
-             provider_mutation_applied = 0, finalized_at = ?
-         WHERE state = 'pending' AND created_at <= ?
-           AND (
-             execution_lease_until IS NULL OR execution_lease_until <= ?
-           )`,
-        now,
-        cutoff,
-        nowMs,
-      );
+      if (unattempted.length > 0) {
+        this.ctx.storage.sql.exec(
+          `UPDATE moderation_commands
+           SET state = 'unsupported', execution_fence = NULL,
+               execution_lease_until = NULL,
+               result_code = 'queue_delivery_exhausted',
+               provider_mutation_applied = 0, finalized_at = ?
+           WHERE state = 'pending' AND created_at <= ?
+             AND (
+               execution_lease_until IS NULL OR execution_lease_until <= ?
+             )`,
+          now,
+          cutoff,
+          nowMs,
+        );
+      }
+      if (attempted.length > 0) {
+        this.ctx.storage.sql.exec(
+          `UPDATE moderation_commands
+           SET state = 'conflict', execution_fence = NULL,
+               execution_lease_until = NULL,
+               provider_state_observed = 0, causality_proven = 0,
+               result_code = 'VOICE_CONTROL_CONFLICT', finalized_at = ?
+           WHERE state IN ('executing', 'pending_observation')
+             AND attempt_started_at IS NOT NULL
+             AND attempt_started_at <= ?
+             AND (
+               execution_lease_until IS NULL OR execution_lease_until <= ?
+             )`,
+          now,
+          cutoff,
+          nowMs,
+        );
+      }
       this.ctx.storage.sql.exec(
         `UPDATE moderation_outbox
          SET state = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?)
          WHERE command_id IN (
            SELECT command_id
            FROM moderation_commands
-           WHERE state = 'unsupported'
-             AND result_code = 'queue_delivery_exhausted'
+           WHERE state IN ('unsupported', 'conflict')
              AND finalized_at = ?
          )`,
         now,
         now,
       );
-      return expired.length;
+      return unattempted.length + attempted.length;
     });
+  }
+
+  private markOutboxTerminal(commandId: string, now: string): void {
+    this.ctx.storage.sql.exec(
+      `UPDATE moderation_outbox
+       SET state = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?)
+       WHERE command_id = ?`,
+      now,
+      commandId,
+    );
   }
 
   private async scheduleNextModerationAlarm(nowMs: number): Promise<void> {
@@ -1387,9 +2131,9 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
 
     const pending = this.ctx.storage.sql
       .exec<PendingCommandDeadlineRow>(
-        `SELECT created_at, execution_lease_until
+        `SELECT created_at, attempt_started_at, state, execution_lease_until
          FROM moderation_commands
-         WHERE state = 'pending'`,
+         WHERE state IN ('pending', 'executing', 'pending_observation')`,
       )
       .toArray();
     if (pending.length === 0) {
@@ -1398,7 +2142,11 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
     }
 
     const earliestDeadline = pending.reduce((earliest, command) => {
-      const createdAt = Date.parse(command.created_at);
+      const deadlineOrigin =
+        command.state === "pending"
+          ? command.created_at
+          : (command.attempt_started_at ?? command.created_at);
+      const createdAt = Date.parse(deadlineOrigin);
       const terminalDeadline =
         (Number.isFinite(createdAt) ? createdAt : nowMs) +
         COMMAND_TERMINAL_DEADLINE_MS;
@@ -1501,17 +2249,37 @@ function toRoomRecord(row: RoomRow): RoomRecord {
 function toModerationCommandRecord(
   row: ModerationCommandRow,
 ): ModerationCommandRecord {
-  return {
+  const record: ModerationCommandRecord = {
     commandId: row.command_id,
     action: row.action,
     targetPrincipalId: row.target_principal_id,
     controlRevision: row.result_revision,
     status: row.state,
-    providerMutationApplied: false,
+    providerRequestAccepted: row.provider_request_accepted === 1,
+    providerStateObserved: row.provider_state_observed === 1,
+    causalityProven: false,
     resultCode: row.result_code,
     createdAt: row.created_at,
     finalizedAt: row.finalized_at,
   };
+  if (
+    row.state === "pending" ||
+    row.state === "unsupported" ||
+    row.state === "conflict"
+  ) {
+    record.providerMutationApplied = false;
+  }
+  return record;
+}
+
+function isTerminalModerationState(
+  state: ModerationCommandRow["state"],
+): boolean {
+  return (
+    state === "desired_state_observed" ||
+    state === "conflict" ||
+    state === "unsupported"
+  );
 }
 
 function outboxEnvelope(

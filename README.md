@@ -36,10 +36,15 @@ outside the room Durable Object. The only enabled executor is deliberately
 unavailable and performs zero provider I/O, so accepted commands remain honest:
 HTTP `202` means pending intent, never an applied RealtimeKit mutation.
 
-Queue/DLQ exhaustion and the ten-minute room watchdog both converge on the same
-terminal non-mutation result. This repository configures bindings and consumers
-only; it does not create Cloudflare resources or authorize deployment. Run the
-local proof with `npm run check` from `services/pocket-realtime`.
+Queue/DLQ exhaustion and the ten-minute room watchdog preserve the same
+truthful boundary: unattempted work is unsupported, while an attempted but
+unobserved REMOVE is conflict, never success. The local production-inert REMOVE
+kernel pins signed peer generations, freshly re-authorizes at execution, reuses
+one durable attempt, and can label only `desired_state_observed` with
+`causalityProven=false`. RealtimeKit kick is not peer-exact, so no live adapter
+is enabled. This repository configures bindings and consumers only; it does not
+create Cloudflare resources or authorize deployment. Run the local proof with
+`npm run check` from `services/pocket-realtime`.
 
 ## Node note
 The CLI needs Node 22 (`~/AppData/Roaming/nvm/v22.15.0/node.exe`). Default `node` is v26 = unsupported and crashes the CLI.

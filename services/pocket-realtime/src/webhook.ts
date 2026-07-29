@@ -70,6 +70,8 @@ export async function handleRealtimeKitWebhook(
     digest,
     eventName,
     providerMeetingId,
+    providerSessionId: boundedString(meeting.sessionId, 128),
+    peerId: boundedString(participant?.peerId, 128),
     customParticipantId: boundedString(participant?.customParticipantId, 200),
     participantJoinedAt: isoDate(participant?.joinedAt),
     participantLeftAt: isoDate(participant?.leftAt),

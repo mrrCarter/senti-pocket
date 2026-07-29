@@ -35,6 +35,9 @@ Cloudflare account, or used to create billable resources.
     and provider participant ID before reserving work;
   - HMAC-fingerprints the owner-scoped idempotency key and command payload, so
     the raw key is never stored, logged, or returned;
+  - for `remove`, pins the signed RealtimeKit provider session and
+    connection-specific peer generation; one nonterminal remove may control
+    that exact peer;
   - in one SQLite transaction, writes one durable command intent and advances
     `controlRevision` once, while exact retries return the original record and
     stale or colliding commands return `VOICE_CONTROL_CONFLICT`;
@@ -50,6 +53,11 @@ Cloudflare account, or used to create billable resources.
   - verifies RSA-SHA256 over the bounded raw body;
   - routes by a non-PII HMAC room locator in the meeting title;
   - deduplicates `rtk-uuid` in SQLite;
+  - orders signed participant joins by peer generation and allows a leave to
+    observe a remove only for the exact provider session, participant key, and
+    peer after the durable attempt began;
+  - bounds reconnect history to four inactive unreferenced peers per
+    participant, while preserving active and nonterminal-command peers;
   - queues only the provider session reference and bounded metadata, never the
     presigned transcript URL or transcript body.
 
@@ -75,26 +83,39 @@ production-ready Senti Pocket voice implementation.
 - Every admission currently serializes through one per-room Durable Object.
   The 5k/10k hot-room target is unproven and requires a sharded admission/load
   design before production.
-- Live moderation still requires a pre-armed alarm/outbox dispatcher, an
-  at-least-once execution Queue and DLQ, provider-state confirmation,
-  reconciliation, bounded state pull/receipt projection, and client conflict
-  UX. None exists in this slice.
+- Alarm/outbox dispatch, the at-least-once Queue/DLQ, leases, and watchdog are
+  implemented locally. A provider-neutral REMOVE execution/observation kernel
+  is also locally proven with test adapters: execution-time fresh
+  authorization, stable attempts, signed peer-generation binding,
+  `pending_observation`, exact leave observation, and conflict timeout.
+  Production still composes only the unavailable executor, so none of this
+  enables a provider call.
 - RealtimeKit's current signed webhook catalog does not contain participant
   mute, preset, role, or stage updates. Unsigned SDK callbacks are UX
   observations, not governance proof. Confirmation is action-specific:
-  `remove` may eventually be labeled only `kick-issued/leave-observed` by
-  correlating the backend kick with signed `participantLeft`; the event has no
-  documented causal reason. Promote/demote are conditionally confirmable only
-  if implemented as preset mutations and a live probe proves the expected
+  `remove` may earn only `desired_state_observed` /
+  `REMOVE_LEAVE_OBSERVED` from an exact signed `participantLeft`;
+  `causalityProven` remains false. Promote/demote are conditionally confirmable
+  only if implemented as preset mutations and a live probe proves the expected
   `preset_name` through session-participant readback. Mute/deny/allow remain
   blocked because no authoritative live audio/publish state is exposed.
 - Current target authorization is bound to the active admission. A future
   asynchronous executor must freshly recheck both actor authority and target
   Senti membership without persisting the caller bearer before any provider
   mutation.
+- The fresh-authority port has no production Senti adapter, and RealtimeKit's
+  backend kick targets stable participant/custom IDs rather than the signed
+  connection-specific peer ID. A preflight cannot eliminate a rapid-rejoin
+  TOCTOU window, so the live remove adapter remains unavailable until
+  peer-exact mutation is proven or the residual is explicitly accepted and
+  independently reviewed.
 - Finalized `unsupported` command identities are retained for eight days only.
   Production idempotency/result retention and archive policy must be decided
   before any applied result is possible.
+- The expanded command/peer schema descends from unpublished local heads and no
+  room Durable Object has been deployed. Any future rollout over an older
+  persisted schema requires an explicit migration and rollback proof; this
+  slice does not claim one.
 - A crash after provider meeting/participant creation can leave an orphan or
   require reconciliation; that provider reconciliation path is not built.
 - RealtimeKit controls participant-token scope and expiry. The service labels
@@ -140,8 +161,9 @@ Before any authorized deployment:
 5. prove or reject the shared-agent-track spike;
 6. obtain explicit paid-transcription authorization, then set
    `TRANSCRIPTION_MODE=post-meeting`;
-7. prove each action's mutation/confirmation adapter and implement the
-   alarm/outbox, Queue/DLQ, reconcile, bounded-pull, and receipt planes;
+7. implement the fresh Senti authority adapter, resolve the peer-exact remove
+   mutation gap, prove each action-specific mutation/observation adapter, and
+   implement bounded-pull and receipt projection;
 8. register the webhook and run signed parity, hot-room moderation, rollback,
    and physical-iPhone gates.
 
