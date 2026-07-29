@@ -353,7 +353,9 @@ public actor RealtimeKitVoiceMediaDriver: VoiceMediaDriver {
         )
     }
 
-    private static func routeKind(_ type: AudioDeviceType) -> VoiceAudioRouteKind {
+    private static func routeKind(
+        _ type: RealtimeKit.AudioDeviceType
+    ) -> VoiceAudioRouteKind {
         switch type {
         case .earPiece: return .receiver
         case .speaker: return .speaker
@@ -475,7 +477,7 @@ private final class RealtimeKitEventRelay:
     }
     func onVideoDeviceChanged(videoDevice: VideoDevice) {}
     func onVideoUpdate(isEnabled: Bool) {}
-    func onWaitListStatusUpdate(waitListStatus: WaitListStatus) {
+    func onWaitListStatusUpdate(waitListStatus: RealtimeKit.WaitListStatus) {
         handler(.refresh)
     }
 
@@ -515,8 +517,8 @@ private final class RealtimeKitEventRelay:
     }
     func onPeerStageStatusUpdated(
         participant: RtkRemoteParticipant,
-        oldStatus: StageStatus,
-        newStatus: StageStatus
+        oldStatus: RealtimeKit.StageStatus,
+        newStatus: RealtimeKit.StageStatus
     ) {
         handler(.refresh)
     }
@@ -532,7 +534,10 @@ private final class RealtimeKitEventRelay:
     func onStageAccessRequestsUpdated(accessRequests: [RtkRemoteParticipant]) {
         handler(.refresh)
     }
-    func onStageStatusUpdated(oldStatus: StageStatus, newStatus: StageStatus) {
+    func onStageStatusUpdated(
+        oldStatus: RealtimeKit.StageStatus,
+        newStatus: RealtimeKit.StageStatus
+    ) {
         handler(.refresh)
     }
 }
