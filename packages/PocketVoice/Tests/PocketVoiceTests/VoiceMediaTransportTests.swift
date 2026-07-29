@@ -252,7 +252,9 @@ final class VoiceMediaTransportTests: XCTestCase {
         role: VoiceParticipantRole,
         capabilities: VoiceJoinCapabilities
     ) throws -> VoiceJoinGrant {
-        let issuedAt = Date(timeIntervalSince1970: 1_000)
+        // These grants exercise live connection behavior. Keep the fixture
+        // relative to the test clock so production expiry checks remain active.
+        let issuedAt = Date()
         let handle = try VoiceJoinCredentialHandle(
             credential: "single-use-provider-token-\(epoch)",
             discardAfter: issuedAt.addingTimeInterval(5 * 60)

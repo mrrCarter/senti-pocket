@@ -49,3 +49,10 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
 - Realtime media and signaling reconnect independently. Combine their states;
   a socket `connected` callback must not hide media that is still reconnecting
   (or the inverse).
+- Finding SDK symbols in a shipped Swift interface is useful compatibility
+  evidence, but it is not compile proof. Objective-C protocol imports preserve
+  exact Swift argument labels; require an iOS-target build before calling an
+  adapter conformant.
+- A credential-expiry test fixture used by live `connect()` tests must be
+  relative to an injected/current clock. A fixed historical timestamp turns a
+  correct production expiry guard into time-dependent test failure.

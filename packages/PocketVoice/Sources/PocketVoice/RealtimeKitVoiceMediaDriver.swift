@@ -470,7 +470,7 @@ private final class RealtimeKitEventRelay:
     func onUnpinned() {
         handler(.refresh)
     }
-    func onUpdate(participant_: RtkSelfParticipant) {
+    func onUpdate(participant: RtkSelfParticipant) {
         handler(.refresh)
     }
     func onVideoDeviceChanged(videoDevice: VideoDevice) {}
@@ -488,7 +488,7 @@ private final class RealtimeKitEventRelay:
     func onAllParticipantsUpdated(allParticipants: [RtkParticipant]) {
         handler(.refresh)
     }
-    func onAudioUpdate(participant: RtkRemoteParticipant, isEnabled_: Bool) {
+    func onAudioUpdate(participant: RtkRemoteParticipant, isEnabled: Bool) {
         handler(.refresh)
     }
     func onNewBroadcastMessage(type: String, payload: [String: Any]) {}
@@ -504,11 +504,11 @@ private final class RealtimeKitEventRelay:
     func onParticipantUnpinned(participant: RtkRemoteParticipant) {
         handler(.refresh)
     }
-    func onScreenShareUpdate(participant: RtkRemoteParticipant, isEnabled_: Bool) {}
+    func onScreenShareUpdate(participant: RtkRemoteParticipant, isEnabled: Bool) {}
     func onUpdate(participants: RtkParticipants) {
         handler(.refresh)
     }
-    func onVideoUpdate(participant: RtkRemoteParticipant, isEnabled_: Bool) {}
+    func onVideoUpdate(participant: RtkRemoteParticipant, isEnabled: Bool) {}
 
     func onNewStageAccessRequest(participant: RtkRemoteParticipant) {
         handler(.refresh)
