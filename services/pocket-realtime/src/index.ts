@@ -3,9 +3,14 @@ import {
   MEDIA_PROVIDER,
   REQUIRED_AGENT_MEDIA_MODE,
   type JoinCredential,
+  type ModerationCommandRecord,
   type RoomDescriptor,
   type RoomRecord,
 } from "./contracts";
+import {
+  moderationFingerprints,
+  UnavailableVoiceControlExecutor,
+} from "./control-executor";
 import type { RuntimeEnv } from "./env";
 import { HttpError, upstreamError } from "./errors";
 import {
@@ -16,10 +21,13 @@ import {
   roleForMembership,
 } from "./identity";
 import { realtimeKitMediaRoomProvider } from "./media-room-provider";
-import { RoomGovernor } from "./room-governor";
+import {
+  RoomGovernor,
+} from "./room-governor";
 import { authenticateMember } from "./senti-client";
 import {
   parseJoinRoomRequest,
+  parseModerateRoomRequest,
   parseOpenRoomRequest,
   parseRoomUsageRequest,
   configuredPositiveInteger,
@@ -63,6 +71,12 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/v1/voice-rooms/usage") {
         return await roomUsage(request, env, requestContext);
+      }
+      if (
+        request.method === "POST" &&
+        url.pathname === "/v1/voice-rooms/moderate"
+      ) {
+        return await moderateRoom(request, env, requestContext);
       }
       if (
         request.method === "POST" &&
@@ -224,6 +238,8 @@ async function joinRoom(
   }
   const reservation = await governor.reserveAdmission(
     participantKey,
+    member.humanId,
+    member.membershipRole,
     role,
     new Date().toISOString(),
     maximum,
@@ -233,6 +249,12 @@ async function joinRoom(
   }
   if (reservation.disposition === "room_not_ready") {
     throw new HttpError(404, "room_not_ready", "Voice room is not ready.");
+  }
+  if (reservation.disposition === "identity_mismatch") {
+    throw upstreamError(
+      "participant_identity_conflict",
+      "Participant identity could not be reconciled.",
+    );
   }
   if (reservation.disposition === "over_budget") {
     throw new HttpError(429, "room_budget_exhausted", "Room control budget is exhausted.");
@@ -280,10 +302,22 @@ async function joinRoom(
   if (!committed) {
     throw upstreamError("participant_admission_conflict", "Participant admission could not be committed.");
   }
+  const currentRoom = await governor.getRoom(
+    member.tenantId,
+    input.sessionId,
+    input.roomEpoch,
+    roomId,
+  );
+  if (!currentRoom) {
+    throw upstreamError(
+      "room_identity_conflict",
+      "Voice room identity could not be reconciled.",
+    );
+  }
 
   const issuedAt = new Date();
   const credential: JoinCredential = {
-    room: descriptor(room),
+    room: descriptor(currentRoom),
     role,
     principalId: member.humanId,
     participantId: participant.id,
@@ -295,7 +329,7 @@ async function joinRoom(
     ).toISOString(),
     providerScope: "single-participant-single-meeting",
     providerExpiry: "time-bound-undisclosed",
-    controlRevision: 0,
+    controlRevision: currentRoom.controlRevision,
     capabilities: capabilitiesForRole(role),
   };
   return json(
@@ -304,6 +338,155 @@ async function joinRoom(
       credential,
     },
     200,
+    traceId,
+    input.requestId,
+  );
+}
+
+async function moderateRoom(
+  request: Request,
+  env: RuntimeEnv,
+  requestContext: RequestContext,
+): Promise<Response> {
+  const input = parseModerateRoomRequest(await readBoundedJson(request));
+  adoptBodyRequestId(requestContext, input.requestId);
+  const { traceId } = requestContext;
+  const member = await authenticateMember(request, input.sessionId, env);
+  const roomId = await deriveRoomId(
+    env.ROOM_KEY_HMAC_SECRET,
+    member.tenantId,
+    input.sessionId,
+    input.roomEpoch,
+  );
+  const fingerprints = await moderationFingerprints(
+    env.IDENTITY_HMAC_SECRET,
+    {
+      tenantId: member.tenantId,
+      actorPrincipalId: member.humanId,
+      input,
+    },
+  );
+  const governor = env.ROOMS.getByName(roomId);
+  const reservation = await governor.reserveModeration({
+    tenantId: member.tenantId,
+    sessionId: input.sessionId,
+    roomEpoch: input.roomEpoch,
+    roomId,
+    actorPrincipalId: member.humanId,
+    actorMembershipRole: member.membershipRole,
+    targetPrincipalId: input.targetPrincipalId,
+    action: input.action,
+    commandId: input.commandId,
+    idempotencyHash: fingerprints.idempotencyHash,
+    payloadHash: fingerprints.payloadHash,
+    expectedRevision: input.expectedRevision,
+    now: new Date().toISOString(),
+    maxDailyRequests: dailyMaximum(env),
+  });
+
+  if (reservation.disposition === "replay") {
+    return unsupportedCommandResponse(
+      reservation.command,
+      traceId,
+      input.requestId,
+    );
+  }
+  if (reservation.disposition === "busy") {
+    return errorResponse(
+      new HttpError(
+        409,
+        "command_execution_busy",
+        "Voice command execution is already in progress.",
+      ),
+      traceId,
+      input.requestId,
+      {
+        controlRevision: reservation.command.controlRevision,
+        command: reservation.command,
+      },
+    );
+  }
+  if (
+    reservation.disposition === "revision_conflict" ||
+    reservation.disposition === "idempotency_conflict"
+  ) {
+    return errorResponse(
+      new HttpError(
+        409,
+        reservation.disposition,
+        reservation.disposition === "revision_conflict"
+          ? "The voice room control revision is stale."
+          : "The command identity was reused with different content or ownership.",
+      ),
+      traceId,
+      input.requestId,
+      { controlRevision: reservation.currentRevision },
+    );
+  }
+  if (reservation.disposition === "not_authorized") {
+    throw new HttpError(
+      403,
+      "moderation_forbidden",
+      "Current session authority does not permit this voice command.",
+    );
+  }
+  if (
+    reservation.disposition === "target_not_found" ||
+    reservation.disposition === "room_not_ready" ||
+    reservation.disposition === "identity_mismatch"
+  ) {
+    throw new HttpError(
+      404,
+      reservation.disposition,
+      "The voice command target or room is unavailable.",
+    );
+  }
+  if (
+    reservation.disposition === "over_budget" ||
+    reservation.disposition === "command_capacity"
+  ) {
+    throw new HttpError(
+      429,
+      reservation.disposition,
+      "The room control-command budget is exhausted.",
+    );
+  }
+  if (reservation.disposition !== "execute") {
+    throw new Error("Unhandled moderation reservation.");
+  }
+  const executable = reservation;
+
+  const executor = new UnavailableVoiceControlExecutor();
+  const execution = await executor.execute({
+    room: executable.room,
+    commandId: executable.command.commandId,
+    controlRevision: executable.command.controlRevision,
+    action: executable.command.action,
+    targetProviderParticipantId: executable.targetProviderParticipantId,
+  });
+  if (
+    execution.disposition !== "unsupported" ||
+    execution.providerMutationApplied
+  ) {
+    throw new HttpError(
+      500,
+      "invalid_executor_result",
+      "Voice command execution returned an invalid result.",
+    );
+  }
+  const finalized = await governor.finalizeModerationUnsupported(
+    executable.command.commandId,
+    executable.fence,
+    new Date().toISOString(),
+  );
+  if (!finalized) {
+    throw upstreamError(
+      "command_execution_conflict",
+      "Voice command execution could not be finalized.",
+    );
+  }
+  return unsupportedCommandResponse(
+    finalized,
     traceId,
     input.requestId,
   );
@@ -373,6 +556,7 @@ function descriptor(room: RoomRecord): RoomDescriptor {
     providerMeetingId: room.providerMeetingId,
     sessionId: room.sessionId,
     roomEpoch: room.roomEpoch,
+    controlRevision: room.controlRevision,
     transcriptMode: "post-meeting",
     requiredAgentMediaMode: REQUIRED_AGENT_MEDIA_MODE,
     agentMediaStatus: "unsupported-pending-spike",
@@ -406,7 +590,12 @@ function json(
   });
 }
 
-function errorResponse(error: unknown, traceId: string, requestId: string): Response {
+function errorResponse(
+  error: unknown,
+  traceId: string,
+  requestId: string,
+  safeContext: Record<string, unknown> = {},
+): Response {
   const httpError =
     error instanceof HttpError
       ? error
@@ -428,10 +617,31 @@ function errorResponse(error: unknown, traceId: string, requestId: string): Resp
         recoverable: isRecoverable(httpError),
         retryAfterMs: retryAfterMs(httpError),
       },
+      ...safeContext,
     },
     httpError.status,
     traceId,
     requestId,
+  );
+}
+
+function unsupportedCommandResponse(
+  command: ModerationCommandRecord,
+  traceId: string,
+  requestId: string,
+): Response {
+  return errorResponse(
+    new HttpError(
+      503,
+      "voice_executor_unavailable",
+      "No trusted voice-control executor is available.",
+    ),
+    traceId,
+    requestId,
+    {
+      controlRevision: command.controlRevision,
+      command,
+    },
   );
 }
 

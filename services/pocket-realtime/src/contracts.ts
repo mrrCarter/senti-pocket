@@ -35,6 +35,17 @@ export interface RoomUsageRequest {
   requestId: string;
 }
 
+export interface ModerateRoomRequest {
+  sessionId: string;
+  roomEpoch: string;
+  requestId: string;
+  commandId: string;
+  idempotencyKey: string;
+  expectedRevision: number;
+  targetPrincipalId: string;
+  action: VoiceModerationAction;
+}
+
 export interface AuthenticatedMember {
   tenantId: string;
   humanId: string;
@@ -49,6 +60,7 @@ export interface RoomDescriptor {
   providerMeetingId: string;
   sessionId: string;
   roomEpoch: string;
+  controlRevision: number;
   transcriptMode: "post-meeting";
   requiredAgentMediaMode: typeof REQUIRED_AGENT_MEDIA_MODE;
   agentMediaStatus: "unsupported-pending-spike";
@@ -101,6 +113,18 @@ export interface RoomUsageSnapshot {
   billingTruth: false;
 }
 
+export interface ModerationCommandRecord {
+  commandId: string;
+  action: VoiceModerationAction;
+  targetPrincipalId: string;
+  controlRevision: number;
+  status: "pending" | "unsupported";
+  providerMutationApplied: false;
+  resultCode: "executor_unavailable" | null;
+  createdAt: string;
+  finalizedAt: string | null;
+}
+
 export interface RoomRecord {
   tenantId: string;
   sessionId: string;
@@ -108,6 +132,7 @@ export interface RoomRecord {
   roomId: string;
   providerMeetingId: string;
   lifecycle: RoomLifecycle;
+  controlRevision: number;
   transcriptMode: "post-meeting";
   createdAt: string;
   updatedAt: string;

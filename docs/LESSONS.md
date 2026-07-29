@@ -57,3 +57,25 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
 - A credential-expiry test fixture used by live `connect()` tests must be
   relative to an injected/current clock. A fixed historical timestamp turns a
   correct production expiry guard into time-dependent test failure.
+- A durable control intent is not provider-state proof. Advance and fence the
+  intent revision atomically, but keep the result pending or explicitly
+  unsupported until an authoritative provider observation confirms it. Never
+  make the UI infer success from `controlRevision` alone.
+- Pre-arm recovery before committing work. For a per-room command outbox,
+  durably schedule the room alarm first and then write the intent; an empty
+  alarm is harmless, while the inverse order has a crash window that can strand
+  committed work. Alarm and Queue delivery are at least once, so stable command
+  identity, desired-state operations, leases, dedupe, and a DLQ are mandatory.
+- Do not route audience-sized receipt fanout through a single-threaded room
+  coordinator. Write the revision once, use provider propagation and
+  cached/coalesced revision pull for the audience, and push only to the bounded
+  stage if push is required.
+- Read the provider's actual event catalog before designing reconciliation.
+  RealtimeKit currently signs webhooks, but it does not currently publish
+  mute, preset, role, or stage-change webhooks. Unsigned SDK callbacks cannot be
+  promoted into governance receipts, and `participantLeft` does not by itself
+  prove that a Senti remove command caused the departure.
+- Bound idempotency storage honestly. Eight-day retention is sufficient for the
+  current terminal-unsupported local proof, but applied production commands
+  need an explicit retention/archive policy tied to the maximum safe retry
+  window before a live executor is allowed.

@@ -14,6 +14,7 @@ const TENANT_ID = "tenant-demo";
 const EPOCH = "5a73635c-cbd2-4e22-b24e-9a31520a939c";
 const MEETING_ID = "bbb8940e-1b97-402a-97d6-2708b7feca41";
 const PARTICIPANT_ID = "e32fb785-ddd0-4b96-b577-879327c0082f";
+const TARGET_PARTICIPANT_ID = "69afb1e1-b979-40f0-96f7-fef432a0a0d1";
 const ACCOUNT_ID = "023e105f4ecef8ad9ca31a8372d0c353";
 const APP_ID = "6f80f956-3195-489a-aa76-9f26d3234160";
 const BEARER = "senti-test-bearer-token-123456789";
@@ -27,6 +28,7 @@ interface ProviderCall {
 
 describe("voice room control plane", () => {
   let membershipRole: "owner" | "viewer";
+  let humanId: string;
   let includeTenantIdentity: boolean;
   let providerCalls: ProviderCall[];
   let queueMessages: TranscriptQueueEnvelope[];
@@ -35,6 +37,7 @@ describe("voice room control plane", () => {
   beforeEach(async () => {
     await reset();
     membershipRole = "owner";
+    humanId = "human-carter";
     includeTenantIdentity = true;
     providerCalls = [];
     queueMessages = [];
@@ -45,7 +48,7 @@ describe("voice room control plane", () => {
         const request = new Request(input, init);
         const url = new URL(request.url);
         if (url.pathname === "/api/v1/auth/me") {
-          return Response.json({ id: "human-carter", githubUsername: "mrrCarter" });
+          return Response.json({ id: humanId, githubUsername: "mrrCarter" });
         }
         if (url.pathname === `/api/v1/sessions/${SESSION_ID}`) {
           return Response.json({
@@ -65,10 +68,18 @@ describe("voice room control plane", () => {
             body,
           });
           if (url.pathname.endsWith("/participants")) {
+            const participantCreateCount = providerCalls.filter(
+              (call) =>
+                call.method === "POST" &&
+                call.url.endsWith("/participants"),
+            ).length;
             return Response.json({
               success: true,
               data: {
-                id: PARTICIPANT_ID,
+                id:
+                  participantCreateCount === 1
+                    ? PARTICIPANT_ID
+                    : TARGET_PARTICIPANT_ID,
                 token: "short-lived-provider-token",
               },
             });
@@ -257,6 +268,184 @@ describe("voice room control plane", () => {
     expect(providerCalls).toHaveLength(0);
   });
 
+  it("records one owner-fenced command and fails honestly without an executor", async () => {
+    const opened = await invoke(
+      testEnv,
+      "/v1/voice-rooms/open",
+      openBody(),
+    );
+    expect(opened.status).toBe(201);
+    const openPayload = await opened.json<{
+      room: { roomId: string; controlRevision: number };
+    }>();
+    expect(openPayload.room.controlRevision).toBe(0);
+
+    const actorJoin = await invoke(
+      testEnv,
+      "/v1/voice-rooms/join",
+      joinBody("moderator"),
+    );
+    expect(actorJoin.status).toBe(200);
+
+    humanId = "human-target";
+    membershipRole = "viewer";
+    const targetJoin = await invoke(
+      testEnv,
+      "/v1/voice-rooms/join",
+      joinBody(),
+    );
+    expect(targetJoin.status).toBe(200);
+
+    humanId = "human-carter";
+    membershipRole = "owner";
+    const providerCallCountBeforeCommand = providerCalls.length;
+    const first = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      moderateBody(),
+    );
+    expect(first.status).toBe(503);
+    const firstPayload = await first.json<{
+      error: { code: string };
+      controlRevision: number;
+      command: {
+        commandId: string;
+        targetPrincipalId: string;
+        action: string;
+        controlRevision: number;
+        status: string;
+        providerMutationApplied: boolean;
+        resultCode: string;
+      };
+    }>();
+    expect(firstPayload.error.code).toBe("VOICE_PROVIDER_UNAVAILABLE");
+    expect(firstPayload.controlRevision).toBe(1);
+    expect(firstPayload.command).toMatchObject({
+      commandId: "command-moderate-0001",
+      targetPrincipalId: "human-target",
+      action: "mute",
+      controlRevision: 1,
+      status: "unsupported",
+      providerMutationApplied: false,
+      resultCode: "executor_unavailable",
+    });
+    expect(JSON.stringify(firstPayload)).not.toContain(
+      "moderation-command-key-0001",
+    );
+    expect(JSON.stringify(firstPayload)).not.toContain(
+      testEnv.IDENTITY_HMAC_SECRET,
+    );
+    expect(providerCalls).toHaveLength(providerCallCountBeforeCommand);
+
+    const replay = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      {
+        ...moderateBody(),
+        requestId: "request-moderate-retry-0001",
+      },
+    );
+    expect(replay.status).toBe(503);
+    const replayPayload = await replay.json<{
+      controlRevision: number;
+      command: typeof firstPayload.command;
+    }>();
+    expect(replayPayload.controlRevision).toBe(1);
+    expect(replayPayload.command).toEqual(firstPayload.command);
+
+    const conflictingReuse = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      {
+        ...moderateBody(),
+        requestId: "request-moderate-conflict-0001",
+        action: "remove",
+      },
+    );
+    expect(conflictingReuse.status).toBe(409);
+    expect(await conflictingReuse.json()).toMatchObject({
+      error: { code: "VOICE_CONTROL_CONFLICT" },
+      controlRevision: 1,
+    });
+
+    humanId = "human-other-owner";
+    const differentOwnerReuse = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      {
+        ...moderateBody(),
+        requestId: "request-moderate-owner-conflict-0001",
+      },
+    );
+    expect(differentOwnerReuse.status).toBe(409);
+    expect(await differentOwnerReuse.json()).toMatchObject({
+      error: { code: "VOICE_CONTROL_CONFLICT" },
+      controlRevision: 1,
+    });
+
+    humanId = "human-carter";
+    const stale = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      {
+        ...moderateBody(),
+        requestId: "request-moderate-stale-0001",
+        commandId: "command-moderate-0002",
+        idempotencyKey: "moderation-command-key-0002",
+      },
+    );
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({
+      error: { code: "VOICE_CONTROL_CONFLICT" },
+      controlRevision: 1,
+    });
+
+    membershipRole = "viewer";
+    const revokedActor = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      {
+        ...moderateBody(),
+        requestId: "request-moderate-revoked-0001",
+        commandId: "command-moderate-0003",
+        idempotencyKey: "moderation-command-key-0003",
+        expectedRevision: 1,
+      },
+    );
+    expect(revokedActor.status).toBe(403);
+    expect(await revokedActor.json()).toMatchObject({
+      error: {
+        code: "VOICE_JOIN_NOT_AUTHORIZED",
+        recoverable: false,
+      },
+    });
+    expect(providerCalls).toHaveLength(providerCallCountBeforeCommand);
+
+    const snapshot = await testEnv.ROOMS.getByName(
+      openPayload.room.roomId,
+    ).debugSnapshot();
+    expect(snapshot.room?.controlRevision).toBe(1);
+    expect(snapshot.commandCount).toBe(1);
+    expect(snapshot.pendingCommandCount).toBe(0);
+  });
+
+  it("rejects client authority fields and remote-unmute vocabulary before command I/O", async () => {
+    const actorRole = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      { ...moderateBody(), actorRole: "owner" },
+    );
+    expect(actorRole.status).toBe(422);
+
+    const remoteUnmute = await invoke(
+      testEnv,
+      "/v1/voice-rooms/moderate",
+      { ...moderateBody(), action: "force_unmute" },
+    );
+    expect(remoteUnmute.status).toBe(422);
+    expect(providerCalls).toHaveLength(0);
+  });
+
   function environment(queue: TranscriptQueueEnvelope[]): RuntimeEnv {
     return {
       ...(env as unknown as RuntimeEnv),
@@ -323,5 +512,18 @@ function joinBody(requestedRole?: string): Record<string, string> {
     roomEpoch: EPOCH,
     requestId: `request-join-${requestedRole ?? "default"}-0001`,
     ...(requestedRole ? { requestedRole } : {}),
+  };
+}
+
+function moderateBody(): Record<string, string | number> {
+  return {
+    sessionId: SESSION_ID,
+    roomEpoch: EPOCH,
+    requestId: "request-moderate-0001",
+    commandId: "command-moderate-0001",
+    idempotencyKey: "moderation-command-key-0001",
+    expectedRevision: 0,
+    targetPrincipalId: "human-target",
+    action: "mute",
   };
 }

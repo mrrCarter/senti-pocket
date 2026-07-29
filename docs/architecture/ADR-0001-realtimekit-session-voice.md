@@ -106,6 +106,102 @@ forbidden. A participant must affirmatively re-enable their own microphone
 after a mute. No provider adapter may emulate unmute by silently replacing a
 participant, reminting broader grants, or changing a preset.
 
+### 4.1 Durable command ledger and scalable execution plane
+
+The room Durable Object owns only the smallest serialized control atom. For one
+moderation request it:
+
+1. verifies the exact tenant/session/epoch/room identity;
+2. accepts only a freshly authenticated Senti owner/admin who also has an active
+   moderator admission;
+3. binds the target canonical principal to the active opaque participant key
+   and provider participant ID;
+4. fences `commandId`, the owner-scoped idempotency fingerprint, payload
+   fingerprint, and `expectedRevision`;
+5. appends one durable command intent and increments `controlRevision` once in
+   one SQLite transaction; and
+6. grants a short execution lease without making a provider call or pushing to
+   listeners.
+
+The raw idempotency key and caller bearer are never stored. Two concurrent
+commands at one expected revision serialize: one may reserve the next revision
+and the other receives `VOICE_CONTROL_CONFLICT` plus the current revision.
+An exact retry returns the original command record; a reused command or key
+with different ownership or content conflicts.
+
+The local implementation stops at this ledger atom. Its only executor is
+`UnavailableVoiceControlExecutor`, which performs zero provider I/O, finalizes
+`providerMutationApplied=false`, and returns `VOICE_PROVIDER_UNAVAILABLE`.
+Therefore the current revision is an ordered intent-ledger revision, not proof
+that RealtimeKit state changed. A client must not render an applied moderation
+result from the revision alone.
+
+The target live path is asynchronous:
+
+```text
+authenticated command
+        |
+        v
+RoomGovernor: intent + revision + lease
+        |
+        v
+pre-armed alarm/outbox dispatcher
+        |
+        v
+at-least-once control Queue -> leased executor -> RealtimeKit desired state
+        |                                            |
+        +---------- retry / DLQ / reconcile <--------+
+                             |
+                             v
+confirmed state + signed Senti receipt -> bounded read projection
+```
+
+Before accepting a live command, the object must durably pre-arm its alarm and
+then commit the command row. This order makes an alarm with no work harmless,
+while a crash after the command commit still leaves a wake-up that can discover
+the durable intent. The alarm publishes stable `commandId` envelopes and marks
+them dispatched only after Queue acceptance. Both Durable Object alarms and
+Cloudflare Queues are at-least-once systems, so a crash after publish but before
+the dispatch mark may duplicate delivery. The Queue consumer and every
+provider adapter must deduplicate by the stable command identity; a DLQ is
+mandatory because exhausted retries must never delete governance work
+silently.
+
+The asynchronous executor must freshly recheck actor authority and target
+membership through a server-to-server Senti path before provider mutation. It
+must not persist or replay the caller's bearer. Provider operations are
+set-to-desired-state transitions rather than toggles. Where the provider does
+not accept an idempotency key, a retry must observe the provider state before
+reapplying. An expired execution lease never authorizes a stale worker to
+finalize over a newer fence.
+
+Provider success is not a confirmation receipt. The intended result remains
+`pending_confirmation` until authoritative provider observation matches it.
+Past a bounded window, the reconciler retries or records
+`VOICE_CONTROL_CONFLICT`; it never silently upgrades an unconfirmed command to
+success. A signed Senti receipt is projected only after provider confirmation.
+Audience delivery uses RealtimeKit's own participant channel and/or a cached,
+coalesced `afterRevision` pull. The Durable Object may notify only the bounded
+stage set (operational default at most eight publishers); it never loops over
+the audience.
+
+There is a current provider gap. RealtimeKit's signed-webhook catalog checked
+on 2026-07-29 includes meeting lifecycle, participant join/left, chat export,
+recording/livestream status, transcript, and summary events, but no participant
+mute, preset, role, or stage-change event. SDK `audioUpdate` and participant
+callbacks are unsigned client observations. `meeting.participantLeft` can show
+that a participant left but cannot prove that Senti's remove command caused
+the departure. The reviewed backend Active Session API exposes kick operations
+and aggregate session detail, not an authoritative mute/preset readback.
+Consequently mute, promote, demote, deny-publish, allow-publish, and causal
+remove confirmation remain blocked until RealtimeKit supplies an authoritative
+signed/readback surface or the provider decision changes.
+
+Finalized unsupported command identities are currently retained for eight
+days as a bounded local proof. Applied results require an explicit production
+retention and archive policy that preserves safe retry semantics across the
+maximum client retry window.
+
 ## 5. Browser and iOS are equal clients
 
 Both clients support:
@@ -350,6 +446,12 @@ Until documented provider quota and load receipts clear a gate, operational
 defaults remain 50 joined and 8 publishers per room. Audio-only is the
 baseline. Video is a separately enabled and metered capability.
 
+Before any moderation executor is labeled live, its provisional control-plane
+gate is 100 concurrent rooms, 50 joined per room, at most 8 publishers, and a
+moderation burst concentrated on one hot room. The receipt path must show
+constant/bounded room-object work as audience size grows; it is not allowed to
+pass by reducing the simulated audience to the stage set.
+
 Minimum acceptance measurements:
 
 - join p95 under 2 seconds;
@@ -386,6 +488,11 @@ evidence of provider capacity.
 | Signed old webhook is replayed | Verify raw `rtk-signature`; durable `rtk-uuid` dedupe; bounded lifecycle/reconciliation rules |
 | Raw audio retained silently | Default off, explicit consent and policy, encrypted object reference only |
 | One hot room overloads control | Stateless listener minting, sharded roster, bounded RoomGovernor mutations |
+| Room object fans one command to every listener | Provider participant channel and cached/coalesced revision pull; object push limited to bounded stage |
+| Crash follows intent commit but precedes provider call | Pre-arm durable alarm, scan durable pending intent, at-least-once Queue, lease-fenced reconcile |
+| Queue or alarm redelivers a command | Stable command identity, owner/payload fence, desired-state operation, provider observation before retry |
+| Provider state diverges from Senti intent | Remain pending, bounded authoritative observation/retry, then visible conflict; never silent success |
+| Two moderators race at one revision | One transactional revision winner; loser receives current revision and visible retry UX |
 | Cost runaway | Entitlement checks, immutable meters, 80/95/100 alerts, emergency capability kill switches |
 | Provider outage | Human-room degrade/reconnect, circuit breaker, explicit status, provider fallback runbook |
 | Index outage loses speech | Append before async index; retry/reconcile by stable utterance ID |
@@ -475,7 +582,8 @@ signature, wrong-session, replay, offline-honesty, or receipt guarantees.
 | Roster and pagination | Joined participant maps plus count/page/page-count/active-mode APIs | Supported; 5k/10k correctness unproven |
 | Active speaker | Web and mobile active-speaker APIs/events | Supported |
 | iOS routes | iOS Core release notes cover available-device updates, device selection, earpiece/speaker and Bluetooth fixes | Supported; physical-device receipt required |
-| Signed webhooks | Raw body RSA-SHA256 in `rtk-signature`; `rtk-uuid` delivery identity; published public key endpoint | Supported |
+| Signed webhooks | Raw body RSA-SHA256 in `rtk-signature`; `rtk-uuid` delivery identity; published public key endpoint | Supported for the documented event catalog |
+| Signed moderation confirmation | No documented mute, preset, role, or stage webhook; participant-left does not prove command causality | Blocking provider gap |
 | Post-meeting transcript | Speaker-separated transcript, `meeting.transcript` webhook/REST, seven-day availability | Supported but not durable |
 | Real-time transcript | Per-participant Deepgram events delivered to meeting participants | Captions supported; trusted server projection unproven |
 | True server voice agent | No documented server bot/synthetic-track publish API in the AI surface | Critical unproven gate |
@@ -526,9 +634,10 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 |---|---|
 | RealtimeKit selected for the spike | Decided |
 | Provider-neutral room/event/error/entitlement contract | Versioned and validation-tested |
-| RealtimeKit adapter/control-plane slice | Built locally and under feature-branch review; no account/resources |
-| Worker checks | Generated types, strict TypeScript, workerd tests, and Wrangler dry-run required at handoff |
-| iOS `VoiceMediaTransport` and RealtimeKit 3.1 adapter | Built locally; Mac/Xcode and physical-device review pending |
+| RealtimeKit adapter/control-plane slice | Draft PR #122 is hosted-Omar green on exact reviewed head; not merged or deployed; no account/resources |
+| Durable moderation ledger | Built locally with unavailable zero-I/O executor; live execution/confirmation remains blocked |
+| Worker checks | Generated types, strict TypeScript, workerd hostile tests, and Wrangler dry-run required at every handoff |
+| iOS `VoiceMediaTransport` and RealtimeKit 3.1 adapter | arm64 iOS Simulator build and 65/65 macOS tests independently green; physical-device review pending |
 | Server-bound remote iOS roster/stage identity | Not built; the SDK adapter fails closed instead of treating provider correlation IDs as Senti principals |
 | Web room integration | Not built |
 | True server agent participant | Unproven critical gate |
@@ -552,9 +661,13 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 - [RealtimeKit remote participants and pagination](https://developers.cloudflare.com/realtime/realtimekit/core/remote-participants/)
 - [RealtimeKit active speakers](https://developers.cloudflare.com/realtime/realtimekit/core/display-active-speakers/)
 - [RealtimeKit webhooks and RSA-SHA256 verification](https://developers.cloudflare.com/realtime/realtimekit/webhooks/)
+- [RealtimeKit Active Session backend API](https://developers.cloudflare.com/api/resources/realtime_kit/subresources/active-session/)
 - [RealtimeKit transcription, retention, and Workers AI rates](https://developers.cloudflare.com/realtime/realtimekit/ai/transcription/)
 - [RealtimeKit AI features](https://developers.cloudflare.com/realtime/realtimekit/ai/)
 - [RealtimeKit iOS Core release notes](https://developers.cloudflare.com/realtime/realtimekit/release-notes/ios-core/)
+- [Durable Object alarms](https://developers.cloudflare.com/durable-objects/api/alarms/)
+- [Cloudflare Queues delivery guarantees](https://developers.cloudflare.com/queues/reference/delivery-guarantees/)
+- [Cloudflare Queues dead-letter queues](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/)
 - [Cloudflare Agents voice channel](https://developers.cloudflare.com/agents/communication-channels/voice/)
 - [Cloudflare Realtime SFU](https://developers.cloudflare.com/realtime/sfu/introduction/)
 - [Cloudflare Realtime WebSocket adapter](https://developers.cloudflare.com/realtime/sfu/media-transport-adapters/websocket-adapter/)

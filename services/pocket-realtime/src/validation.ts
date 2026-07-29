@@ -1,8 +1,10 @@
 import type {
   JoinRoomRequest,
+  ModerateRoomRequest,
   OpenRoomRequest,
   RoomUsageRequest,
   TranscriptMode,
+  VoiceModerationAction,
   VoiceRole,
 } from "./contracts";
 import { HttpError } from "./errors";
@@ -13,6 +15,9 @@ const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const ROOM_ID = /^[A-Za-z0-9_-]{43}$/;
 const DELIVERY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const EVENT_NAME = /^[A-Za-z][A-Za-z0-9.]{2,79}$/;
+const COMMAND_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$/;
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,255}$/;
+const PRINCIPAL_ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,159}$/;
 const MAX_JSON_BYTES = 8 * 1024;
 export const MAX_WEBHOOK_BYTES = 256 * 1024;
 
@@ -67,6 +72,38 @@ export function parseRoomUsageRequest(value: unknown): RoomUsageRequest {
     sessionId: uuid(body.sessionId, "sessionId"),
     roomEpoch: uuid(body.roomEpoch, "roomEpoch"),
     requestId: requestIdValue(body.requestId),
+  };
+}
+
+export function parseModerateRoomRequest(value: unknown): ModerateRoomRequest {
+  const body = record(value);
+  exactKeys(body, [
+    "sessionId",
+    "roomEpoch",
+    "requestId",
+    "commandId",
+    "idempotencyKey",
+    "expectedRevision",
+    "targetPrincipalId",
+    "action",
+  ]);
+  return {
+    sessionId: uuid(body.sessionId, "sessionId"),
+    roomEpoch: uuid(body.roomEpoch, "roomEpoch"),
+    requestId: requestIdValue(body.requestId),
+    commandId: boundedPattern(body.commandId, COMMAND_ID, "commandId"),
+    idempotencyKey: boundedPattern(
+      body.idempotencyKey,
+      IDEMPOTENCY_KEY,
+      "idempotencyKey",
+    ),
+    expectedRevision: revision(body.expectedRevision),
+    targetPrincipalId: boundedPattern(
+      body.targetPrincipalId,
+      PRINCIPAL_ID,
+      "targetPrincipalId",
+    ),
+    action: moderationAction(body.action),
   };
 }
 
@@ -195,4 +232,44 @@ function optionalVoiceRole(value: unknown): VoiceRole | undefined {
   if (value === undefined) return undefined;
   if (value === "moderator" || value === "speaker" || value === "listener") return value;
   throw new HttpError(422, "invalid_request", "requestedRole is invalid.");
+}
+
+function boundedPattern(
+  value: unknown,
+  pattern: RegExp,
+  field: string,
+): string {
+  if (typeof value !== "string" || !pattern.test(value)) {
+    throw new HttpError(422, "invalid_request", `${field} is invalid.`);
+  }
+  return value;
+}
+
+function revision(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0
+  ) {
+    throw new HttpError(
+      422,
+      "invalid_request",
+      "expectedRevision must be a non-negative safe integer.",
+    );
+  }
+  return value;
+}
+
+function moderationAction(value: unknown): VoiceModerationAction {
+  if (
+    value === "promote" ||
+    value === "demote" ||
+    value === "mute" ||
+    value === "remove" ||
+    value === "deny_publish" ||
+    value === "allow_publish"
+  ) {
+    return value;
+  }
+  throw new HttpError(422, "invalid_request", "action is invalid.");
 }
