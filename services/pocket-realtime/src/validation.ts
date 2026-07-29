@@ -3,6 +3,7 @@ import {
   type JoinRoomRequest,
   type ModerateRoomRequest,
   type OpenRoomRequest,
+  type RoomRosterRequest,
   type RoomUsageRequest,
   type TranscriptMode,
   type VoiceControlQueueEnvelope,
@@ -74,6 +75,36 @@ export function parseRoomUsageRequest(value: unknown): RoomUsageRequest {
     sessionId: uuid(body.sessionId, "sessionId"),
     roomEpoch: uuid(body.roomEpoch, "roomEpoch"),
     requestId: requestIdValue(body.requestId),
+  };
+}
+
+export function parseRoomRosterRequest(value: unknown): RoomRosterRequest {
+  const body = record(value);
+  exactKeys(body, [
+    "sessionId",
+    "roomEpoch",
+    "requestId",
+    "cursor",
+    "pageSize",
+  ]);
+  const cursor =
+    body.cursor === undefined
+      ? undefined
+      : boundedPattern(
+          body.cursor,
+          /^r1\.[A-Za-z0-9_-]{1,6144}\.[A-Za-z0-9_-]{43}$/,
+          "cursor",
+        );
+  const pageSize =
+    body.pageSize === undefined
+      ? undefined
+      : boundedPageSize(body.pageSize);
+  return {
+    sessionId: uuid(body.sessionId, "sessionId"),
+    roomEpoch: uuid(body.roomEpoch, "roomEpoch"),
+    requestId: requestIdValue(body.requestId),
+    ...(cursor ? { cursor } : {}),
+    ...(pageSize ? { pageSize } : {}),
   };
 }
 
@@ -285,6 +316,22 @@ function revision(value: unknown): number {
       "expectedRevision must be a non-negative safe integer.",
     );
   }
+}
+
+function boundedPageSize(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > 200
+  ) {
+    throw new HttpError(
+      422,
+      "invalid_request",
+      "pageSize must be an integer from 1 through 200.",
+    );
+  }
+  return value;
 }
 
 function nonNegativeSafeInteger(value: unknown, field: string): number {

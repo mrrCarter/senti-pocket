@@ -1,30 +1,45 @@
-# REMOVE observation-kernel slice
+# Server-authoritative roster identity slice
 
-Base: `e8477a7fa61548222d89df1118b6bbbda81cb236`
+Base: `d856adfb682f625c2daab68b80e94ada20d6a4ef`
 
 ## Plan
 
-- [x] Preserve the reviewed outbox head in its existing worktree.
-- [x] Verify RealtimeKit's signed peer identity and backend kick target surfaces.
-- [x] Freeze the peer-generation fence and execution-side TOCTOU residual with Forge.
-- [x] Add fresh execution-time authorization and peer-exact desired-state provider ports.
-- [x] Pin signed provider session plus peer identity into REMOVE commands.
-- [x] Add the durable attempt, observation, conflict, and three-field truth model.
-- [x] Keep production composition on the unavailable zero-I/O executor.
-- [x] Prove revoke-before-execute, stable crash retry, stale fence, peer mismatch,
-  stale join/old leave ordering, exact signed observation, duplicate webhook,
-  already absent, one nonterminal remove per peer, and timeout conflict.
-- [x] Update the normative contract, ADR, README, and lessons.
-- [x] Run generated types, strict TypeScript, all Worker tests, Wrangler dry-run,
-  and staged SentinelLayer review.
-- [ ] Commit and push the exact SHA, unlock files, and obtain Forge's independent
-  CODE+DOCS verdict.
+- [x] Preserve the REMOVE observation-kernel exact head in its own worktree.
+- [x] Trace the current iOS fail-closed remote identity boundary.
+- [x] Define deterministic roster shards and an HMAC revision-vector cursor.
+- [x] Project server admission bindings without provider IDs becoming
+  principals.
+- [x] Project only verified exact peer joins/leaves with delivery/digest
+  dedupe and stale-generation protection.
+- [x] Add authenticated bounded roster pages with final vector revalidation
+  and explicit resync.
+- [x] Add Swift atomic page staging with wrong-epoch, gap, duplicate-binding,
+  and count-overclaim rejection.
+- [x] Prove the Worker kernel with strict TypeScript and 50/50 workerd tests.
+- [x] Run generated types, strict TypeScript, 50/50 workerd tests, and Wrangler
+  dry-run.
+- [x] Run the deterministic staged SentinelLayer review.
+- [ ] Obtain Forge CODE+DOCS and Mac/iOS compile verdict on an exact pushed
+  revision.
+
+## Honest gates
+
+- Production composition, Cloudflare resources, provider calls, secrets,
+  deployment, PR, merge, and activation remain untouched.
+- The roster read model is sharded, but room admission and initial signed
+  delivery acceptance still touch the RoomGovernor. No 5k/10k or provider
+  capacity claim is made.
+- The Swift files are uncomposed package code. This Windows host has no Swift
+  toolchain; Forge's Mac/iOS compile and physical-device receipts remain
+  required.
+- Forge's connected Claude Code host reached its weekly usage limit on
+  2026-07-29 and reported a reset at 2026-08-01 01:00 America/New_York.
+  Independent review remains pending; this is not a review waiver.
 
 ## Review
 
-- `npm run check`: generated bindings, strict TypeScript, 43/43 workerd tests,
+- `npm run check`: generated bindings, strict TypeScript, 50/50 workerd tests,
   and Wrangler dry-run green.
-- SentinelLayer deterministic review
-  `review-20260729-114438-49b5d7d0`: 14 staged files, normative contract
-  supplied, refreshed ingest, P0/P1/P2/P3 = 0.
-- Independent exact-SHA Forge/Claude review pending before handoff.
+- SentinelLayer staged review `review-20260729-123447-447b36ee`: 19 files,
+  refreshed ingest, normative contract supplied, P0/P1/P2/P3 = 0.
+- Swift/Mac compile and independent exact-revision Forge review remain pending.

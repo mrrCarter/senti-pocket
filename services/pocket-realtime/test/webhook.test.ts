@@ -8,7 +8,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import worker from "../src/index";
 import type { TranscriptQueueEnvelope } from "../src/contracts";
 import type { RuntimeEnv } from "../src/env";
-import { deriveRoomId, meetingTitle } from "../src/identity";
+import {
+  deriveParticipantId,
+  deriveRoomId,
+  meetingTitle,
+} from "../src/identity";
+import {
+  rosterShardIndex,
+  rosterShardName,
+} from "../src/roster-cursor";
 
 const SESSION_ID = "6cf7e861-546a-4b9f-b937-39182a5bd395";
 const TENANT_ID = "tenant-demo";
@@ -17,6 +25,8 @@ const MEETING_ID = "bbb8940e-1b97-402a-97d6-2708b7feca41";
 const ACCOUNT_ID = "023e105f4ecef8ad9ca31a8372d0c353";
 const APP_ID = "6f80f956-3195-489a-aa76-9f26d3234160";
 const ROOM_SECRET = "room-key-test-secret-at-least-thirty-two-characters";
+const IDENTITY_SECRET =
+  "identity-test-secret-at-least-thirty-two-characters";
 
 describe("RealtimeKit signed webhook intake", () => {
   let keyPair: CryptoKeyPair;
@@ -223,6 +233,107 @@ describe("RealtimeKit signed webhook intake", () => {
     expect(queue).toHaveLength(0);
   });
 
+  it("projects a verified signed peer generation into the bound roster shard", async () => {
+    const principalId = "human-signed-roster";
+    const participantKey = await deriveParticipantId(
+      IDENTITY_SECRET,
+      roomId,
+      principalId,
+    );
+    const shardIndex = rosterShardIndex(participantKey);
+    const shard = testEnv.ROOM_ROSTER_SHARDS.getByName(
+      rosterShardName(roomId, shardIndex),
+    );
+    const room = await testEnv.ROOMS.getByName(roomId).getRoom(
+      TENANT_ID,
+      SESSION_ID,
+      EPOCH,
+      roomId,
+    );
+    if (!room) throw new Error("Expected room.");
+    expect(
+      await shard.bindParticipant({
+        room,
+        shardIndex,
+        participantKey,
+        principalId,
+        providerParticipantId: "provider-signed-roster",
+        kind: "human",
+        role: "listener",
+        displayName: "Signed Roster",
+        now: "2026-07-29T12:00:00.000Z",
+      }),
+    ).toBe("applied");
+
+    const participant = {
+      peerId: "peer-signed-roster",
+      customParticipantId: participantKey,
+      joinedAt: "2026-07-29T12:20:00.000Z",
+    };
+    const joined = await postSigned(
+      {
+        event: "meeting.participantJoined",
+        meeting: {
+          id: MEETING_ID,
+          title: meetingTitle(roomId),
+          sessionId: "provider-session-signed-roster",
+        },
+        participant,
+      },
+      "delivery-signed-roster-join-0001",
+    );
+    expect(joined.status).toBe(202);
+    const descriptor = await shard.describe(
+      room,
+      "2026-07-29T12:20:01.000Z",
+    );
+    if (descriptor.disposition !== "ok") {
+      throw new Error("Expected roster descriptor.");
+    }
+    expect(descriptor.descriptor.joinedCount).toBe(1);
+    const page = await shard.page(
+      room,
+      descriptor.descriptor.revision,
+      null,
+      10,
+      "2026-07-29T12:20:01.000Z",
+    );
+    expect(page).toMatchObject({
+      disposition: "ok",
+      participants: [
+        {
+          principalId,
+          providerCorrelationId: participantKey,
+          providerSessionId: "provider-session-signed-roster",
+          providerPeerId: "peer-signed-roster",
+        },
+      ],
+    });
+
+    const left = await postSigned(
+      {
+        event: "meeting.participantLeft",
+        meeting: {
+          id: MEETING_ID,
+          title: meetingTitle(roomId),
+          sessionId: "provider-session-signed-roster",
+        },
+        participant: {
+          ...participant,
+          leftAt: "2026-07-29T12:21:00.000Z",
+        },
+      },
+      "delivery-signed-roster-left-0001",
+    );
+    expect(left.status).toBe(202);
+    expect(
+      await shard.describe(room, "2026-07-29T12:21:01.000Z"),
+    ).toMatchObject({
+      disposition: "ok",
+      descriptor: { joinedCount: 0 },
+    });
+  });
+
   async function postSigned(body: unknown, deliveryId: string): Promise<Response> {
     const text = JSON.stringify(body);
     return invokeWebhook(text, await sign(text), deliveryId);
@@ -292,7 +403,7 @@ describe("RealtimeKit signed webhook intake", () => {
       MAX_CONTROL_REQUESTS_PER_ROOM_PER_DAY: "10000",
       CLOUDFLARE_API_TOKEN: "cloudflare-test-token-never-client-visible",
       ROOM_KEY_HMAC_SECRET: ROOM_SECRET,
-      IDENTITY_HMAC_SECRET: "identity-test-secret-at-least-thirty-two-characters",
+      IDENTITY_HMAC_SECRET: IDENTITY_SECRET,
       TRANSCRIPT_INGEST_QUEUE: {
         async send(message: TranscriptQueueEnvelope): Promise<void> {
           if (queueFailuresRemaining > 0) {

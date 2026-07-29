@@ -46,5 +46,13 @@ is enabled. This repository configures bindings and consumers only; it does not
 create Cloudflare resources or authorize deployment. Run the local proof with
 `npm run check` from `services/pocket-realtime`.
 
+The successor roster slice projects server-owned Senti identity and verified
+peer generations into sixteen paginated Durable Object shards. An HMAC-bound
+revision-vector cursor makes concurrent mutation an explicit resync instead of
+a partial roster. The Swift package stages all pages and commits only the final
+count-complete snapshot; it never promotes a provider identifier into a Senti
+principal. Media/app wiring, Mac/device proof, Forge review, 5k/10k load proof,
+and deployment remain pending.
+
 ## Node note
 The CLI needs Node 22 (`~/AppData/Roaming/nvm/v22.15.0/node.exe`). Default `node` is v26 = unsupported and crashes the CLI.

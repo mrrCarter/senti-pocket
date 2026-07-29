@@ -23,11 +23,20 @@ import { realtimeKitMediaRoomProvider } from "./media-room-provider";
 import {
   RoomGovernor,
 } from "./room-governor";
+import {
+  RoomRosterShard,
+} from "./room-roster-shard";
+import {
+  rosterShardIndex,
+  rosterShardName,
+} from "./roster-cursor";
+import { readRosterPage } from "./roster-reader";
 import { authenticateMember } from "./senti-client";
 import {
   parseJoinRoomRequest,
   parseModerateRoomRequest,
   parseOpenRoomRequest,
+  parseRoomRosterRequest,
   parseRoomUsageRequest,
   configuredPositiveInteger,
   configuredPositiveNumber,
@@ -38,6 +47,7 @@ import { handleRealtimeKitWebhook } from "./webhook";
 import { handleVoiceControlQueue } from "./voice-control-queue";
 
 export { RoomGovernor };
+export { RoomRosterShard };
 
 interface RequestContext {
   traceId: string;
@@ -71,6 +81,9 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/v1/voice-rooms/usage") {
         return await roomUsage(request, env, requestContext);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/voice-rooms/roster") {
+        return await roomRoster(request, env, requestContext);
       }
       if (
         request.method === "POST" &&
@@ -317,6 +330,30 @@ async function joinRoom(
       "Voice room identity could not be reconciled.",
     );
   }
+  const rosterProjection = await rosterShardForParticipant(
+    env,
+    roomId,
+    participantKey,
+  ).bindParticipant({
+    room: currentRoom,
+    shardIndex: rosterShardIndex(participantKey),
+    participantKey,
+    principalId: member.humanId,
+    providerParticipantId: participant.id,
+    kind: "human",
+    role,
+    displayName: member.displayName,
+    now: new Date().toISOString(),
+  });
+  if (
+    rosterProjection === "identity_mismatch" ||
+    rosterProjection === "binding_conflict"
+  ) {
+    throw upstreamError(
+      "roster_projection_conflict",
+      "The server-owned voice roster identity could not be reconciled.",
+    );
+  }
 
   const issuedAt = new Date();
   const credential: JoinCredential = {
@@ -452,6 +489,38 @@ async function moderateRoom(
   );
 }
 
+async function roomRoster(
+  request: Request,
+  env: RuntimeEnv,
+  requestContext: RequestContext,
+): Promise<Response> {
+  const input = parseRoomRosterRequest(await readBoundedJson(request));
+  adoptBodyRequestId(requestContext, input.requestId);
+  const { traceId } = requestContext;
+  const member = await authenticateMember(request, input.sessionId, env);
+  const roomId = await deriveRoomId(
+    env.ROOM_KEY_HMAC_SECRET,
+    member.tenantId,
+    input.sessionId,
+    input.roomEpoch,
+  );
+  const page = await readRosterPage(
+    env,
+    {
+      ...input,
+      tenantId: member.tenantId,
+      roomId,
+    },
+    new Date(),
+  );
+  return json(
+    { requestId: input.requestId, page },
+    200,
+    traceId,
+    input.requestId,
+  );
+}
+
 async function roomUsage(
   request: Request,
   env: RuntimeEnv,
@@ -505,6 +574,17 @@ async function roomUsage(
     200,
     traceId,
     input.requestId,
+  );
+}
+
+function rosterShardForParticipant(
+  env: RuntimeEnv,
+  roomId: string,
+  participantKey: string,
+) {
+  const shardIndex = rosterShardIndex(participantKey);
+  return env.ROOM_ROSTER_SHARDS.getByName(
+    rosterShardName(roomId, shardIndex),
   );
 }
 
@@ -663,6 +743,9 @@ function adoptBodyRequestId(
 
 function canonicalVoiceCode(error: HttpError): string {
   if (error.code === "room_epoch_ended") return "VOICE_ROOM_ENDED";
+  if (error.code === "roster_resync_required") {
+    return "VOICE_STREAM_RESYNC_REQUIRED";
+  }
   if (error.code === "room_budget_exhausted") {
     return "VOICE_ENTITLEMENT_EXCEEDED";
   }
@@ -684,6 +767,7 @@ function isRecoverable(error: HttpError): boolean {
 }
 
 function retryAfterMs(error: HttpError): number | null {
+  if (error.code === "roster_resync_required") return 0;
   if (error.status === 409) return 250;
   if (error.status === 429) return 60_000;
   if (error.status >= 500) return 1_000;

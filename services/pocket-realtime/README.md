@@ -49,6 +49,17 @@ Cloudflare account, or used to create billable resources.
   - returns per-room completed participant-presence and a clearly labeled
     transcription-neuron estimate;
   - never presents the estimate as provider billing truth.
+- `POST /v1/voice-rooms/roster`
+  - re-verifies current Senti membership on every page;
+  - returns only server-bound canonical principals and exact signed peer
+    generations, never treating provider correlation IDs as authority;
+  - pages at most 200 participants from one of sixteen deterministic roster
+    shards;
+  - binds its opaque HMAC cursor to the room/meeting, shard revision/count
+    vector, page position, joined total, and ten-minute expiry;
+  - revalidates every shard before the final page and returns
+    `VOICE_STREAM_RESYNC_REQUIRED` on any concurrent mutation, so clients can
+    discard partial staging instead of displaying an inconsistent roster.
 - `POST /v1/realtimekit/webhooks`
   - verifies RSA-SHA256 over the bounded raw body;
   - routes by a non-PII HMAC room locator in the meeting title;
@@ -58,6 +69,8 @@ Cloudflare account, or used to create billable resources.
     peer after the durable attempt began;
   - bounds reconnect history to four inactive unreferenced peers per
     participant, while preserving active and nonterminal-command peers;
+  - idempotently mirrors valid participant generations into the sharded roster
+    read model before final webhook acceptance;
   - queues only the provider session reference and bounded metadata, never the
     presigned transcript URL or transcript body.
 
@@ -83,6 +96,13 @@ production-ready Senti Pocket voice implementation.
 - Every admission currently serializes through one per-room Durable Object.
   The 5k/10k hot-room target is unproven and requires a sharded admission/load
   design before production.
+- The roster page itself is sharded and vector-fenced, but initial admission
+  and webhook delivery acceptance still touch the room governor. This slice
+  does not claim end-to-end hot-room throughput or provider quota.
+- `VoiceRosterProjection` stages authenticated pages atomically in the Swift
+  package, but it is not wired into the SDK media adapter/app. This Windows
+  host has no Swift toolchain; Mac/iOS compile and device receipts remain
+  pending Forge review.
 - Alarm/outbox dispatch, the at-least-once Queue/DLQ, leases, and watchdog are
   implemented locally. A provider-neutral REMOVE execution/observation kernel
   is also locally proven with test adapters: execution-time fresh

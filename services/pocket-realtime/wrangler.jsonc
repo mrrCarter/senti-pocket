@@ -27,6 +27,10 @@
       {
         "name": "ROOMS",
         "class_name": "RoomGovernor"
+      },
+      {
+        "name": "ROOM_ROSTER_SHARDS",
+        "class_name": "RoomRosterShard"
       }
     ]
   },
@@ -34,6 +38,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["RoomGovernor"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["RoomRosterShard"]
     }
   ],
   "queues": {

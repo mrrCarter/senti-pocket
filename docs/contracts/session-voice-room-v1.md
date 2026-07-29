@@ -594,6 +594,48 @@ Heartbeat events contain no semantic state beyond current control revision and
 time. UI state MUST NOT turn a transport heartbeat into a successful room or
 moderation result.
 
+### 14.1 Server-authoritative roster pages
+
+The audience roster is read through authenticated
+`senti.voice_roster.page.v1` pages. A page contains exact
+tenant/session/epoch identity, one opaque snapshot ID, zero-based page index,
+joined count, at most 200 participants, an opaque next cursor, and `complete`.
+Each participant contains the canonical Senti principal, server-issued stable
+provider participant/correlation identifiers, exact signed provider session
+and peer generation, role, kind, bounded display name, and joined time.
+Provider identifiers are correlation and freshness inputs only; none is a
+principal or authorization grant.
+
+The first request freshly verifies visible Senti membership and captures a
+fixed vector of roster-shard revisions and counts. The HMAC-authenticated
+cursor is bound to the room identity, provider meeting, vector, page size,
+position, total count, and a ten-minute maximum lifetime. It is integrity
+protected, not encrypted, and MUST NOT contain a bearer, provider credential,
+membership role, or private policy. Every continuation request re-verifies
+Senti membership.
+
+One page reads one deterministic participant shard. Before `complete=true`,
+the server re-reads every shard descriptor. Any revision/count mismatch,
+expired/forged cursor, shard identity mismatch, page gap, duplicate principal,
+duplicate provider correlation, duplicate exact peer, or total-count mismatch
+fails closed. A concurrent roster mutation yields
+`VOICE_STREAM_RESYNC_REQUIRED`; clients discard the staged pages and restart.
+iOS and web MUST NOT publish a partial page set as an authoritative roster.
+
+Admission establishes the server-owned
+`principalId <-> providerCorrelationId <-> providerParticipantId` binding.
+Only raw-signature-verified participant join/left deliveries may attach or
+retire the exact `(providerSessionId, peerId)` generation. Projection is
+idempotent by delivery ID and digest. A stale join cannot replace a newer peer,
+and an old-peer leave cannot clear a replacement.
+
+The current local implementation uses sixteen deterministic SQLite-backed
+Durable Object shards per room and queries all shard descriptors only at
+snapshot open and final validation. That is an implementation proof, not a
+5k/10k provider, latency, webhook-ingress, or load receipt. The existing room
+governor still participates in admission and signed-delivery acceptance; those
+hot-path scale gates remain open.
+
 ## 15. Webhook and transcript ordering
 
 Provider deliveries are at-least-once and may be late or out of order.
@@ -705,6 +747,10 @@ An adapter is not conforming until independent receipts cover:
 - conflicting utterance identity cannot overwrite evidence;
 - transcript event cannot authorize a write;
 - agent utterance cannot bypass human confirmation.
+- forged, expired, wrong-room, or wrong-epoch roster cursor rejected;
+- provider participant/correlation/session/peer identifiers cannot become a
+  Senti principal or authorization input;
+- stale join and old-peer leave cannot replace/clear a newer roster peer.
 
 ### Client behavior
 
@@ -714,6 +760,8 @@ An adapter is not conforming until independent receipts cover:
 - foreground/background/rejoin behavior;
 - VoiceOver, keyboard, focus, dynamic type, contrast, and responsive roster;
 - stale room/participant callbacks cannot corrupt a new epoch.
+- partial or gapped roster pages never replace the last complete snapshot;
+- a mutation during pagination produces explicit resync and no mixed snapshot;
 - each agent keeps a distinct stable voice/tone profile across web and iOS;
 - premium-provider loss produces a labeled, non-secret fallback without
   changing agent identity.

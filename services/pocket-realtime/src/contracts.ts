@@ -3,6 +3,8 @@ export const REQUIRED_AGENT_MEDIA_MODE = "shared-room-track" as const;
 export const DEGRADED_AGENT_FALLBACK = "edge-text-client-tts" as const;
 export const VOICE_CONTROL_QUEUE_SCHEMA =
   "senti.voice_control.command.v1" as const;
+export const VOICE_ROSTER_PAGE_SCHEMA =
+  "senti.voice_roster.page.v1" as const;
 
 export type SentiMembershipRole = "owner" | "admin" | "contributor" | "viewer";
 export type VoiceRole = "moderator" | "speaker" | "listener";
@@ -35,6 +37,14 @@ export interface RoomUsageRequest {
   sessionId: string;
   roomEpoch: string;
   requestId: string;
+}
+
+export interface RoomRosterRequest {
+  sessionId: string;
+  roomEpoch: string;
+  requestId: string;
+  cursor?: string;
+  pageSize?: number;
 }
 
 export interface ModerateRoomRequest {
@@ -120,6 +130,31 @@ export interface RoomUsageSnapshot {
   transcriptionNeuronsEstimate: number;
   estimateBasis: "completed-participant-presence";
   billingTruth: false;
+}
+
+export interface RoomRosterParticipant {
+  principalId: string;
+  providerParticipantId: string;
+  providerCorrelationId: string;
+  providerSessionId: string;
+  providerPeerId: string;
+  kind: "human" | "agent";
+  role: VoiceRole;
+  displayName: string | null;
+  joinedAt: string;
+}
+
+export interface RoomRosterPage {
+  schemaVersion: typeof VOICE_ROSTER_PAGE_SCHEMA;
+  tenantId: string;
+  sessionId: string;
+  roomEpoch: string;
+  snapshotId: string;
+  pageIndex: number;
+  joinedCount: number;
+  participants: RoomRosterParticipant[];
+  nextCursor: string | null;
+  complete: boolean;
 }
 
 export interface ModerationCommandRecord {

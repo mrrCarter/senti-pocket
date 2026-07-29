@@ -272,6 +272,39 @@ days as a bounded local proof. Applied results require an explicit production
 retention and archive policy that preserves safe retry semantics across the
 maximum client retry window.
 
+### 4.2 Sharded roster identity read model
+
+Remote iOS/web identity must come from Senti, not from an SDK participant
+object. The local successor therefore projects admission bindings and verified
+RealtimeKit peer generations into sixteen deterministic room-roster shards.
+The stable HMAC participant key selects a shard; the shard owns only its
+binding rows, exact peer history, delivery/digest dedupe, and a monotonically
+increasing visible revision. A join webhook may arrive before admission
+projection: the peer remains invisible until the server binding arrives, then
+converges without inventing identity.
+
+Roster pagination freezes a revision/count vector across all sixteen shards.
+Each continuation reads one shard with the expected revision. The opaque HMAC
+cursor binds room/meeting identity, vector, page position, page size, joined
+total, and a ten-minute expiry. Final-page delivery revalidates the whole
+vector. If any shard changed, the result is
+`VOICE_STREAM_RESYNC_REQUIRED`; clients discard staged pages. This provides an
+atomically committed client snapshot without sending the whole audience
+through the control stream or reading every shard on every page.
+
+The Swift `VoiceRosterProjection` mirrors that boundary: it commits only a
+complete, gap-free snapshot and rejects wrong epochs, duplicate principals,
+duplicate provider correlations, duplicate exact peers, total-count
+overclaims, and any provider identifier reused as a Senti principal. It is a
+package kernel only. It is not wired to the RealtimeKit media adapter or app,
+and its Mac/iOS compile and physical-device receipt remain Forge-owned.
+
+This does not clear the high-room scale gate. Admission and initial signed
+delivery acceptance still touch the current room governor, no controlled load
+receipt exists, and the provider quota remains unproven. The sharded read
+model removes one known audience-sized storage/pagination bottleneck without
+claiming that the complete ingress path is ready for 5k/10k participants.
+
 ## 5. Browser and iOS are equal clients
 
 Both clients support:
@@ -671,6 +704,7 @@ This is a path plan, not authority to create or edit the paths:
 | Provider-neutral server domain | `services/pocket-voice-control/src/domain/` | Room identity/state, entitlements, commands, events, error/result types |
 | Cloudflare entry points | `services/pocket-voice-control/src/worker/` | Authenticated join broker, control API/stream, request ID and tracing |
 | Bounded room coordination | `services/pocket-voice-control/src/governor/` | Lifecycle, stage/moderation, turn lease, dedupe/cursors |
+| Sharded roster identity | current local `services/pocket-realtime/src/room-roster-shard.ts`; future final service location | Server principal/provider binding, exact peer projection, vector-fenced pages |
 | RealtimeKit adapter | `services/pocket-voice-control/src/providers/realtimekit/` | Token, preset, participant, webhook, agent-media, usage translation |
 | Transcript projector | `services/pocket-voice-control/src/transcript/` | Provider verification, binding, dedupe, final utterance and reconciliation |
 | Infrastructure | `services/pocket-voice-control/infra/` | Worker/DO/queues/storage bindings, observability, alerts, kill switches |
@@ -711,7 +745,7 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 | REMOVE execution/observation kernel | Built locally behind unavailable production composition: fresh-auth port, signed peer-generation fence, stable attempt retry, exact leave observation, conflict timeout, and three-field truth; live RealtimeKit execution remains blocked by missing authority adapter and non-peer-exact kick TOCTOU |
 | Worker checks | Generated types, strict TypeScript, workerd hostile tests, and Wrangler dry-run required at every handoff |
 | iOS `VoiceMediaTransport` and RealtimeKit 3.1 adapter | arm64 iOS Simulator build and 65/65 macOS tests independently green; physical-device review pending |
-| Server-bound remote iOS roster/stage identity | Not built; the SDK adapter fails closed instead of treating provider correlation IDs as Senti principals |
+| Server-bound remote iOS roster/stage identity | Sharded authenticated page contract and fail-closed Swift staging kernel built locally; not wired to media/app, Mac/device review pending |
 | Web room integration | Not built |
 | True server agent participant | Unproven critical gate |
 | 5k/10k hot-room capacity | Unproven load gate |

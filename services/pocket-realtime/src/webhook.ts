@@ -8,6 +8,11 @@ import type { RuntimeEnv } from "./env";
 import { HttpError, upstreamError } from "./errors";
 import { roomIdFromMeetingTitle } from "./identity";
 import {
+  isRosterParticipantKey,
+  rosterShardIndex,
+  rosterShardName,
+} from "./roster-cursor";
+import {
   MAX_WEBHOOK_BYTES,
   parseDeclaredLength,
   configuredPositiveInteger,
@@ -122,6 +127,38 @@ export async function handleRealtimeKitWebhook(
       throw upstreamError(
         "transcript_queue_unavailable",
         "Transcript intake is temporarily unavailable.",
+      );
+    }
+  }
+  if (
+    (eventName === "meeting.participantJoined" ||
+      eventName === "meeting.participantLeft") &&
+    summary.customParticipantId &&
+    isRosterParticipantKey(summary.customParticipantId)
+  ) {
+    const shardIndex = rosterShardIndex(summary.customParticipantId);
+    const projection = await env.ROOM_ROSTER_SHARDS.getByName(
+      rosterShardName(roomId, shardIndex),
+    ).applyPresence({
+      room: acceptance.room,
+      shardIndex,
+      event: summary,
+      now,
+    });
+    if (projection === "digest_conflict") {
+      throw new HttpError(
+        409,
+        "webhook_delivery_conflict",
+        "Webhook delivery identifier was reused with different content.",
+      );
+    }
+    if (
+      projection === "identity_mismatch" ||
+      projection === "binding_conflict"
+    ) {
+      throw upstreamError(
+        "roster_projection_conflict",
+        "The server-owned voice roster identity could not be reconciled.",
       );
     }
   }

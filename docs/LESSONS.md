@@ -116,3 +116,14 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
   command. Persist one attempt identity before provider I/O, allow the same
   attempt to reacquire a fresh fence, and reject every stale fence before
   provider I/O.
+- A paginated live roster needs a snapshot fence, not merely stable sort
+  order. Freeze a bounded shard revision/count vector, sign it into the cursor,
+  and revalidate the vector before publishing the final page. If any shard
+  changed, discard staging and resync; otherwise joins/leaves between pages can
+  create silent omissions or duplicates.
+- Keep client roster staging separate from committed UI state. Reject wrong
+  epochs, page gaps, duplicate principals/correlations/peers, and joined-count
+  overclaims before replacing the last complete snapshot.
+- Sharding one read model does not prove the whole hot path. If admission or
+  signed-delivery intake still passes through a room coordinator, say so and
+  keep the 5k/10k gate open until controlled load and provider receipts exist.

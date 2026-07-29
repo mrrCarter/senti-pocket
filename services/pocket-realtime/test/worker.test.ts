@@ -8,6 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { TranscriptQueueEnvelope } from "../src/contracts";
 import type { RuntimeEnv } from "../src/env";
+import {
+  rosterShardIndex,
+  rosterShardName,
+} from "../src/roster-cursor";
 
 const SESSION_ID = "6cf7e861-546a-4b9f-b937-39182a5bd395";
 const TENANT_ID = "tenant-demo";
@@ -207,6 +211,90 @@ describe("voice room control plane", () => {
     expect(providerCalls.filter((call) => call.url.endsWith("/participants"))).toHaveLength(1);
     expect(providerCalls.filter((call) => call.url.endsWith("/token"))).toHaveLength(1);
     expect(queueMessages).toHaveLength(0);
+  });
+
+  it("projects a join admission as a server-owned roster binding", async () => {
+    const opened = await invoke(
+      testEnv,
+      "/v1/voice-rooms/open",
+      openBody(),
+    );
+    const openPayload = await opened.json<{
+      room: { roomId: string };
+    }>();
+    const joined = await invoke(
+      testEnv,
+      "/v1/voice-rooms/join",
+      joinBody("moderator"),
+    );
+    expect(joined.status).toBe(200);
+    const joinedPayload = await joined.json<{
+      credential: {
+        participantId: string;
+        providerCorrelationId: string;
+      };
+    }>();
+    const room = await testEnv.ROOMS.getByName(
+      openPayload.room.roomId,
+    ).getRoom(
+      TENANT_ID,
+      SESSION_ID,
+      EPOCH,
+      openPayload.room.roomId,
+    );
+    if (!room) throw new Error("Expected room.");
+    const participantKey =
+      joinedPayload.credential.providerCorrelationId;
+    const shardIndex = rosterShardIndex(participantKey);
+    const shard = testEnv.ROOM_ROSTER_SHARDS.getByName(
+      rosterShardName(openPayload.room.roomId, shardIndex),
+    );
+    const joinedAt = "2026-07-29T12:20:00.000Z";
+    expect(
+      await shard.applyPresence({
+        room,
+        shardIndex,
+        event: {
+          deliveryId: "delivery-admission-roster-0001",
+          digest: "digest-admission-roster-0001",
+          eventName: "meeting.participantJoined",
+          providerMeetingId: MEETING_ID,
+          providerSessionId: "provider-session-admission",
+          peerId: "peer-admission",
+          customParticipantId: participantKey,
+          participantJoinedAt: joinedAt,
+          participantLeftAt: null,
+          occurredAt: joinedAt,
+        },
+        now: joinedAt,
+      }),
+    ).toBe("applied");
+    const descriptor = await shard.describe(room, joinedAt);
+    if (descriptor.disposition !== "ok") {
+      throw new Error("Expected roster descriptor.");
+    }
+    const page = await shard.page(
+      room,
+      descriptor.descriptor.revision,
+      null,
+      10,
+      joinedAt,
+    );
+    expect(page).toMatchObject({
+      disposition: "ok",
+      participants: [
+        {
+          principalId: "human-carter",
+          providerParticipantId:
+            joinedPayload.credential.participantId,
+          providerCorrelationId: participantKey,
+          providerSessionId: "provider-session-admission",
+          providerPeerId: "peer-admission",
+          role: "moderator",
+          displayName: "mrrCarter",
+        },
+      ],
+    });
   });
 
   it("fails closed when paid transcription was not explicitly enabled", async () => {
