@@ -507,24 +507,25 @@ The checked-in `OWNERSHIP.md` at the source base still assigns the frozen
 `PocketContracts`, app composition, gateway, voice, and security paths to
 Atlas, Relay, Echo, and Warden. Carter later directed in the Senti room that
 Pulse writes future implementation while Forge reviews and performs
-Mac/device/load/deploy work. That room decision has not yet been reconciled
-into the repository ownership map.
+Mac/device/load/deploy work. Carter subsequently confirmed the build-go and
+Forge requested a feature-branch handoff for independent review.
 
-Therefore this change touches only new, previously unowned ADR/contract files.
-Before implementation, Carter/Warden MUST ratify the new path map, update or
-supersede `OWNERSHIP.md`, and complete explicit lock handoffs. In particular,
-this ADR does not authorize edits to frozen `packages/PocketContracts`,
-`apps/SentiPocketApp`, `packages/PocketVoice`, or
-`services/pocket-gateway`.
+The initial implementation therefore remains confined to the new, previously
+unowned `services/pocket-realtime` path plus these ADR/contract files. The
+repository ownership map still needs an authorized reconciliation; unrelated
+automated ownership edits are excluded from the handoff. This authority does
+not permit edits to frozen `packages/PocketContracts`, `apps/SentiPocketApp`,
+`packages/PocketVoice`, or `services/pocket-gateway`, and it does not authorize
+Cloudflare resources, secrets, paid features, deployment, or spend.
 
 ## 17. Current truth
 
 | Claim | State |
 |---|---|
 | RealtimeKit selected for the spike | Decided |
-| Provider-neutral room/event/error/entitlement contract | Proposed in this change |
-| Accepted RealtimeKit adapter or account | Not built / not created |
-| Concurrent untracked Worker scaffold | Quarantined, failing, and excluded from this change pending shared-record build authority |
+| Provider-neutral room/event/error/entitlement contract | Versioned and validation-tested |
+| RealtimeKit adapter/control-plane slice | Built locally and under feature-branch review; no account/resources |
+| Worker checks | Generated types, strict TypeScript, workerd tests, and Wrangler dry-run required at handoff |
 | Web or iOS room integration | Not built |
 | True server agent participant | Unproven critical gate |
 | 5k/10k hot-room capacity | Unproven load gate |
@@ -533,7 +534,7 @@ this ADR does not authorize edits to frozen `packages/PocketContracts`,
 | Voice-aware Markdown no-loss export | Not built |
 | ENGRAM voice indexing | Not built |
 | Billing | Intentionally not built |
-| Usage meters, alerts, entitlements, kill switches | Contracted; not built |
+| Usage meters, alerts, entitlements, kill switches | Bounded local estimate/budget only; provider billing truth and operational controls not built |
 | Production deploy/provider approval | Not authorized |
 
 ## 18. Primary provider references
