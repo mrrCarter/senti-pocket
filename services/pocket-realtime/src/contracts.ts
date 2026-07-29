@@ -4,6 +4,13 @@ export const DEGRADED_AGENT_FALLBACK = "edge-text-client-tts" as const;
 
 export type SentiMembershipRole = "owner" | "admin" | "contributor" | "viewer";
 export type VoiceRole = "moderator" | "speaker" | "listener";
+export type VoiceModerationAction =
+  | "promote"
+  | "demote"
+  | "mute"
+  | "remove"
+  | "deny_publish"
+  | "allow_publish";
 export type TranscriptConsent = "granted";
 export type TranscriptMode = "disabled" | "post-meeting";
 export type RoomLifecycle = "provisioning" | "ready" | "ended";
@@ -51,12 +58,21 @@ export interface RoomDescriptor {
 export interface JoinCredential {
   room: RoomDescriptor;
   role: VoiceRole;
+  principalId: string;
   participantId: string;
+  providerCorrelationId: string;
   authToken: string;
   issuedAt: string;
   clientDiscardAfter: string;
   providerScope: "single-participant-single-meeting";
   providerExpiry: "time-bound-undisclosed";
+  controlRevision: number;
+  capabilities: {
+    canPublishAudio: boolean;
+    canRaiseHand: boolean;
+    canCancelHandRaise: boolean;
+    moderationActions: VoiceModerationAction[];
+  };
 }
 
 export interface TranscriptQueueEnvelope {

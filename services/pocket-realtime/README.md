@@ -19,6 +19,9 @@ Cloudflare account, or used to create billable resources.
 - `POST /v1/voice-rooms/join`
   - derives `moderator`, `speaker`, or `listener` from server-returned Senti role;
   - permits caller-requested downgrades but never elevation;
+  - returns server-derived capabilities plus the opaque provider correlation
+    key so the media client can bind self callbacks without confusing that key
+    with the canonical Senti principal;
   - returns only a participant join token, never the RealtimeKit API token;
   - marks that token memory-only with a five-minute client discard policy
     because RealtimeKit does not disclose the provider expiry;

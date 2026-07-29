@@ -33,9 +33,11 @@ client into an STT/TTS relay, the predefined provider fallback is LiveKit. A
 client-side "edge text" mode may remain as an explicitly degraded feature, but
 it does not satisfy the true-agent acceptance gate.
 
-This ADR authorizes design and local contract work only. It does not authorize
-Cloudflare account creation, credentials, a paid plan, DNS, production
-mutation, deployment, spend, push, pull request, merge, or release.
+At acceptance, this ADR authorized design and local contract work only.
+Carter's subsequent build-go authorized implementation and a feature-branch
+handoff for independent review. Neither ruling authorizes Cloudflare account
+creation, credentials, a paid plan, DNS, production mutation, deployment,
+spend, a pull request to the protected branch, merge, or release.
 
 ## 2. Why this is a separate product plane
 
@@ -377,7 +379,7 @@ evidence of provider capacity.
 | Cross-tenant/session join | Tenant/session/epoch binding at every lookup and token mint |
 | Stolen join token | Short TTL, single epoch, minimum grants, no persistence/logging, revocation path |
 | Forged transcript speaker | Signed provider event plus server-owned participant-to-principal binding |
-| Webhook replay/reorder | Signature verification, timestamp window, provider-event dedupe, reconciliation cursor |
+| Webhook replay/reorder | Raw-body signature verification, durable delivery-ID/digest dedupe, bounded lifecycle and reconciliation rules; no invented signed-timestamp claim |
 | Moderator force-unmutes user | No contract action; adapter tests prove absence; user gesture required |
 | Agent speech executes a tool | Agent has no write authority; typed proposal plus explicit human confirmation |
 | Transcript or prompt leaks | Text/audio excluded from operational logs/traces/errors; retention and redaction policy |
@@ -510,12 +512,12 @@ Pulse writes future implementation while Forge reviews and performs
 Mac/device/load/deploy work. Carter subsequently confirmed the build-go and
 Forge requested a feature-branch handoff for independent review.
 
-The initial implementation therefore remains confined to the new, previously
-unowned `services/pocket-realtime` path plus these ADR/contract files. The
-repository ownership map still needs an authorized reconciliation; unrelated
-automated ownership edits are excluded from the handoff. This authority does
-not permit edits to frozen `packages/PocketContracts`, `apps/SentiPocketApp`,
-`packages/PocketVoice`, or `services/pocket-gateway`, and it does not authorize
+The current ruling is recorded at the top of `OWNERSHIP.md`: Pulse authors and
+drives the Senti Pocket implementation, while Forge independently reviews it
+and owns the Mac, physical-iPhone, load, and authorized deployment receipts.
+That current ruling supersedes the older path table where they conflict. It
+does not permit edits to frozen `packages/PocketContracts` or shared Xcode
+composition without their own review boundaries, and it does not authorize
 Cloudflare resources, secrets, paid features, deployment, or spend.
 
 ## 17. Current truth
@@ -526,7 +528,9 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 | Provider-neutral room/event/error/entitlement contract | Versioned and validation-tested |
 | RealtimeKit adapter/control-plane slice | Built locally and under feature-branch review; no account/resources |
 | Worker checks | Generated types, strict TypeScript, workerd tests, and Wrangler dry-run required at handoff |
-| Web or iOS room integration | Not built |
+| iOS `VoiceMediaTransport` and RealtimeKit 3.1 adapter | Built locally; Mac/Xcode and physical-device review pending |
+| Server-bound remote iOS roster/stage identity | Not built; the SDK adapter fails closed instead of treating provider correlation IDs as Senti principals |
+| Web room integration | Not built |
 | True server agent participant | Unproven critical gate |
 | 5k/10k hot-room capacity | Unproven load gate |
 | Durable typed voice utterance in Senti | Not built |

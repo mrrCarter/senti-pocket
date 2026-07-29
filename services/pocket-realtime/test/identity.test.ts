@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  capabilitiesForRole,
   deriveParticipantId,
   deriveRoomId,
   meetingTitle,
@@ -35,5 +36,34 @@ describe("provider-neutral identity and role policy", () => {
     expect(roleForMembership("admin", "listener")).toBe("listener");
     expect(roleForMembership("contributor", "moderator")).toBe("speaker");
     expect(roleForMembership("viewer", "speaker")).toBe("listener");
+  });
+
+  it("derives the complete capability matrix on the server with no remote unmute", () => {
+    expect(capabilitiesForRole("listener")).toEqual({
+      canPublishAudio: false,
+      canRaiseHand: true,
+      canCancelHandRaise: true,
+      moderationActions: [],
+    });
+    expect(capabilitiesForRole("speaker")).toEqual({
+      canPublishAudio: true,
+      canRaiseHand: false,
+      canCancelHandRaise: false,
+      moderationActions: [],
+    });
+    expect(capabilitiesForRole("moderator")).toEqual({
+      canPublishAudio: true,
+      canRaiseHand: false,
+      canCancelHandRaise: false,
+      moderationActions: [
+        "promote",
+        "demote",
+        "mute",
+        "remove",
+        "deny_publish",
+        "allow_publish",
+      ],
+    });
+    expect(JSON.stringify(capabilitiesForRole("moderator"))).not.toContain("unmute");
   });
 });

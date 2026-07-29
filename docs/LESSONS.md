@@ -12,3 +12,40 @@ Do this EVERY TIME a message arrives in the room (not only when you are @-mentio
 9. The orchestrator (claude-warden) polls the room tightly and WILL challenge you if you drift from the pinned requirements — treat a challenge as a gate, respond with evidence or a corrected plan, not defensiveness.
 
 Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your welcome thread. CREATE that file in the repo at agents/<your-id>.soul.md and write your soul into it, then reply confirming it exists (commit sha).
+
+## 2026-07-29 — authority and ownership corrections
+
+- Treat a teammate's relay of Carter's intent as coordination context, not as a
+  substitute for direct authority to build, spend, deploy, push, or merge.
+- Carter directly authorized `codex-pocket-pulse` to author/drive all Senti
+  Pocket code and assigned Forge/Claude as independent reviewer plus
+  Mac/iPhone/load/deploy gate. Record a current ruling above an obsolete path
+  table instead of silently following the stale table or deleting its history.
+- Scope authority precisely. “Get coding” authorized local source and
+  proportionate tests. It did not authorize Cloudflare resources, paid
+  transcription, secrets, GitHub publication, or production mutation.
+- A scalable media design must name the control atom and keep media off its
+  serialization path. Here that is one Durable Object per opaque
+  `(sessionId, roomEpoch)` while RealtimeKit carries audio/video directly.
+- Do not convert a provider gap into an architectural assumption. RealtimeKit
+  has no documented server AI participant that publishes synthetic audio, so
+  shared agent audio remains explicitly unsupported until the headless-bot
+  spike proves it. Client-TTS of governed edge text is a labeled degraded
+  fallback, not a silent product-default rewrite.
+- Do not claim webhook freshness that the provider cannot prove. RealtimeKit
+  signs raw bytes and supplies a delivery ID but no signed timestamp; implement
+  bounded delivery-ID/digest dedupe and state the remaining replay window.
+- Cost estimates are not billing receipts. Label presence-derived Neuron
+  estimates `billingTruth: false`, retain provider usage as authority, and fail
+  closed before paid transcription is enabled.
+- Derive `issuedAt` and a maximum client-discard deadline from the same clock
+  sample, then enforce the maximum again when decoding. Two separate `now`
+  calls can accidentally produce a nominal five-minute grant that is a few
+  milliseconds too long.
+- A provider `customParticipantId` can be an opaque server correlation key
+  without being the canonical Senti `principalId`. Do not rename one into the
+  other in a client adapter; keep remote identity empty until an authenticated
+  control snapshot supplies the binding.
+- Realtime media and signaling reconnect independently. Combine their states;
+  a socket `connected` callback must not hide media that is still reconnecting
+  (or the inverse).

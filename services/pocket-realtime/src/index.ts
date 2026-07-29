@@ -9,6 +9,7 @@ import {
 import type { RuntimeEnv } from "./env";
 import { HttpError, upstreamError } from "./errors";
 import {
+  capabilitiesForRole,
   deriveParticipantId,
   deriveRoomId,
   meetingTitle,
@@ -280,15 +281,22 @@ async function joinRoom(
     throw upstreamError("participant_admission_conflict", "Participant admission could not be committed.");
   }
 
+  const issuedAt = new Date();
   const credential: JoinCredential = {
     room: descriptor(room),
     role,
+    principalId: member.humanId,
     participantId: participant.id,
+    providerCorrelationId: participantKey,
     authToken: participant.token,
-    issuedAt: new Date().toISOString(),
-    clientDiscardAfter: new Date(Date.now() + 5 * 60 * 1_000).toISOString(),
+    issuedAt: issuedAt.toISOString(),
+    clientDiscardAfter: new Date(
+      issuedAt.getTime() + 5 * 60 * 1_000,
+    ).toISOString(),
     providerScope: "single-participant-single-meeting",
     providerExpiry: "time-bound-undisclosed",
+    controlRevision: 0,
+    capabilities: capabilitiesForRole(role),
   };
   return json(
     {

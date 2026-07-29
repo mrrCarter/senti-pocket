@@ -1,4 +1,8 @@
-import type { SentiMembershipRole, VoiceRole } from "./contracts";
+import type {
+  JoinCredential,
+  SentiMembershipRole,
+  VoiceRole,
+} from "./contracts";
 import { HttpError } from "./errors";
 
 export function roleForMembership(
@@ -14,6 +18,38 @@ export function roleForMembership(
   if (!requestedRole) return maximum;
   const rank: Record<VoiceRole, number> = { listener: 0, speaker: 1, moderator: 2 };
   return rank[requestedRole] <= rank[maximum] ? requestedRole : maximum;
+}
+
+export function capabilitiesForRole(role: VoiceRole): JoinCredential["capabilities"] {
+  if (role === "moderator") {
+    return {
+      canPublishAudio: true,
+      canRaiseHand: false,
+      canCancelHandRaise: false,
+      moderationActions: [
+        "promote",
+        "demote",
+        "mute",
+        "remove",
+        "deny_publish",
+        "allow_publish",
+      ],
+    };
+  }
+  if (role === "speaker") {
+    return {
+      canPublishAudio: true,
+      canRaiseHand: false,
+      canCancelHandRaise: false,
+      moderationActions: [],
+    };
+  }
+  return {
+    canPublishAudio: false,
+    canRaiseHand: true,
+    canCancelHandRaise: true,
+    moderationActions: [],
+  };
 }
 
 export async function deriveRoomId(

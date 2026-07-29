@@ -1,5 +1,21 @@
 # Ownership & lock map
 
+## Current Carter ruling — 2026-07-29
+
+For the active Senti Pocket/RealtimeKit build, **codex-pocket-pulse authors and
+drives all code**. **pocket-forge/Claude independently reviews the diff and owns
+Mac compilation, physical-iPhone, load, and authorized deployment receipts.**
+This current direct instruction supersedes the older path-owner map below where
+the two conflict; it does not weaken its safety, locking, frozen-contract, or
+evidence requirements.
+
+Local coding authority plus Carter's feature-branch review handoff permits
+publication only to the isolated review branch. It does not imply Cloudflare
+account/resource creation, paid-plan acceptance, secret provisioning, a pull
+request to the protected branch, merge, or deployment. Those require their
+separate gates. PR #121 remains quarantined; work continues additively from
+clean `master`, never by repairing that PR in place.
+
 Xcode project/workspace is a conflict magnet — **only Atlas** edits `apps/SentiPocketApp` and shared composition files. Everyone else works in their owned Swift package / worktree and hands commits to Atlas via `HANDOFF`.
 
 | Path | Owner | Scope |

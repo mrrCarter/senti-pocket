@@ -127,7 +127,9 @@ describe("voice room control plane", () => {
     const createCall = providerCalls.find(
       (call) => call.method === "POST" && call.url.endsWith("/meetings"),
     );
-    expect(createCall?.authorization).toBe("Bearer cloudflare-test-token-never-client-visible");
+    expect(createCall?.authorization).toBe(
+      `Bearer ${testEnv.CLOUDFLARE_API_TOKEN}`,
+    );
     expect(createCall?.body).toContain('"transcribe_on_end":true');
     expect(createCall?.body).not.toContain(SESSION_ID);
 
@@ -137,23 +139,47 @@ describe("voice room control plane", () => {
     const joinedPayload = await joined.json<{
       credential: {
         role: string;
+        principalId: string;
+        providerCorrelationId: string;
         authToken: string;
+        issuedAt: string;
         clientDiscardAfter: string;
         providerScope: string;
         providerExpiry: string;
+        controlRevision: number;
+        capabilities: {
+          canPublishAudio: boolean;
+          canRaiseHand: boolean;
+          canCancelHandRaise: boolean;
+          moderationActions: string[];
+        };
       };
     }>();
     expect(joinedPayload.credential.role).toBe("listener");
+    expect(joinedPayload.credential.principalId).toBe("human-carter");
+    expect(joinedPayload.credential.providerCorrelationId).toMatch(/^senti_[A-Za-z0-9_-]+$/);
     expect(joinedPayload.credential.authToken).toBe("short-lived-provider-token");
     expect(Date.parse(joinedPayload.credential.clientDiscardAfter)).toBeGreaterThan(Date.now());
+    expect(
+      Date.parse(joinedPayload.credential.clientDiscardAfter)
+        - Date.parse(joinedPayload.credential.issuedAt),
+    ).toBe(5 * 60 * 1_000);
     expect(joinedPayload.credential.providerScope).toBe(
       "single-participant-single-meeting",
     );
     expect(joinedPayload.credential.providerExpiry).toBe(
       "time-bound-undisclosed",
     );
+    expect(joinedPayload.credential.controlRevision).toBe(0);
+    expect(joinedPayload.credential.capabilities).toEqual({
+      canPublishAudio: false,
+      canRaiseHand: true,
+      canCancelHandRaise: true,
+      moderationActions: [],
+    });
+    expect(joinedPayload.credential.capabilities).not.toHaveProperty("forceUnmute");
     expect(JSON.stringify(joinedPayload)).not.toContain(
-      "cloudflare-test-token-never-client-visible",
+      testEnv.CLOUDFLARE_API_TOKEN,
     );
 
     const addCall = providerCalls.find((call) => call.url.endsWith("/participants"));
