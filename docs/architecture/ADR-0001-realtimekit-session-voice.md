@@ -294,16 +294,73 @@ through the control stream or reading every shard on every page.
 
 The Swift `VoiceRosterProjection` mirrors that boundary: it commits only a
 complete, gap-free snapshot and rejects wrong epochs, duplicate principals,
-duplicate provider correlations, duplicate exact peers, total-count
-overclaims, and any provider identifier reused as a Senti principal. It is a
-package kernel only. It is not wired to the RealtimeKit media adapter or app,
-and its Mac/iOS compile and physical-device receipt remain Forge-owned.
+duplicate provider participant IDs, duplicate provider correlations,
+duplicate exact peers, total-count overclaims, and any provider identifier
+reused as a Senti principal. It is a package kernel only. It is not wired to
+the RealtimeKit media adapter or app, and its Mac/iOS compile and
+physical-device receipt remain Forge-owned.
 
 This does not clear the high-room scale gate. Admission and initial signed
 delivery acceptance still touch the current room governor, no controlled load
 receipt exists, and the provider quota remains unproven. The sharded read
 model removes one known audience-sized storage/pagination bottleneck without
 claiming that the complete ingress path is ready for 5k/10k participants.
+
+### 4.3 Sharded admission ledger kernel
+
+The next deploy-inert kernel separates audience admission state from the
+bounded room-control atom. A server-derived participant key has 256 bits of
+HMAC output encoded with the base64url alphabet. Its first encoded symbol
+therefore selects exactly one of sixty-four room admission shards without
+exposing a tenant, session, or principal. The shard owns at most 4,096
+participant rows; sixty-four is a deterministic topology decision, not a
+capacity or latency receipt.
+
+A trusted room-open composer must prime all shards with the exact
+tenant/session/epoch/room/provider-meeting identity before exposing the room.
+Priming is idempotent, never reopens an ended epoch, and advances only a
+monotonic `controlRevisionFloor`. The floor is a cache/recovery lower bound,
+not authority to accept a command. A moderation CAS still requires the current
+RoomGovernor revision. Signed meeting end must irreversibly fence all shards
+before a composed join path can be considered complete.
+
+One shard transaction validates identity and principal uniqueness, consumes
+the shard's deterministic share of the daily room-admission budget, and
+reserves one `create`, token `refresh`, or role `update` with a random fence
+and stable attempt ID. The provider request runs outside the Durable Object.
+Exact completion binds one provider participant ID and publishes a monotonic
+admission revision. A provider participant ID cannot bind two principals.
+Bearer and provider tokens never enter shard storage, RPC results, or debug
+state.
+
+An expired lease is outcome uncertainty, not permission to create again. It
+becomes `reconciliation_required` under the original fence and attempt ID.
+Only exact positive reconciliation may complete the binding; an authoritative
+provider-absence observation may release it through the separately named
+absent-resolution method. `releaseKnownFailure` is legal only before outcome
+uncertainty. This is intentionally more conservative than the existing
+runtime admission path.
+
+The room-wide daily maximum is divided deterministically across sixty-four
+shards; the shares sum exactly to the configured maximum and differ by at
+most one. HMAC distribution should make skew unlikely, but unused capacity in
+one shard is not borrowed by another. That conservative trade-off preserves a
+hard aggregate ceiling without introducing a global quota coordinator.
+
+A future moderation composer must resolve actor and target admissions from
+their shards, bind their monotonic admission revisions into the bounded
+command intake, and freshly re-read both shard state and Senti authority at
+execution before provider I/O. Cross-object snapshots are not atomic, so the
+second read is mandatory; rebuilding a full audience mirror inside
+RoomGovernor is forbidden.
+
+The current source only exports the new SQLite class and workerd tests it.
+`/open`, `/join`, moderation, roster binding, signed end propagation, and
+provider reconciliation do not call it. The current RoomGovernor admission
+table remains authoritative at runtime, initial webhook acceptance is still
+centralized, no provider call or Cloudflare resource was created, and no
+5k/10k claim is made. Composition waits for Forge's independent architecture
+and exact-source review.
 
 ## 5. Browser and iOS are equal clients
 

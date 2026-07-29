@@ -617,10 +617,11 @@ Senti membership.
 One page reads one deterministic participant shard. Before `complete=true`,
 the server re-reads every shard descriptor. Any revision/count mismatch,
 expired/forged cursor, shard identity mismatch, page gap, duplicate principal,
-duplicate provider correlation, duplicate exact peer, or total-count mismatch
-fails closed. A concurrent roster mutation yields
-`VOICE_STREAM_RESYNC_REQUIRED`; clients discard the staged pages and restart.
-iOS and web MUST NOT publish a partial page set as an authoritative roster.
+duplicate provider participant, duplicate provider correlation, duplicate
+exact peer, or total-count mismatch fails closed. A concurrent roster mutation
+yields `VOICE_STREAM_RESYNC_REQUIRED`; clients discard the staged pages and
+restart. iOS and web MUST NOT publish a partial page set as an authoritative
+roster.
 
 Admission establishes the server-owned
 `principalId <-> providerCorrelationId <-> providerParticipantId` binding.
@@ -635,6 +636,46 @@ snapshot open and final validation. That is an implementation proof, not a
 5k/10k provider, latency, webhook-ingress, or load receipt. The existing room
 governor still participates in admission and signed-delivery acceptance; those
 hot-path scale gates remain open.
+
+### 14.2 Admission-shard contract
+
+The deploy-inert admission kernel defines sixty-four deterministic shards per
+room. `providerCorrelationId` selects exactly one shard from the first six
+bits of its server HMAC output. A caller MUST NOT select a different shard,
+and a provider participant identifier MUST NOT be used as the shard key.
+
+Before use, a trusted server composer MUST prime every shard with the exact
+tenant/session/epoch/room/provider-meeting identity. A shard MUST reject an
+identity change, MUST NOT decrease its control-revision floor, and MUST NOT
+reopen an ended epoch. The revision floor is not a command authorization
+revision.
+
+Each reservation binds one canonical Senti principal to one stable provider
+correlation key. It produces one fenced attempt for `create`, credential
+`refresh`, or role `update`; provider I/O occurs outside the shard. Completion
+MUST match the fence and MUST preserve an existing provider participant ID.
+The active result carries a monotonically increasing admission revision.
+The client roster projection MUST reject a provider participant ID repeated
+under another principal across any staged page. Provider credentials, Senti
+bearers, raw idempotency keys, and private policy MUST NOT be stored or
+returned.
+
+An unexpired attempt rejects concurrent work. An expired attempt or ambiguous
+provider result MUST enter `reconciliation_required` with its original
+attempt identity and MUST NOT create again. Known-zero-mutation release is
+illegal after uncertainty. Reconciliation may finish only from an exact
+provider binding or an authoritative provider-absence observation.
+
+The configured daily room-admission maximum is partitioned across all shards
+such that the shares sum exactly to the maximum and differ by at most one.
+Unused quota is not transferred across shards. Each shard retains at most
+4,096 admission rows and rejects new participants at capacity while preserving
+existing reconciliation state.
+
+This is not the active join contract. The current `/join` path still uses
+RoomGovernor. Before composition, room-open priming, irreversible end
+propagation, roster projection, provider reconciliation, and revision-bound
+moderation revalidation MUST be independently reviewed and fault tested.
 
 ## 15. Webhook and transcript ordering
 

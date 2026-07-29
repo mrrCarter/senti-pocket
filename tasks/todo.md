@@ -1,45 +1,41 @@
-# Server-authoritative roster identity slice
+# Sharded admission ledger kernel
 
-Base: `d856adfb682f625c2daab68b80e94ada20d6a4ef`
+Base: `d31b8f56f0850edc5cceea8063a9a1f2dfb22d69`
 
 ## Plan
 
-- [x] Preserve the REMOVE observation-kernel exact head in its own worktree.
-- [x] Trace the current iOS fail-closed remote identity boundary.
-- [x] Define deterministic roster shards and an HMAC revision-vector cursor.
-- [x] Project server admission bindings without provider IDs becoming
-  principals.
-- [x] Project only verified exact peer joins/leaves with delivery/digest
-  dedupe and stale-generation protection.
-- [x] Add authenticated bounded roster pages with final vector revalidation
-  and explicit resync.
-- [x] Add Swift atomic page staging with wrong-epoch, gap, duplicate-binding,
-  and count-overclaim rejection.
-- [x] Prove the Worker kernel with strict TypeScript and 50/50 workerd tests.
-- [x] Run generated types, strict TypeScript, 50/50 workerd tests, and Wrangler
-  dry-run.
-- [x] Run the deterministic staged SentinelLayer review.
-- [ ] Obtain Forge CODE+DOCS and Mac/iOS compile verdict on an exact pushed
-  revision.
+- [x] Preserve the roster candidate in its own clean worktree.
+- [x] Record the proposed admission boundary for Forge architecture challenge.
+- [x] Define 64 deterministic room admission shards from server HMAC keys.
+- [x] Implement room priming, exact identity matching, and revision floors.
+- [x] Implement fenced create/refresh/update admission reservations.
+- [x] Fail closed into reconciliation on uncertain or expired provider work.
+- [x] Partition the room admission budget exactly across all 64 shards.
+- [x] Add hostile workerd tests for identity, fences, quota, and crash recovery.
+- [x] Document composition, migration, and remaining scale gates honestly.
+- [x] Run generated types, strict TypeScript, workerd tests, and Wrangler dry-run.
+- [x] Run a deterministic staged SentinelLayer review.
+- [ ] Push one immutable candidate and obtain Forge CODE+DOCS verdict.
 
 ## Honest gates
 
-- Production composition, Cloudflare resources, provider calls, secrets,
-  deployment, PR, merge, and activation remain untouched.
-- The roster read model is sharded, but room admission and initial signed
-  delivery acceptance still touch the RoomGovernor. No 5k/10k or provider
-  capacity claim is made.
-- The Swift files are uncomposed package code. This Windows host has no Swift
-  toolchain; Forge's Mac/iOS compile and physical-device receipts remain
-  required.
-- Forge's connected Claude Code host reached its weekly usage limit on
-  2026-07-29 and reported a reset at 2026-08-01 01:00 America/New_York.
-  Independent review remains pending; this is not a review waiver.
+- This atom adds an uncomposed Durable Object class and does not reroute the
+  production join endpoint.
+- Provider calls, tokens, Cloudflare resources, deployment, PR, merge, and
+  activation remain untouched.
+- The existing RoomGovernor admission and webhook paths remain the current
+  runtime. No 5k/10k, provider capacity, or latency claim is made.
+- Forge's connected Claude Code host remains live but quota-limited until its
+  reported 2026-08-01 01:00 America/New_York reset. Review is queued, not
+  waived.
 
 ## Review
 
-- `npm run check`: generated bindings, strict TypeScript, 50/50 workerd tests,
-  and Wrangler dry-run green.
-- SentinelLayer staged review `review-20260729-123447-447b36ee`: 19 files,
-  refreshed ingest, normative contract supplied, P0/P1/P2/P3 = 0.
-- Swift/Mac compile and independent exact-revision Forge review remain pending.
+- `npm run check`: generated bindings, strict TypeScript, 61/61 workerd tests,
+  and Wrangler 4.115 dry-run green.
+- The Windows host has no Swift toolchain. The additive duplicate-provider-ID
+  roster guard has authored XCTest coverage but remains Mac/iOS compile
+  unproven.
+- SentinelLayer staged review is rerun against the final staged candidate
+  after every bookkeeping change; final run ID is recorded in the immutable
+  handoff.

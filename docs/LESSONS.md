@@ -122,8 +122,21 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
   changed, discard staging and resync; otherwise joins/leaves between pages can
   create silent omissions or duplicates.
 - Keep client roster staging separate from committed UI state. Reject wrong
-  epochs, page gaps, duplicate principals/correlations/peers, and joined-count
-  overclaims before replacing the last complete snapshot.
+  epochs, page gaps, duplicate principals/provider participants/correlations/
+  peers, and joined-count overclaims before replacing the last complete
+  snapshot.
 - Sharding one read model does not prove the whole hot path. If admission or
   signed-delivery intake still passes through a room coordinator, say so and
   keep the 5k/10k gate open until controlled load and provider receipts exist.
+- A timed-out admission lease does not prove the provider request never
+  happened. Preserve one attempt identity and enter explicit reconciliation;
+  never turn an ambiguous timeout into permission to create a second provider
+  participant.
+- Distributed admission quotas need an honest aggregate bound. Deterministic
+  per-shard shares can sum exactly to the room maximum without a global
+  coordinator, but they trade away cross-shard borrowing and do not prove
+  traffic balance or provider capacity.
+- A cached control revision in an admission shard is only a monotonic floor.
+  It cannot authorize a command. Bind monotonic admission revisions at intake
+  and freshly revalidate actor, target, and Senti authority before provider
+  I/O instead of recreating an audience-sized central mirror.

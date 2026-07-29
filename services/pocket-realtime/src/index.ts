@@ -21,6 +21,9 @@ import {
 } from "./identity";
 import { realtimeKitMediaRoomProvider } from "./media-room-provider";
 import {
+  RoomAdmissionShard,
+} from "./room-admission-shard";
+import {
   RoomGovernor,
 } from "./room-governor";
 import {
@@ -46,8 +49,7 @@ import {
 import { handleRealtimeKitWebhook } from "./webhook";
 import { handleVoiceControlQueue } from "./voice-control-queue";
 
-export { RoomGovernor };
-export { RoomRosterShard };
+export { RoomAdmissionShard, RoomGovernor, RoomRosterShard };
 
 interface RequestContext {
   traceId: string;

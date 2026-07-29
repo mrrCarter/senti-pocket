@@ -53,6 +53,8 @@ Cloudflare account, or used to create billable resources.
   - re-verifies current Senti membership on every page;
   - returns only server-bound canonical principals and exact signed peer
     generations, never treating provider correlation IDs as authority;
+  - requires clients to reject duplicate provider participant IDs as well as
+    duplicate principals, correlations, and exact peers across staged pages;
   - pages at most 200 participants from one of sixteen deterministic roster
     shards;
   - binds its opaque HMAC cursor to the room/meeting, shard revision/count
@@ -79,6 +81,17 @@ Object. The room object also performs no audience fanout. The
 `TRANSCRIPT_INGEST_QUEUE` consumer and permanent ENGRAM materialization are a
 future slice; production activation is blocked until that consumer exists.
 
+An uncomposed scalability kernel adds sixty-four deterministic
+`RoomAdmissionShard` objects per room. The first six bits of the
+server-derived HMAC participant key choose the shard. Each shard owns bounded
+admission leases, monotonic participant revisions, an exact share of the daily
+room-admission budget, and the server-owned principal/provider binding. A
+provider call remains outside the object and must complete through its fence.
+An expired lease or ambiguous provider result becomes sticky
+`reconciliation_required`; it cannot silently issue a second create. This
+kernel is exported for workerd proof only. The current `/join` handler does not
+call it.
+
 Shared in-room agent audio is required but not yet proven on RealtimeKit. Room
 descriptors report `unsupported-pending-spike`. Client-TTS of governed edge text
 is only a labeled degraded fallback, not the default product path.
@@ -93,16 +106,18 @@ production-ready Senti Pocket voice implementation.
 - The shared server track, headless agent participant, per-agent synthesis,
   live moderation/stage executor, web/app integration, and physical-iPhone
   proof are not implemented. The command ledger is not a live executor.
-- Every admission currently serializes through one per-room Durable Object.
-  The 5k/10k hot-room target is unproven and requires a sharded admission/load
-  design before production.
+- Every runtime admission still serializes through one per-room Durable
+  Object. A sixty-four-way admission ledger kernel now proves the local
+  reservation state machine, but room-open priming, lifecycle/revision
+  propagation, `/join` composition, roster projection, and moderation
+  revalidation are not wired. The 5k/10k hot-room target remains unproven.
 - The roster page itself is sharded and vector-fenced, but initial admission
   and webhook delivery acceptance still touch the room governor. This slice
   does not claim end-to-end hot-room throughput or provider quota.
 - `VoiceRosterProjection` stages authenticated pages atomically in the Swift
-  package, but it is not wired into the SDK media adapter/app. This Windows
-  host has no Swift toolchain; Mac/iOS compile and device receipts remain
-  pending Forge review.
+  package and rejects cross-page provider participant aliasing, but it is not
+  wired into the SDK media adapter/app. This Windows host has no Swift
+  toolchain; Mac/iOS compile and device receipts remain pending Forge review.
 - Alarm/outbox dispatch, the at-least-once Queue/DLQ, leases, and watchdog are
   implemented locally. A provider-neutral REMOVE execution/observation kernel
   is also locally proven with test adapters: execution-time fresh
@@ -136,8 +151,11 @@ production-ready Senti Pocket voice implementation.
   room Durable Object has been deployed. Any future rollout over an older
   persisted schema requires an explicit migration and rollback proof; this
   slice does not claim one.
-- A crash after provider meeting/participant creation can leave an orphan or
-  require reconciliation; that provider reconciliation path is not built.
+- A crash in the current runtime after provider meeting/participant creation
+  can leave an orphan or require reconciliation. The uncomposed shard kernel
+  prevents a blind duplicate by retaining one stable attempt in
+  `reconciliation_required`, but the authoritative provider lookup that must
+  resolve that state is not implemented.
 - RealtimeKit controls participant-token scope and expiry. The service labels
   that expiry as provider-undisclosed and gives clients a five-minute local
   discard deadline; the deadline is memory hygiene, not provider revocation.
@@ -184,7 +202,10 @@ Before any authorized deployment:
 7. implement the fresh Senti authority adapter, resolve the peer-exact remove
    mutation gap, prove each action-specific mutation/observation adapter, and
    implement bounded-pull and receipt projection;
-8. register the webhook and run signed parity, hot-room moderation, rollback,
+8. compose admission shards only after proving room-open priming, irreversible
+   end propagation, revision-floor delivery, authoritative provider
+   reconciliation, roster binding, and fresh actor/target revalidation;
+9. register the webhook and run signed parity, hot-room moderation, rollback,
    and physical-iPhone gates.
 
 See `docs/architecture/ADR-0001-realtimekit-session-voice.md` for the threat,

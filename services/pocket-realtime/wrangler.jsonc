@@ -31,6 +31,10 @@
       {
         "name": "ROOM_ROSTER_SHARDS",
         "class_name": "RoomRosterShard"
+      },
+      {
+        "name": "ROOM_ADMISSION_SHARDS",
+        "class_name": "RoomAdmissionShard"
       }
     ]
   },
@@ -42,6 +46,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["RoomRosterShard"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["RoomAdmissionShard"]
     }
   ],
   "queues": {

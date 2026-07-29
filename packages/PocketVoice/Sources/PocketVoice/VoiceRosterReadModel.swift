@@ -221,10 +221,14 @@ public struct VoiceRosterPage: Decodable, Equatable, Sendable {
         _ participants: [VoiceRosterParticipant]
     ) -> Bool {
         var principals = Set<String>()
+        var providerParticipants = Set<String>()
         var correlations = Set<String>()
         var peers = Set<String>()
         for participant in participants {
             guard principals.insert(participant.principalId).inserted,
+                  providerParticipants.insert(
+                    participant.providerParticipantId
+                  ).inserted,
                   correlations.insert(participant.providerCorrelationId).inserted,
                   peers.insert(
                     "\(participant.providerSessionId):\(participant.providerPeerId)"
@@ -282,6 +286,7 @@ public actor VoiceRosterProjection {
         var nextPageIndex: Int
         var participants: [VoiceRosterParticipant]
         var principalIds: Set<String>
+        var providerParticipantIds: Set<String>
         var providerCorrelationIds: Set<String>
         var providerPeerKeys: Set<String>
     }
@@ -309,6 +314,7 @@ public actor VoiceRosterProjection {
                 nextPageIndex: 0,
                 participants: [],
                 principalIds: [],
+                providerParticipantIds: [],
                 providerCorrelationIds: [],
                 providerPeerKeys: []
             )
@@ -325,6 +331,9 @@ public actor VoiceRosterProjection {
             let peerKey =
                 "\(participant.providerSessionId):\(participant.providerPeerId)"
             guard next.principalIds.insert(participant.principalId).inserted,
+                  next.providerParticipantIds.insert(
+                    participant.providerParticipantId
+                  ).inserted,
                   next.providerCorrelationIds.insert(
                     participant.providerCorrelationId
                   ).inserted,

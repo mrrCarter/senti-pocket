@@ -117,6 +117,43 @@ final class VoiceRosterReadModelTests: XCTestCase {
         XCTAssertNil(current)
     }
 
+    func testDuplicateProviderParticipantAcrossPagesFailsClosed() async throws {
+        let identity = try makeIdentity()
+        let projection = VoiceRosterProjection(identity: identity)
+        let firstResult = try await projection.apply(
+            try VoiceRosterPage(
+                identity: identity,
+                snapshotId: snapshotId,
+                pageIndex: 0,
+                joinedCount: 2,
+                participants: [try participant(index: 1)],
+                nextCursor: "r1.next.signature",
+                complete: false
+            )
+        )
+        XCTAssertNil(firstResult)
+        await XCTAssertThrowsVoiceError(.invalidSnapshot) {
+            try await projection.apply(
+                try VoiceRosterPage(
+                    identity: identity,
+                    snapshotId: snapshotId,
+                    pageIndex: 1,
+                    joinedCount: 2,
+                    participants: [
+                        try participant(
+                            index: 2,
+                            providerParticipantId: "provider-1"
+                        )
+                    ],
+                    nextCursor: nil,
+                    complete: true
+                )
+            )
+        }
+        let current = await projection.currentSnapshot()
+        XCTAssertNil(current)
+    }
+
     func testWrongEpochCannotReplaceTheProjection() async throws {
         let identity = try makeIdentity()
         let projection = VoiceRosterProjection(identity: identity)
@@ -219,10 +256,13 @@ final class VoiceRosterReadModelTests: XCTestCase {
         )
     }
 
-    private func participant(index: Int) throws -> VoiceRosterParticipant {
+    private func participant(
+        index: Int,
+        providerParticipantId: String? = nil
+    ) throws -> VoiceRosterParticipant {
         try VoiceRosterParticipant(
             principalId: "human-\(index)",
-            providerParticipantId: "provider-\(index)",
+            providerParticipantId: providerParticipantId ?? "provider-\(index)",
             providerCorrelationId:
                 "senti_\(String(repeating: "\(index % 10)", count: 43))",
             providerSessionId: "provider-session-\(index)",
