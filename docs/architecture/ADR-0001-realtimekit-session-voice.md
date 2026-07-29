@@ -118,9 +118,10 @@ moderation request it:
    and provider participant ID;
 4. fences `commandId`, the owner-scoped idempotency fingerprint, payload
    fingerprint, and `expectedRevision`;
-5. appends one durable command intent and increments `controlRevision` once in
-   one SQLite transaction; and
-6. grants a short execution lease without making a provider call or pushing to
+5. pre-arms recovery and appends one durable command intent, one outbox row,
+   and the next `controlRevision` in one SQLite-backed Durable Object
+   transaction; and
+6. returns the pending command without making a provider call or pushing to
    listeners.
 
 The raw idempotency key and caller bearer are never stored. Two concurrent
@@ -129,8 +130,10 @@ and the other receives `VOICE_CONTROL_CONFLICT` plus the current revision.
 An exact retry returns the original command record; a reused command or key
 with different ownership or content conflicts.
 
-The local implementation stops at this ledger atom. Its only executor is
-`UnavailableVoiceControlExecutor`, which performs zero provider I/O, finalizes
+The local implementation now includes the offline-safe alarm/outbox, Queue
+consumer, execution lease, DLQ terminalizer, and terminal watchdog. Its only
+executor is `UnavailableVoiceControlExecutor`, which runs outside the room
+coordinator, performs zero provider I/O, finalizes
 `providerMutationApplied=false`, and returns `VOICE_PROVIDER_UNAVAILABLE`.
 Therefore the current revision is an ordered intent-ledger revision, not proof
 that RealtimeKit state changed. A client must not render an applied moderation
@@ -156,16 +159,38 @@ at-least-once control Queue -> leased executor -> RealtimeKit desired state
 confirmed state + signed Senti receipt -> bounded read projection
 ```
 
-Before accepting a live command, the object must durably pre-arm its alarm and
-then commit the command row. This order makes an alarm with no work harmless,
-while a crash after the command commit still leaves a wake-up that can discover
-the durable intent. The alarm publishes stable `commandId` envelopes and marks
-them dispatched only after Queue acceptance. Both Durable Object alarms and
-Cloudflare Queues are at-least-once systems, so a crash after publish but before
-the dispatch mark may duplicate delivery. The Queue consumer and every
-provider adapter must deduplicate by the stable command identity; a DLQ is
-mandatory because exhausted retries must never delete governance work
-silently.
+Before accepting a command, the object durably pre-arms its alarm and commits
+the command row, outbox row, and revision CAS in the same SQLite-backed Durable
+Object transaction. A workerd rollback proof sets the alarm, writes SQL, throws,
+and observes that neither survives. The alarm publishes an exact four-field,
+secret-free envelope—schema version, opaque room ID, command ID, and result
+revision—and marks it dispatched only after Queue acceptance. Both Durable
+Object alarms and Cloudflare Queues are at-least-once systems, so a crash after
+publish but before the dispatch mark may duplicate delivery. The Queue consumer
+and every future provider adapter deduplicate by stable command identity and a
+fenced execution lease.
+
+Dispatch is mechanically bounded to 32 envelopes per alarm, with a 250 ms
+initial coalescing delay and a 250 ms continuation re-arm. One room epoch
+retains at most 4,096 commands and then rejects new intake with explicit
+backpressure rather than growing without bound. That implies an ideal
+scheduling ceiling of 128 envelopes/second per continuously hot room, but it is
+not a platform latency SLO. Cross-room scale is horizontal: each opaque
+session/epoch room key has an independent Durable Object and outbox. A
+33-command workerd proof drains 32 then 1; the 5k/10k hot-room gate remains
+unproven and is not weakened by this smaller correctness receipt.
+
+A valid message that exhausts the main consumer enters a mandatory DLQ handled
+by the same Worker. It terminalizes the durable command as `unsupported` with
+`resultCode=queue_delivery_exhausted` and
+`providerMutationApplied=false`, then acknowledges idempotently. Independently,
+the room alarm applies the same false/non-mutating terminal state ten minutes
+after command creation when no execution lease remains. That watchdog covers a
+send-uncertain outage and a DLQ consumer outage, so neither leaves an eternal
+pending command. Any later Queue duplicate observes terminal state and is a
+no-op. Uncertain Queue send is logged without identifiers and rethrown, keeping
+Cloudflare's native alarm retry in addition to the pre-armed 30-second recovery
+wake-up.
 
 The asynchronous executor must freshly recheck actor authority and target
 membership through a server-to-server Senti path before provider mutation. It
@@ -647,7 +672,7 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 | RealtimeKit selected for the spike | Decided |
 | Provider-neutral room/event/error/entitlement contract | Versioned and validation-tested |
 | RealtimeKit adapter/control-plane slice | Draft PR #122 is hosted-Omar green on exact reviewed head; not merged or deployed; no account/resources |
-| Durable moderation ledger | Built locally with unavailable zero-I/O executor; live execution/confirmation remains blocked |
+| Durable moderation ledger/outbox | Built locally with atomic alarm+intent+outbox, bounded Queue drain, leases, DLQ/watchdog terminalization, and unavailable zero-I/O executor; live execution/confirmation remains blocked |
 | Worker checks | Generated types, strict TypeScript, workerd hostile tests, and Wrangler dry-run required at every handoff |
 | iOS `VoiceMediaTransport` and RealtimeKit 3.1 adapter | arm64 iOS Simulator build and 65/65 macOS tests independently green; physical-device review pending |
 | Server-bound remote iOS roster/stage identity | Not built; the SDK adapter fails closed instead of treating provider correlation IDs as Senti principals |

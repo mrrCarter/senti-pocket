@@ -41,6 +41,25 @@
       {
         "binding": "TRANSCRIPT_INGEST_QUEUE",
         "queue": "senti-pocket-transcript-ingest"
+      },
+      {
+        "binding": "VOICE_CONTROL_QUEUE",
+        "queue": "senti-pocket-voice-control-v1"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "senti-pocket-voice-control-v1",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "senti-pocket-voice-control-v1-dlq"
+      },
+      {
+        "queue": "senti-pocket-voice-control-v1-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 5
       }
     ]
   }

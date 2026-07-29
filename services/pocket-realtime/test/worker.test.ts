@@ -268,7 +268,7 @@ describe("voice room control plane", () => {
     expect(providerCalls).toHaveLength(0);
   });
 
-  it("records one owner-fenced command and fails honestly without an executor", async () => {
+  it("accepts one owner-fenced command without inline provider or Queue I/O", async () => {
     const opened = await invoke(
       testEnv,
       "/v1/voice-rooms/open",
@@ -304,9 +304,9 @@ describe("voice room control plane", () => {
       "/v1/voice-rooms/moderate",
       moderateBody(),
     );
-    expect(first.status).toBe(503);
+    expect(first.status).toBe(202);
     const firstPayload = await first.json<{
-      error: { code: string };
+      requestId: string;
       controlRevision: number;
       command: {
         commandId: string;
@@ -315,19 +315,18 @@ describe("voice room control plane", () => {
         controlRevision: number;
         status: string;
         providerMutationApplied: boolean;
-        resultCode: string;
+        resultCode: string | null;
       };
     }>();
-    expect(firstPayload.error.code).toBe("VOICE_PROVIDER_UNAVAILABLE");
     expect(firstPayload.controlRevision).toBe(1);
     expect(firstPayload.command).toMatchObject({
       commandId: "command-moderate-0001",
       targetPrincipalId: "human-target",
       action: "mute",
       controlRevision: 1,
-      status: "unsupported",
+      status: "pending",
       providerMutationApplied: false,
-      resultCode: "executor_unavailable",
+      resultCode: null,
     });
     expect(JSON.stringify(firstPayload)).not.toContain(
       "moderation-command-key-0001",
@@ -345,7 +344,7 @@ describe("voice room control plane", () => {
         requestId: "request-moderate-retry-0001",
       },
     );
-    expect(replay.status).toBe(503);
+    expect(replay.status).toBe(202);
     const replayPayload = await replay.json<{
       controlRevision: number;
       command: typeof firstPayload.command;
@@ -426,7 +425,9 @@ describe("voice room control plane", () => {
     ).debugSnapshot();
     expect(snapshot.room?.controlRevision).toBe(1);
     expect(snapshot.commandCount).toBe(1);
-    expect(snapshot.pendingCommandCount).toBe(0);
+    expect(snapshot.pendingCommandCount).toBe(1);
+    expect(snapshot.pendingOutboxCount).toBe(1);
+    expect(snapshot.dispatchedOutboxCount).toBe(0);
   });
 
   it("rejects client authority fields and remote-unmute vocabulary before command I/O", async () => {

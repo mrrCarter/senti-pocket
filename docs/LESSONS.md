@@ -81,3 +81,16 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
   current terminal-unsupported local proof, but applied production commands
   need an explicit retention/archive policy tied to the maximum safe retry
   window before a live executor is allowed.
+- Prove alarm/SQL atomicity in the real workerd storage model, not only from
+  type signatures. A transaction test that sets an alarm, writes SQL, then
+  throws must observe that both effects rolled back.
+- Treat an uncertain Queue send as a failure that must escape the alarm handler.
+  A pre-armed recovery wake-up is additive; swallowing the error disables the
+  platform's native alarm-retry guarantee.
+- A DLQ is not sufficient if its consumer can fail forever. Give every durable
+  command a bounded, lease-aware terminal watchdog, and make both DLQ handling
+  and watchdog reconciliation converge on one explicit non-mutation result.
+- State hot-room mechanics separately from load claims. Batch size, re-arm
+  delay, per-room capacity, and backpressure are deterministic correctness
+  bounds; they do not become a 5k/10k provider or latency receipt without a
+  controlled load run.

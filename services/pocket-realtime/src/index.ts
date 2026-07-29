@@ -9,7 +9,6 @@ import {
 } from "./contracts";
 import {
   moderationFingerprints,
-  UnavailableVoiceControlExecutor,
 } from "./control-executor";
 import type { RuntimeEnv } from "./env";
 import { HttpError, upstreamError } from "./errors";
@@ -36,6 +35,7 @@ import {
   requirePostMeetingTranscription,
 } from "./validation";
 import { handleRealtimeKitWebhook } from "./webhook";
+import { handleVoiceControlQueue } from "./voice-control-queue";
 
 export { RoomGovernor };
 
@@ -99,6 +99,9 @@ export default {
         requestContext.requestId,
       );
     }
+  },
+  async queue(batch, env): Promise<void> {
+    await handleVoiceControlQueue(batch, env);
   },
 } satisfies ExportedHandler<RuntimeEnv>;
 
@@ -385,25 +388,10 @@ async function moderateRoom(
   });
 
   if (reservation.disposition === "replay") {
-    return unsupportedCommandResponse(
+    return moderationCommandResponse(
       reservation.command,
       traceId,
       input.requestId,
-    );
-  }
-  if (reservation.disposition === "busy") {
-    return errorResponse(
-      new HttpError(
-        409,
-        "command_execution_busy",
-        "Voice command execution is already in progress.",
-      ),
-      traceId,
-      input.requestId,
-      {
-        controlRevision: reservation.command.controlRevision,
-        command: reservation.command,
-      },
     );
   }
   if (
@@ -451,42 +439,11 @@ async function moderateRoom(
       "The room control-command budget is exhausted.",
     );
   }
-  if (reservation.disposition !== "execute") {
+  if (reservation.disposition !== "accepted") {
     throw new Error("Unhandled moderation reservation.");
   }
-  const executable = reservation;
-
-  const executor = new UnavailableVoiceControlExecutor();
-  const execution = await executor.execute({
-    room: executable.room,
-    commandId: executable.command.commandId,
-    controlRevision: executable.command.controlRevision,
-    action: executable.command.action,
-    targetProviderParticipantId: executable.targetProviderParticipantId,
-  });
-  if (
-    execution.disposition !== "unsupported" ||
-    execution.providerMutationApplied
-  ) {
-    throw new HttpError(
-      500,
-      "invalid_executor_result",
-      "Voice command execution returned an invalid result.",
-    );
-  }
-  const finalized = await governor.finalizeModerationUnsupported(
-    executable.command.commandId,
-    executable.fence,
-    new Date().toISOString(),
-  );
-  if (!finalized) {
-    throw upstreamError(
-      "command_execution_conflict",
-      "Voice command execution could not be finalized.",
-    );
-  }
-  return unsupportedCommandResponse(
-    finalized,
+  return moderationCommandResponse(
+    reservation.command,
     traceId,
     input.requestId,
   );
@@ -630,11 +587,17 @@ function unsupportedCommandResponse(
   traceId: string,
   requestId: string,
 ): Response {
+  const deliveryExhausted =
+    command.resultCode === "queue_delivery_exhausted";
   return errorResponse(
     new HttpError(
       503,
-      "voice_executor_unavailable",
-      "No trusted voice-control executor is available.",
+      deliveryExhausted
+        ? "voice_control_delivery_exhausted"
+        : "voice_executor_unavailable",
+      deliveryExhausted
+        ? "Voice-control delivery could not be completed."
+        : "No trusted voice-control executor is available.",
     ),
     traceId,
     requestId,
@@ -642,6 +605,26 @@ function unsupportedCommandResponse(
       controlRevision: command.controlRevision,
       command,
     },
+  );
+}
+
+function moderationCommandResponse(
+  command: ModerationCommandRecord,
+  traceId: string,
+  requestId: string,
+): Response {
+  if (command.status === "unsupported") {
+    return unsupportedCommandResponse(command, traceId, requestId);
+  }
+  return json(
+    {
+      requestId,
+      controlRevision: command.controlRevision,
+      command,
+    },
+    202,
+    traceId,
+    requestId,
   );
 }
 

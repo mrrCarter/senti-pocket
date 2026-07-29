@@ -195,6 +195,69 @@ expected room revision, command ID, and idempotency key. The server rechecks
 authorization at execution time. A stale revision returns
 `VOICE_CONTROL_CONFLICT` and the current safe snapshot.
 
+### 7.1 Durable command intake and delivery
+
+The server MUST commit the next control revision, command intent, outbox row,
+and recovery alarm in one SQLite-backed Durable Object transaction. An accepted
+command and an exact retry while it remains pending return HTTP `202` with the
+same command identity and control revision. That revision orders intent; it is
+not evidence of a provider mutation. Reusing a command identity or
+owner-scoped idempotency fingerprint for different content MUST fail closed.
+
+The Queue boundary is the following exact, secret-free envelope:
+
+```json
+{
+  "schemaVersion": "senti.voice_control.command.v1",
+  "roomId": "opaque-room-key",
+  "commandId": "command_01",
+  "controlRevision": 42
+}
+```
+
+Consumers MUST reject unknown fields or a different schema version. The
+envelope MUST NOT contain a bearer, raw idempotency key, principal identity,
+provider participant ID, target, action, transcript, or prompt. The room
+governor resolves those fields from its durable command ledger after validating
+the exact room, command, and revision tuple.
+
+Alarm dispatch is at least once. It MUST publish stable envelope bytes, mark an
+outbox row dispatched only after the Queue send promise resolves, and throw
+after an uncertain send so the platform's native alarm retry remains active.
+A pre-armed recovery alarm is an additional guarantee, not a replacement for
+native retry. Duplicate Queue deliveries MUST acquire a fenced execution lease
+or observe an existing terminal result; they MUST NOT duplicate provider work.
+
+The current safe implementation has these explicit mechanical bounds:
+
+- at most 32 outbox envelopes per room alarm;
+- a 250 ms initial/coalescing delay and 250 ms continuation re-arm;
+- at most 4,096 retained commands per room epoch, after which intake returns
+  backpressure instead of growing unbounded; and
+- a ten-minute terminal deadline from command creation. After that deadline,
+  a command not protected by a live execution lease becomes `unsupported` with
+  `resultCode=queue_delivery_exhausted` and
+  `providerMutationApplied=false`.
+
+The ten-minute watchdog covers both send-uncertain commands and commands that
+were dispatched but never completed Queue/DLQ processing. A valid DLQ envelope
+MUST request the same idempotent terminal transition. Structurally invalid
+Queue poison has no command identity to terminalize and is safely acknowledged
+with secret-free telemetry. These numbers are correctness bounds, not a
+latency SLO or a 5k/10k hot-room load receipt.
+
+The only enabled executor remains `UnavailableVoiceControlExecutor`. It runs
+outside the room coordinator, performs zero provider I/O, and can finalize only
+`status=unsupported`, `resultCode=executor_unavailable`, and
+`providerMutationApplied=false`. A later live executor remains blocked until it
+can freshly re-authorize through Senti, use desired-state/idempotent provider
+operations, and produce authoritative action-specific confirmation.
+
+Posting the same `commandId` is the current actor-authorized poll: it returns
+the original `202` pending record or the original terminal failure and command
+record. Audience-sized room receipt fanout is deferred; it MUST NOT be routed
+through the single room coordinator.
+
 ## 8. Per-agent voice profile
 
 Every agent principal MUST resolve to one active, versioned

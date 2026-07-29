@@ -1,11 +1,13 @@
-import type {
-  JoinRoomRequest,
-  ModerateRoomRequest,
-  OpenRoomRequest,
-  RoomUsageRequest,
-  TranscriptMode,
-  VoiceModerationAction,
-  VoiceRole,
+import {
+  VOICE_CONTROL_QUEUE_SCHEMA,
+  type JoinRoomRequest,
+  type ModerateRoomRequest,
+  type OpenRoomRequest,
+  type RoomUsageRequest,
+  type TranscriptMode,
+  type VoiceControlQueueEnvelope,
+  type VoiceModerationAction,
+  type VoiceRole,
 } from "./contracts";
 import { HttpError } from "./errors";
 
@@ -104,6 +106,34 @@ export function parseModerateRoomRequest(value: unknown): ModerateRoomRequest {
       "targetPrincipalId",
     ),
     action: moderationAction(body.action),
+  };
+}
+
+export function parseVoiceControlQueueEnvelope(
+  value: unknown,
+): VoiceControlQueueEnvelope {
+  const body = record(value);
+  exactKeys(body, [
+    "schemaVersion",
+    "roomId",
+    "commandId",
+    "controlRevision",
+  ]);
+  if (body.schemaVersion !== VOICE_CONTROL_QUEUE_SCHEMA) {
+    throw new HttpError(
+      422,
+      "invalid_queue_envelope",
+      "Voice-control Queue schema is invalid.",
+    );
+  }
+  return {
+    schemaVersion: VOICE_CONTROL_QUEUE_SCHEMA,
+    roomId: validateRoomIdValue(body.roomId),
+    commandId: boundedPattern(body.commandId, COMMAND_ID, "commandId"),
+    controlRevision: nonNegativeSafeInteger(
+      body.controlRevision,
+      "controlRevision",
+    ),
   };
 }
 
@@ -246,6 +276,18 @@ function boundedPattern(
 }
 
 function revision(value: unknown): number {
+  try {
+    return nonNegativeSafeInteger(value, "expectedRevision");
+  } catch {
+    throw new HttpError(
+      422,
+      "invalid_request",
+      "expectedRevision must be a non-negative safe integer.",
+    );
+  }
+}
+
+function nonNegativeSafeInteger(value: unknown, field: string): number {
   if (
     typeof value !== "number" ||
     !Number.isSafeInteger(value) ||
@@ -254,10 +296,21 @@ function revision(value: unknown): number {
     throw new HttpError(
       422,
       "invalid_request",
-      "expectedRevision must be a non-negative safe integer.",
+      `${field} must be a non-negative safe integer.`,
     );
   }
   return value;
+}
+
+function validateRoomIdValue(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new HttpError(
+      422,
+      "invalid_queue_envelope",
+      "Voice-control Queue room identifier is invalid.",
+    );
+  }
+  return validateRoomId(value);
 }
 
 function moderationAction(value: unknown): VoiceModerationAction {

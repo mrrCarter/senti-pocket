@@ -1,13 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
-import type {
-  ModerationCommandRecord,
-  RoomRecord,
-  RoomUsageSnapshot,
-  SentiMembershipRole,
-  VoiceModerationAction,
-  VoiceRole,
-  WebhookAcceptance,
-  WebhookEventSummary,
+import {
+  VOICE_CONTROL_QUEUE_SCHEMA,
+  type ModerationCommandRecord,
+  type RoomRecord,
+  type RoomUsageSnapshot,
+  type SentiMembershipRole,
+  type VoiceControlQueueEnvelope,
+  type VoiceModerationAction,
+  type VoiceRole,
+  type WebhookAcceptance,
+  type WebhookEventSummary,
 } from "./contracts";
 import type { RuntimeEnv } from "./env";
 
@@ -16,6 +18,11 @@ const ADMISSION_LEASE_MS = 15_000;
 const COMMAND_LEASE_MS = 15_000;
 const COMMAND_RETENTION_MS = 8 * 24 * 60 * 60 * 1_000;
 const MAX_COMMANDS = 4_096;
+const OUTBOX_INITIAL_DELAY_MS = 250;
+const OUTBOX_CONTINUATION_DELAY_MS = 250;
+const OUTBOX_BATCH_SIZE = 32;
+const OUTBOX_RECOVERY_MS = 30_000;
+const COMMAND_TERMINAL_DEADLINE_MS = 10 * 60 * 1_000;
 const DELIVERY_RETENTION_MS = 8 * 24 * 60 * 60 * 1_000;
 const MAX_DELIVERIES = 2_048;
 
@@ -67,14 +74,11 @@ export interface ModerationReservationInput {
 
 export type ModerationReservation =
   | {
-      disposition: "execute";
-      fence: string;
-      room: RoomRecord;
+      disposition: "accepted";
       command: ModerationCommandRecord;
-      targetProviderParticipantId: string;
     }
   | {
-      disposition: "replay" | "busy";
+      disposition: "replay";
       command: ModerationCommandRecord;
     }
   | {
@@ -88,6 +92,23 @@ export type ModerationReservation =
   | { disposition: "identity_mismatch"; currentRevision: number }
   | { disposition: "over_budget"; currentRevision: number }
   | { disposition: "command_capacity"; currentRevision: number };
+
+export type ModerationExecutionReservation =
+  | {
+      disposition: "execute";
+      fence: string;
+      room: RoomRecord;
+      command: ModerationCommandRecord;
+      targetProviderParticipantId: string;
+    }
+  | {
+      disposition: "terminal";
+      command: ModerationCommandRecord;
+    }
+  | { disposition: "busy" }
+  | { disposition: "not_authorized" }
+  | { disposition: "target_not_found" }
+  | { disposition: "invalid" };
 
 export type UsageResult =
   | { disposition: "ok"; room: RoomRecord; usage: RoomUsageSnapshot }
@@ -138,7 +159,10 @@ interface ModerationCommandRow {
   state: "pending" | "unsupported";
   execution_fence: string | null;
   execution_lease_until: number | null;
-  result_code: "executor_unavailable" | null;
+  result_code:
+    | "executor_unavailable"
+    | "queue_delivery_exhausted"
+    | null;
   provider_mutation_applied: 0;
   created_at: string;
   finalized_at: string | null;
@@ -148,6 +172,23 @@ interface DeliveryRow {
   [key: string]: SqlStorageValue;
   digest: string;
   state: "pending" | "enqueued";
+}
+
+interface ModerationOutboxRow {
+  [key: string]: SqlStorageValue;
+  command_id: string;
+  room_id: string;
+  result_revision: number;
+  state: "pending" | "dispatched";
+  dispatch_attempts: number;
+  last_attempt_at: string | null;
+  dispatched_at: string | null;
+}
+
+interface PendingCommandDeadlineRow {
+  [key: string]: SqlStorageValue;
+  created_at: string;
+  execution_lease_until: number | null;
 }
 
 export class RoomGovernor extends DurableObject<RuntimeEnv> {
@@ -233,7 +274,35 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         );
         CREATE INDEX IF NOT EXISTS moderation_commands_finalized_at
           ON moderation_commands(finalized_at);
+        CREATE TABLE IF NOT EXISTS moderation_outbox (
+          command_id TEXT PRIMARY KEY,
+          room_id TEXT NOT NULL,
+          result_revision INTEGER NOT NULL,
+          state TEXT NOT NULL,
+          dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+          last_attempt_at TEXT,
+          dispatched_at TEXT,
+          CHECK (state IN ('pending', 'dispatched')),
+          CHECK (dispatch_attempts >= 0)
+        );
+        CREATE INDEX IF NOT EXISTS moderation_outbox_pending
+          ON moderation_outbox(state, result_revision);
+        INSERT OR IGNORE INTO moderation_outbox (
+          command_id, room_id, result_revision, state, dispatch_attempts,
+          last_attempt_at, dispatched_at
+        )
+        SELECT commands.command_id, room.room_id, commands.result_revision,
+               'pending', 0, NULL, NULL
+        FROM moderation_commands AS commands
+        CROSS JOIN room
+        WHERE room.singleton = 1 AND commands.state = 'pending';
       `);
+      if (this.pendingCommandCount() > 0) {
+        const alarm = await this.ctx.storage.getAlarm();
+        if (alarm === null) {
+          await this.scheduleNextModerationAlarm(Date.now());
+        }
+      }
     });
   }
 
@@ -476,10 +545,10 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
     });
   }
 
-  reserveModeration(
+  async reserveModeration(
     input: ModerationReservationInput,
-  ): ModerationReservation {
-    return this.ctx.storage.transactionSync(() => {
+  ): Promise<ModerationReservation> {
+    return this.ctx.storage.transaction(async (txn) => {
       const room = this.roomRow();
       const currentRevision = room?.control_revision ?? 0;
       if (
@@ -546,32 +615,10 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         ) {
           return { disposition: "target_not_found", currentRevision };
         }
-        const nowMs = Date.parse(input.now);
-        if (
-          command.execution_lease_until !== null &&
-          command.execution_lease_until > nowMs
-        ) {
-          return {
-            disposition: "busy",
-            command: toModerationCommandRecord(command),
-          };
-        }
-        const fence = crypto.randomUUID();
-        this.ctx.storage.sql.exec(
-          `UPDATE moderation_commands
-           SET execution_fence = ?, execution_lease_until = ?
-           WHERE command_id = ? AND state = 'pending'`,
-          fence,
-          nowMs + COMMAND_LEASE_MS,
-          command.command_id,
-        );
-        const reacquired = this.moderationCommandRow(command.command_id);
+        await txn.setAlarm(Date.now() + OUTBOX_INITIAL_DELAY_MS);
         return {
-          disposition: "execute",
-          fence,
-          room: toRoomRecord(room),
-          command: toModerationCommandRecord(reacquired),
-          targetProviderParticipantId: reacquired.provider_participant_id,
+          disposition: "replay",
+          command: toModerationCommandRecord(command),
         };
       }
 
@@ -610,8 +657,9 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       }
 
       const resultRevision = currentRevision + 1;
-      const fence = crypto.randomUUID();
-      const leaseUntil = Date.parse(input.now) + COMMAND_LEASE_MS;
+      // Alarm and SQL writes share this SQLite-backed DO transaction. Scheduling
+      // first means a committed intent can never exist without a durable wake-up.
+      await txn.setAlarm(Date.now() + OUTBOX_INITIAL_DELAY_MS);
       this.ctx.storage.sql.exec(
         `INSERT INTO moderation_commands (
            command_id, idempotency_hash, payload_hash, actor_principal_id,
@@ -619,7 +667,7 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
            provider_participant_id, action, expected_revision,
            result_revision, state, execution_fence, execution_lease_until,
            result_code, provider_mutation_applied, created_at, finalized_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, 0, ?, NULL)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, 0, ?, NULL)`,
         input.commandId,
         input.idempotencyHash,
         input.payloadHash,
@@ -630,9 +678,16 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         input.action,
         input.expectedRevision,
         resultRevision,
-        fence,
-        leaseUntil,
         input.now,
+      );
+      this.ctx.storage.sql.exec(
+        `INSERT INTO moderation_outbox (
+           command_id, room_id, result_revision, state, dispatch_attempts,
+           last_attempt_at, dispatched_at
+         ) VALUES (?, ?, ?, 'pending', 0, NULL, NULL)`,
+        input.commandId,
+        input.roomId,
+        resultRevision,
       );
       this.ctx.storage.sql.exec(
         `UPDATE room
@@ -644,11 +699,80 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       );
       const command = this.moderationCommandRow(input.commandId);
       return {
+        disposition: "accepted",
+        command: toModerationCommandRecord(command),
+      };
+    });
+  }
+
+  reserveModerationExecution(
+    envelope: VoiceControlQueueEnvelope,
+    now: string,
+  ): ModerationExecutionReservation {
+    return this.ctx.storage.transactionSync(() => {
+      const room = this.roomRow();
+      const command = this.moderationCommandRowOrNull(envelope.commandId);
+      if (
+        !room ||
+        room.lifecycle !== "ready" ||
+        !room.provider_meeting_id ||
+        room.room_id !== envelope.roomId ||
+        !command ||
+        command.result_revision !== envelope.controlRevision
+      ) {
+        return { disposition: "invalid" };
+      }
+      if (command.state === "unsupported") {
+        return {
+          disposition: "terminal",
+          command: toModerationCommandRecord(command),
+        };
+      }
+
+      const actor = this.admissionByPrincipal(command.actor_principal_id);
+      if (
+        !actor ||
+        actor.state !== "active" ||
+        (actor.membership_role !== "owner" &&
+          actor.membership_role !== "admin") ||
+        actor.role !== "moderator" ||
+        !actor.provider_participant_id
+      ) {
+        return { disposition: "not_authorized" };
+      }
+      const target = this.admissionByPrincipal(command.target_principal_id);
+      if (
+        !target ||
+        target.state !== "active" ||
+        target.participant_key !== command.target_participant_key ||
+        target.provider_participant_id !== command.provider_participant_id
+      ) {
+        return { disposition: "target_not_found" };
+      }
+
+      const nowMs = Date.parse(now);
+      if (
+        command.execution_lease_until !== null &&
+        command.execution_lease_until > nowMs
+      ) {
+        return { disposition: "busy" };
+      }
+      const fence = crypto.randomUUID();
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET execution_fence = ?, execution_lease_until = ?
+         WHERE command_id = ? AND state = 'pending'`,
+        fence,
+        nowMs + COMMAND_LEASE_MS,
+        command.command_id,
+      );
+      const acquired = this.moderationCommandRow(command.command_id);
+      return {
         disposition: "execute",
         fence,
-        room: toRoomRecord(this.roomRowRequired()),
-        command: toModerationCommandRecord(command),
-        targetProviderParticipantId: command.provider_participant_id,
+        room: toRoomRecord(room),
+        command: toModerationCommandRecord(acquired),
+        targetProviderParticipantId: acquired.provider_participant_id,
       };
     });
   }
@@ -677,10 +801,120 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         commandId,
         fence,
       );
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_outbox
+         SET state = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?)
+         WHERE command_id = ?`,
+        now,
+        commandId,
+      );
       return toModerationCommandRecord(
         this.moderationCommandRow(commandId),
       );
     });
+  }
+
+  finalizeModerationUndelivered(
+    envelope: VoiceControlQueueEnvelope,
+    now: string,
+  ): ModerationCommandRecord | null {
+    return this.ctx.storage.transactionSync(() => {
+      const room = this.roomRow();
+      const command = this.moderationCommandRowOrNull(envelope.commandId);
+      if (
+        !room ||
+        room.room_id !== envelope.roomId ||
+        !command ||
+        command.result_revision !== envelope.controlRevision
+      ) {
+        return null;
+      }
+      if (command.state === "unsupported") {
+        return toModerationCommandRecord(command);
+      }
+      const nowMs = Date.parse(now);
+      if (
+        command.execution_lease_until !== null &&
+        command.execution_lease_until > nowMs
+      ) {
+        return null;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET state = 'unsupported', execution_fence = NULL,
+             execution_lease_until = NULL,
+             result_code = 'queue_delivery_exhausted',
+             provider_mutation_applied = 0, finalized_at = ?
+         WHERE command_id = ? AND state = 'pending'
+           AND (
+             execution_lease_until IS NULL OR execution_lease_until <= ?
+           )`,
+        now,
+        envelope.commandId,
+        nowMs,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_outbox
+         SET state = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?)
+         WHERE command_id = ?`,
+        now,
+        envelope.commandId,
+      );
+      return toModerationCommandRecord(
+        this.moderationCommandRow(envelope.commandId),
+      );
+    });
+  }
+
+  override async alarm(): Promise<void> {
+    // Pre-arm recovery before Queue I/O, then throw on uncertain delivery so
+    // both the durable wake-up and Cloudflare's native alarm retry remain live.
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    await this.ctx.storage.setAlarm(nowMs + OUTBOX_RECOVERY_MS);
+    const reconciled = this.reconcileExpiredModerationCommands(now, nowMs);
+    if (reconciled > 0) {
+      console.warn(
+        JSON.stringify({
+          event: "voice_control_pending_commands_terminalized",
+          commandCount: reconciled,
+          resultCode: "queue_delivery_exhausted",
+        }),
+      );
+    }
+    const pending = this.pendingOutboxRows(OUTBOX_BATCH_SIZE);
+    if (pending.length === 0) {
+      await this.scheduleNextModerationAlarm(nowMs);
+      return;
+    }
+
+    const attemptedAt = new Date().toISOString();
+    this.recordOutboxAttempt(pending, attemptedAt);
+    try {
+      await this.env.VOICE_CONTROL_QUEUE.sendBatch(
+        pending.map((row) => ({
+          body: outboxEnvelope(row),
+          contentType: "json",
+        })),
+      );
+      this.markOutboxDispatched(pending, new Date().toISOString());
+    } catch {
+      console.error(
+        JSON.stringify({
+          event: "voice_control_outbox_dispatch_deferred",
+          commandCount: pending.length,
+        }),
+      );
+      throw new Error("Voice-control outbox dispatch failed.");
+    }
+
+    if (this.pendingOutboxCount() > 0) {
+      await this.ctx.storage.setAlarm(
+        Date.now() + OUTBOX_CONTINUATION_DELAY_MS,
+      );
+    } else {
+      await this.scheduleNextModerationAlarm(Date.now());
+    }
   }
 
   acceptWebhook(
@@ -783,6 +1017,8 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
     participantCount: number;
     commandCount: number;
     pendingCommandCount: number;
+    pendingOutboxCount: number;
+    dispatchedOutboxCount: number;
     transcriptBodyColumns: 0;
   } {
     const room = this.roomRow();
@@ -807,6 +1043,16 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
         "SELECT COUNT(*) AS count FROM moderation_commands WHERE state = 'pending'",
       )
       .one();
+    const pendingOutbox = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM moderation_outbox WHERE state = 'pending'",
+      )
+      .one();
+    const dispatchedOutbox = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM moderation_outbox WHERE state = 'dispatched'",
+      )
+      .one();
     return {
       room: room ? toRoomRecord(room) : null,
       controlRequests: usage.count,
@@ -814,8 +1060,30 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       participantCount: participants.count,
       commandCount: commands.count,
       pendingCommandCount: pendingCommands.count,
+      pendingOutboxCount: pendingOutbox.count,
+      dispatchedOutboxCount: dispatchedOutbox.count,
       transcriptBodyColumns: 0,
     };
+  }
+
+  debugOutboxSnapshot(): Array<{
+    commandId: string;
+    controlRevision: number;
+    state: "pending" | "dispatched";
+    dispatchAttempts: number;
+  }> {
+    return this.ctx.storage.sql
+      .exec<ModerationOutboxRow>(
+        `SELECT * FROM moderation_outbox
+         ORDER BY result_revision, command_id`,
+      )
+      .toArray()
+      .map((row) => ({
+        commandId: row.command_id,
+        controlRevision: row.result_revision,
+        state: row.state,
+        dispatchAttempts: row.dispatch_attempts,
+      }));
   }
 
   private applyEvent(event: WebhookEventSummary, now: string): void {
@@ -933,6 +1201,14 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       Date.parse(now) - COMMAND_RETENTION_MS,
     ).toISOString();
     this.ctx.storage.sql.exec(
+      `DELETE FROM moderation_outbox
+       WHERE command_id IN (
+         SELECT command_id FROM moderation_commands
+         WHERE state = 'unsupported' AND finalized_at < ?
+       )`,
+      cutoff,
+    );
+    this.ctx.storage.sql.exec(
       `DELETE FROM moderation_commands
        WHERE state = 'unsupported' AND finalized_at < ?`,
       cutoff,
@@ -1017,6 +1293,166 @@ export class RoomGovernor extends DurableObject<RuntimeEnv> {
       .one().count;
   }
 
+  private pendingOutboxRows(limit: number): ModerationOutboxRow[] {
+    return this.ctx.storage.sql
+      .exec<ModerationOutboxRow>(
+        `SELECT outbox.*
+         FROM moderation_outbox AS outbox
+         JOIN moderation_commands AS commands
+           ON commands.command_id = outbox.command_id
+         WHERE outbox.state = 'pending' AND commands.state = 'pending'
+         ORDER BY outbox.result_revision, outbox.command_id
+         LIMIT ?`,
+        limit,
+      )
+      .toArray();
+  }
+
+  private pendingOutboxCount(): number {
+    return this.ctx.storage.sql
+      .exec<{ count: number }>(
+        `SELECT COUNT(*) AS count
+         FROM moderation_outbox AS outbox
+         JOIN moderation_commands AS commands
+           ON commands.command_id = outbox.command_id
+         WHERE outbox.state = 'pending' AND commands.state = 'pending'`,
+      )
+      .one().count;
+  }
+
+  private pendingCommandCount(): number {
+    return this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM moderation_commands WHERE state = 'pending'",
+      )
+      .one().count;
+  }
+
+  private reconcileExpiredModerationCommands(
+    now: string,
+    nowMs: number,
+  ): number {
+    const cutoff = new Date(nowMs - COMMAND_TERMINAL_DEADLINE_MS).toISOString();
+    return this.ctx.storage.transactionSync(() => {
+      const expired = this.ctx.storage.sql
+        .exec<{ command_id: string }>(
+          `SELECT command_id
+           FROM moderation_commands
+           WHERE state = 'pending' AND created_at <= ?
+             AND (
+               execution_lease_until IS NULL OR execution_lease_until <= ?
+             )`,
+          cutoff,
+          nowMs,
+        )
+        .toArray();
+      if (expired.length === 0) return 0;
+
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_commands
+         SET state = 'unsupported', execution_fence = NULL,
+             execution_lease_until = NULL,
+             result_code = 'queue_delivery_exhausted',
+             provider_mutation_applied = 0, finalized_at = ?
+         WHERE state = 'pending' AND created_at <= ?
+           AND (
+             execution_lease_until IS NULL OR execution_lease_until <= ?
+           )`,
+        now,
+        cutoff,
+        nowMs,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE moderation_outbox
+         SET state = 'dispatched', dispatched_at = COALESCE(dispatched_at, ?)
+         WHERE command_id IN (
+           SELECT command_id
+           FROM moderation_commands
+           WHERE state = 'unsupported'
+             AND result_code = 'queue_delivery_exhausted'
+             AND finalized_at = ?
+         )`,
+        now,
+        now,
+      );
+      return expired.length;
+    });
+  }
+
+  private async scheduleNextModerationAlarm(nowMs: number): Promise<void> {
+    if (this.pendingOutboxCount() > 0) {
+      await this.ctx.storage.setAlarm(nowMs + OUTBOX_CONTINUATION_DELAY_MS);
+      return;
+    }
+
+    const pending = this.ctx.storage.sql
+      .exec<PendingCommandDeadlineRow>(
+        `SELECT created_at, execution_lease_until
+         FROM moderation_commands
+         WHERE state = 'pending'`,
+      )
+      .toArray();
+    if (pending.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    const earliestDeadline = pending.reduce((earliest, command) => {
+      const createdAt = Date.parse(command.created_at);
+      const terminalDeadline =
+        (Number.isFinite(createdAt) ? createdAt : nowMs) +
+        COMMAND_TERMINAL_DEADLINE_MS;
+      const leaseSafeDeadline =
+        command.execution_lease_until !== null
+          ? Math.max(
+              terminalDeadline,
+              command.execution_lease_until + OUTBOX_CONTINUATION_DELAY_MS,
+            )
+          : terminalDeadline;
+      return Math.min(earliest, leaseSafeDeadline);
+    }, Number.POSITIVE_INFINITY);
+    await this.ctx.storage.setAlarm(
+      Math.max(
+        nowMs + OUTBOX_CONTINUATION_DELAY_MS,
+        earliestDeadline,
+      ),
+    );
+  }
+
+  private recordOutboxAttempt(
+    rows: ModerationOutboxRow[],
+    attemptedAt: string,
+  ): void {
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows) {
+        this.ctx.storage.sql.exec(
+          `UPDATE moderation_outbox
+           SET dispatch_attempts = dispatch_attempts + 1, last_attempt_at = ?
+           WHERE command_id = ? AND state = 'pending'`,
+          attemptedAt,
+          row.command_id,
+        );
+      }
+    });
+  }
+
+  private markOutboxDispatched(
+    rows: ModerationOutboxRow[],
+    dispatchedAt: string,
+  ): void {
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows) {
+        this.ctx.storage.sql.exec(
+          `UPDATE moderation_outbox
+           SET state = 'dispatched', dispatched_at = ?
+           WHERE command_id = ? AND state = 'pending'`,
+          dispatchedAt,
+          row.command_id,
+        );
+      }
+    });
+  }
+
   private deliveryRow(deliveryId: string): DeliveryRow | null {
     return (
       this.ctx.storage.sql
@@ -1075,6 +1511,17 @@ function toModerationCommandRecord(
     resultCode: row.result_code,
     createdAt: row.created_at,
     finalizedAt: row.finalized_at,
+  };
+}
+
+function outboxEnvelope(
+  row: ModerationOutboxRow,
+): VoiceControlQueueEnvelope {
+  return {
+    schemaVersion: VOICE_CONTROL_QUEUE_SCHEMA,
+    roomId: row.room_id,
+    commandId: row.command_id,
+    controlRevision: row.result_revision,
   };
 }
 

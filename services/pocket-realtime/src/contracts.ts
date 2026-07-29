@@ -1,6 +1,8 @@
 export const MEDIA_PROVIDER = "cloudflare-realtimekit" as const;
 export const REQUIRED_AGENT_MEDIA_MODE = "shared-room-track" as const;
 export const DEGRADED_AGENT_FALLBACK = "edge-text-client-tts" as const;
+export const VOICE_CONTROL_QUEUE_SCHEMA =
+  "senti.voice_control.command.v1" as const;
 
 export type SentiMembershipRole = "owner" | "admin" | "contributor" | "viewer";
 export type VoiceRole = "moderator" | "speaker" | "listener";
@@ -103,6 +105,13 @@ export interface TranscriptQueueEnvelope {
   receivedAt: string;
 }
 
+export interface VoiceControlQueueEnvelope {
+  schemaVersion: typeof VOICE_CONTROL_QUEUE_SCHEMA;
+  roomId: string;
+  commandId: string;
+  controlRevision: number;
+}
+
 export interface RoomUsageSnapshot {
   usageDay: string;
   controlRequests: number;
@@ -120,7 +129,7 @@ export interface ModerationCommandRecord {
   controlRevision: number;
   status: "pending" | "unsupported";
   providerMutationApplied: false;
-  resultCode: "executor_unavailable" | null;
+  resultCode: "executor_unavailable" | "queue_delivery_exhausted" | null;
   createdAt: string;
   finalizedAt: string | null;
 }

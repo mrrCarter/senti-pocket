@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { VOICE_CONTROL_QUEUE_SCHEMA } from "../src/contracts";
 import type { RuntimeEnv } from "../src/env";
 import { deriveRoomId } from "../src/identity";
 
@@ -114,18 +115,33 @@ describe("RoomGovernor invariants", () => {
   it("advances one revision for one command and fences exact retries", async () => {
     const { governor, input } = await setupModerationGovernor();
     const first = await governor.reserveModeration(input);
-    expect(first.disposition).toBe("execute");
-    if (first.disposition !== "execute") {
-      throw new Error("Expected command execution lease.");
+    expect(first.disposition).toBe("accepted");
+    if (first.disposition !== "accepted") {
+      throw new Error("Expected accepted command intent.");
     }
     expect(first.command.controlRevision).toBe(1);
 
-    const busy = await governor.reserveModeration(input);
-    expect(busy.disposition).toBe("busy");
+    const pendingReplay = await governor.reserveModeration(input);
+    expect(pendingReplay).toEqual({
+      disposition: "replay",
+      command: first.command,
+    });
 
+    const execution = await governor.reserveModerationExecution(
+      {
+        schemaVersion: VOICE_CONTROL_QUEUE_SCHEMA,
+        roomId: input.roomId,
+        commandId: input.commandId,
+        controlRevision: 1,
+      },
+      NOW,
+    );
+    if (execution.disposition !== "execute") {
+      throw new Error("Expected command execution lease.");
+    }
     const finalized = await governor.finalizeModerationUnsupported(
       input.commandId,
-      first.fence,
+      execution.fence,
       NOW,
     );
     expect(finalized).toMatchObject({
@@ -170,6 +186,7 @@ describe("RoomGovernor invariants", () => {
     expect(snapshot.room?.controlRevision).toBe(1);
     expect(snapshot.commandCount).toBe(1);
     expect(snapshot.pendingCommandCount).toBe(0);
+    expect(snapshot.pendingOutboxCount).toBe(0);
     expect(snapshot.controlRequests).toBe(4);
   });
 
@@ -187,22 +204,34 @@ describe("RoomGovernor invariants", () => {
     ]);
 
     expect(
-      commands.filter((result) => result.disposition === "execute"),
+      commands.filter((result) => result.disposition === "accepted"),
     ).toHaveLength(1);
     expect(
       commands.filter((result) => result.disposition === "revision_conflict"),
     ).toHaveLength(1);
     const executable = commands.find(
-      (result) => result.disposition === "execute",
+      (result) => result.disposition === "accepted",
     );
-    if (!executable || executable.disposition !== "execute") {
-      throw new Error("Expected exactly one command execution lease.");
+    if (!executable || executable.disposition !== "accepted") {
+      throw new Error("Expected exactly one accepted command intent.");
     }
     expect(executable.command.controlRevision).toBe(1);
+    const execution = await governor.reserveModerationExecution(
+      {
+        schemaVersion: VOICE_CONTROL_QUEUE_SCHEMA,
+        roomId: input.roomId,
+        commandId: executable.command.commandId,
+        controlRevision: executable.command.controlRevision,
+      },
+      NOW,
+    );
+    if (execution.disposition !== "execute") {
+      throw new Error("Expected exactly one command execution lease.");
+    }
     expect(
       await governor.finalizeModerationUnsupported(
         executable.command.commandId,
-        executable.fence,
+        execution.fence,
         NOW,
       ),
     ).toMatchObject({
@@ -220,7 +249,19 @@ describe("RoomGovernor invariants", () => {
   it("rechecks authority and target binding before reacquiring an expired lease", async () => {
     const { governor, input } = await setupModerationGovernor();
     const first = await governor.reserveModeration(input);
-    if (first.disposition !== "execute") {
+    if (first.disposition !== "accepted") {
+      throw new Error("Expected accepted command intent.");
+    }
+    const execution = await governor.reserveModerationExecution(
+      {
+        schemaVersion: VOICE_CONTROL_QUEUE_SCHEMA,
+        roomId: input.roomId,
+        commandId: input.commandId,
+        controlRevision: first.command.controlRevision,
+      },
+      NOW,
+    );
+    if (execution.disposition !== "execute") {
       throw new Error("Expected command execution lease.");
     }
     const afterLease = "2026-07-29T08:20:16.000Z";

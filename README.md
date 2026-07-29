@@ -27,5 +27,19 @@ See `OWNERSHIP.md`. Every agent has a soul in `agents/<id>.soul.md` — read you
 ## Governance
 `claude-warden` gates every integration: audit vs `SWE_excellence_framework` + a security scan (confirmation-bypass, replay/stale confirm, wrong-session write, prompt/tool injection from checkpoint content, offline false-success, secret leakage). Nothing merges to the demo branch without a warden +1 **and** a second distinct-role sign-off — CI/billing being down does not lower the bar.
 
+## Realtime voice control slice
+
+`services/pocket-realtime` contains the local, provider-neutral room-control
+Worker. Moderation intake atomically commits a command, revision, outbox row,
+and recovery alarm; a bounded at-least-once Queue path then leases execution
+outside the room Durable Object. The only enabled executor is deliberately
+unavailable and performs zero provider I/O, so accepted commands remain honest:
+HTTP `202` means pending intent, never an applied RealtimeKit mutation.
+
+Queue/DLQ exhaustion and the ten-minute room watchdog both converge on the same
+terminal non-mutation result. This repository configures bindings and consumers
+only; it does not create Cloudflare resources or authorize deployment. Run the
+local proof with `npm run check` from `services/pocket-realtime`.
+
 ## Node note
 The CLI needs Node 22 (`~/AppData/Roaming/nvm/v22.15.0/node.exe`). Default `node` is v26 = unsupported and crashes the CLI.
