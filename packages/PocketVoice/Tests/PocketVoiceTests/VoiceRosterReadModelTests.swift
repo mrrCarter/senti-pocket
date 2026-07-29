@@ -154,6 +154,27 @@ final class VoiceRosterReadModelTests: XCTestCase {
         XCTAssertNil(current)
     }
 
+    func testDuplicateProviderParticipantInsideOnePageFailsClosed() throws {
+        let identity = try makeIdentity()
+        XCTAssertThrowsError(
+            try VoiceRosterPage(
+                identity: identity,
+                snapshotId: snapshotId,
+                pageIndex: 0,
+                joinedCount: 2,
+                participants: [
+                    try participant(index: 1),
+                    try participant(
+                        index: 2,
+                        providerParticipantId: "provider-1"
+                    )
+                ],
+                nextCursor: nil,
+                complete: true
+            )
+        )
+    }
+
     func testWrongEpochCannotReplaceTheProjection() async throws {
         let identity = try makeIdentity()
         let projection = VoiceRosterProjection(identity: identity)

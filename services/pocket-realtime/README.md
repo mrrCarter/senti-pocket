@@ -86,11 +86,23 @@ An uncomposed scalability kernel adds sixty-four deterministic
 server-derived HMAC participant key choose the shard. Each shard owns bounded
 admission leases, monotonic participant revisions, an exact share of the daily
 room-admission budget, and the server-owned principal/provider binding. A
-provider call remains outside the object and must complete through its fence.
-An expired lease or ambiguous provider result becomes sticky
-`reconciliation_required`; it cannot silently issue a second create. This
-kernel is exported for workerd proof only. The current `/join` handler does not
-call it.
+room-scoped quota authority is pinned once on provider-identity owner shard
+zero, so the sixty-four shards cannot accept different ceilings. A separate
+sixty-four-way `RoomProviderIdentityShard` namespace owns irreversible,
+room-epoch-scoped provider-ID claims. Completion pins one provider ID locally
+before its cross-object RPC, then persists an applied fence/attempt receipt;
+crash replay cannot claim a second ID or lose a committed result. A provider
+call remains outside the object. An expired lease or ambiguous provider result
+becomes sticky `reconciliation_required`; it cannot silently issue a second
+create. Both physical DO names and logical shard indices are verified.
+
+Admission timestamps must be exact JavaScript UTC instants
+(`YYYY-MM-DDTHH:mm:ss.sssZ`) before a quota day is derived. They remain a
+trusted internal server-clock input: this deploy-inert kernel does not defend
+against a compromised binding caller deliberately selecting another canonical
+day. The future composer must create the value server-side and must never
+accept client time. These classes are exported for workerd proof only. The
+current `/open` and `/join` handlers do not call them.
 
 Shared in-room agent audio is required but not yet proven on RealtimeKit. Room
 descriptors report `unsupported-pending-spike`. Client-TTS of governed edge text
@@ -108,16 +120,20 @@ production-ready Senti Pocket voice implementation.
   proof are not implemented. The command ledger is not a live executor.
 - Every runtime admission still serializes through one per-room Durable
   Object. A sixty-four-way admission ledger kernel now proves the local
-  reservation state machine, but room-open priming, lifecycle/revision
-  propagation, `/join` composition, roster projection, and moderation
-  revalidation are not wired. The 5k/10k hot-room target remains unproven.
+  reservation state machine and room-wide provider-ID ownership, but room-open
+  priming, lifecycle/revision propagation, `/join` composition, roster
+  projection, and moderation revalidation are not wired. Provider-ID
+  tombstones are bounded but intentionally unreleased; end-of-epoch retention
+  and object disposal must be reviewed before activation. The 5k/10k hot-room
+  target remains unproven.
 - The roster page itself is sharded and vector-fenced, but initial admission
   and webhook delivery acceptance still touch the room governor. This slice
   does not claim end-to-end hot-room throughput or provider quota.
 - `VoiceRosterProjection` stages authenticated pages atomically in the Swift
-  package and rejects cross-page provider participant aliasing, but it is not
-  wired into the SDK media adapter/app. This Windows host has no Swift
-  toolchain; Mac/iOS compile and device receipts remain pending Forge review.
+  package and rejects same-page and cross-page provider participant aliasing,
+  but it is not wired into the SDK media adapter/app. This Windows host has no
+  Swift toolchain; Mac/iOS compile and device receipts remain pending Forge
+  review.
 - Alarm/outbox dispatch, the at-least-once Queue/DLQ, leases, and watchdog are
   implemented locally. A provider-neutral REMOVE execution/observation kernel
   is also locally proven with test adapters: execution-time fresh
@@ -189,6 +205,12 @@ client configuration:
 - `CLOUDFLARE_API_TOKEN`
 - `ROOM_KEY_HMAC_SECRET`
 - `IDENTITY_HMAC_SECRET`
+
+`IDENTITY_HMAC_SECRET` is part of the participant identity and shard-routing
+derivation. It must remain stable for every live or reconciling room epoch.
+Rotation requires an epoch rollover or an explicitly reviewed dual-key
+migration. Replacing it in place can orphan or duplicate principal routing and
+is forbidden.
 
 Before any authorized deployment:
 

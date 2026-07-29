@@ -322,30 +322,67 @@ Priming is idempotent, never reopens an ended epoch, and advances only a
 monotonic `controlRevisionFloor`. The floor is a cache/recovery lower bound,
 not authority to accept a command. A moderation CAS still requires the current
 RoomGovernor revision. Signed meeting end must irreversibly fence all shards
-before a composed join path can be considered complete.
+before a composed join path can be considered complete. Every operation also
+compares the logical shard with the physical Durable Object ID derived from its
+room and index; a valid payload sent to another named object fails closed.
+
+Priming first pins the room identity and daily maximum on provider-identity
+owner shard zero. All admission shards must receive the same immutable
+maximum; concurrent disagreement produces one winner and one
+`quota_mismatch`. This is one bounded room-open control-plane coordinator, not
+a join-path counter. A legacy admission row without a pinned maximum fails
+closed rather than inferring or raising its historical ceiling.
 
 One shard transaction validates identity and principal uniqueness, consumes
 the shard's deterministic share of the daily room-admission budget, and
 reserves one `create`, token `refresh`, or role `update` with a random fence
 and stable attempt ID. The provider request runs outside the Durable Object.
 Exact completion binds one provider participant ID and publishes a monotonic
-admission revision. A provider participant ID cannot bind two principals.
+admission revision.
+
+Room-wide provider-ID uniqueness uses another sixty-four deterministic owner
+shards, selected by the first six bits of a SHA-256 digest over the room and
+opaque provider participant ID. The admission shard transactionally pins one
+`pending_provider_participant_id` under the attempt fence before awaiting that
+owner. The owner independently verifies its physical object ID and rederives
+the participant key from the principal with the server HMAC secret. A
+different provider ID cannot race through the same local fence, and a direct
+binding caller cannot poison a claim with a mismatched principal/key. After
+the owner claim, local commit records a bounded completed fence/attempt
+receipt, so response loss and eviction replay return the same applied result.
 Bearer and provider tokens never enter shard storage, RPC results, or debug
-state.
+state; provider owners retain the opaque provider ID and HMAC participant key,
+not the raw principal.
+
+The identity HMAC secret is therefore epoch-stable routing state, not an
+arbitrarily rotatable credential. It must remain stable while any room epoch is
+live or reconciling. Rotation requires a new epoch or an explicitly reviewed
+dual-key migration. An in-place replacement can orphan or duplicate principal
+routing and is forbidden.
 
 An expired lease is outcome uncertainty, not permission to create again. It
 becomes `reconciliation_required` under the original fence and attempt ID.
 Only exact positive reconciliation may complete the binding; an authoritative
 provider-absence observation may release it through the separately named
 absent-resolution method. `releaseKnownFailure` is legal only before outcome
-uncertainty. This is intentionally more conservative than the existing
-runtime admission path.
+uncertainty and before a provider completion intent is pinned. Provider-ID
+owner claims are irreversible tombstones: a crash after owner success but
+before local commit may retain a safe claim, but it can never reassign that ID
+to another principal. The local intent bounds this leak to one provider ID per
+attempt. Owner shards retain at most 4,096 claims; end-of-epoch retention and
+object disposal remain an activation gate. This is intentionally more
+conservative than the existing runtime admission path.
 
 The room-wide daily maximum is divided deterministically across sixty-four
 shards; the shares sum exactly to the configured maximum and differ by at
 most one. HMAC distribution should make skew unlikely, but unused capacity in
 one shard is not borrowed by another. That conservative trade-off preserves a
-hard aggregate ceiling without introducing a global quota coordinator.
+hard aggregate ceiling. Exact UTC syntax
+`YYYY-MM-DDTHH:mm:ss.sssZ` is required before slicing the quota day, rejecting
+offset, RFC-1123, impossible-calendar, and non-millisecond forms. The timestamp
+is still a trusted internal server-clock input; this kernel does not resist a
+compromised internal binding caller choosing an arbitrary canonical day. The
+future composer must create it server-side and must never forward client time.
 
 A future moderation composer must resolve actor and target admissions from
 their shards, bind their monotonic admission revisions into the bounded
@@ -354,13 +391,14 @@ execution before provider I/O. Cross-object snapshots are not atomic, so the
 second read is mandatory; rebuilding a full audience mirror inside
 RoomGovernor is forbidden.
 
-The current source only exports the new SQLite class and workerd tests it.
+The current source only exports the new SQLite classes and workerd tests them.
 `/open`, `/join`, moderation, roster binding, signed end propagation, and
-provider reconciliation do not call it. The current RoomGovernor admission
+provider reconciliation do not call them. The current RoomGovernor admission
 table remains authoritative at runtime, initial webhook acceptance is still
-centralized, no provider call or Cloudflare resource was created, and no
-5k/10k claim is made. Composition waits for Forge's independent architecture
-and exact-source review.
+centralized, and migration tags are checked configuration rather than evidence
+that a Cloudflare resource was created or deployed. No provider call or
+Cloudflare resource was created, and no 5k/10k claim is made. Composition waits
+for Forge's independent architecture and exact-source review.
 
 ## 5. Browser and iOS are equal clients
 
@@ -800,6 +838,7 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 | RealtimeKit adapter/control-plane slice | Draft PR #122 is hosted-Omar green on exact reviewed head; not merged or deployed; no account/resources |
 | Durable moderation ledger/outbox | Built locally with atomic alarm+intent+outbox, bounded Queue drain, leases, DLQ/watchdog terminalization, and unavailable zero-I/O executor |
 | REMOVE execution/observation kernel | Built locally behind unavailable production composition: fresh-auth port, signed peer-generation fence, stable attempt retry, exact leave observation, conflict timeout, and three-field truth; live RealtimeKit execution remains blocked by missing authority adapter and non-peer-exact kick TOCTOU |
+| Sharded admission/provider identity kernel | Built and hostile-tested locally with physical routing checks, room-wide immutable quota pin, canonical UTC buckets, local completion intent, irreversible provider-ID owners, crash/eviction replay, and bounded capacity; not composed, reviewed, deployed, or load-proven |
 | Worker checks | Generated types, strict TypeScript, workerd hostile tests, and Wrangler dry-run required at every handoff |
 | iOS `VoiceMediaTransport` and RealtimeKit 3.1 adapter | arm64 iOS Simulator build and 65/65 macOS tests independently green; physical-device review pending |
 | Server-bound remote iOS roster/stage identity | Sharded authenticated page contract and fail-closed Swift staging kernel built locally; not wired to media/app, Mac/device review pending |

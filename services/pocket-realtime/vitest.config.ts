@@ -7,6 +7,12 @@ export default defineConfig({
       wrangler: {
         configPath: "./wrangler.jsonc",
       },
+      miniflare: {
+        bindings: {
+          IDENTITY_HMAC_SECRET:
+            "identity-test-secret-at-least-thirty-two-characters",
+        },
+      },
     }),
   ],
 });

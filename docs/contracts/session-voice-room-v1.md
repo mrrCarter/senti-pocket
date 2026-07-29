@@ -642,35 +642,70 @@ hot-path scale gates remain open.
 The deploy-inert admission kernel defines sixty-four deterministic shards per
 room. `providerCorrelationId` selects exactly one shard from the first six
 bits of its server HMAC output. A caller MUST NOT select a different shard,
-and a provider participant identifier MUST NOT be used as the shard key.
+and a provider participant identifier MUST NOT be used as the admission shard
+key. Every method MUST verify that the physical Durable Object ID equals the
+name derived from the room and logical index.
 
 Before use, a trusted server composer MUST prime every shard with the exact
 tenant/session/epoch/room/provider-meeting identity. A shard MUST reject an
 identity change, MUST NOT decrease its control-revision floor, and MUST NOT
 reopen an ended epoch. The revision floor is not a command authorization
-revision.
+revision. Priming MUST first pin the exact room identity and immutable daily
+maximum on the room's provider-identity authority (owner shard zero).
+Concurrent shards requesting different maxima MUST NOT both become ready. A
+legacy admission row without an authoritative pinned maximum MUST fail closed.
 
 Each reservation binds one canonical Senti principal to one stable provider
 correlation key. It produces one fenced attempt for `create`, credential
 `refresh`, or role `update`; provider I/O occurs outside the shard. Completion
 MUST match the fence and MUST preserve an existing provider participant ID.
-The active result carries a monotonically increasing admission revision.
+Before cross-object completion, the admission shard MUST durably pin exactly
+one pending provider participant ID under the local fence. A second provider
+ID under that fence MUST fail closed, and known-failure/absent release MUST NOT
+erase a pinned completion intent.
+
+Provider participant IDs MUST be owned room-wide by one of sixty-four
+deterministic provider-identity shards. The owner MUST rederive the admission
+participant key from the submitted principal, MUST verify its physical object
+ID, and MUST treat an exact participant/provider replay as idempotent. Claims
+are irreversible tombstones: they MAY outlive a failed local completion but
+MUST NOT transfer to another participant. Local completion MUST retain a
+bounded fence/attempt receipt so an exact retry after commit, response loss,
+or object eviction returns the applied result. The active result carries a
+monotonically increasing admission revision.
 The client roster projection MUST reject a provider participant ID repeated
 under another principal across any staged page. Provider credentials, Senti
 bearers, raw idempotency keys, and private policy MUST NOT be stored or
-returned.
+returned. Provider owners MUST NOT persist the raw Senti principal.
+
+The identity HMAC secret MUST remain stable while any room epoch is live or
+reconciling. Rotation MUST use a new epoch or an independently reviewed
+dual-key migration. In-place replacement can orphan or duplicate principal
+routing and MUST be prohibited.
 
 An unexpired attempt rejects concurrent work. An expired attempt or ambiguous
 provider result MUST enter `reconciliation_required` with its original
 attempt identity and MUST NOT create again. Known-zero-mutation release is
 illegal after uncertainty. Reconciliation may finish only from an exact
-provider binding or an authoritative provider-absence observation.
+provider binding or an authoritative provider-absence observation, and an
+absence path MUST remain blocked while a provider completion intent is pinned.
 
 The configured daily room-admission maximum is partitioned across all shards
 such that the shares sum exactly to the maximum and differ by at most one.
 Unused quota is not transferred across shards. Each shard retains at most
 4,096 admission rows and rejects new participants at capacity while preserving
-existing reconciliation state.
+existing reconciliation state. Each provider-identity owner retains at most
+4,096 irreversible claims; retention and end-of-epoch object disposal MUST be
+reviewed before activation.
+
+Admission timestamps MUST use exact
+`YYYY-MM-DDTHH:mm:ss.sssZ` syntax and round-trip through the JavaScript UTC
+instant representation before a quota day is derived. Offset timestamps,
+RFC-1123 text, impossible calendar dates, and missing milliseconds MUST fail
+closed. `now` remains a trusted internal server-clock input: a composer MUST
+construct it server-side and MUST NOT accept or forward client time. This
+kernel does not claim resistance to a compromised internal binding caller
+choosing another otherwise canonical day.
 
 This is not the active join contract. The current `/join` path still uses
 RoomGovernor. Before composition, room-open priming, irreversible end

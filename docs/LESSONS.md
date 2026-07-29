@@ -133,9 +133,23 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
   never turn an ambiguous timeout into permission to create a second provider
   participant.
 - Distributed admission quotas need an honest aggregate bound. Deterministic
-  per-shard shares can sum exactly to the room maximum without a global
-  coordinator, but they trade away cross-shard borrowing and do not prove
-  traffic balance or provider capacity.
+  per-shard shares trade away cross-shard borrowing, and independently pinning
+  the maximum in every shard does not prove they all pinned the same value.
+  Pin room identity plus the maximum once on a bounded room-open authority,
+  then let shards consume immutable shares; this does not prove traffic balance
+  or provider capacity.
+- Valid logical routing fields do not prove code reached the intended Durable
+  Object. Recompute the physical name and compare `ctx.id` with the namespace's
+  `idFromName` result before storing anything.
+- A cross-object uniqueness claim needs a durable local intent before the
+  `await`. Otherwise two completions for one fence can claim two owner
+  tombstones, or a release can delete the row while the owner RPC is in flight.
+  Pin one provider ID locally, make owner claims replay-safe and irreversible,
+  and retain a bounded completed fence/attempt receipt for response-loss replay.
+- Canonical UTC syntax prevents offset/RFC/impossible-date bucket splitting;
+  it does not make caller time authoritative. Either derive time inside the
+  state owner or document and enforce a server-only caller boundary. Never
+  forward client time into a quota key or lease clock.
 - A cached control revision in an admission shard is only a monotonic floor.
   It cannot authorize a command. Bind monotonic admission revisions at intake
   and freshly revalidate actor, target, and Senti authority before provider

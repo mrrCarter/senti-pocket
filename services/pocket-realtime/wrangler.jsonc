@@ -35,6 +35,10 @@
       {
         "name": "ROOM_ADMISSION_SHARDS",
         "class_name": "RoomAdmissionShard"
+      },
+      {
+        "name": "ROOM_PROVIDER_IDENTITY_SHARDS",
+        "class_name": "RoomProviderIdentityShard"
       }
     ]
   },
@@ -50,6 +54,10 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["RoomAdmissionShard"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["RoomProviderIdentityShard"]
     }
   ],
   "queues": {

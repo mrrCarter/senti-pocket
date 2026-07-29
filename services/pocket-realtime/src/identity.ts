@@ -69,6 +69,19 @@ export async function deriveParticipantId(
   return `senti_${await hmacBase64Url(secret, `participant:v1:${roomId}:${humanId}`)}`;
 }
 
+export async function deriveProviderIdentityKey(
+  roomId: string,
+  providerParticipantId: string,
+): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      `provider-identity:v1:${roomId}:${providerParticipantId}`,
+    ),
+  );
+  return bytesToBase64Url(new Uint8Array(digest));
+}
+
 export function meetingTitle(roomId: string): string {
   return `senti-v1-${roomId}`;
 }
