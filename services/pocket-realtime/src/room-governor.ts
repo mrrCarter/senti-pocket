@@ -2262,11 +2262,7 @@ function toModerationCommandRecord(
     createdAt: row.created_at,
     finalizedAt: row.finalized_at,
   };
-  if (
-    row.state === "pending" ||
-    row.state === "unsupported" ||
-    row.state === "conflict"
-  ) {
+  if (row.state === "pending" || row.state === "unsupported") {
     record.providerMutationApplied = false;
   }
   return record;

@@ -138,10 +138,9 @@ export interface ModerationCommandRecord {
   providerStateObserved: boolean;
   causalityProven: false;
   /**
-   * Legacy negative-result field. It remains present and false for records
-   * that never entered the remove kernel. Positive observation records omit
-   * it because an observed end state does not prove that a provider request
-   * caused that state.
+   * Legacy non-mutation field. It remains present and false only while work is
+   * pending or definitively unsupported. Observation and conflict records omit
+   * it because neither proves whether a provider mutation occurred.
    */
   providerMutationApplied?: false;
   resultCode:

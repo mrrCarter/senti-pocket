@@ -189,7 +189,8 @@ by the same Worker. An unattempted command terminalizes as `unsupported` with
 `providerMutationApplied=false`. Once a provider attempt has begun, an
 unobserved deadline or exhausted delivery is outcome uncertainty instead:
 `status=conflict`, `resultCode=VOICE_CONTROL_CONFLICT`,
-`providerStateObserved=false`, and `causalityProven=false`. The room alarm
+`providerStateObserved=false`, and `causalityProven=false`; it omits the legacy
+`providerMutationApplied` field because unknown is not false. The room alarm
 enforces the matching lease-aware ten-minute deadline from command creation or
 attempt start, so neither Queue/DLQ failure nor a missing observation leaves an
 eternal command. Any later Queue duplicate observes terminal or

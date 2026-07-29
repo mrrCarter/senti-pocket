@@ -103,6 +103,10 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
   A signed exact-peer leave proves absence, not that a preceding kick caused
   it. Use `desired_state_observed` and keep `causalityProven=false`; never hide
   that uncertainty behind "confirmed" or an overloaded applied boolean.
+- Do not emit a legacy `providerMutationApplied=false` on an attempted conflict.
+  A timeout or ambiguous response proves neither application nor
+  non-application; omit the obsolete field and expose the explicit truth
+  dimensions instead.
 - Desired-state preflight does not create peer-exact mutation. If the provider
   kick accepts only a stable participant/custom ID, a leave-and-rejoin between
   preflight and kick can target the replacement. Keep the production adapter

@@ -288,8 +288,9 @@ Every command record separates:
 An accepted request remains `pending_observation`; it is not success. A
 matching leave earns `REMOVE_LEAVE_OBSERVED` and
 `desired_state_observed`, not a "confirmed" or "kick applied" label.
-`providerMutationApplied` remains only as `false` on legacy negative results
-and MUST be absent from positive observation records.
+`providerMutationApplied` remains only as `false` on pending and definitively
+unsupported records. It MUST be absent from both positive observation and
+conflict records: conflict means the mutation outcome is unknown, not false.
 
 A live RealtimeKit remove adapter remains prohibited: the reviewed kick API
 targets stable participant/custom IDs rather than peer ID, leaving a

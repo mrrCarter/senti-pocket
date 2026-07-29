@@ -59,8 +59,8 @@ describe("remove-only execution and signed observation kernel", () => {
       providerRequestAccepted: false,
       providerStateObserved: false,
       causalityProven: false,
-      providerMutationApplied: false,
     });
+    expect(command).not.toHaveProperty("providerMutationApplied");
   });
 
   it("reuses one attempt after an ambiguous crash and converges on an exact peer leave", async () => {
@@ -448,14 +448,15 @@ describe("remove-only execution and signed observation kernel", () => {
     );
     expect(outcome.disposition).toBe("conflict");
     expect(mutationCalls).toBe(0);
-    expect(await replay(setup)).toMatchObject({
+    const command = await replay(setup);
+    expect(command).toMatchObject({
       status: "conflict",
       resultCode: "VOICE_CONTROL_CONFLICT",
       providerRequestAccepted: false,
       providerStateObserved: false,
       causalityProven: false,
-      providerMutationApplied: false,
     });
+    expect(command).not.toHaveProperty("providerMutationApplied");
   });
 
   it("rejects a stale execution fence before provider I/O", async () => {
@@ -538,13 +539,15 @@ describe("remove-only execution and signed observation kernel", () => {
       );
     });
     expect(await runDurableObjectAlarm(setup.governor)).toBe(true);
-    expect(await replay(setup)).toMatchObject({
+    const command = await replay(setup);
+    expect(command).toMatchObject({
       status: "conflict",
       resultCode: "VOICE_CONTROL_CONFLICT",
       providerRequestAccepted: true,
       providerStateObserved: false,
       causalityProven: false,
     });
+    expect(command).not.toHaveProperty("providerMutationApplied");
   });
 });
 
