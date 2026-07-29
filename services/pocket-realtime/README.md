@@ -81,10 +81,13 @@ production-ready Senti Pocket voice implementation.
   UX. None exists in this slice.
 - RealtimeKit's current signed webhook catalog does not contain participant
   mute, preset, role, or stage updates. Unsigned SDK callbacks are UX
-  observations, not governance proof. Mute/promote/demote/deny/allow therefore
-  remain blocked until an authoritative provider confirmation surface exists;
-  `participantLeft` alone also cannot prove that a remove command caused a
-  departure.
+  observations, not governance proof. Confirmation is action-specific:
+  `remove` may eventually be labeled only `kick-issued/leave-observed` by
+  correlating the backend kick with signed `participantLeft`; the event has no
+  documented causal reason. Promote/demote are conditionally confirmable only
+  if implemented as preset mutations and a live probe proves the expected
+  `preset_name` through session-participant readback. Mute/deny/allow remain
+  blocked because no authoritative live audio/publish state is exposed.
 - Current target authorization is bound to the active admission. A future
   asynchronous executor must freshly recheck both actor authority and target
   Senti membership without persisting the caller bearer before any provider
@@ -137,7 +140,7 @@ Before any authorized deployment:
 5. prove or reject the shared-agent-track spike;
 6. obtain explicit paid-transcription authorization, then set
    `TRANSCRIPTION_MODE=post-meeting`;
-7. prove an authoritative moderation-confirmation surface and implement the
+7. prove each action's mutation/confirmation adapter and implement the
    alarm/outbox, Queue/DLQ, reconcile, bounded-pull, and receipt planes;
 8. register the webhook and run signed parity, hot-room moderation, rollback,
    and physical-iPhone gates.

@@ -189,13 +189,23 @@ There is a current provider gap. RealtimeKit's signed-webhook catalog checked
 on 2026-07-29 includes meeting lifecycle, participant join/left, chat export,
 recording/livestream status, transcript, and summary events, but no participant
 mute, preset, role, or stage-change event. SDK `audioUpdate` and participant
-callbacks are unsigned client observations. `meeting.participantLeft` can show
-that a participant left but cannot prove that Senti's remove command caused
-the departure. The reviewed backend Active Session API exposes kick operations
-and aggregate session detail, not an authoritative mute/preset readback.
-Consequently mute, promote, demote, deny-publish, allow-publish, and causal
-remove confirmation remain blocked until RealtimeKit supplies an authoritative
-signed/readback surface or the provider decision changes.
+callbacks are unsigned client observations.
+
+The gap is action-specific:
+
+| Action | Available observation | Honest gate |
+|---|---|---|
+| `remove` | Backend kick plus signed `meeting.participantLeft` for the bound participant | May prove `kick-issued/leave-observed` in a bounded window. The documented webhook has no causal leave reason, so it cannot be labeled `kick-confirmed` without stronger provider evidence. |
+| `promote` / `demote` | Session participant detail includes `preset_name` | Conditionally confirmable only if the implementation mutates the participant preset and a live capability probe proves readback changes to the expected preset. Stage `grantAccess`/`leave` alone is a separate state and does not qualify. |
+| `mute` | Unsigned SDK `audioUpdate` only | Blocked: no signed webhook or backend live-audio readback. |
+| `deny_publish` / `allow_publish` | No reviewed authoritative live publish-state observation | Blocked until an authoritative provider surface or different provider adapter exists. |
+
+The reviewed session participant-detail API exposes `preset_name`, `left_at`,
+and connection-only peer events (`PEER_CREATED`, `PEER_JOINING`,
+`PEER_LEAVING`); it exposes no audio-state transition. Every current action
+still uses the unavailable zero-I/O executor. A future action becomes live only
+after its own mutation and confirmation adapter passes fault, causality, and
+replay tests; one confirmable action does not waive another action's gate.
 
 Finalized unsupported command identities are currently retained for eight
 days as a bounded local proof. Applied results require an explicit production
@@ -583,7 +593,9 @@ signature, wrong-session, replay, offline-honesty, or receipt guarantees.
 | Active speaker | Web and mobile active-speaker APIs/events | Supported |
 | iOS routes | iOS Core release notes cover available-device updates, device selection, earpiece/speaker and Bluetooth fixes | Supported; physical-device receipt required |
 | Signed webhooks | Raw body RSA-SHA256 in `rtk-signature`; `rtk-uuid` delivery identity; published public key endpoint | Supported for the documented event catalog |
-| Signed moderation confirmation | No documented mute, preset, role, or stage webhook; participant-left does not prove command causality | Blocking provider gap |
+| Remove observation | Backend kick plus signed `meeting.participantLeft` | Conditionally supports `kick-issued/leave-observed`; causal `kick-confirmed` is not proven |
+| Role/preset readback | Session participant detail returns `preset_name` | Conditional on proving live preset mutation/readback; stage access alone is different state |
+| Audio/publish confirmation | No documented mute/publish webhook or backend live-state readback | Blocking gap for mute/deny/allow |
 | Post-meeting transcript | Speaker-separated transcript, `meeting.transcript` webhook/REST, seven-day availability | Supported but not durable |
 | Real-time transcript | Per-participant Deepgram events delivered to meeting participants | Captions supported; trusted server projection unproven |
 | True server voice agent | No documented server bot/synthetic-track publish API in the AI surface | Critical unproven gate |
@@ -662,6 +674,7 @@ Cloudflare resources, secrets, paid features, deployment, or spend.
 - [RealtimeKit active speakers](https://developers.cloudflare.com/realtime/realtimekit/core/display-active-speakers/)
 - [RealtimeKit webhooks and RSA-SHA256 verification](https://developers.cloudflare.com/realtime/realtimekit/webhooks/)
 - [RealtimeKit Active Session backend API](https://developers.cloudflare.com/api/resources/realtime_kit/subresources/active-session/)
+- [RealtimeKit session participant detail](https://developers.cloudflare.com/api/resources/realtime_kit/subresources/sessions/methods/get_session_participant_details/)
 - [RealtimeKit transcription, retention, and Workers AI rates](https://developers.cloudflare.com/realtime/realtimekit/ai/transcription/)
 - [RealtimeKit AI features](https://developers.cloudflare.com/realtime/realtimekit/ai/)
 - [RealtimeKit iOS Core release notes](https://developers.cloudflare.com/realtime/realtimekit/release-notes/ios-core/)

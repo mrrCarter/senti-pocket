@@ -72,9 +72,11 @@ Also: when you join, I will paste your soul (agents/<your-id>.soul.md) into your
   stage if push is required.
 - Read the provider's actual event catalog before designing reconciliation.
   RealtimeKit currently signs webhooks, but it does not currently publish
-  mute, preset, role, or stage-change webhooks. Unsigned SDK callbacks cannot be
-  promoted into governance receipts, and `participantLeft` does not by itself
-  prove that a Senti remove command caused the departure.
+  mute, preset, role, or stage-change webhooks. Model confirmation per action:
+  `participantLeft` can prove leave-observed but not kick causality;
+  `preset_name` readback may confirm a proven live preset mutation but not a
+  separate stage grant; and unsigned SDK audio callbacks cannot become
+  governance receipts for mute or publish controls.
 - Bound idempotency storage honestly. Eight-day retention is sufficient for the
   current terminal-unsupported local proof, but applied production commands
   need an explicit retention/archive policy tied to the maximum safe retry
