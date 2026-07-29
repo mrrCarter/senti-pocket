@@ -24,6 +24,8 @@ models/
 
 # node (sidecars / tooling)
 node_modules/
+services/pocket-realtime/dist/
+services/pocket-realtime/worker-configuration.d.ts
 .env
 .env.*
 
