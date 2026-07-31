@@ -31,6 +31,8 @@ private struct ExecuteRequest: Encodable {
 enum PocketWriteError: LocalizedError, Equatable {
     case notConfigured
     case notLoggedIn
+    case reauthenticationRequired(requestToken: String)
+    case supersededAuthentication
     case network(String)
     case retryable(String)       // TRANSIENT gateway response (409 in-progress / 5xx / 503 checkpoint-not-available) — queue + retry
     case rejected(String)        // TERMINAL 4xx (proposal_rejected / hash mismatch / not a known session / auth) — won't succeed on retry
@@ -40,6 +42,10 @@ enum PocketWriteError: LocalizedError, Equatable {
         switch self {
         case .notConfigured:      return "Senti's secure gateway is not configured for this build."
         case .notLoggedIn:       return "Sign in first — the write needs your Senti session."
+        case .reauthenticationRequired:
+            return "Your Senti authorization expired. Sign in again before retrying this write."
+        case .supersededAuthentication:
+            return "The write response belonged to an earlier sign-in and was ignored."
         case .network(let m):    return "Write network error: \(m)"
         case .retryable(let m):  return "The gateway is busy — will retry: \(m)"
         case .rejected(let m):   return "The gateway rejected the write: \(m)"
@@ -103,6 +109,12 @@ final class PocketWriteClient {
             struct ErrorEnvelope: Decodable { let error: String?; let reason: String? }
             let env = try? JSONDecoder().decode(ErrorEnvelope.self, from: data)
             let reason = env?.reason ?? env?.error ?? "HTTP \(http.statusCode)"
+            if http.statusCode == 401 {
+                guard tokenProvider() == token else {
+                    throw PocketWriteError.supersededAuthentication
+                }
+                throw PocketWriteError.reauthenticationRequired(requestToken: token)
+            }
             // 409 (execution-in-progress / reconcile) + any 5xx (transient / 503 checkpoint-not-available, retryable)
             // → RETRYABLE (queue + retry, never terminal-refuse a write that could still land). Other 4xx → terminal.
             if http.statusCode == 409 || (500..<600).contains(http.statusCode) {

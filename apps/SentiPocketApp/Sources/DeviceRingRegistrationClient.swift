@@ -26,7 +26,9 @@ import Foundation
 
 enum DeviceRingRegistrationError: LocalizedError, Equatable {
     case notLoggedIn                 // no session bearer yet → defer; register once login lands
-    case notAuthorized               // 401 / 403 — bad/absent auth, or sessionId isn't one the human belongs to
+    case reauthenticationRequired    // 401 — the request bearer expired
+    case supersededAuthentication    // a late response for an earlier principal; never invalidate the current root
+    case notAuthorized               // 403 — sessionId isn't one the human belongs to / missing scope
     case retryable(Int)              // 5xx — transient; safe to re-register later
     case rejected(Int)               // other non-2xx 4xx — won't succeed on retry (bad request)
     case network(String)
@@ -34,6 +36,10 @@ enum DeviceRingRegistrationError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:      return "Sign in first — registering this device for rings needs your Senti session."
+        case .reauthenticationRequired:
+            return "Your Senti authorization expired while registering this device."
+        case .supersededAuthentication:
+            return "The registration response belonged to an earlier sign-in and was ignored."
         case .notAuthorized:    return "Not authorized to register this device for that session."
         case .retryable(let c): return "The gateway couldn't register the device (HTTP \(c)) — will retry."
         case .rejected(let c):  return "The gateway rejected the device registration (HTTP \(c))."
@@ -48,13 +54,16 @@ struct DeviceRingRegistrationClient {
     private let apiBaseURL: URL
     private let urlSession: URLSession
     private let tokenProvider: @Sendable () -> String?
+    private let onReauthenticationRequired: @Sendable (String?) -> Void
 
     init(apiBaseURL: URL,
          urlSession: URLSession = .shared,
-         tokenProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() }) {
+         tokenProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() },
+         onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
         self.tokenProvider = tokenProvider
+        self.onReauthenticationRequired = onReauthenticationRequired
     }
 
     /// The body — {voipToken, sessionId, platform} ONLY. NO humanId (warden gate #2: the gateway derives it from auth;
@@ -69,7 +78,10 @@ struct DeviceRingRegistrationClient {
     /// "apns" — the gateway's valid set is ['apns','fcm'] (relay 322300), and iOS/PushKit is always APNs; an invalid
     /// platform → 400. Throws the taxonomy above; a 2xx is success (idempotent upsert — no body is required or read back).
     func register(voipToken: String, sessionId: String, platform: String = "apns") async throws {
-        guard let token = tokenProvider(), !token.isEmpty else { throw DeviceRingRegistrationError.notLoggedIn }
+        guard let token = tokenProvider(), !token.isEmpty else {
+            onReauthenticationRequired(nil)
+            throw DeviceRingRegistrationError.notLoggedIn
+        }
         guard !voipToken.isEmpty, !sessionId.isEmpty else {
             throw DeviceRingRegistrationError.rejected(400)   // never POST an empty binding
         }
@@ -91,8 +103,14 @@ struct DeviceRingRegistrationClient {
         switch http.statusCode {
         case 200..<300:
             return                                            // idempotent upsert ok — nothing to decode
-        case 401, 403:
-            throw DeviceRingRegistrationError.notAuthorized   // bad auth OR sessionId not one the human belongs to
+        case 401:
+            guard tokenProvider() == token else {
+                throw DeviceRingRegistrationError.supersededAuthentication
+            }
+            onReauthenticationRequired(token)
+            throw DeviceRingRegistrationError.reauthenticationRequired
+        case 403:
+            throw DeviceRingRegistrationError.notAuthorized
         case 500..<600:
             throw DeviceRingRegistrationError.retryable(http.statusCode)
         default:

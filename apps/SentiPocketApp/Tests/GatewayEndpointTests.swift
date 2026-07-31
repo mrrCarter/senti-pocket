@@ -1,17 +1,37 @@
 import Foundation
 import XCTest
+import PocketCall
 import PocketContracts
+import PocketReasoning
 @testable import SentiPocketApp
 
 private final class GatewayEndpointStubURLProtocol: URLProtocol {
     private static let lock = NSLock()
     private(set) static var requestCount = 0
     private(set) static var lastHost: String?
+    private static var responseStatus: Int?
+    private static var responseBody = Data()
+    private static var requestHook: (@Sendable () -> Void)?
 
     static func reset() {
         lock.lock()
         requestCount = 0
         lastHost = nil
+        responseStatus = nil
+        responseBody = Data()
+        requestHook = nil
+        lock.unlock()
+    }
+
+    static func respond(
+        status: Int,
+        body: Data = Data("{}".utf8),
+        requestHook: (@Sendable () -> Void)? = nil
+    ) {
+        lock.lock()
+        responseStatus = status
+        responseBody = body
+        self.requestHook = requestHook
         lock.unlock()
     }
 
@@ -22,7 +42,24 @@ private final class GatewayEndpointStubURLProtocol: URLProtocol {
         Self.lock.lock()
         Self.requestCount += 1
         Self.lastHost = request.url?.host
+        let status = Self.responseStatus
+        let body = Self.responseBody
+        let requestHook = Self.requestHook
         Self.lock.unlock()
+        requestHook?()
+        if let status,
+           let url = request.url,
+           let response = HTTPURLResponse(
+               url: url,
+               statusCode: status,
+               httpVersion: "HTTP/1.1",
+               headerFields: ["Content-Type": "application/json"]
+           ) {
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
         client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
     }
 
@@ -171,6 +208,48 @@ final class GatewayEndpointTests: XCTestCase {
 
         XCTAssertNil(host.callManager)
     }
+
+    @MainActor
+    func test_unselected_dial_is_rejected_before_hydration_request() async {
+        let gate = DialSessionSelectionGate()
+        gate.select("session-B")
+        var hydrationCalls = 0
+        let hydrator = SelectedSessionDialHydrator(
+            selectionGate: gate,
+            hydrate: { state in
+                hydrationCalls += 1
+                guard case .needsHydration(_, let core) = state else {
+                    throw DialHostError.sessionNotSelected
+                }
+                return RenderableRing(
+                    core: core,
+                    message: "must not hydrate",
+                    options: [],
+                    evidenceSeqs: [],
+                    confidence: nil
+                )
+            }
+        )
+        let core = RingCore(
+            id: "dial-A",
+            kind: "go",
+            priority: "high",
+            callerName: "Senti",
+            sessionId: "session-A",
+            checkpointId: nil
+        )
+
+        do {
+            _ = try await hydrator.hydrate(.needsHydration(id: core.id, core: core))
+            XCTFail("an unselected session must fail before hydration")
+        } catch DialHostError.sessionNotSelected {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(hydrationCalls, 0, "an old/unselected push must initiate zero authenticated hydration calls")
+    }
     #endif
 
     @MainActor
@@ -197,5 +276,268 @@ final class GatewayEndpointTests: XCTestCase {
 
         XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 1)
         XCTAssertEqual(GatewayEndpointStubURLProtocol.lastHost, "trusted-gateway.example")
+    }
+
+    @MainActor
+    func test_write_401_invalidates_authentication_and_does_not_cross_account_boundary() async {
+        OutboxStore.clear()
+        defer {
+            OutboxStore.clear()
+            GatewayEndpointStubURLProtocol.reset()
+        }
+        GatewayEndpointStubURLProtocol.reset()
+        GatewayEndpointStubURLProtocol.respond(
+            status: 401,
+            body: Data(#"{"error":"unauthorized"}"#.utf8)
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        var invalidationCount = 0
+        let viewModel = PhoneWriteViewModel(
+            sessionId: "session-A",
+            client: PocketWriteClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example"),
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { "expired-token" }
+            ),
+            onReauthenticationRequired: { _ in invalidationCount += 1 }
+        )
+
+        viewModel.draft("Keep this confirmed intent for after sign-in")
+        viewModel.confirm()
+        for _ in 0..<40 {
+            if invalidationCount == 1 { break }
+            await Task.yield()
+        }
+
+        XCTAssertEqual(invalidationCount, 1)
+        guard case .refused(let message) = viewModel.state else {
+            return XCTFail("an expired principal must make the old confirmation non-retryable")
+        }
+        XCTAssertTrue(message.contains("review"))
+        XCTAssertNil(OutboxStore.load(), "a confirmed intent must not survive into a potentially different account")
+    }
+
+    func test_reasoning_401_signals_the_shared_authentication_gate() async {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        GatewayEndpointStubURLProtocol.respond(status: 401)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let signal = LockedCounter()
+        let client = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: { "expired-token" },
+            onReauthenticationRequired: { _ in signal.increment() }
+        )
+
+        do {
+            _ = try await client.postBrief(sessionId: "session-A", checkpointId: nil)
+            XCTFail("a 401 must fail reasoning")
+        } catch GatewayReasoningError.reauthenticationRequired {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(signal.value, 1)
+    }
+
+    @MainActor
+    func test_late_write_401_from_old_principal_does_not_invalidate_or_clear_new_principal() async {
+        OutboxStore.clear()
+        GatewayEndpointStubURLProtocol.reset()
+        defer {
+            OutboxStore.clear()
+            GatewayEndpointStubURLProtocol.reset()
+        }
+        let token = LockedTokenBox("principal-A")
+        let proposalB = PocketWriteClient.makeHumanMessageProposal(
+            sessionId: "session-B",
+            message: "Principal B owns this outbox",
+            at: Date(timeIntervalSince1970: 1_784_000_000)
+        )
+        let confirmationB = GovernedWriteConfirmation(
+            proposalId: proposalB.id,
+            confirmedProposalHash: proposalB.proposalHash,
+            confirmedAt: Date(timeIntervalSince1970: 1_784_000_001)
+        )
+        let intentB = PersistedWriteIntent(proposal: proposalB, confirmation: confirmationB)
+        GatewayEndpointStubURLProtocol.respond(
+            status: 401,
+            requestHook: {
+                token.value = "principal-B"
+                OutboxStore.save(intentB)
+            }
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        var invalidationCount = 0
+        let viewModel = PhoneWriteViewModel(
+            sessionId: "session-A",
+            client: PocketWriteClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example"),
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { token.value }
+            ),
+            onReauthenticationRequired: { _ in invalidationCount += 1 }
+        )
+
+        viewModel.draft("Principal A request")
+        viewModel.confirm()
+        for _ in 0..<40 {
+            if case .refused = viewModel.state { break }
+            await Task.yield()
+        }
+
+        guard case .refused(let refusal) = viewModel.state else {
+            return XCTFail("the stale response path must complete as a refusal")
+        }
+        XCTAssertTrue(refusal.contains("earlier sign-in"))
+        XCTAssertEqual(invalidationCount, 0, "a stale A response must never sign principal B out")
+        XCTAssertEqual(OutboxStore.load(), intentB, "a stale A response must never clear B's confirmed outbox")
+    }
+
+    func test_late_reasoning_401_from_old_principal_is_superseded_without_auth_signal() async {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        let token = LockedTokenBox("principal-A")
+        GatewayEndpointStubURLProtocol.respond(
+            status: 401,
+            requestHook: { token.value = "principal-B" }
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let signal = LockedCounter()
+        let client = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: { token.value },
+            onReauthenticationRequired: { _ in signal.increment() }
+        )
+
+        do {
+            _ = try await client.postBrief(sessionId: "session-A", checkpointId: nil)
+            XCTFail("the stale response must fail")
+        } catch GatewayReasoningError.supersededAuthentication {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertEqual(signal.value, 0)
+    }
+
+    @MainActor
+    func test_voice_confirm_after_selection_revocation_never_arms_a_write() async {
+        OutboxStore.clear()
+        GatewayEndpointStubURLProtocol.reset()
+        defer {
+            OutboxStore.clear()
+            GatewayEndpointStubURLProtocol.reset()
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        var isAuthorized = true
+        let viewModel = PhoneWriteViewModel(
+            sessionId: "session-A",
+            client: PocketWriteClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example"),
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { "valid-token" }
+            ),
+            isWriteAuthorized: { isAuthorized }
+        )
+        let adapter = PhoneWriteAdapter(
+            viewModel,
+            isWriteAuthorized: { isAuthorized }
+        )
+        await adapter.draft("Late speech result must not post")
+        guard case .confirming = viewModel.state else {
+            return XCTFail("precondition: the authorized draft must be armed")
+        }
+
+        isAuthorized = false
+        let result = await adapter.confirmAndPost()
+
+        guard case .refused(let reason) = result else {
+            return XCTFail("a late confirm after revocation must be refused")
+        }
+        XCTAssertTrue(reason.contains("changed"))
+        XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 0)
+        XCTAssertNil(OutboxStore.load(), "revoked voice confirmation must queue nothing")
+    }
+
+    @MainActor
+    func test_revocation_between_confirm_and_send_task_starts_no_request() async {
+        OutboxStore.clear()
+        GatewayEndpointStubURLProtocol.reset()
+        defer {
+            OutboxStore.clear()
+            GatewayEndpointStubURLProtocol.reset()
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        var isAuthorized = true
+        let viewModel = PhoneWriteViewModel(
+            sessionId: "session-A",
+            client: PocketWriteClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example"),
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { "valid-token" }
+            ),
+            isWriteAuthorized: { isAuthorized }
+        )
+
+        viewModel.draft("Fence the executor-turn gap")
+        viewModel.confirm()
+        isAuthorized = false
+        for _ in 0..<20 { await Task.yield() }
+
+        XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 0)
+        guard case .pending(let message) = viewModel.state else {
+            return XCTFail("the confirmed intent should remain session-bound and retryable, never posted")
+        }
+        XCTAssertTrue(message.contains("session-A"))
+        XCTAssertEqual(OutboxStore.load()?.proposal.targetSessionId, "session-A")
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+}
+
+private final class LockedTokenBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: String
+
+    init(_ value: String) {
+        storedValue = value
+    }
+
+    var value: String {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedValue
+        }
+        set {
+            lock.lock()
+            storedValue = newValue
+            lock.unlock()
+        }
     }
 }

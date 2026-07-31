@@ -81,17 +81,25 @@ public struct SessionListView: View {
                     .foregroundStyle(state.failure == nil ? PocketPalette.accent : PocketPalette.warning)
                     .accessibilityHidden(true)
 
-                Text(state.failure?.title ?? emptyTitle)
+                Text(state.isRefreshing ? "Loading sessions" : (state.failure?.title ?? emptyTitle))
                     .font(.title2.bold())
-                Text(state.failure?.detail ?? emptyDetail)
+                Text(state.isRefreshing
+                    ? "Fetching the sessions authorized for this account."
+                    : (state.failure?.detail ?? emptyDetail))
                     .foregroundStyle(PocketPalette.textSecondary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Button("Try again") { send(.refreshSessions) }
-                    .buttonStyle(.borderedProminent)
-                    .tint(PocketPalette.accent)
-                    .accessibilityIdentifier("pocket.sessions.retry")
+                if state.isRefreshing {
+                    ProgressView()
+                        .accessibilityLabel("Loading sessions")
+                        .accessibilityIdentifier("pocket.sessions.refreshing")
+                } else {
+                    Button("Try again") { send(.refreshSessions) }
+                        .buttonStyle(.borderedProminent)
+                        .tint(PocketPalette.accent)
+                        .accessibilityIdentifier("pocket.sessions.retry")
+                }
             }
             .padding(28)
             .frame(maxWidth: 560)
@@ -239,7 +247,7 @@ struct SessionProvenanceBanner: View {
             return "Live session data · updated \(lastUpdated.formatted(.relative(presentation: .named)))"
         case .cache(let cachedAt, let authenticationExpired):
             let suffix = authenticationExpired ? " · sign in again to refresh" : ""
-            return "Offline copy · cached \(cachedAt.formatted(.relative(presentation: .named)))\(suffix)"
+            return "Last synced copy · cached \(cachedAt.formatted(.relative(presentation: .named)))\(suffix)"
         case .fixture:
             return "Preview data · not live"
         case .unavailable:

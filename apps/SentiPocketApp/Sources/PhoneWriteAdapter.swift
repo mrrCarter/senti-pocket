@@ -10,12 +10,18 @@ import PocketCall
 @MainActor
 final class PhoneWriteAdapter: DialWriter {
     private let viewModel: PhoneWriteViewModel
+    private let isWriteAuthorized: @MainActor () -> Bool
 
-    init(_ viewModel: PhoneWriteViewModel) {
+    init(
+        _ viewModel: PhoneWriteViewModel,
+        isWriteAuthorized: @escaping @MainActor () -> Bool = { true }
+    ) {
         self.viewModel = viewModel
+        self.isWriteAuthorized = isWriteAuthorized
     }
 
     func draft(_ message: String) async {
+        guard isWriteAuthorized() else { return }
         viewModel.draft(message)
     }
 
@@ -30,11 +36,17 @@ final class PhoneWriteAdapter: DialWriter {
         guard case .confirming = viewModel.state else {
             return .refused("no confirmable draft is armed")   // fail-safe: nothing to confirm → never posts
         }
+        guard isWriteAuthorized() else {
+            viewModel.cancel()
+            return .refused("the selected session or authentication changed before confirmation")
+        }
         viewModel.confirm()   // identical GovernedWriteConfirmation to the human tap (voice-GO === tap-GO)
         for await state in viewModel.$state.values {
             switch state {
             case .sent:                 return .posted
             case .pending(let message): return .pending(message)
+            case .blockedByPendingSession(let sessionId):
+                return .refused("a confirmed write is already queued for session \(sessionId)")
             case .refused(let message): return .refused(message)
             case .composing:            return .refused("write returned to composing without posting")
             case .sending, .confirming: continue   // transient — keep awaiting the terminal state

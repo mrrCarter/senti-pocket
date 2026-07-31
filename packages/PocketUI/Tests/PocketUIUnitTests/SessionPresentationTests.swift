@@ -4,6 +4,44 @@ import PocketContracts
 @testable import PocketUI
 
 final class SessionPresentationTests: XCTestCase {
+    func testRepositorySnapshotInitializerDoesNotManufactureWireProvenance() throws {
+        let page = try decode(SessionListPage.self, """
+        {"sessions":[{"sessionId":"room-1","status":"active","archiveStatus":"active",
+        "visibility":"private","membershipRole":"owner","title":"Room","summaryText":null,
+        "summaryGeneratedAt":null,"summaryModel":null,"agentCount":1,"eventCount":1,
+        "totalCostUsd":0,"createdAt":null,"lastActivityAt":null,"expiresAt":null,
+        "killedAt":null,"templateName":null,"codebasePath":null,"s3ArchivePath":null}],
+        "count":1,"include_archived":false,"next_cursor":null,"has_more":false}
+        """)
+        let state = SessionListPresentationState(
+            sessions: page.sessions,
+            includesArchived: false,
+            hasMore: false,
+            provenance: .network(lastUpdated: Date(timeIntervalSince1970: 9))
+        )
+
+        XCTAssertEqual(state.rows.map(\.id), ["room-1"])
+        XCTAssertEqual(state.resultCount, 1)
+        XCTAssertNil(state.failure)
+    }
+
+    func testRepositorySnapshotInitializerRejectsCountDrift() throws {
+        let page = try decode(SessionListPage.self, """
+        {"sessions":[],"count":0,"include_archived":false,"next_cursor":null,"has_more":false}
+        """)
+        let state = SessionListPresentationState(
+            sessions: page.sessions,
+            resultCount: 1,
+            includesArchived: false,
+            hasMore: false,
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertTrue(state.rows.isEmpty)
+        XCTAssertEqual(state.resultCount, 0)
+        XCTAssertEqual(state.failure, .invalidData)
+    }
+
     private let decoder = JSONDecoder()
 
     func testSessionRowsPreserveIdentityAndUsePresentationFallbacks() throws {

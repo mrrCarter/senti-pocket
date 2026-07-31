@@ -70,9 +70,32 @@ public struct SessionListPresentationState: Equatable, Sendable {
         isRefreshing: Bool = false,
         failure: SessionLoadFailure? = nil
     ) {
-        let ids = page.sessions.map(\.sessionId)
+        self.init(
+            sessions: page.sessions,
+            resultCount: page.count,
+            includesArchived: page.includeArchived,
+            hasMore: page.hasMore,
+            provenance: provenance,
+            isRefreshing: isRefreshing,
+            failure: failure
+        )
+    }
+
+    /// Projects an already validated repository snapshot without manufacturing a wire response.
+    public init(
+        sessions: [SessionSummary],
+        resultCount: Int? = nil,
+        includesArchived: Bool,
+        hasMore: Bool,
+        provenance: SessionPresentationProvenance,
+        isRefreshing: Bool = false,
+        failure: SessionLoadFailure? = nil
+    ) {
+        let reportedCount = resultCount ?? sessions.count
+        let ids = sessions.map(\.sessionId)
         let identitiesAreValid = ids.allSatisfy { $0.pocketNonblank != nil }
             && Set(ids).count == ids.count
+        let countIsValid = reportedCount >= 0 && reportedCount == sessions.count
         let sourceAllowsContent: Bool
         if case .unavailable = provenance {
             sourceAllowsContent = false
@@ -80,15 +103,15 @@ public struct SessionListPresentationState: Equatable, Sendable {
             sourceAllowsContent = true
         }
         let failureAllowsContent = failure?.suppressesProtectedContent != true
-        let canPresentRows = identitiesAreValid && sourceAllowsContent && failureAllowsContent
+        let canPresentRows = identitiesAreValid && countIsValid && sourceAllowsContent && failureAllowsContent
 
-        self.rows = canPresentRows ? page.sessions.map(SessionRowPresentation.init) : []
-        self.resultCount = canPresentRows ? page.count : 0
-        self.includesArchived = page.includeArchived
-        self.hasMore = canPresentRows && page.hasMore
+        self.rows = canPresentRows ? sessions.map(SessionRowPresentation.init) : []
+        self.resultCount = canPresentRows ? reportedCount : 0
+        self.includesArchived = includesArchived
+        self.hasMore = canPresentRows && hasMore
         self.provenance = provenance
         self.isRefreshing = isRefreshing
-        self.failure = identitiesAreValid ? failure : .invalidData
+        self.failure = identitiesAreValid && countIsValid ? failure : .invalidData
     }
 }
 

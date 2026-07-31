@@ -15,8 +15,10 @@ import PocketContracts
 
 enum DialHydrationClientError: LocalizedError, Equatable {
     case notLoggedIn
+    case reauthenticationRequired
+    case supersededAuthentication
     case unavailable                 // uniform 410 gone: absent | expired | not a member — NEVER distinguished
-    case notAuthorized               // 401 / 403 (missing pocket:dial scope or no auth)
+    case notAuthorized               // 403 (missing pocket:dial scope / session access)
     case notConfigured               // 501 (dial hydration not wired server-side)
     case network(String)
     case retryable(String)           // 500 / 503 / other 5xx — transient, safe to retry
@@ -27,6 +29,10 @@ enum DialHydrationClientError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:          return "Sign in first — hydrating a ring needs your Senti session."
+        case .reauthenticationRequired:
+            return "Your Senti authorization expired. Sign in again before answering this ring."
+        case .supersededAuthentication:
+            return "The ring response belonged to an earlier sign-in and was ignored."
         case .unavailable:          return "This ring is no longer available."
         case .notAuthorized:        return "Not authorized to hydrate this ring."
         case .notConfigured:        return "Ring hydration isn't configured on the server."
@@ -44,15 +50,18 @@ final class DialHydrationClient {
     private let apiBaseURL: URL
     private let urlSession: URLSession
     private let tokenProvider: () -> String?
+    private let onReauthenticationRequired: @Sendable (String?) -> Void
 
     /// `tokenProvider` defaults to the real Keychain session token (SessionTokenStore) but is injectable so the
     /// fetch is hermetically testable (adopted from forge's DialSignalClient #97 — the one improvement to fold in).
     init(apiBaseURL: URL,
          urlSession: URLSession = .shared,
-         tokenProvider: @escaping () -> String? = { SessionTokenStore.load() }) {
+         tokenProvider: @escaping () -> String? = { SessionTokenStore.load() },
+         onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
         self.tokenProvider = tokenProvider
+        self.onReauthenticationRequired = onReauthenticationRequired
     }
 
     /// The single seam. Hand it a decoded receive state, get a renderable ring:
@@ -73,7 +82,10 @@ final class DialHydrationClient {
     /// Fetch the FULL NeedCarterSignal over the authenticated GET /dial?id= and merge it onto the push core. The merge
     /// is the security gate: a signal whose id/session/checkpoint doesn't match the push is refused, never rendered.
     private func fetchAndMerge(id: String, core: RingCore) async throws -> RenderableRing {
-        guard let token = tokenProvider(), !token.isEmpty else { throw DialHydrationClientError.notLoggedIn }
+        guard let token = tokenProvider(), !token.isEmpty else {
+            onReauthenticationRequired(nil)
+            throw DialHydrationClientError.notLoggedIn
+        }
         guard var comps = URLComponents(url: apiBaseURL, resolvingAgainstBaseURL: true) else {
             throw DialHydrationClientError.network("bad gateway base url")
         }
@@ -94,7 +106,13 @@ final class DialHydrationClient {
         switch http.statusCode {
         case 200:
             break
-        case 401, 403:
+        case 401:
+            guard tokenProvider() == token else {
+                throw DialHydrationClientError.supersededAuthentication
+            }
+            onReauthenticationRequired(token)
+            throw DialHydrationClientError.reauthenticationRequired
+        case 403:
             throw DialHydrationClientError.notAuthorized
         case 410:
             throw DialHydrationClientError.unavailable                    // uniform gone — never reveal absent vs non-member vs expired

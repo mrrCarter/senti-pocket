@@ -9,8 +9,8 @@
 // → converse → confirm → governed writeback. This is an APP VoIP call — NO PSTN / NO Twilio (that would be a v2 fallback).
 //
 // SCOPE: device PLUMBING only. The rich /dial VoIP payload contract is relay's wire (gateway POST /dial); `decode(_:)`
-// reads only what CallKit needs (id / who / priority) and ALWAYS yields a presentable call, so a malformed or partial
-// push still RINGS (a delivery is never silently dropped) and the orchestrator re-validates the episode on answer.
+// reads only what CallKit needs (id / who / priority) and ALWAYS yields a presentable call. A malformed, signed-out,
+// or unselected push is still reported as iOS requires, but with generic redacted metadata and no retained answer state.
 #if canImport(CallKit) && canImport(PushKit)
 import AVFoundation
 import CallKit
@@ -49,13 +49,18 @@ public final class SentiCallManager: NSObject {
     /// NEVER carried here — this only surfaces the ring shape + the dialId. Decoded via the KAV-locked DialReceive.receive.
     /// (internal, not public: DialReceiveState is app-internal; the DialHost consumer is in-module.)
     var onDialReceived: ((DialReceiveState, String) -> Void)?
+    /// Receive-time privacy gate installed by DialHost. Durable server registrations can outlive a local selection,
+    /// so push metadata is exposed and retained only for the exact currently selected authorized session.
+    var isIncomingSessionAuthorized: ((String) -> Bool)?
     /// The call ended / was declined → tear down (stop audio, drop the episode).
     public var onEnded: ((UUID) -> Void)?
     /// CallKit ACTIVATED the audio session → safe to start capture/playback (hand to PocketVoice's DuplexAudioSessionLease).
     public var onAudioSessionActivated: ((AVAudioSession) -> Void)?
 
     private let provider: CXProvider
-    private let pushRegistry: PKPushRegistry
+    private let pushRegistry: PKPushRegistry?
+    private let reportIncomingCall: (UUID, CXCallUpdate) -> Void
+    private let reportEndedCall: (UUID) -> Void
     private var active: [UUID: IncomingDecisionCall] = [:]
 
     public override init() {
@@ -65,12 +70,34 @@ public final class SentiCallManager: NSObject {
         configuration.maximumCallGroups = 1
         configuration.includesCallsInRecents = false     // a decision ring is not a phone call to log in Recents
         configuration.supportedHandleTypes = [.generic]
-        provider = CXProvider(configuration: configuration)
-        pushRegistry = PKPushRegistry(queue: .main)
+        let provider = CXProvider(configuration: configuration)
+        let pushRegistry = PKPushRegistry(queue: .main)
+        self.provider = provider
+        self.pushRegistry = pushRegistry
+        self.reportIncomingCall = { id, update in
+            provider.reportNewIncomingCall(with: id, update: update, completion: { _ in })
+        }
+        self.reportEndedCall = { id in
+            provider.reportCall(with: id, endedAt: nil, reason: .remoteEnded)
+        }
         super.init()
         provider.setDelegate(self, queue: nil)            // nil → main queue
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
+    }
+
+    /// Hermetic lifecycle-test initializer: no PushKit registration and no real CallKit report side effects.
+    init(
+        provider: CXProvider,
+        reportIncomingCall: @escaping (UUID, CXCallUpdate) -> Void = { _, _ in },
+        reportEndedCall: @escaping (UUID) -> Void = { _ in }
+    ) {
+        self.provider = provider
+        self.pushRegistry = nil
+        self.reportIncomingCall = reportIncomingCall
+        self.reportEndedCall = reportEndedCall
+        super.init()
+        provider.setDelegate(self, queue: nil)
     }
 
     /// Present the native incoming-call UI for a decision ring. Foreground-capable (demoable without a VoIP cert) and
@@ -87,7 +114,7 @@ public final class SentiCallManager: NSObject {
         update.remoteHandle = CXHandle(type: .generic, value: "senti-\(call.priority)")
         // The report completion is @Sendable, so we touch no main-actor state in it. A (rare) report failure leaves a
         // harmless stale `active` entry — no answer/end will arrive for it, and providerDidReset clears it.
-        provider.reportNewIncomingCall(with: call.id, update: update, completion: { _ in })
+        reportIncomingCall(call.id, update)
     }
 
     /// Demo convenience: ring from the foreground with no VoIP cert — Carter sees the native call UI today.
@@ -103,14 +130,29 @@ public final class SentiCallManager: NSObject {
 
     /// Programmatically end an active call (e.g., the governed writeback finished and we hang up).
     public func end(_ id: UUID) {
-        provider.reportCall(with: id, endedAt: nil, reason: .remoteEnded)
-        active[id] = nil
+        guard active.removeValue(forKey: id) != nil else { return }
+        reportEndedCall(id)
+    }
+
+    /// Revoke ringing and answered calls together. Selection/auth transitions cannot wait for an answer before
+    /// removing metadata; notify the host synchronously so any governed flow is cancelled before CallKit cleanup.
+    func revokeAllCalls() {
+        let ids = Array(active.keys)
+        active.removeAll()
+        for id in ids {
+            onEnded?(id)
+            reportEndedCall(id)
+        }
     }
 }
 
 extension SentiCallManager: @preconcurrency CXProviderDelegate {
     public func providerDidReset(_ provider: CXProvider) {
+        let ids = Array(active.keys)
         active.removeAll()
+        for id in ids {
+            onEnded?(id)
+        }
     }
 
     public func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
@@ -119,8 +161,9 @@ extension SentiCallManager: @preconcurrency CXProviderDelegate {
     }
 
     public func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
-        onEnded?(action.callUUID)
-        active[action.callUUID] = nil
+        if active.removeValue(forKey: action.callUUID) != nil {
+            onEnded?(action.callUUID)
+        }
         action.fulfill()
     }
 
@@ -150,12 +193,16 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
     ) {
         guard type == .voIP else { completion(); return }
         let dict = payload.dictionaryPayload
+        let prepared = Self.prepareIncomingPush(
+            dict,
+            isSessionAuthorized: isIncomingSessionAuthorized ?? { _ in false }
+        )
         // Report the incoming call (inside `ring`) BEFORE completion() — the iOS 13+ requirement.
-        ring(Self.decode(dict))
+        ring(prepared.call)
         // ALSO surface the full DialReceiveState for the coordinator to hydrate on answer, via the extracted+tested
         // receiveState() so the ENVELOPED-push round-trip has coverage (relay's find). Reuses the KAV-locked
         // DialReceive.receive — never a 2nd decoder. Governed content stays behind the authed GET.
-        if let (state, dialId) = Self.receiveState(from: dict) {
+        if let state = prepared.state, let dialId = prepared.dialId {
             onDialReceived?(state, dialId)
         }
         completion()
@@ -177,6 +224,44 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
               JSONSerialization.isValidJSONObject(dict),
               let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
         return (DialReceive.receive(data), dialId)
+    }
+
+    /// iOS requires every VoIP push to be reported to CallKit. An old server-side registration may still deliver a
+    /// push after sign-out/selection change, so unauthorized or malformed payloads become a generic, non-actionable
+    /// call: no caller/message/context/priority metadata is exposed and no hydration state is retained.
+    static func prepareIncomingPush(
+        _ payload: [AnyHashable: Any],
+        isSessionAuthorized: (String) -> Bool
+    ) -> (call: IncomingDecisionCall, state: DialReceiveState?, dialId: String?) {
+        let decoded = decode(payload)
+        guard let received = receiveState(from: payload),
+              let sessionId = sessionId(from: received.state),
+              isSessionAuthorized(sessionId) else {
+            return (
+                IncomingDecisionCall(
+                    id: decoded.id,
+                    dialId: decoded.dialId,
+                    callerDisplayName: "Senti",
+                    message: "",
+                    context: nil,
+                    priority: "medium"
+                ),
+                nil,
+                nil
+            )
+        }
+        return (decoded, received.state, received.dialId)
+    }
+
+    private static func sessionId(from state: DialReceiveState) -> String? {
+        switch state {
+        case .renderable(let ring):
+            return ring.core.sessionId
+        case .needsHydration(_, let core):
+            return core.sessionId
+        case .rejected:
+            return nil
+        }
     }
 
     static func decode(_ payload: [AnyHashable: Any]) -> IncomingDecisionCall {

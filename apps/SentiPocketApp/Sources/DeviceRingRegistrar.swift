@@ -7,9 +7,11 @@
 // So it's correct whether the token arrives BEFORE login (cached → registered on loginCompleted) or AFTER
 // (registered immediately since we're already logged in). The gateway upsert is idempotent, so a double-fire is safe.
 //
-// It attaches the app-PRIMARY sessionId (a member session of the human — the gateway membership-gates it, warden gate
-// #3) and drives the DeviceRingRegistrationClient, which enforces the rest of warden's 5-gate (authed Bearer, no
+// It attaches one coordinator-authorized selected sessionId (the gateway membership-gates it, warden gate #3) and
+// drives the DeviceRingRegistrationClient, which enforces the rest of warden's 5-gate (authed Bearer, no
 // spoofable humanId, apns platform). Registration is best-effort: a transient failure is retried by the next trigger.
+// The current gateway has no unregister/lease operation, so invalidate() revokes local authority only; receive-time
+// selection gating in SentiCallManager keeps any late push generic and non-actionable until that server contract lands.
 
 import Foundation
 
@@ -59,5 +61,16 @@ final class DeviceRingRegistrar {
         }
         inFlight = task
         return task
+    }
+
+    /// A session selection or authentication transition revokes this fixed-session registrar immediately.
+    func invalidate() {
+        inFlight?.cancel()
+        inFlight = nil
+        latestToken = nil
+    }
+
+    deinit {
+        inFlight?.cancel()
     }
 }

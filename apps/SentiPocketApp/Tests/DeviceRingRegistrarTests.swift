@@ -71,6 +71,17 @@ final class DeviceRingRegistrarTests: XCTestCase {
         XCTAssertEqual(registerCount(), 0)
     }
 
+    func test_invalidate_revokes_the_cached_token_before_a_later_login() async {
+        let (reg, auth) = makeRegistrar(loggedIn: false)
+        await reg.tokenUpdated("session-a-token")?.value
+        reg.invalidate()
+        auth.loggedIn = true
+
+        await reg.loginCompleted()?.value
+
+        XCTAssertEqual(registerCount(), 0, "a revoked session registrar must never bind its old cached token")
+    }
+
     // MARK: - rotation → re-registers with the NEW token
 
     func test_rotation_reregisters_with_the_new_token() async throws {

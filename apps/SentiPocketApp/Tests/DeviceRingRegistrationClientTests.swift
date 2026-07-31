@@ -56,7 +56,11 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
 
     private let base = URL(string: "https://gw.example.com")!
 
-    private func makeClient(token: String = "tok123") -> DeviceRingRegistrationClient {
+    private func makeClient(
+        token: String = "tok123",
+        tokenProvider: (@Sendable () -> String?)? = nil,
+        onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in }
+    ) -> DeviceRingRegistrationClient {
         RegisterStubURLProtocol.lock.lock()
         RegisterStubURLProtocol.status = 200
         RegisterStubURLProtocol.networkError = nil
@@ -66,8 +70,9 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [RegisterStubURLProtocol.self]
         return DeviceRingRegistrationClient(apiBaseURL: base,
-                                            urlSession: URLSession(configuration: cfg),
-                                            tokenProvider: { token.isEmpty ? nil : token })
+                                             urlSession: URLSession(configuration: cfg),
+                                             tokenProvider: tokenProvider ?? { token.isEmpty ? nil : token },
+                                             onReauthenticationRequired: onReauthenticationRequired)
     }
 
     private func setStatus(_ code: Int) {
@@ -141,9 +146,26 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
 
     // MARK: - status taxonomy
 
-    func test_401_is_notAuthorized() async {
-        let client = makeClient(); setStatus(401)
-        await expect(client, .notAuthorized)
+    func test_401_requires_reauthentication_and_signals_the_request_token() async {
+        let signal = RegistrationAuthSignal()
+        let client = makeClient(onReauthenticationRequired: { signal.record($0) })
+        setStatus(401)
+        await expect(client, .reauthenticationRequired)
+        XCTAssertEqual(signal.tokens, ["tok123"])
+    }
+
+    func test_late_401_for_an_old_token_is_superseded_without_auth_signal() async {
+        let token = RegistrationTokenSequence(["principal-A", "principal-B"])
+        let signal = RegistrationAuthSignal()
+        let client = makeClient(
+            tokenProvider: { token.next() },
+            onReauthenticationRequired: { signal.record($0) }
+        )
+        setStatus(401)
+
+        await expect(client, .supersededAuthentication)
+
+        XCTAssertEqual(signal.tokens, [])
     }
 
     func test_403_is_notAuthorized_nonmember_session() async {
@@ -159,5 +181,41 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
     func test_other_4xx_is_rejected() async {
         let client = makeClient(); setStatus(422)
         await expect(client, .rejected(422))
+    }
+}
+
+private final class RegistrationAuthSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedTokens: [String?] = []
+
+    var tokens: [String?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedTokens
+    }
+
+    func record(_ token: String?) {
+        lock.lock()
+        storedTokens.append(token)
+        lock.unlock()
+    }
+}
+
+private final class RegistrationTokenSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let values: [String]
+    private var index = 0
+
+    init(_ values: [String]) {
+        self.values = values
+    }
+
+    func next() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !values.isEmpty else { return nil }
+        let value = values[min(index, values.count - 1)]
+        index += 1
+        return value
     }
 }

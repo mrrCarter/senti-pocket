@@ -1,5 +1,6 @@
 #if canImport(CallKit) && canImport(PushKit)
 import XCTest
+import CallKit
 @testable import SentiPocketApp
 
 /// Locks SentiCallManager's decode (CallKit-ring DISPLAY) + receiveState (the DialReceiveState surfaced at push-receive).
@@ -98,6 +99,94 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
     func test_receiveState_nil_on_nonconforming_dict_no_crash() {
         let bad: [AnyHashable: Any] = ["id": "dial_x", "createdAt": Date()]  // Date is not JSON-serializable
         XCTAssertNil(SentiCallManager.receiveState(from: bad))               // fail-safe nil, NEVER a crash
+    }
+
+    func test_unselected_push_is_redacted_and_not_retained_for_answer() throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases.values.first as? [String: Any],
+              let payload = raw["payload"] as? [String: Any] else {
+            return XCTFail("source fixture missing a payload")
+        }
+
+        let prepared = SentiCallManager.prepareIncomingPush(
+            payload,
+            isSessionAuthorized: { _ in false }
+        )
+
+        XCTAssertEqual(prepared.call.callerDisplayName, "Senti")
+        XCTAssertEqual(prepared.call.message, "")
+        XCTAssertNil(prepared.call.context)
+        XCTAssertEqual(prepared.call.priority, "medium")
+        XCTAssertNil(prepared.state, "an old registration must not arm hydration after selection/sign-out revocation")
+        XCTAssertNil(prepared.dialId)
+    }
+
+    func test_selected_push_keeps_display_and_receive_state() throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases.values.first as? [String: Any],
+              let payload = raw["payload"] as? [String: Any],
+              let sessionId = payload["sessionId"] as? String else {
+            return XCTFail("source fixture missing a session payload")
+        }
+
+        let prepared = SentiCallManager.prepareIncomingPush(
+            payload,
+            isSessionAuthorized: { $0 == sessionId }
+        )
+
+        XCTAssertNotNil(prepared.state)
+        XCTAssertEqual(prepared.dialId, payload["id"] as? String)
+        XCTAssertEqual(prepared.call.dialId, payload["id"] as? String)
+    }
+
+    func test_revoke_all_calls_ends_a_still_ringing_call_and_notifies_host() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        var reportedEnds: [UUID] = []
+        let manager = SentiCallManager(
+            provider: provider,
+            reportEndedCall: { reportedEnds.append($0) }
+        )
+        var hostCancellations: [UUID] = []
+        manager.onEnded = { hostCancellations.append($0) }
+        let call = IncomingDecisionCall(
+            id: UUID(),
+            dialId: "dial-ringing",
+            callerDisplayName: "Sensitive caller",
+            message: "Sensitive decision",
+            context: "Sensitive context",
+            priority: "high"
+        )
+        manager.ring(call)
+
+        manager.revokeAllCalls()
+        manager.end(call.id)
+
+        XCTAssertEqual(hostCancellations, [call.id])
+        XCTAssertEqual(reportedEnds, [call.id], "deferred cleanup after revoke must not report the UUID twice")
+    }
+
+    func test_provider_reset_notifies_host_for_every_active_call_once() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        let manager = SentiCallManager(provider: provider)
+        var hostCancellations: [UUID] = []
+        manager.onEnded = { hostCancellations.append($0) }
+        let call = IncomingDecisionCall(
+            id: UUID(),
+            dialId: "dial-answered",
+            callerDisplayName: "Senti",
+            message: "",
+            context: nil,
+            priority: "medium"
+        )
+        manager.ring(call)
+
+        manager.providerDidReset(provider)
+        manager.providerDidReset(provider)
+
+        XCTAssertEqual(hostCancellations, [call.id],
+                       "provider reset must cancel the host flow, and a second reset must not duplicate it")
     }
 }
 #endif

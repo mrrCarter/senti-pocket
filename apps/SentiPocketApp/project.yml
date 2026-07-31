@@ -73,6 +73,10 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: false
         SWIFT_VERSION: "5.9"
+      configs:
+        Release:
+          # The signed canonical bundle is a DEBUG/preview fixture, never a Release app resource.
+          EXCLUDED_SOURCE_FILE_NAMES: canonical_checkpoint.json
   # XCUITest device/sim target (Atlas-owned per Pulse #249472) — enables the DeviceUITests to run at all.
   # The app-under-test is wired via the `target: SentiPocketApp` dependency (XcodeGen sets the target application).
   # Forge runs a NAMED single test until Atlas maps the -PocketUITestScenario reducer for the other 14.
@@ -101,6 +105,8 @@ targets:
       - target: SentiPocketApp
       - package: PocketContracts
       - package: PocketUI
+      - package: PocketSyncClient
+      - package: PocketReasoning
       # PocketCall: DialCoordinatorTests imports it + references PocketCall.DialOutcome. Was missing → the test target
       # failed to LINK (undefined symbol, caught on the MacinCloud build — no build-CI had caught this pre-existing gap).
       - package: PocketCall
