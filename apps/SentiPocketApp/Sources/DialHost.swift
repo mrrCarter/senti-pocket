@@ -8,7 +8,7 @@ import PocketDialVoice
 // DialHost — the app-lifetime composition wiring for DIALS (Forge, onAnswered hookup part-b). With a trusted gateway
 // configured, it owns SentiCallManager (its PKPushRegistry delegate must live the whole app) + DialCoordinator and
 // installs the two adapters + three governed DI seams warden's part-b gate specifies:
-//   • push-receive  → coordinator.received(state, dialId)         (adapter 1)
+//   • push-receive  → coordinator.received(state, dialId, UUID)   (adapter 1)
 //   • answer        → coordinator.answered(dialId, callUUID)      (adapter 2)  — dialId+UUID only, never .message
 //   • hydrate seam  = the AUTHED DialHydrationClient (governed content from the GET, never the push)
 //   • runDial seam  = the governed LiveDialVoice + PhoneWriteAdapter + DialOrchestrator
@@ -28,6 +28,7 @@ final class DialHost: ObservableObject {
     private let bindingGate: DeviceRingBindingGate
     private let installation: DeviceRingInstallationController
     private let authenticationExpiry: AuthenticationExpiryRelay
+    private let callAuthorizationGate: DialCallAuthorizationGate
     private var registrar: DeviceRingRegistrar?
     private var selectedSessionId: String?
     private var latestVoipToken: String?
@@ -35,16 +36,19 @@ final class DialHost: ObservableObject {
     private var activeDialTask: Task<Void, Never>?
     private var activeCallUUID: UUID?
     private var dialRevision: UInt64 = 0
+    private var callLifecycle = DialCallLifecycle()
 
     init(gatewayURL: URL? = DialHost.gatewayURL()) {
         let selectionGate = DialSessionSelectionGate()
         let installation = DeviceRingInstallationController.live
         let bindingGate = DeviceRingBindingGate(initialBinding: installation.loadCurrentBinding())
         let authenticationExpiry = AuthenticationExpiryRelay()
+        let callAuthorizationGate = DialCallAuthorizationGate()
         self.selectionGate = selectionGate
         self.installation = installation
         self.bindingGate = bindingGate
         self.authenticationExpiry = authenticationExpiry
+        self.callAuthorizationGate = callAuthorizationGate
         guard let gatewayURL else {
             // The default/unconfigured build does not start PushKit token acquisition or construct any gateway client.
             // A later configured launch builds the complete, app-lifetime call stack below.
@@ -72,12 +76,12 @@ final class DialHost: ObservableObject {
         )
         let coord = DialCoordinator(
             hydrate: selectedHydrator.hydrate,
-            runDial: { ring in
+            runDial: { ring, callUUID in
                 guard DialDeviceAuthorization.permits(
                     ring.core,
                     selectionGate: selectionGate,
                     bindingGate: bindingGate
-                ) else {
+                ), callAuthorizationGate.permits(callUUID) else {
                     return .declined("the selected session or device binding changed before the dial could run")
                 }
                 return await DialHost.run(
@@ -89,7 +93,7 @@ final class DialHost: ObservableObject {
                             ring.core,
                             selectionGate: selectionGate,
                             bindingGate: bindingGate
-                        )
+                        ) && callAuthorizationGate.permits(callUUID)
                     }
                 )
             },
@@ -111,13 +115,21 @@ final class DialHost: ObservableObject {
             )
         }
         // Adapter 1 — store the state decoded at push-receive (governed content fetched on answer).
-        cm.onDialReceived = { coord.received($0, dialId: $1) }
+        cm.onDialReceived = { [weak self] state, dialId, callUUID in
+            self?.callReported(state: state, dialId: dialId, callUUID: callUUID)
+        }
         // Adapter 2 — hydrate + run off the dialId + CallKit UUID ONLY; never off IncomingDecisionCall.message.
         cm.onAnswered = { [weak self] call in
             self?.answer(dialId: call.dialId, callUUID: call.id)
         }
         cm.onEnded = { [weak self] callUUID in
             self?.callEnded(callUUID)
+        }
+        cm.onAudioSessionActivated = { [weak self] _, callUUID in
+            self?.callAudioActivated(callUUID)
+        }
+        cm.onAudioSessionDeactivated = { [weak self] _, callUUID in
+            self?.callAudioDeactivated(callUUID)
         }
         // Adapter 3 — cache every APNs rotation. It is posted only after the authorized Sessions surface selects the
         // exact target and constructs that target's registrar.
@@ -149,6 +161,7 @@ final class DialHost: ObservableObject {
     func onAuthenticationInvalidated() {
         authenticated = false
         callManager?.revokeAllCalls()
+        revokeDialExecutionAuthority()
         let hadRegistrar = registrar != nil
         selectSession(nil)
         if !hadRegistrar {
@@ -164,10 +177,7 @@ final class DialHost: ObservableObject {
 
         selectionGate.select(nil)
         callManager?.revokeAllCalls()
-        activeDialTask?.cancel()
-        activeDialTask = nil
-        activeCallUUID = nil
-        dialRevision &+= 1
+        revokeDialExecutionAuthority()
         registrar?.invalidate()
         registrar = nil
         selectedSessionId = nil
@@ -192,10 +202,7 @@ final class DialHost: ObservableObject {
                 self.bindingGate.replace(with: binding)
                 if binding == nil {
                     self.callManager?.revokeAllCalls()
-                    self.activeDialTask?.cancel()
-                    self.activeDialTask = nil
-                    self.activeCallUUID = nil
-                    self.dialRevision &+= 1
+                    self.revokeDialExecutionAuthority()
                 }
             }
         )
@@ -220,27 +227,114 @@ final class DialHost: ObservableObject {
         }
     }
 
-    private func answer(dialId: String, callUUID: UUID) {
-        guard selectedSessionId != nil, let coordinator else {
+    private func callReported(state: DialReceiveState, dialId: String, callUUID: UUID) {
+        guard let coordinator, callLifecycle.reported(callUUID: callUUID, dialId: dialId) else {
+            coordinator?.discard(callUUID: callUUID)
             callManager?.end(callUUID)
             return
         }
-        activeDialTask?.cancel()
+        coordinator.received(state, dialId: dialId, callUUID: callUUID)
+    }
+
+    private func answer(dialId: String, callUUID: UUID) {
+        guard selectedSessionId != nil, coordinator != nil else {
+            callManager?.end(callUUID)
+            return
+        }
         dialRevision &+= 1
         let operationRevision = dialRevision
         activeCallUUID = callUUID
+        let answerResult = callLifecycle.answered(
+            callUUID: callUUID,
+            dialId: dialId,
+            revision: operationRevision
+        )
+        switch answerResult {
+        case .rejected:
+            callEnded(callUUID)
+            callManager?.end(callUUID)
+        case .waiting, .ready(_):
+            do {
+                // Configure play-and-record/voiceChat before SentiCallManager fulfills CXAnswerCallAction. CallKit,
+                // not PocketVoice, remains the owner that activates/deactivates the session.
+                try LiveDialVoice.prepareCallKitAudioSession()
+            } catch {
+                callEnded(callUUID)
+                callManager?.end(callUUID)
+                return
+            }
+            if case .ready(let ready) = answerResult {
+                startDial(ready)
+            }
+        }
+    }
+
+    private func callAudioActivated(_ callUUID: UUID) {
+        LiveDialVoice.callKitDidActivateAudioSession()
+        if let ready = callLifecycle.audioActivated(callUUID: callUUID) {
+            startDial(ready)
+        }
+    }
+
+    private func callAudioDeactivated(_ callUUID: UUID) {
+        LiveDialVoice.callKitDidDeactivateAudioSession()
+        guard callLifecycle.audioDeactivated(callUUID: callUUID) != nil else { return }
+        coordinator?.discard(callUUID: callUUID)
+        callAuthorizationGate.close(callUUID)
+        if activeCallUUID == callUUID {
+            activeDialTask?.cancel()
+            activeDialTask = nil
+            activeCallUUID = nil
+            dialRevision &+= 1
+        }
+        callManager?.end(callUUID)
+    }
+
+    private func startDial(_ ready: DialCallLifecycle.Ready) {
+        guard dialRevision == ready.revision,
+              selectedSessionId != nil,
+              let coordinator,
+              callLifecycle.isReported(ready.callUUID) else {
+            callEnded(ready.callUUID)
+            callManager?.end(ready.callUUID)
+            return
+        }
+        activeDialTask?.cancel()
+        callAuthorizationGate.open(ready.callUUID)
+        activeCallUUID = ready.callUUID
         activeDialTask = Task { @MainActor [weak self] in
-            _ = await coordinator.answered(dialId: dialId, callUUID: callUUID)
-            guard let self, self.dialRevision == operationRevision else { return }
+            _ = await coordinator.answered(dialId: ready.dialId, callUUID: ready.callUUID)
+            guard let self, self.dialRevision == ready.revision else { return }
+            self.callAuthorizationGate.close(ready.callUUID)
+            _ = self.callLifecycle.ended(callUUID: ready.callUUID)
             self.activeDialTask = nil
-            if self.activeCallUUID == callUUID {
+            if self.activeCallUUID == ready.callUUID {
                 self.activeCallUUID = nil
             }
         }
     }
 
     private func callEnded(_ callUUID: UUID) {
-        guard activeCallUUID == callUUID else { return }
+        coordinator?.discard(callUUID: callUUID)
+        let ownedLifecycleEpisode = callLifecycle.ended(callUUID: callUUID) != nil
+        callAuthorizationGate.close(callUUID)
+        let ownedActiveTask = activeCallUUID == callUUID
+        if ownedActiveTask {
+            activeDialTask?.cancel()
+            activeDialTask = nil
+            activeCallUUID = nil
+        }
+        // A generic/stale CallKit UUID can end while another governed episode is alive. Only the UUID that actually
+        // owned reported/pending/started lifecycle state or the active task may invalidate that task's revision.
+        if ownedLifecycleEpisode || ownedActiveTask {
+            dialRevision &+= 1
+        }
+    }
+
+    private func revokeDialExecutionAuthority() {
+        coordinator?.discardAll()
+        callLifecycle.reset()
+        callAuthorizationGate.closeAll()
         activeDialTask?.cancel()
         activeDialTask = nil
         activeCallUUID = nil
@@ -381,6 +475,122 @@ final class DialSessionSelectionGate: @unchecked Sendable {
     func permits(_ sessionId: String) -> Bool {
         lock.lock()
         let permitted = self.sessionId == sessionId
+        lock.unlock()
+        return permitted
+    }
+}
+
+/// Main-actor episode reducer for the CallKit answer/audio handshake. A flow can start once, and only after the same
+/// reported UUID has both an answer and a CallKit audio activation. End/reset/revoke/deactivate erase the episode, so
+/// late callbacks are inert instead of reviving speech or a write path.
+struct DialCallLifecycle {
+    struct Ready: Equatable {
+        let callUUID: UUID
+        let dialId: String
+        let revision: UInt64
+    }
+
+    enum AnswerResult: Equatable {
+        case rejected
+        case waiting
+        case ready(Ready)
+    }
+
+    private var reported: [UUID: String] = [:]
+    private var pendingAnswer: Ready?
+    private var audioActivatedCallUUID: UUID?
+    private var startedCallUUID: UUID?
+
+    mutating func reported(callUUID: UUID, dialId: String) -> Bool {
+        guard !dialId.isEmpty,
+              reported[callUUID] == nil,
+              reported.isEmpty else { return false }
+        reported[callUUID] = dialId
+        return true
+    }
+
+    mutating func answered(callUUID: UUID, dialId: String, revision: UInt64) -> AnswerResult {
+        guard reported[callUUID] == dialId,
+              startedCallUUID == nil,
+              pendingAnswer == nil else { return .rejected }
+        let ready = Ready(callUUID: callUUID, dialId: dialId, revision: revision)
+        pendingAnswer = ready
+        if let ready = takeReady() { return .ready(ready) }
+        return .waiting
+    }
+
+    mutating func audioActivated(callUUID: UUID) -> Ready? {
+        guard reported[callUUID] != nil,
+              pendingAnswer?.callUUID == callUUID,
+              startedCallUUID == nil else { return nil }
+        audioActivatedCallUUID = callUUID
+        return takeReady()
+    }
+
+    mutating func audioDeactivated(callUUID: UUID) -> UUID? {
+        guard reported[callUUID] != nil,
+              audioActivatedCallUUID == callUUID || pendingAnswer?.callUUID == callUUID else { return nil }
+        _ = ended(callUUID: callUUID)
+        return callUUID
+    }
+
+    @discardableResult
+    mutating func ended(callUUID: UUID) -> String? {
+        let dialId = reported.removeValue(forKey: callUUID)
+        if pendingAnswer?.callUUID == callUUID { pendingAnswer = nil }
+        if audioActivatedCallUUID == callUUID { audioActivatedCallUUID = nil }
+        if startedCallUUID == callUUID { startedCallUUID = nil }
+        return dialId
+    }
+
+    mutating func reset() {
+        reported.removeAll()
+        pendingAnswer = nil
+        audioActivatedCallUUID = nil
+        startedCallUUID = nil
+    }
+
+    func isReported(_ callUUID: UUID) -> Bool {
+        reported[callUUID] != nil
+    }
+
+    private mutating func takeReady() -> Ready? {
+        guard let pendingAnswer,
+              audioActivatedCallUUID == pendingAnswer.callUUID,
+              startedCallUUID == nil else { return nil }
+        self.pendingAnswer = nil
+        startedCallUUID = pendingAnswer.callUUID
+        return pendingAnswer
+    }
+}
+
+/// Synchronous write-time fence. Task cancellation is advisory; this lock-backed UUID gate is rechecked by every
+/// draft/confirm request so End/Reset/auth/selection/binding/deactivation wins even if an async transcript resumes late.
+final class DialCallAuthorizationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var liveCallUUIDs = Set<UUID>()
+
+    func open(_ callUUID: UUID) {
+        lock.lock()
+        liveCallUUIDs.insert(callUUID)
+        lock.unlock()
+    }
+
+    func close(_ callUUID: UUID) {
+        lock.lock()
+        liveCallUUIDs.remove(callUUID)
+        lock.unlock()
+    }
+
+    func closeAll() {
+        lock.lock()
+        liveCallUUIDs.removeAll()
+        lock.unlock()
+    }
+
+    func permits(_ callUUID: UUID) -> Bool {
+        lock.lock()
+        let permitted = liveCallUUIDs.contains(callUUID)
         lock.unlock()
         return permitted
     }

@@ -208,4 +208,35 @@ final class PhoneWriteOutboxDurabilityTests: XCTestCase {
 
         for _ in 0..<5 { await Task.yield() }
     }
+
+    func test_later_dial_cancel_cannot_erase_an_earlier_confirmed_intent() async {
+        let proposal = PocketWriteClient.makeHumanMessageProposal(
+            sessionId: "session-A",
+            message: "Already confirmed before the new call",
+            at: Date(timeIntervalSince1970: 1_784_000_000)
+        )
+        let persisted = PersistedWriteIntent(
+            proposal: proposal,
+            confirmation: GovernedWriteConfirmation(
+                proposalId: proposal.id,
+                confirmedProposalHash: proposal.proposalHash,
+                confirmedAt: Date(timeIntervalSince1970: 1_784_000_000)
+            )
+        )
+        OutboxStore.save(persisted)
+        let restored = PhoneWriteViewModel(sessionId: "session-A", client: makeClient())
+        let laterDial = PhoneWriteAdapter(restored)
+        guard case .pending = restored.state else {
+            return XCTFail("precondition: the earlier committed operation must restore as pending")
+        }
+
+        await laterDial.draft("A later call cannot arm while the earlier operation is pending")
+        await laterDial.cancel()
+
+        guard case .pending = restored.state else {
+            return XCTFail("a pre-confirm hangup in the later call must leave the earlier operation pending")
+        }
+        XCTAssertEqual(OutboxStore.load(), persisted,
+                       "the later adapter owns no draft and must not delete an earlier confirmation")
+    }
 }

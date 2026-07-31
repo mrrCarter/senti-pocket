@@ -1,6 +1,7 @@
 #if canImport(CallKit) && canImport(PushKit)
 import XCTest
 import CallKit
+import AVFoundation
 @testable import SentiPocketApp
 
 /// Locks SentiCallManager's decode (CallKit-ring DISPLAY) + receiveState (the DialReceiveState surfaced at push-receive).
@@ -226,6 +227,96 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
         XCTAssertTrue(reason.contains("binding proof"))
     }
 
+    func test_push_completion_and_hydration_wait_for_successful_callkit_report() async throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases.values.first as? [String: Any],
+              let payload = raw["payload"] as? [String: Any] else {
+            return XCTFail("source fixture missing a payload")
+        }
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        var reportCallback: (@MainActor @Sendable (Bool) -> Void)?
+        let manager = SentiCallManager(
+            provider: provider,
+            reportIncomingCall: { _, _, completion in reportCallback = completion }
+        )
+        manager.isIncomingDialAuthorized = { _ in true }
+        var received: [(String, UUID)] = []
+        manager.onDialReceived = { _, dialId, callUUID in received.append((dialId, callUUID)) }
+        var pushCompletionCount = 0
+
+        manager.handleIncomingPushPayload(payload) { pushCompletionCount += 1 }
+
+        XCTAssertEqual(pushCompletionCount, 0)
+        XCTAssertTrue(received.isEmpty, "protected hydration state must wait for CallKit acceptance")
+        reportCallback?(true)
+        for _ in 0..<3 { await Task.yield() }
+        XCTAssertEqual(pushCompletionCount, 1)
+        XCTAssertEqual(received.count, 1)
+        XCTAssertEqual(received.first?.0, payload["id"] as? String)
+
+        reportCallback?(true)
+        for _ in 0..<3 { await Task.yield() }
+        XCTAssertEqual(pushCompletionCount, 1, "a hostile duplicate report callback cannot complete PushKit twice")
+        XCTAssertEqual(received.count, 1)
+    }
+
+    func test_failed_callkit_report_completes_push_once_without_retaining_hydration() async throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases.values.first as? [String: Any],
+              let payload = raw["payload"] as? [String: Any] else {
+            return XCTFail("source fixture missing a payload")
+        }
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        var reportCallback: (@MainActor @Sendable (Bool) -> Void)?
+        let manager = SentiCallManager(
+            provider: provider,
+            reportIncomingCall: { _, _, completion in reportCallback = completion }
+        )
+        manager.isIncomingDialAuthorized = { _ in true }
+        var receivedCount = 0
+        manager.onDialReceived = { _, _, _ in receivedCount += 1 }
+        var pushCompletionCount = 0
+
+        manager.handleIncomingPushPayload(payload) { pushCompletionCount += 1 }
+        reportCallback?(false)
+        for _ in 0..<3 { await Task.yield() }
+
+        XCTAssertEqual(pushCompletionCount, 1)
+        XCTAssertEqual(receivedCount, 0)
+    }
+
+    func test_revoke_during_report_tombstones_late_success_and_never_resurrects_state() async throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases.values.first as? [String: Any],
+              let payload = raw["payload"] as? [String: Any] else {
+            return XCTFail("source fixture missing a payload")
+        }
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        var reportCallback: (@MainActor @Sendable (Bool) -> Void)?
+        var reportedEnds: [UUID] = []
+        let manager = SentiCallManager(
+            provider: provider,
+            reportIncomingCall: { _, _, completion in reportCallback = completion },
+            reportEndedCall: { reportedEnds.append($0) }
+        )
+        manager.isIncomingDialAuthorized = { _ in true }
+        var receivedCount = 0
+        manager.onDialReceived = { _, _, _ in receivedCount += 1 }
+        var pushCompletionCount = 0
+
+        manager.handleIncomingPushPayload(payload) { pushCompletionCount += 1 }
+        manager.revokeAllCalls()
+        reportCallback?(true)
+        for _ in 0..<3 { await Task.yield() }
+
+        XCTAssertEqual(pushCompletionCount, 1)
+        XCTAssertEqual(receivedCount, 0)
+        XCTAssertEqual(reportedEnds.count, 1, "late CallKit success must be ended after authority was revoked")
+    }
+
     func test_revoke_all_calls_ends_a_still_ringing_call_and_notifies_host() {
         let provider = CXProvider(configuration: CXProviderConfiguration())
         var reportedEnds: [UUID] = []
@@ -272,6 +363,179 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
 
         XCTAssertEqual(hostCancellations, [call.id],
                        "provider reset must cancel the host flow, and a second reset must not duplicate it")
+    }
+
+    func test_late_deactivation_is_attributed_to_ended_call_not_the_next_answer() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        let manager = SentiCallManager(provider: provider)
+        let first = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-first", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        let second = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-second", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        let third = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-third", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        var activations: [UUID] = []
+        var deactivations: [UUID] = []
+        var hostEnds: [UUID] = []
+        manager.onAudioSessionActivated = { _, id in activations.append(id) }
+        manager.onAudioSessionDeactivated = { _, id in deactivations.append(id) }
+        manager.onEnded = { hostEnds.append($0) }
+
+        manager.ring(first)
+        manager.provider(provider, perform: CXAnswerCallAction(call: first.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        manager.end(first.id)
+
+        manager.ring(second)
+        manager.provider(provider, perform: CXAnswerCallAction(call: second.id))
+        manager.provider(provider, didDeactivate: AVAudioSession.sharedInstance())
+
+        XCTAssertEqual(activations, [first.id])
+        XCTAssertEqual(deactivations, [first.id], "call A's late deactivation must stay attributed to call A")
+        XCTAssertEqual(hostEnds, [second.id], "call B must fail closed while call A owns the audio callback slot")
+
+        manager.ring(third)
+        manager.provider(provider, perform: CXAnswerCallAction(call: third.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        XCTAssertEqual(activations, [first.id, third.id], "consuming call A's tombstone must let a fresh call activate")
+    }
+
+    func test_provider_reset_releases_callkit_audio_ownership_without_didDeactivate() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        let manager = SentiCallManager(provider: provider)
+        let call = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-reset", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        var deactivations: [UUID] = []
+        manager.onAudioSessionDeactivated = { _, id in deactivations.append(id) }
+
+        manager.ring(call)
+        manager.provider(provider, perform: CXAnswerCallAction(call: call.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        manager.providerDidReset(provider)
+        manager.providerDidReset(provider)
+
+        XCTAssertEqual(deactivations, [call.id], "provider reset must release shared audio ownership exactly once")
+    }
+
+    func test_answer_activation_deadline_ends_a_wedged_episode_once() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        var reportedEnds: [UUID] = []
+        let manager = SentiCallManager(
+            provider: provider,
+            reportEndedCall: { reportedEnds.append($0) },
+            audioActivationTimeoutNanoseconds: 60_000_000_000
+        )
+        let call = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-timeout", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        let blocked = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-blocked", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        let fresh = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-fresh", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        var hostEnds: [UUID] = []
+        var activations: [UUID] = []
+        var deactivations: [UUID] = []
+        manager.onEnded = { hostEnds.append($0) }
+        manager.onAudioSessionActivated = { _, id in activations.append(id) }
+        manager.onAudioSessionDeactivated = { _, id in deactivations.append(id) }
+
+        manager.ring(call)
+        manager.provider(provider, perform: CXAnswerCallAction(call: call.id))
+        manager.expireAudioActivation(callUUID: call.id)
+        manager.expireAudioActivation(callUUID: call.id)
+        manager.ring(blocked)
+        manager.provider(provider, perform: CXAnswerCallAction(call: blocked.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        manager.provider(provider, didDeactivate: AVAudioSession.sharedInstance())
+
+        XCTAssertEqual(hostEnds, [call.id, blocked.id])
+        XCTAssertEqual(reportedEnds, [call.id, blocked.id])
+        XCTAssertEqual(activations, [call.id], "late activation remains quarantined to the timed-out UUID")
+        XCTAssertEqual(deactivations, [call.id])
+
+        manager.ring(fresh)
+        manager.provider(provider, perform: CXAnswerCallAction(call: fresh.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        XCTAssertEqual(activations, [call.id, fresh.id], "a fresh call may proceed only after quarantine drains")
+    }
+
+    func test_provider_reset_releases_a_timed_out_activation_quarantine() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        let manager = SentiCallManager(
+            provider: provider,
+            audioActivationTimeoutNanoseconds: 60_000_000_000
+        )
+        let timedOut = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-reset-timeout", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        let fresh = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-after-reset", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        var deactivations: [UUID] = []
+        var activations: [UUID] = []
+        manager.onAudioSessionDeactivated = { _, id in deactivations.append(id) }
+        manager.onAudioSessionActivated = { _, id in activations.append(id) }
+
+        manager.ring(timedOut)
+        manager.provider(provider, perform: CXAnswerCallAction(call: timedOut.id))
+        manager.expireAudioActivation(callUUID: timedOut.id)
+        manager.providerDidReset(provider)
+
+        XCTAssertEqual(deactivations, [timedOut.id])
+        manager.ring(fresh)
+        manager.provider(provider, perform: CXAnswerCallAction(call: fresh.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        XCTAssertEqual(activations, [fresh.id])
+    }
+
+    func test_end_before_activation_serializes_late_callbacks_away_from_next_call() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        var reportedEnds: [UUID] = []
+        let manager = SentiCallManager(
+            provider: provider,
+            reportEndedCall: { reportedEnds.append($0) },
+            audioActivationTimeoutNanoseconds: 60_000_000_000
+        )
+        let first = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-preactive-A", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        let second = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-preactive-B", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        let third = IncomingDecisionCall(
+            id: UUID(), dialId: "dial-preactive-C", callerDisplayName: "Senti", message: "", context: nil, priority: "high"
+        )
+        var hostEnds: [UUID] = []
+        var activations: [UUID] = []
+        var deactivations: [UUID] = []
+        manager.onEnded = { hostEnds.append($0) }
+        manager.onAudioSessionActivated = { _, id in activations.append(id) }
+        manager.onAudioSessionDeactivated = { _, id in deactivations.append(id) }
+
+        manager.ring(first)
+        manager.provider(provider, perform: CXAnswerCallAction(call: first.id))
+        manager.end(first.id)
+        manager.ring(second)
+        manager.provider(provider, perform: CXAnswerCallAction(call: second.id))
+
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        manager.provider(provider, didDeactivate: AVAudioSession.sharedInstance())
+
+        XCTAssertEqual(activations, [first.id], "late activation must stay attributed to ended call A")
+        XCTAssertEqual(deactivations, [first.id], "late deactivation must stay attributed to ended call A")
+        XCTAssertEqual(hostEnds, [second.id], "call B is rejected while call A owns the callback slot")
+        XCTAssertEqual(reportedEnds, [first.id, second.id])
+
+        manager.ring(third)
+        manager.provider(provider, perform: CXAnswerCallAction(call: third.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        XCTAssertEqual(activations, [first.id, third.id], "call C may start only after call A fully deactivates")
     }
 }
 #endif

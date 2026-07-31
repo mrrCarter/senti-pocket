@@ -1,0 +1,119 @@
+name: iOS Verify
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/ios-verify.yml"
+      - "apps/SentiPocketApp/**"
+      - "packages/PocketCall/**"
+      - "packages/PocketContracts/**"
+      - "packages/PocketDialVoice/**"
+      - "packages/PocketReasoning/**"
+      - "packages/PocketSyncClient/**"
+      - "packages/PocketUI/**"
+      - "packages/PocketVoice/**"
+  pull_request:
+    paths:
+      - ".github/workflows/ios-verify.yml"
+      - "apps/SentiPocketApp/**"
+      - "packages/PocketCall/**"
+      - "packages/PocketContracts/**"
+      - "packages/PocketDialVoice/**"
+      - "packages/PocketReasoning/**"
+      - "packages/PocketSyncClient/**"
+      - "packages/PocketUI/**"
+      - "packages/PocketVoice/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift-packages:
+    name: ${{ matrix.name }} tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: PocketCall
+            path: packages/PocketCall
+          - name: PocketVoice
+            path: packages/PocketVoice
+          - name: PocketDialVoice
+            path: packages/PocketDialVoice
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: swift --version
+      - name: Build and test package
+        run: swift test --package-path "${{ matrix.path }}"
+
+  hosted-app-tests:
+    name: Hosted app build and tests
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        working-directory: apps/SentiPocketApp
+        run: xcodegen generate
+      - name: Resolve local packages
+        run: >-
+          xcodebuild
+          -project apps/SentiPocketApp/SentiPocketApp.xcodeproj
+          -scheme SentiPocketApp
+          -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+          -resolvePackageDependencies
+      - name: Build simulator closure
+        run: >-
+          xcodebuild
+          -project apps/SentiPocketApp/SentiPocketApp.xcodeproj
+          -scheme SentiPocketApp
+          -destination 'generic/platform=iOS Simulator'
+          -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          CODE_SIGNING_ALLOWED=NO
+          build
+      - name: Select available iPhone simulator
+        id: simulator
+        shell: bash
+        run: |
+          device_id="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          payload = json.load(sys.stdin)
+          for devices in payload.get("devices", {}).values():
+              for device in devices:
+                  if device.get("isAvailable") and device.get("name", "").startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit(0)
+          raise SystemExit("no available iPhone simulator")
+          ')"
+          echo "device_id=$device_id" >> "$GITHUB_OUTPUT"
+      - name: Run hosted unit tests
+        run: >-
+          xcodebuild
+          -project apps/SentiPocketApp/SentiPocketApp.xcodeproj
+          -scheme SentiPocketApp
+          -destination 'id=${{ steps.simulator.outputs.device_id }}'
+          -only-testing:SentiPocketAppTests
+          -skip-testing:SentiPocketAppUITests
+          -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          -resultBundlePath "$RUNNER_TEMP/SentiPocketAppTests.xcresult"
+          CODE_SIGNING_ALLOWED=NO
+          test
+      - name: Upload XCTest result bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SentiPocketAppTests-xcresult
+          path: ${{ runner.temp }}/SentiPocketAppTests.xcresult
+          if-no-files-found: ignore

@@ -625,6 +625,54 @@ final class GatewayEndpointTests: XCTestCase {
         XCTAssertTrue(message.contains("session-A"))
         XCTAssertEqual(OutboxStore.load()?.proposal.targetSessionId, "session-A")
     }
+
+    @MainActor
+    func test_hangup_after_explicit_confirmation_retains_one_durable_operation() async {
+        OutboxStore.clear()
+        GatewayEndpointStubURLProtocol.reset()
+        defer {
+            OutboxStore.clear()
+            GatewayEndpointStubURLProtocol.reset()
+        }
+        let cancellation = LockedCancellationBox()
+        GatewayEndpointStubURLProtocol.respond(
+            status: 503,
+            body: Data("{\"reason\":\"temporarily busy\"}".utf8),
+            requestHook: { cancellation.cancel() }
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let viewModel = PhoneWriteViewModel(
+            sessionId: "session-A",
+            client: PocketWriteClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example"),
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { "valid-token" }
+            )
+        )
+        let adapter = PhoneWriteAdapter(viewModel)
+        await adapter.draft("This explicitly confirmed operation must survive hangup")
+
+        let callTask = Task { @MainActor in
+            await adapter.confirmAndPost()
+        }
+        cancellation.install { callTask.cancel() }
+        let result = await callTask.value
+        guard case .pending = result else {
+            return XCTFail("post-confirm hangup must report a durable pending operation, got \(result)")
+        }
+        for _ in 0..<50 {
+            if case .pending = viewModel.state { break }
+            await Task.yield()
+        }
+
+        XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 1, "the committed operation starts at most once")
+        guard case .pending = viewModel.state else {
+            return XCTFail("the transient result must settle as retryable pending")
+        }
+        XCTAssertEqual(OutboxStore.load()?.proposal.targetSessionId, "session-A",
+                       "hangup after commit must not erase the reconciliation record")
+    }
 }
 
 private final class LockedCounter: @unchecked Sendable {
@@ -663,5 +711,23 @@ private final class LockedTokenBox: @unchecked Sendable {
             storedValue = newValue
             lock.unlock()
         }
+    }
+}
+
+private final class LockedCancellationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+
+    func install(_ action: @escaping @Sendable () -> Void) {
+        lock.lock()
+        self.action = action
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        let action = self.action
+        lock.unlock()
+        action?()
     }
 }
