@@ -12,8 +12,9 @@ the three SwiftPM packages. macOS has **CryptoKit**, so every `#if canImport(Cry
 ```bash
 git clone https://github.com/mrrCarter/senti-pocket.git   # or: git -C senti-pocket pull
 cd senti-pocket
-git checkout atlas/pocket-contracts-v0.1     # verify HEAD is 7e1cfbe (or later)
-git rev-parse --short HEAD
+git switch <intended-current-branch>
+git status --short                          # must be clean for an attributable archive
+git rev-parse HEAD
 
 # Logic packages — pure SwiftPM, verify with `swift test` (local path deps resolve automatically).
 for pkg in packages/PocketContracts packages/PocketCall packages/PocketBriefing packages/PocketUI; do
@@ -35,6 +36,11 @@ done
 cd apps/SentiPocketApp && xcodegen generate && xcodebuild -scheme SentiPocketApp \
   -destination 'generic/platform=iOS Simulator' build
 ```
+
+For a signed device archive and verified `.ipa`, sign into the authorized Apple Developer account in Xcode and use
+`scripts/ios/archive_ipa.sh` from the repository root. It requires the non-secret Team ID, Release API/gateway HTTPS
+origins, and optionally an overridden bundle ID/build number; see `apps/SentiPocketApp/README.md`. A simulator build
+does not prove provisioning, APNs entitlements, archive export, or installability.
 
 ## Expected
 - **All three build clean and all tests pass** (0 failures). Coverage that MUST pass:

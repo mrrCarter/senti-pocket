@@ -58,9 +58,16 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: Senti Pocket
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        # CallKit audio remains active while a live Senti call is backgrounded; PushKit must wake the app for a
+        # genuine incoming VoIP call. These modes correspond to the app's existing AVAudioSession + PKPushRegistry.
+        UIBackgroundModes:
+          - audio
+          - voip
         # Required or iOS SIGABRTs on the first permission request (on-device Speech STT + mic barge-in/PTT).
         NSMicrophoneUsageDescription: "Senti Pocket uses the microphone so you can barge in and answer the briefing by voice."
         NSSpeechRecognitionUsageDescription: "Senti Pocket transcribes your speech on-device so you can interrupt a briefing and dictate a proposed action."
@@ -71,10 +78,19 @@ targets:
         SENTI_GATEWAY_URL: "$(SENTI_GATEWAY_URL)"
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: Sources/SentiPocketApp.entitlements
+        CODE_SIGN_STYLE: Automatic
+        CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: false
+        MARKETING_VERSION: "0.1.0"
+        PRODUCT_BUNDLE_IDENTIFIER: com.plexaura.sentipocket.app
         SWIFT_VERSION: "5.9"
+        VERSIONING_SYSTEM: apple-generic
       configs:
+        Debug:
+          APS_ENVIRONMENT: development
         Release:
+          APS_ENVIRONMENT: production
           # The signed canonical bundle is a DEBUG/preview fixture, never a Release app resource.
           EXCLUDED_SOURCE_FILE_NAMES: canonical_checkpoint.json
   # XCUITest device/sim target (Atlas-owned per Pulse #249472) — enables the DeviceUITests to run at all.
