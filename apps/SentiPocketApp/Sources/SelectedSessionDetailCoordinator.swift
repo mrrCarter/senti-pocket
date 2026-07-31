@@ -20,6 +20,24 @@ enum SelectedSessionDetailLoadState: Equatable, Sendable {
     }
 }
 
+/// Lossless identity for a visible read-only Activity destination.
+///
+/// Event navigation retains both the sequence and event id so a refreshed row cannot silently replace the
+/// destination with a different event that happens to reuse the same sequence number.
+enum SessionDetailDestination: Hashable, Identifiable {
+    case event(sequenceId: Int64, eventId: String)
+    case action(actionId: String)
+
+    var id: String {
+        switch self {
+        case .event(let sequenceId, let eventId):
+            return "event:\(sequenceId):\(eventId.utf8.count):\(eventId)"
+        case .action(let actionId):
+            return "action:\(actionId.utf8.count):\(actionId)"
+        }
+    }
+}
+
 /// Authentication-scoped owner for the selected session's read-only Activity and checkpoint projections.
 ///
 /// Cancellation is only a resource optimization. Every completion is also fenced by the immutable request identity:
@@ -32,6 +50,7 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
     @Published private(set) var checkpointState: SessionCheckpointListPresentationState?
     @Published private(set) var activityLoadState: SelectedSessionDetailLoadState = .idle
     @Published private(set) var checkpointLoadState: SelectedSessionDetailLoadState = .idle
+    @Published private(set) var destination: SessionDetailDestination?
 
     private struct RequestToken: Equatable, Sendable {
         let authenticationRevision: UInt64
@@ -147,16 +166,16 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
             refreshCheckpoints()
         case .openEvent(let sessionId, let sequenceId):
             guard sessionId == selectedSessionId,
-                  activityState?.events.contains(where: {
+                  let event = activityState?.events.first(where: {
                       $0.sessionId == sessionId && $0.sequenceId == sequenceId
-                  }) == true else { return }
-            // A validated typed no-op until the separately reviewed event-detail destination lands.
+                  }) else { return }
+            destination = .event(sequenceId: sequenceId, eventId: event.id.eventId)
         case .openAction(let sessionId, let actionId):
             guard sessionId == selectedSessionId,
                   activityState?.actions.contains(where: {
                       $0.sessionId == sessionId && $0.id.actionId == actionId
                   }) == true else { return }
-            // A validated typed no-op until the separately reviewed action-detail destination lands.
+            destination = .action(actionId: actionId)
         case .openCheckpoint(let sessionId, let checkpointId):
             guard sessionId == selectedSessionId,
                   checkpointState?.rows.contains(where: {
@@ -166,6 +185,20 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
         default:
             break
         }
+    }
+
+    func clearDestination() {
+        destination = nil
+    }
+
+    func event(sequenceId: Int64, eventId: String) -> SessionEventRowPresentation? {
+        activityState?.events.first {
+            $0.sequenceId == sequenceId && $0.id.eventId == eventId
+        }
+    }
+
+    func action(actionId: String) -> SessionActionRowPresentation? {
+        activityState?.actions.first { $0.id.actionId == actionId }
     }
 
     @discardableResult
@@ -308,6 +341,7 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
         activitySnapshot = snapshot
         activityProvenance = provenance
         activityState = projected
+        reconcileDestination()
         activityLoadState = .loaded
         activityOperation = nil
     }
@@ -397,6 +431,7 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
                 activityState = nil
                 activityLoadState = .failed(noSnapshotFailure)
             }
+            reconcileDestination()
             activityOperation = nil
 
         case .checkpoints:
@@ -436,6 +471,7 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
                 activityState = nil
                 activityLoadState = .idle
             }
+            reconcileDestination()
             activityOperation = nil
 
         case .checkpoints:
@@ -502,6 +538,21 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
         checkpointProvenance = .unavailable
         activityState = nil
         checkpointState = nil
+        destination = nil
+    }
+
+    private func reconcileDestination() {
+        guard let destination else { return }
+        switch destination {
+        case .event(let sequenceId, let eventId):
+            if event(sequenceId: sequenceId, eventId: eventId) == nil {
+                self.destination = nil
+            }
+        case .action(let actionId):
+            if action(actionId: actionId) == nil {
+                self.destination = nil
+            }
+        }
     }
 
     private func renderActivity(

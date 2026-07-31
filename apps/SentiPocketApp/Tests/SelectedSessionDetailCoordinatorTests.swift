@@ -134,6 +134,79 @@ final class SelectedSessionDetailCoordinatorTests: XCTestCase {
         }
     }
 
+    func test_activity_navigation_accepts_only_exact_visible_rows_and_clears_with_selection() async throws {
+        let transport = ControlledSessionDetailTransport()
+        let coordinator = SelectedSessionDetailCoordinator(transport: transport)
+
+        let operation = try XCTUnwrap(coordinator.setSelectedSession(
+            "room-1",
+            authenticationRevision: 1
+        ))
+        try await waitForRequests(transport, events: 1, actions: 1, checkpoints: 1)
+        await transport.resumeNextEvent(.success(try eventPage(sessionId: "room-1", marker: "visible")))
+        await transport.resumeNextAction(.success(try actionPage(sessionId: "room-1", marker: "visible")))
+        await transport.resumeNextCheckpoint(.success(try checkpointPage(
+            sessionId: "room-1",
+            marker: "visible"
+        )))
+        await operation.value
+
+        coordinator.send(.openEvent(sessionId: "other-room", sequenceId: 1))
+        coordinator.send(.openEvent(sessionId: "room-1", sequenceId: 999))
+        coordinator.send(.openAction(sessionId: "room-1", actionId: "forged"))
+        XCTAssertNil(coordinator.destination)
+
+        coordinator.send(.openEvent(sessionId: "room-1", sequenceId: 1))
+        XCTAssertEqual(
+            coordinator.destination,
+            .event(sequenceId: 1, eventId: "event-visible")
+        )
+        XCTAssertEqual(
+            coordinator.event(sequenceId: 1, eventId: "event-visible")?.id.eventId,
+            "event-visible"
+        )
+        XCTAssertNil(coordinator.event(sequenceId: 1, eventId: "event-forged"))
+
+        coordinator.clearDestination()
+        coordinator.send(.openAction(sessionId: "room-1", actionId: "action-visible"))
+        XCTAssertEqual(coordinator.destination, .action(actionId: "action-visible"))
+        XCTAssertEqual(coordinator.action(actionId: "action-visible")?.id.actionId, "action-visible")
+
+        coordinator.clearSelection()
+        XCTAssertNil(coordinator.destination)
+    }
+
+    func test_successful_activity_revision_clears_destination_when_exact_event_identity_changes() async throws {
+        let transport = ControlledSessionDetailTransport()
+        let coordinator = SelectedSessionDetailCoordinator(transport: transport)
+
+        let initial = try XCTUnwrap(coordinator.setSelectedSession(
+            "room-1",
+            authenticationRevision: 1
+        ))
+        try await waitForRequests(transport, events: 1, actions: 1, checkpoints: 1)
+        await transport.resumeNextEvent(.success(try eventPage(sessionId: "room-1", marker: "first")))
+        await transport.resumeNextAction(.success(try actionPage(sessionId: "room-1", marker: "first")))
+        await transport.resumeNextCheckpoint(.success(try checkpointPage(
+            sessionId: "room-1",
+            marker: "first"
+        )))
+        await initial.value
+
+        coordinator.send(.openEvent(sessionId: "room-1", sequenceId: 1))
+        XCTAssertEqual(coordinator.destination, .event(sequenceId: 1, eventId: "event-first"))
+
+        let refresh = try XCTUnwrap(coordinator.refreshActivity())
+        try await waitForRequests(transport, events: 2, actions: 2, checkpoints: 1)
+        XCTAssertEqual(coordinator.destination, .event(sequenceId: 1, eventId: "event-first"))
+        await transport.resumeNextEvent(.success(try eventPage(sessionId: "room-1", marker: "second")))
+        await transport.resumeNextAction(.success(try actionPage(sessionId: "room-1", marker: "second")))
+        await refresh.value
+
+        XCTAssertNil(coordinator.destination)
+        XCTAssertEqual(coordinator.activityState?.events.first?.id.eventId, "event-second")
+    }
+
     func test_completion_after_selection_revocation_publishes_nothing() async throws {
         let transport = ControlledSessionDetailTransport()
         let reauthentication = DetailCallbackProbe()
@@ -293,6 +366,9 @@ final class SelectedSessionDetailCoordinatorTests: XCTestCase {
         )))
         await initial.value
 
+        coordinator.send(.openEvent(sessionId: "room-1", sequenceId: 1))
+        XCTAssertEqual(coordinator.destination, .event(sequenceId: 1, eventId: "event-initial"))
+
         let refresh = try XCTUnwrap(coordinator.refresh())
         try await waitForRequests(transport, events: 2, actions: 2, checkpoints: 2)
         await transport.resumeNextEvent(.failure(.network))
@@ -302,6 +378,7 @@ final class SelectedSessionDetailCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(coordinator.activityState?.events.map(\.id.eventId), ["event-initial"])
         XCTAssertEqual(coordinator.checkpointState?.rows.map(\.checkpointId), ["checkpoint-initial"])
+        XCTAssertEqual(coordinator.destination, .event(sequenceId: 1, eventId: "event-initial"))
         XCTAssertEqual(coordinator.activityState?.failure, .network)
         XCTAssertEqual(coordinator.checkpointState?.failure, .service)
         guard case .some(.cache) = coordinator.activityState?.provenance else {

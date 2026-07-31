@@ -163,11 +163,13 @@ public struct SessionActivityPresentationState: Equatable, Sendable {
         let actionSessionsMatch = actionPage.sessionId == sessionId
             && actionPage.actions.allSatisfy { $0.sessionId == sessionId }
         let eventIDs = eventPage.events.map(\.id)
+        let eventSequences = eventPage.events.map(\.sequenceId)
         let actionIDs = actionPage.actions.map(\.id)
         let identitiesAreValid = sessionId.pocketNonblank != nil
             && eventIDs.allSatisfy { $0.pocketNonblank != nil }
             && actionIDs.allSatisfy { $0.pocketNonblank != nil }
             && Set(eventIDs).count == eventIDs.count
+            && Set(eventSequences).count == eventSequences.count
             && Set(actionIDs).count == actionIDs.count
         let sourceAllowsContent: Bool
         if case .unavailable = provenance {
@@ -251,6 +253,9 @@ public struct SessionActionRowPresentation: Equatable, Identifiable, Sendable {
     }
 
     public var actionTypeLabel: String { actionType.pocketTokenLabel }
+    public var targetLabel: String {
+        targetSequenceId == 0 ? "Session-level" : "Target #\(targetSequenceId)"
+    }
 }
 
 private extension Optional where Wrapped == String {

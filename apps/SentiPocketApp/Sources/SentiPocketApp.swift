@@ -278,29 +278,68 @@ private struct SelectedSessionActivityBoundary: View {
     @ViewBuilder
     var body: some View {
         NavigationStack {
-            if sessions.selectedSessionId == nil {
-                StatusView(
-                    title: "Choose a session",
-                    systemImage: "waveform.path.ecg",
-                    message: "Select an authorized session before loading its activity or room checkpoints."
-                )
-                .navigationTitle("Activity")
-            } else {
-                activityContent
-                    .toolbar {
-                        ToolbarItem(placement: .navigationBarTrailing) {
-                            NavigationLink {
-                                checkpointContent
-                            } label: {
-                                Label("Room checkpoints", systemImage: "tray.full")
-                                    .labelStyle(.iconOnly)
+            Group {
+                if sessions.selectedSessionId == nil {
+                    StatusView(
+                        title: "Choose a session",
+                        systemImage: "waveform.path.ecg",
+                        message: "Select an authorized session before loading its activity or room checkpoints."
+                    )
+                    .navigationTitle("Activity")
+                } else {
+                    activityContent
+                        .toolbar {
+                            ToolbarItem(placement: .navigationBarTrailing) {
+                                NavigationLink {
+                                    checkpointContent
+                                } label: {
+                                    Label("Room checkpoints", systemImage: "tray.full")
+                                        .labelStyle(.iconOnly)
+                                }
+                                .accessibilityLabel("Room checkpoints")
                             }
-                            .accessibilityLabel("Room checkpoints")
                         }
-                    }
+                }
+            }
+            .navigationDestination(isPresented: destinationIsPresented) {
+                if let destination = details.destination {
+                    destinationView(destination)
+                }
             }
         }
         .id(sessions.selectedSessionId)
+    }
+
+    /// Item-based navigation destinations require iOS 17; Pocket's floor remains iOS 16.
+    private var destinationIsPresented: Binding<Bool> {
+        Binding(
+            get: { details.destination != nil },
+            set: { isPresented in
+                if !isPresented {
+                    details.clearDestination()
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func destinationView(_ destination: SessionDetailDestination) -> some View {
+        switch destination {
+        case .event(let sequenceId, let eventId):
+            if let event = details.event(sequenceId: sequenceId, eventId: eventId) {
+                SessionEventDetailView(
+                    event: event,
+                    provenance: details.activityState?.provenance ?? .unavailable
+                )
+            }
+        case .action(let actionId):
+            if let action = details.action(actionId: actionId) {
+                SessionActionDetailView(
+                    action: action,
+                    provenance: details.activityState?.provenance ?? .unavailable
+                )
+            }
+        }
     }
 
     @ViewBuilder

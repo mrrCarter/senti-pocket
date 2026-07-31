@@ -94,7 +94,29 @@ final class SessionPresentationTests: XCTestCase {
         XCTAssertEqual(state.events.first?.text, "hello")
         XCTAssertEqual(state.actions.first?.id.actionId, "act-1")
         XCTAssertEqual(state.actions.first?.targetSequenceId, 230141)
+        XCTAssertEqual(state.actions.first?.targetLabel, "Target #230141")
         XCTAssertEqual(state.actions.first?.actionType, "ack")
+    }
+
+    func testSessionLevelActionDoesNotManufactureEventZeroTarget() throws {
+        let events = try decode(SessionEventForwardPage.self, #"{"events":[]}"#)
+        let actions = try decode(SessionActionPage.self, """
+        {"sessionId":"room-1","count":1,"projection":{},"actions":[{"id":"act-session",
+        "sessionId":"room-1","targetSequenceId":0,"targetCursor":null,"targetActionId":null,
+        "actionType":"working_on","actorKind":"agent","actorId":"relay","actorUserId":null,
+        "actorRole":null,"note":null,"metadata":{},"idempotencyKey":"idem-session",
+        "createdAt":"2026-07-18T10:36:00Z"}]}
+        """)
+
+        let state = SessionActivityPresentationState(
+            sessionId: "room-1",
+            eventPage: events,
+            actionPage: actions,
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertEqual(state.actions.first?.targetSequenceId, 0)
+        XCTAssertEqual(state.actions.first?.targetLabel, "Session-level")
     }
 
     func testCrossSessionActivityFailsClosedWithoutLeakingRows() throws {
@@ -103,6 +125,32 @@ final class SessionPresentationTests: XCTestCase {
         "agentModel":"","payload":{"text":"private"},"ts":"2026-07-18T10:35:00Z",
         "timestamp":"2026-07-18T10:35:00Z","cursor":"c1","sequenceId":7,
         "sessionId":"different-room","source":null}]}
+        """)
+        let actions = try decode(SessionActionPage.self, """
+        {"sessionId":"room-1","count":0,"projection":{},"actions":[]}
+        """)
+
+        let state = SessionActivityPresentationState(
+            sessionId: "room-1",
+            eventPage: events,
+            actionPage: actions,
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertEqual(state.failure, .invalidData)
+        XCTAssertTrue(state.events.isEmpty)
+        XCTAssertTrue(state.actions.isEmpty)
+    }
+
+    func testDuplicateEventSequenceFailsClosedBeforeIntentRouting() throws {
+        let events = try decode(SessionEventForwardPage.self, """
+        {"events":[{"id":"ev-1","event":"session_message","agent":{},"agentId":"relay",
+        "agentModel":"","payload":{"text":"first"},"ts":"2026-07-18T10:35:00Z",
+        "timestamp":"2026-07-18T10:35:00Z","cursor":"c1","sequenceId":7,
+        "sessionId":"room-1","source":null},{"id":"ev-2","event":"session_message","agent":{},
+        "agentId":"relay","agentModel":"","payload":{"text":"ambiguous"},
+        "ts":"2026-07-18T10:36:00Z","timestamp":"2026-07-18T10:36:00Z","cursor":"c2",
+        "sequenceId":7,"sessionId":"room-1","source":null}]}
         """)
         let actions = try decode(SessionActionPage.self, """
         {"sessionId":"room-1","count":0,"projection":{},"actions":[]}
