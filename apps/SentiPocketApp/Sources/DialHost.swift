@@ -25,6 +25,8 @@ final class DialHost: ObservableObject {
     private let coordinator: DialCoordinator?
     private let registrationClient: DeviceRingRegistrationClient?
     private let selectionGate: DialSessionSelectionGate
+    private let bindingGate: DeviceRingBindingGate
+    private let installation: DeviceRingInstallationController
     private let authenticationExpiry: AuthenticationExpiryRelay
     private var registrar: DeviceRingRegistrar?
     private var selectedSessionId: String?
@@ -36,8 +38,12 @@ final class DialHost: ObservableObject {
 
     init(gatewayURL: URL? = DialHost.gatewayURL()) {
         let selectionGate = DialSessionSelectionGate()
+        let installation = DeviceRingInstallationController.live
+        let bindingGate = DeviceRingBindingGate(initialBinding: installation.loadCurrentBinding())
         let authenticationExpiry = AuthenticationExpiryRelay()
         self.selectionGate = selectionGate
+        self.installation = installation
+        self.bindingGate = bindingGate
         self.authenticationExpiry = authenticationExpiry
         guard let gatewayURL else {
             // The default/unconfigured build does not start PushKit token acquisition or construct any gateway client.
@@ -56,20 +62,34 @@ final class DialHost: ObservableObject {
         )
         let selectedHydrator = SelectedSessionDialHydrator(
             selectionGate: selectionGate,
+            isBindingAuthorized: { core in
+                DialDeviceAuthorization.permitsBinding(
+                    core,
+                    bindingGate: bindingGate
+                )
+            },
             hydrate: dialClient.hydrate
         )
         let coord = DialCoordinator(
             hydrate: selectedHydrator.hydrate,
             runDial: { ring in
-                guard selectionGate.permits(ring.core.sessionId) else {
-                    return .declined("the selected session changed before the dial could run")
+                guard DialDeviceAuthorization.permits(
+                    ring.core,
+                    selectionGate: selectionGate,
+                    bindingGate: bindingGate
+                ) else {
+                    return .declined("the selected session or device binding changed before the dial could run")
                 }
                 return await DialHost.run(
                     ring,
                     gatewayURL: gatewayURL,
                     onReauthenticationRequired: { authenticationExpiry.signal(expectedToken: $0) },
                     isWriteAuthorized: {
-                        selectionGate.permits(ring.core.sessionId)
+                        DialDeviceAuthorization.permits(
+                            ring.core,
+                            selectionGate: selectionGate,
+                            bindingGate: bindingGate
+                        )
                     }
                 )
             },
@@ -83,8 +103,12 @@ final class DialHost: ObservableObject {
             onReauthenticationRequired: { authenticationExpiry.signal(expectedToken: $0) }
         )
         self.registrar = nil
-        cm.isIncomingSessionAuthorized = { sessionId in
-            selectionGate.permits(sessionId)
+        cm.isIncomingDialAuthorized = { core in
+            DialDeviceAuthorization.permits(
+                core,
+                selectionGate: selectionGate,
+                bindingGate: bindingGate
+            )
         }
         // Adapter 1 — store the state decoded at push-receive (governed content fetched on answer).
         cm.onDialReceived = { coord.received($0, dialId: $1) }
@@ -99,6 +123,9 @@ final class DialHost: ObservableObject {
         // exact target and constructs that target's registrar.
         cm.onVoipToken = { [weak self] token in
             self?.voipTokenUpdated(token)
+        }
+        cm.onVoipTokenInvalidated = { [weak self] in
+            self?.voipTokenInvalidated()
         }
     }
 
@@ -122,7 +149,12 @@ final class DialHost: ObservableObject {
     func onAuthenticationInvalidated() {
         authenticated = false
         callManager?.revokeAllCalls()
+        let hadRegistrar = registrar != nil
         selectSession(nil)
+        if !hadRegistrar {
+            _ = try? installation.beginRevocation(installation.loadCurrentBinding())
+        }
+        bindingGate.replace(with: nil)
     }
 
     /// Bind PushKit registration and dial hydration to the exact session selected from SessionListCoordinator's
@@ -153,6 +185,18 @@ final class DialHost: ObservableObject {
             sessionId: sessionId,
             isLoggedIn: { [weak self] in
                 self?.authenticated == true && SessionTokenStore.load() != nil
+            },
+            installation: installation,
+            onBindingChanged: { [weak self] binding in
+                guard let self else { return }
+                self.bindingGate.replace(with: binding)
+                if binding == nil {
+                    self.callManager?.revokeAllCalls()
+                    self.activeDialTask?.cancel()
+                    self.activeDialTask = nil
+                    self.activeCallUUID = nil
+                    self.dialRevision &+= 1
+                }
             }
         )
         self.registrar = registrar
@@ -164,6 +208,16 @@ final class DialHost: ObservableObject {
     private func voipTokenUpdated(_ token: String) {
         latestVoipToken = token
         _ = registrar?.tokenUpdated(token)
+    }
+
+    private func voipTokenInvalidated() {
+        latestVoipToken = nil
+        if let registrar {
+            _ = registrar.tokenInvalidated()
+        } else {
+            _ = try? installation.beginRevocation(installation.loadCurrentBinding())
+            bindingGate.replace(with: nil)
+        }
     }
 
     private func answer(dialId: String, callUUID: UUID) {
@@ -245,36 +299,68 @@ enum DialHostError: LocalizedError {
     }
 }
 
+/// One reusable authorization expression for receive, post-hydration run, and every governed-write recheck. Keeping
+/// selection and the exact Registry V2 proof composed prevents a same-session principal/binding ABA from reviving an
+/// answered flow that was authorized under an older bearer.
+enum DialDeviceAuthorization {
+    static func permits(
+        _ core: RingCore,
+        selectionGate: DialSessionSelectionGate,
+        bindingGate: DeviceRingBindingGate
+    ) -> Bool {
+        selectionGate.permits(core.sessionId) &&
+        permitsBinding(core, bindingGate: bindingGate)
+    }
+
+    static func permitsBinding(
+        _ core: RingCore,
+        bindingGate: DeviceRingBindingGate
+    ) -> Bool {
+        bindingGate.permits(
+            sessionId: core.sessionId,
+            bindingVersion: core.bindingVersion,
+            bindingId: core.bindingId,
+            bindingRevision: core.bindingRevision,
+            installationGeneration: core.installationGeneration
+        )
+    }
+}
+
 /// Reject an unselected push before the authenticated GET, then recheck after await to close selection TOCTOU.
 @MainActor
 final class SelectedSessionDialHydrator {
     private let selectionGate: DialSessionSelectionGate
+    private let isBindingAuthorized: @MainActor (RingCore) -> Bool
     private let hydrateState: @MainActor (DialReceiveState) async throws -> RenderableRing
 
     init(
         selectionGate: DialSessionSelectionGate,
+        isBindingAuthorized: @escaping @MainActor (RingCore) -> Bool = { _ in true },
         hydrate: @escaping @MainActor (DialReceiveState) async throws -> RenderableRing
     ) {
         self.selectionGate = selectionGate
+        self.isBindingAuthorized = isBindingAuthorized
         self.hydrateState = hydrate
     }
 
     func hydrate(_ state: DialReceiveState) async throws -> RenderableRing {
-        let incomingSessionId: String
+        let incomingCore: RingCore
         switch state {
         case .renderable(let ring):
-            incomingSessionId = ring.core.sessionId
+            incomingCore = ring.core
         case .needsHydration(_, let core):
-            incomingSessionId = core.sessionId
+            incomingCore = core
         case .rejected:
             throw DialHostError.sessionNotSelected
         }
-        guard selectionGate.permits(incomingSessionId) else {
+        guard selectionGate.permits(incomingCore.sessionId),
+              isBindingAuthorized(incomingCore) else {
             throw DialHostError.sessionNotSelected
         }
 
         let ring = try await hydrateState(state)
-        guard selectionGate.permits(ring.core.sessionId) else {
+        guard selectionGate.permits(ring.core.sessionId),
+              isBindingAuthorized(ring.core) else {
             throw DialHostError.sessionNotSelected
         }
         return ring

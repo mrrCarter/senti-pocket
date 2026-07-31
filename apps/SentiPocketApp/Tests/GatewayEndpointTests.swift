@@ -250,6 +250,48 @@ final class GatewayEndpointTests: XCTestCase {
 
         XCTAssertEqual(hydrationCalls, 0, "an old/unselected push must initiate zero authenticated hydration calls")
     }
+
+    @MainActor
+    func test_binding_revision_is_rechecked_after_hydration_to_close_answer_toctou() async {
+        let gate = DialSessionSelectionGate()
+        gate.select("session-A")
+        var bindingIsCurrent = true
+        let core = RingCore(
+            id: "dial-A",
+            kind: "go",
+            priority: "high",
+            callerName: "Senti",
+            sessionId: "session-A",
+            checkpointId: nil,
+            bindingVersion: 2,
+            bindingId: String(repeating: "i", count: 24),
+            bindingRevision: String(repeating: "r", count: 32),
+            installationGeneration: "1"
+        )
+        let hydrator = SelectedSessionDialHydrator(
+            selectionGate: gate,
+            isBindingAuthorized: { _ in bindingIsCurrent },
+            hydrate: { _ in
+                bindingIsCurrent = false
+                return RenderableRing(
+                    core: core,
+                    message: "must not run after rebind",
+                    options: [],
+                    evidenceSeqs: [],
+                    confidence: nil
+                )
+            }
+        )
+
+        do {
+            _ = try await hydrator.hydrate(.needsHydration(id: core.id, core: core))
+            XCTFail("a binding replaced during hydration must fail before the governed flow")
+        } catch DialHostError.sessionNotSelected {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
     #endif
 
     @MainActor
@@ -467,6 +509,88 @@ final class GatewayEndpointTests: XCTestCase {
         XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 0)
         XCTAssertNil(OutboxStore.load(), "revoked voice confirmation must queue nothing")
     }
+
+    #if canImport(CallKit) && canImport(PushKit)
+    @MainActor
+    func test_same_session_binding_aba_cannot_revive_a_hydrated_write() async {
+        OutboxStore.clear()
+        GatewayEndpointStubURLProtocol.reset()
+        defer {
+            OutboxStore.clear()
+            GatewayEndpointStubURLProtocol.reset()
+        }
+        let sessionId = "session-A"
+        let bindingA = DeviceRingBinding(
+            registryVersion: 2,
+            sessionId: sessionId,
+            tokenFingerprint: DeviceRingTokenFingerprint.make("token-A"),
+            installationGeneration: "1",
+            bindingId: String(repeating: "a", count: 24),
+            bindingRevision: String(repeating: "r", count: 32),
+            leaseExpiresAtSec: Int64.max
+        )
+        let bindingB = DeviceRingBinding(
+            registryVersion: 2,
+            sessionId: sessionId,
+            tokenFingerprint: DeviceRingTokenFingerprint.make("token-B"),
+            installationGeneration: "2",
+            bindingId: String(repeating: "b", count: 24),
+            bindingRevision: String(repeating: "s", count: 32),
+            leaseExpiresAtSec: Int64.max
+        )
+        let hydratedCoreA = RingCore(
+            id: "dial-A",
+            kind: "go",
+            priority: "high",
+            callerName: "Senti",
+            sessionId: sessionId,
+            checkpointId: nil,
+            bindingVersion: 2,
+            bindingId: bindingA.bindingId,
+            bindingRevision: bindingA.bindingRevision,
+            installationGeneration: bindingA.installationGeneration
+        )
+        let selectionGate = DialSessionSelectionGate()
+        selectionGate.select(sessionId)
+        let bindingGate = DeviceRingBindingGate(initialBinding: bindingA)
+        let isWriteAuthorized: @MainActor () -> Bool = {
+            DialDeviceAuthorization.permits(
+                hydratedCoreA,
+                selectionGate: selectionGate,
+                bindingGate: bindingGate
+            )
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let viewModel = PhoneWriteViewModel(
+            sessionId: sessionId,
+            client: PocketWriteClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example"),
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { "principal-B-token" }
+            ),
+            isWriteAuthorized: isWriteAuthorized
+        )
+        let adapter = PhoneWriteAdapter(viewModel, isWriteAuthorized: isWriteAuthorized)
+        await adapter.draft("Do not let principal B post principal A's hydrated answer")
+        guard case .confirming = viewModel.state else {
+            return XCTFail("precondition: binding A should authorize the hydrated draft")
+        }
+
+        selectionGate.select(nil)
+        bindingGate.replace(with: nil)
+        selectionGate.select(sessionId)
+        bindingGate.replace(with: bindingB)
+        let result = await adapter.confirmAndPost()
+
+        guard case .refused(let reason) = result else {
+            return XCTFail("same-session binding ABA must refuse the old hydrated flow")
+        }
+        XCTAssertTrue(reason.contains("changed"))
+        XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 0)
+        XCTAssertNil(OutboxStore.load(), "principal A's intent must not enter principal B's outbox")
+    }
+    #endif
 
     @MainActor
     func test_revocation_between_confirm_and_send_task_starts_no_request() async {

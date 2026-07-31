@@ -63,6 +63,7 @@ require_https_origin "SENTI_GATEWAY_URL" "$GATEWAY_URL"
 require_command xcodebuild
 require_command xcodegen
 require_command codesign
+require_command security
 require_command ditto
 require_command plutil
 require_command shasum
@@ -89,9 +90,19 @@ fi
 case "$EXPORT_METHOD" in
   debugging|development)
     REQUIRED_APS_ENVIRONMENT="development"
+    REQUIRED_PROFILE_CLASS="development"
     ;;
-  release-testing|ad-hoc|app-store-connect|app-store|enterprise)
+  release-testing|ad-hoc)
     REQUIRED_APS_ENVIRONMENT="production"
+    REQUIRED_PROFILE_CLASS="ad-hoc"
+    ;;
+  app-store-connect|app-store)
+    REQUIRED_APS_ENVIRONMENT="production"
+    REQUIRED_PROFILE_CLASS="app-store"
+    ;;
+  enterprise)
+    REQUIRED_APS_ENVIRONMENT="production"
+    REQUIRED_PROFILE_CLASS="enterprise"
     ;;
   *)
     fail "unsupported iOS IPA export method: $EXPORT_METHOD"
@@ -213,9 +224,78 @@ SIGNED_GATEWAY_URL="$(/usr/libexec/PlistBuddy -c 'Print :SENTI_GATEWAY_URL' "$AP
 SIGNED_ENTITLEMENTS="$RUN_DIR/signed-entitlements.plist"
 codesign -d --entitlements :- "$APP_PATH" >"$SIGNED_ENTITLEMENTS" 2>/dev/null
 plutil -lint "$SIGNED_ENTITLEMENTS" >/dev/null
+SIGNED_TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$SIGNED_ENTITLEMENTS")"
+[[ "$SIGNED_TEAM_ID" == "$TEAM_ID" ]] \
+  || fail "signed developer team is $SIGNED_TEAM_ID, expected $TEAM_ID"
+SIGNED_APPLICATION_ID="$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$SIGNED_ENTITLEMENTS")"
+# Older Developer Program memberships can have an App ID prefix (bundle seed ID) distinct from the Team ID.
+# The explicit team entitlement above is authoritative; the application identifier must still bind this bundle ID.
+[[ "$SIGNED_APPLICATION_ID" == *".$BUNDLE_ID" ]] \
+  || fail "signed application identifier is $SIGNED_APPLICATION_ID and does not bind bundle id $BUNDLE_ID"
 SIGNED_APS_ENVIRONMENT="$(/usr/libexec/PlistBuddy -c 'Print :aps-environment' "$SIGNED_ENTITLEMENTS")"
 [[ "$SIGNED_APS_ENVIRONMENT" == "$APS_ENVIRONMENT" ]] \
   || fail "signed aps-environment is $SIGNED_APS_ENVIRONMENT, expected $APS_ENVIRONMENT"
+
+# The exported IPA must carry an Apple-signed provisioning profile that independently authorizes this exact app,
+# team, capability set, and distribution channel. Code-sign entitlements alone do not prove device/channel eligibility.
+EMBEDDED_PROFILE="$APP_PATH/embedded.mobileprovision"
+[[ -f "$EMBEDDED_PROFILE" ]] || fail "exported app is missing embedded.mobileprovision"
+PROFILE_PLIST="$RUN_DIR/embedded-profile.plist"
+security cms -D -i "$EMBEDDED_PROFILE" -o "$PROFILE_PLIST" \
+  || fail "embedded provisioning profile failed CMS signature/decode validation"
+plutil -lint "$PROFILE_PLIST" >/dev/null
+
+PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")"
+[[ -n "$PROFILE_UUID" ]] || fail "embedded provisioning profile has no UUID"
+PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")"
+[[ -n "$PROFILE_NAME" ]] || fail "embedded provisioning profile has no name"
+PROFILE_EXPIRATION="$(plutil -extract ExpirationDate raw -o - "$PROFILE_PLIST")"
+PROFILE_EXPIRATION_EPOCH="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$PROFILE_EXPIRATION" '+%s' 2>/dev/null)" \
+  || fail "embedded provisioning profile has an unparseable ExpirationDate: $PROFILE_EXPIRATION"
+(( PROFILE_EXPIRATION_EPOCH > $(date -u '+%s') )) \
+  || fail "embedded provisioning profile expired at $PROFILE_EXPIRATION"
+
+PROFILE_TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")"
+[[ "$PROFILE_TEAM_ID" == "$TEAM_ID" ]] \
+  || fail "provisioning profile team is $PROFILE_TEAM_ID, expected $TEAM_ID"
+PROFILE_ENTITLEMENT_TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$PROFILE_PLIST")"
+[[ "$PROFILE_ENTITLEMENT_TEAM_ID" == "$TEAM_ID" ]] \
+  || fail "provisioning profile entitlement team is $PROFILE_ENTITLEMENT_TEAM_ID, expected $TEAM_ID"
+PROFILE_APPLICATION_ID="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")"
+[[ "$PROFILE_APPLICATION_ID" == "$SIGNED_APPLICATION_ID" ]] \
+  || fail "provisioning profile application identifier does not match the signed app"
+PROFILE_APS_ENVIRONMENT="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:aps-environment' "$PROFILE_PLIST")"
+[[ "$PROFILE_APS_ENVIRONMENT" == "$SIGNED_APS_ENVIRONMENT" ]] \
+  || fail "provisioning profile APNs environment does not match the signed app"
+
+PROFILE_GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$PROFILE_PLIST" 2>/dev/null || printf 'false')"
+SIGNED_GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :get-task-allow' "$SIGNED_ENTITLEMENTS" 2>/dev/null || printf 'false')"
+[[ "$PROFILE_GET_TASK_ALLOW" == "$SIGNED_GET_TASK_ALLOW" ]] \
+  || fail "signed get-task-allow does not match the provisioning profile"
+PROFILE_HAS_DEVICES=false
+if /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices:0' "$PROFILE_PLIST" >/dev/null 2>&1; then
+  PROFILE_HAS_DEVICES=true
+fi
+PROFILE_ALL_DEVICES="$(/usr/libexec/PlistBuddy -c 'Print :ProvisionsAllDevices' "$PROFILE_PLIST" 2>/dev/null || printf 'false')"
+
+case "$REQUIRED_PROFILE_CLASS" in
+  development)
+    [[ "$PROFILE_GET_TASK_ALLOW" == "true" && "$PROFILE_HAS_DEVICES" == "true" && "$PROFILE_ALL_DEVICES" != "true" ]] \
+      || fail "debugging/development export did not contain a device-bound development profile"
+    ;;
+  ad-hoc)
+    [[ "$PROFILE_GET_TASK_ALLOW" != "true" && "$PROFILE_HAS_DEVICES" == "true" && "$PROFILE_ALL_DEVICES" != "true" ]] \
+      || fail "release-testing/ad-hoc export did not contain a device-bound distribution profile"
+    ;;
+  app-store)
+    [[ "$PROFILE_GET_TASK_ALLOW" != "true" && "$PROFILE_HAS_DEVICES" == "false" && "$PROFILE_ALL_DEVICES" != "true" ]] \
+      || fail "App Store Connect export did not contain a non-device-bound distribution profile"
+    ;;
+  enterprise)
+    [[ "$PROFILE_GET_TASK_ALLOW" != "true" && "$PROFILE_ALL_DEVICES" == "true" ]] \
+      || fail "enterprise export did not contain an all-devices distribution profile"
+    ;;
+esac
 
 BACKGROUND_MODES="$(/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' "$APP_PATH/Info.plist")"
 grep -q 'audio' <<<"$BACKGROUND_MODES" || fail "signed app is missing UIBackgroundModes audio"
@@ -227,6 +307,18 @@ MANIFEST_PATH="$RUN_DIR/IPA_MANIFEST.txt"
   printf 'source_sha=%s\n' "$SOURCE_SHA"
   printf 'source_tree=%s\n' "$SOURCE_TREE"
   printf 'bundle_id=%s\n' "$SIGNED_BUNDLE_ID"
+  printf 'developer_team_id=%s\n' "$SIGNED_TEAM_ID"
+  printf 'application_identifier=%s\n' "$SIGNED_APPLICATION_ID"
+  printf 'provisioning_profile_verified=true\n'
+  printf 'provisioning_profile_uuid=%s\n' "$PROFILE_UUID"
+  printf 'provisioning_profile_name=%s\n' "$PROFILE_NAME"
+  printf 'provisioning_profile_expiration=%s\n' "$PROFILE_EXPIRATION"
+  printf 'provisioning_profile_team_id=%s\n' "$PROFILE_TEAM_ID"
+  printf 'provisioning_profile_application_identifier=%s\n' "$PROFILE_APPLICATION_ID"
+  printf 'provisioning_profile_aps_environment=%s\n' "$PROFILE_APS_ENVIRONMENT"
+  printf 'provisioning_profile_class=%s\n' "$REQUIRED_PROFILE_CLASS"
+  printf 'provisioning_profile_has_devices=%s\n' "$PROFILE_HAS_DEVICES"
+  printf 'provisioning_profile_all_devices=%s\n' "$PROFILE_ALL_DEVICES"
   printf 'marketing_version=%s\n' "$SIGNED_MARKETING_VERSION"
   printf 'build_number=%s\n' "$SIGNED_BUILD_NUMBER"
   printf 'release_origins_verified=true\n'

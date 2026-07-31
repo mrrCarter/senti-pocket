@@ -42,6 +42,8 @@ public final class SentiCallManager: NSObject {
     /// The device VoIP push token (lowercase hex). Send it to the gateway's /dial registry so a ring can target THIS
     /// device — bound at authenticated login → the outbound-binding substrate for warden's consent gate.
     public var onVoipToken: ((String) -> Void)?
+    /// PushKit invalidated the current token. Revoke the accepted binding immediately; a later didUpdate registers anew.
+    public var onVoipTokenInvalidated: (() -> Void)?
     /// The human ANSWERED the ring → begin the briefing/converse flow (wire to PocketCallMachine `.answered`).
     public var onAnswered: ((IncomingDecisionCall) -> Void)?
     /// A VoIP push ARRIVED → the LEAN/RICH `DialReceiveState` decoded from it (+ relay's dialId), fired at RECEIVE so
@@ -49,9 +51,9 @@ public final class SentiCallManager: NSObject {
     /// NEVER carried here — this only surfaces the ring shape + the dialId. Decoded via the KAV-locked DialReceive.receive.
     /// (internal, not public: DialReceiveState is app-internal; the DialHost consumer is in-module.)
     var onDialReceived: ((DialReceiveState, String) -> Void)?
-    /// Receive-time privacy gate installed by DialHost. Durable server registrations can outlive a local selection,
-    /// so push metadata is exposed and retained only for the exact currently selected authorized session.
-    var isIncomingSessionAuthorized: ((String) -> Bool)?
+    /// Receive-time privacy gate installed by DialHost. Durable server registrations can outlive a local selection or
+    /// principal, so metadata is exposed only for the exact selected session AND current Registry V2 binding proof.
+    var isIncomingDialAuthorized: ((RingCore) -> Bool)?
     /// The call ended / was declined → tear down (stop audio, drop the episode).
     public var onEnded: ((UUID) -> Void)?
     /// CallKit ACTIVATED the audio session → safe to start capture/playback (hand to PocketVoice's DuplexAudioSessionLease).
@@ -180,7 +182,8 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
     }
 
     public func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
-        // Token invalidated → the gateway should drop it; a fresh `didUpdate` follows on re-register.
+        guard type == .voIP else { return }
+        onVoipTokenInvalidated?()
     }
 
     /// iOS 13+: on a VoIP push we MUST report an incoming call to CallKit BEFORE calling completion(), or the app is
@@ -195,7 +198,7 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
         let dict = payload.dictionaryPayload
         let prepared = Self.prepareIncomingPush(
             dict,
-            isSessionAuthorized: isIncomingSessionAuthorized ?? { _ in false }
+            isDialAuthorized: isIncomingDialAuthorized ?? { _ in false }
         )
         // Report the incoming call (inside `ring`) BEFORE completion() — the iOS 13+ requirement.
         ring(prepared.call)
@@ -231,12 +234,12 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
     /// call: no caller/message/context/priority metadata is exposed and no hydration state is retained.
     static func prepareIncomingPush(
         _ payload: [AnyHashable: Any],
-        isSessionAuthorized: (String) -> Bool
+        isDialAuthorized: (RingCore) -> Bool
     ) -> (call: IncomingDecisionCall, state: DialReceiveState?, dialId: String?) {
         let decoded = decode(payload)
         guard let received = receiveState(from: payload),
-              let sessionId = sessionId(from: received.state),
-              isSessionAuthorized(sessionId) else {
+              let core = core(from: received.state),
+              isDialAuthorized(core) else {
             return (
                 IncomingDecisionCall(
                     id: decoded.id,
@@ -253,12 +256,12 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
         return (decoded, received.state, received.dialId)
     }
 
-    private static func sessionId(from state: DialReceiveState) -> String? {
+    private static func core(from state: DialReceiveState) -> RingCore? {
         switch state {
         case .renderable(let ring):
-            return ring.core.sessionId
+            return ring.core
         case .needsHydration(_, let core):
-            return core.sessionId
+            return core
         case .rejected:
             return nil
         }

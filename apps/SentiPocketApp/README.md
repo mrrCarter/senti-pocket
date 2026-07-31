@@ -30,16 +30,24 @@ export SENTI_BUNDLE_ID="com.plexaura.sentipocket.app" # override only if this ID
 ```
 
 The script generates the Xcode project, resolves packages, archives a Release device build with automatic signing,
-exports a registered-device IPA, and then verifies the archive contents, code signature, bundle ID, APNs environment,
-`audio`/`voip` background modes, and SHA-256. Each run goes to the ignored `build/ios/<timestamp>-<commit>/` directory
-with an `IPA_MANIFEST.txt`; no credential or provisioning private key is written to the repository. It requires a
-clean Git worktree and records both commit and tree hashes so an IPA cannot be mislabeled as code it did not build.
+exports a registered-device IPA, and then verifies the archive contents, code signature, developer Team ID,
+bundle-qualified application identifier, bundle ID, APNs environment, `audio`/`voip` background modes, and SHA-256.
+It also decodes the embedded provisioning profile and proves it is unexpired, belongs to the requested team and App
+ID, carries the same APNs entitlement, and has the device/debugging/distribution shape required by the export method.
+Each run goes to the ignored `build/ios/<timestamp>-<commit>/` directory with an `IPA_MANIFEST.txt`; no credential or
+provisioning private key is written to the repository. It requires a clean Git worktree and records both commit and
+tree hashes so an IPA cannot be mislabeled as code it did not build.
 
 On current Xcode, the default export method is `debugging`; older Xcode uses `development`. For another destination,
 set `SENTI_EXPORT_METHOD` to a value supported by that Mac's `xcodebuild -help`, set a unique
 `SENTI_BUILD_NUMBER`, and let the script enforce the required APNs environment for that export method. The build
 always runs from a fresh detached worktree at the recorded commit, so ignored local model files cannot silently enter
 an IPA.
+
+Registry V2 device bindings are installation-owned. The app keeps the random installation identifier, monotonic
+generation, pending transition, and accepted server proof in one `AfterFirstUnlockThisDeviceOnly` Keychain item. A
+ring is admitted only when its complete binding proof exactly matches that live, unexpired item; authentication,
+session, or PushKit-token loss clears the proof before best-effort server cleanup.
 
 ## Watchability
 

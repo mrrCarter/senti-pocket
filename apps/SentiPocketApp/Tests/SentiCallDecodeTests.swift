@@ -77,6 +77,27 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
         }
     }
 
+    func test_registry_v2_additive_fixture_decodes_the_exact_binding_proof() throws {
+        let fixture = try loadFixture("dial-binding-v2.json")
+        guard let payload = fixture["payload"] as? [String: Any],
+              let received = SentiCallManager.receiveState(from: payload) else {
+            return XCTFail("Registry V2 fixture must decode")
+        }
+        let core: RingCore
+        switch received.state {
+        case .renderable(let ring):
+            core = ring.core
+        case .needsHydration(_, let value):
+            core = value
+        case .rejected(let reason):
+            return XCTFail("Registry V2 fixture rejected: \(reason)")
+        }
+        XCTAssertEqual(core.bindingVersion, 2)
+        XCTAssertEqual(core.bindingId, "iiiiiiiiiiiiiiiiiiiiiiii")
+        XCTAssertEqual(core.bindingRevision, "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
+        XCTAssertEqual(core.installationGeneration, "7")
+    }
+
     /// NEGATIVE (test b): nesting the DTO under a wrong-placement key ({aps, payload:<DTO>}) → top-level id absent →
     /// nil (no ring stored). The naive apnsSend that nests under the field literally named `payload` would silently
     /// drop EVERY ring in production — this catches it. Keys single-sourced from the fixture's wrongPlacementKeys.
@@ -111,7 +132,7 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
 
         let prepared = SentiCallManager.prepareIncomingPush(
             payload,
-            isSessionAuthorized: { _ in false }
+            isDialAuthorized: { _ in false }
         )
 
         XCTAssertEqual(prepared.call.callerDisplayName, "Senti")
@@ -133,12 +154,76 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
 
         let prepared = SentiCallManager.prepareIncomingPush(
             payload,
-            isSessionAuthorized: { $0 == sessionId }
+            isDialAuthorized: { $0.sessionId == sessionId }
         )
 
         XCTAssertNotNil(prepared.state)
         XCTAssertEqual(prepared.dialId, payload["id"] as? String)
         XCTAssertEqual(prepared.call.dialId, payload["id"] as? String)
+    }
+
+    func test_real_binding_gate_rejects_legacy_and_stale_revision_but_accepts_exact_v2_proof() throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases.values.first as? [String: Any],
+              var payload = raw["payload"] as? [String: Any],
+              let sessionId = payload["sessionId"] as? String else {
+            return XCTFail("source fixture missing a session payload")
+        }
+        let binding = DeviceRingBinding(
+            registryVersion: 2,
+            sessionId: sessionId,
+            tokenFingerprint: "fingerprint",
+            installationGeneration: "9",
+            bindingId: String(repeating: "i", count: 24),
+            bindingRevision: String(repeating: "r", count: 32),
+            leaseExpiresAtSec: 2_000
+        )
+        let gate = DeviceRingBindingGate(initialBinding: binding, nowEpochSec: { 1_000 })
+        let authorize: (RingCore) -> Bool = { core in
+            gate.permits(
+                sessionId: core.sessionId,
+                bindingVersion: core.bindingVersion,
+                bindingId: core.bindingId,
+                bindingRevision: core.bindingRevision,
+                installationGeneration: core.installationGeneration
+            )
+        }
+
+        let legacy = SentiCallManager.prepareIncomingPush(payload, isDialAuthorized: authorize)
+        XCTAssertNil(legacy.state, "new app must not accept an unversioned V1 push as current V2 authority")
+
+        payload["bindingVersion"] = 2
+        payload["bindingId"] = binding.bindingId
+        payload["bindingRevision"] = "stale-revision"
+        payload["installationGeneration"] = binding.installationGeneration
+        let stale = SentiCallManager.prepareIncomingPush(payload, isDialAuthorized: authorize)
+        XCTAssertNil(stale.state)
+        XCTAssertEqual(stale.call.callerDisplayName, "Senti")
+
+        payload["bindingRevision"] = binding.bindingRevision
+        let exact = SentiCallManager.prepareIncomingPush(payload, isDialAuthorized: authorize)
+        XCTAssertNotNil(exact.state)
+        XCTAssertEqual(exact.dialId, payload["id"] as? String)
+    }
+
+    func test_partial_v2_proof_is_rejected_before_authorization() throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases.values.first as? [String: Any],
+              var payload = raw["payload"] as? [String: Any] else {
+            return XCTFail("source fixture missing a payload")
+        }
+        payload["bindingVersion"] = 2
+        payload["bindingId"] = String(repeating: "i", count: 24)
+
+        guard let received = SentiCallManager.receiveState(from: payload) else {
+            return XCTFail("top-level id remains decodable")
+        }
+        guard case .rejected(let reason) = received.state else {
+            return XCTFail("a partial V2 tuple must reject, never downgrade")
+        }
+        XCTAssertTrue(reason.contains("binding proof"))
     }
 
     func test_revoke_all_calls_ends_a_still_ringing_call_and_notifies_host() {

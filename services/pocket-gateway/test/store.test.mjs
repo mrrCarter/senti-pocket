@@ -65,3 +65,64 @@ test('putIfAbsent keeps atomic-reserve semantics with a valid ttl (conditional p
   assert.equal(c.puts[0].Item.ttl, VALID);
   assert.equal(c.puts[0].ConditionExpression, 'attribute_not_exists(pk)', 'still conditional (atomic reserve)');
 });
+
+test('advanceGeneration is monotonic in memory: equal/lower stalled writers cannot replace a newer durable head', async () => {
+  const store = createInMemoryStore();
+  const generation2 = { generationOrder: '00000000000000000002', generation: '2', operation: 'register' };
+  const generation3 = { generationOrder: '00000000000000000003', generation: '3', operation: 'register' };
+  assert.equal((await store.advanceGeneration('install', generation2)).advanced, true);
+  assert.equal((await store.advanceGeneration('install', generation3)).advanced, true);
+  const delayed = await store.advanceGeneration('install', generation2);
+  assert.equal(delayed.advanced, false);
+  assert.equal(delayed.current.generation, '3');
+  assert.equal((await store.get('install')).generation, '3');
+});
+
+test('compareAndSwap is exact-version atomic in memory and rejects stale index writers', async () => {
+  const store = createInMemoryStore();
+  assert.equal((await store.compareAndSwap('index', null, {
+    recordVersion: '1', installationHashes: ['a'],
+  })).swapped, true);
+  assert.equal((await store.compareAndSwap('index', null, {
+    recordVersion: '1', installationHashes: ['lost'],
+  })).swapped, false, 'absent-CAS cannot overwrite an existing index');
+  assert.equal((await store.compareAndSwap('index', '1', {
+    recordVersion: '2', installationHashes: ['a', 'b'],
+  })).swapped, true);
+  assert.equal((await store.compareAndSwap('index', '1', {
+    recordVersion: '2', installationHashes: ['stale'],
+  })).swapped, false);
+  assert.deepEqual((await store.get('index')).installationHashes, ['a', 'b']);
+});
+
+test('Dynamo generation/index CAS emit conditional puts and return the current value after a failed condition', async () => {
+  const condition = Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
+  const current = { generationOrder: '00000000000000000003', generation: '3' };
+  const calls = [];
+  let rejectPut = false;
+  const client = {
+    async get() { return { Item: { value: current } }; },
+    async put(params) {
+      calls.push(params);
+      if (rejectPut) throw condition;
+      return {};
+    },
+    async delete() {},
+  };
+  const store = createDynamoStore({ client, table: 'T' });
+  const next = { generationOrder: '00000000000000000002', generation: '2' };
+  assert.equal((await store.advanceGeneration('head', next)).advanced, true);
+  assert.equal(calls[0].ConditionExpression, 'attribute_not_exists(pk) OR #go < :next');
+  assert.equal(calls[0].Item.generationOrder, next.generationOrder, 'generation order is top-level for Dynamo comparison');
+
+  await store.compareAndSwap('index', null, { recordVersion: '1', installationHashes: [] });
+  assert.equal(calls[1].ConditionExpression, 'attribute_not_exists(pk)');
+  await store.compareAndSwap('index', '1', { recordVersion: '2', installationHashes: ['a'] });
+  assert.equal(calls[2].ConditionExpression, '#rv = :expected');
+  assert.equal(calls[2].ExpressionAttributeValues[':expected'], '1');
+
+  rejectPut = true;
+  const refused = await store.advanceGeneration('head', next);
+  assert.equal(refused.advanced, false);
+  assert.equal(refused.current.generation, '3');
+});
