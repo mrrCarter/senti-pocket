@@ -19,50 +19,52 @@ final class DeviceRingRegistrarTests: XCTestCase {
         var binding: DeviceRingBinding?
         var cleanups: [DeviceRingUnregistrationAttempt] = []
 
-        lazy var controller = DeviceRingInstallationController(
-            beginRegistration: { [unowned self] sessionId, token, forceNew in
-                let fingerprint = DeviceRingTokenFingerprint.make(token)
-                if !forceNew, let pending = self.pending,
-                   pending.sessionId == sessionId,
-                   pending.tokenFingerprint == fingerprint {
-                    return pending
-                }
-                self.generation += 1
-                let attempt = DeviceRingRegistrationAttempt(
-                    installationId: String(repeating: "A", count: 43),
-                    installationGeneration: String(self.generation),
-                    sessionId: sessionId,
-                    tokenFingerprint: fingerprint
-                )
-                self.pending = attempt
-                self.binding = nil
-                return attempt
-            },
-            commitRegistration: { [unowned self] attempt, binding in
-                guard self.pending == attempt else { throw DeviceRingBindingStoreError.corruptState }
-                self.binding = binding
-                self.pending = nil
-            },
-            beginRevocation: { [unowned self] supplied in
-                self.generation += 1
-                let current = supplied ?? self.binding
-                self.binding = nil
-                self.pending = nil
-                guard let current else { return nil }
-                let cleanup = DeviceRingUnregistrationAttempt(
-                    installationId: String(repeating: "A", count: 43),
-                    installationGeneration: String(self.generation),
-                    previousInstallationGeneration: current.installationGeneration,
-                    sessionId: current.sessionId,
-                    bindingId: current.bindingId,
-                    bindingRevision: current.bindingRevision
-                )
-                self.cleanups.append(cleanup)
-                return cleanup
-            },
-            completeUnregistration: { _ in },
-            loadCurrentBinding: { [unowned self] in self.binding }
-        )
+        var controller: DeviceRingInstallationController {
+            DeviceRingInstallationController(
+                beginRegistration: { sessionId, token, forceNew in
+                    let fingerprint = DeviceRingTokenFingerprint.make(token)
+                    if !forceNew, let pending = self.pending,
+                       pending.sessionId == sessionId,
+                       pending.tokenFingerprint == fingerprint {
+                        return pending
+                    }
+                    self.generation += 1
+                    let attempt = DeviceRingRegistrationAttempt(
+                        installationId: String(repeating: "A", count: 43),
+                        installationGeneration: String(self.generation),
+                        sessionId: sessionId,
+                        tokenFingerprint: fingerprint
+                    )
+                    self.pending = attempt
+                    self.binding = nil
+                    return attempt
+                },
+                commitRegistration: { attempt, binding in
+                    guard self.pending == attempt else { throw DeviceRingBindingStoreError.corruptState }
+                    self.binding = binding
+                    self.pending = nil
+                },
+                beginRevocation: { supplied in
+                    self.generation += 1
+                    let current = supplied ?? self.binding
+                    self.binding = nil
+                    self.pending = nil
+                    guard let current else { return nil }
+                    let cleanup = DeviceRingUnregistrationAttempt(
+                        installationId: String(repeating: "A", count: 43),
+                        installationGeneration: String(self.generation),
+                        previousInstallationGeneration: current.installationGeneration,
+                        sessionId: current.sessionId,
+                        bindingId: current.bindingId,
+                        bindingRevision: current.bindingRevision
+                    )
+                    self.cleanups.append(cleanup)
+                    return cleanup
+                },
+                completeUnregistration: { _ in },
+                loadCurrentBinding: { self.binding }
+            )
+        }
     }
 
     private func makeRegistrar(
