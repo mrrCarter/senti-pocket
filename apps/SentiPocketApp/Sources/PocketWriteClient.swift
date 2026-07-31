@@ -29,6 +29,7 @@ private struct ExecuteRequest: Encodable {
 }
 
 enum PocketWriteError: LocalizedError, Equatable {
+    case notConfigured
     case notLoggedIn
     case network(String)
     case retryable(String)       // TRANSIENT gateway response (409 in-progress / 5xx / 503 checkpoint-not-available) — queue + retry
@@ -37,6 +38,7 @@ enum PocketWriteError: LocalizedError, Equatable {
     case notPosted(String)       // a receipt came back but not a verified .posted (pending/failed) — NEVER render as sent
     var errorDescription: String? {
         switch self {
+        case .notConfigured:      return "Senti's secure gateway is not configured for this build."
         case .notLoggedIn:       return "Sign in first — the write needs your Senti session."
         case .network(let m):    return "Write network error: \(m)"
         case .retryable(let m):  return "The gateway is busy — will retry: \(m)"
@@ -49,12 +51,16 @@ enum PocketWriteError: LocalizedError, Equatable {
 
 @MainActor
 final class PocketWriteClient {
-    private let apiBaseURL: URL
+    private let apiBaseURL: URL?
     private let urlSession: URLSession
+    private let tokenProvider: () -> String?
 
-    init(apiBaseURL: URL, urlSession: URLSession = .shared) {
+    init(apiBaseURL: URL?,
+         urlSession: URLSession = .shared,
+         tokenProvider: @escaping () -> String? = { SessionTokenStore.load() }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
+        self.tokenProvider = tokenProvider
     }
 
     /// Compose the humanMessage proposal for a top-level say. targetSequence is the SENTINEL 0 (mirrored + enforced
@@ -75,7 +81,8 @@ final class PocketWriteClient {
     /// throws (never lets a pending/failed receipt read as sent). The caller still verifies the signature against the
     /// gateway public key before rendering "sent — appeared in the room as you".
     func execute(proposal: ActionProposal, confirmation: GovernedWriteConfirmation) async throws -> ActionReceipt {
-        guard let token = SessionTokenStore.load(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
+        guard let apiBaseURL else { throw PocketWriteError.notConfigured }
+        guard let token = tokenProvider(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
         guard let url = URL(string: "/actions/execute", relativeTo: apiBaseURL) else {
             throw PocketWriteError.network("bad execute url")
         }

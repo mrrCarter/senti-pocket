@@ -29,7 +29,8 @@ struct SentiPocketApp: App {
         WindowGroup {
             rootView
             #if canImport(CallKit) && canImport(PushKit)
-                .environmentObject(dialHost)   // hold + provide the host; ensures it inits + registers for VoIP at launch
+                // The host is app-lifetime, but it constructs PushKit/CallKit only with a valid trusted gateway config.
+                .environmentObject(dialHost)
                 .onAppear { wireRegistrarToLogin() }
             #endif
         }
@@ -61,29 +62,25 @@ struct SentiPocketApp: App {
     }
 
     #if !DEBUG
-    /// Build the REAL device-flow login closure (gate #2: never fake a token). The auth-API base is SENTI_API_URL if
-    /// set, else the gateway (which proxies /api/v1/auth/cli/… in the demo) — @claude-pocket-relay confirms which on PR.
+    /// Build the REAL device-flow login closure (gate #2: never fake a token). SENTI_API_URL may explicitly override
+    /// the gateway, but there is no baked public-tunnel fallback: missing/invalid configuration fails before auth.
     private static func makeLogin() -> () async throws -> Void {
-        let base = authBaseURL()
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.1"
-        return { try await SentiNativeAuth(apiBaseURL: base, appVersion: version).login() }
-    }
-
-    /// The auth device-flow base: SENTI_API_URL if configured, else SENTI_GATEWAY_URL, else the current tunnel. Kept
-    /// separate from the gateway resolver so auth can move to its own host without a code change.
-    private static func authBaseURL() -> URL {
-        let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
-        let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_API_URL") as? String)
-            ?? (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)
-        let raw = (configured?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? fallback
-        return URL(string: raw) ?? URL(string: fallback)!
+        return {
+            guard let base = GatewayEndpoint.resolve(
+                infoPlistKeys: ["SENTI_API_URL", "SENTI_GATEWAY_URL"]
+            ) else {
+                throw GatewayEndpointError.notConfigured
+            }
+            try await SentiNativeAuth(apiBaseURL: base, appVersion: version).login()
+        }
     }
     #endif
 }
 
-/// B2 composition root (warden #261831): the real reasoning coordinator + the phone-write flow, wired to the
-/// live-demo gateway. Reasoning uses the Cached provider today (labeled sample); relay's GatewayReasoningProvider
-/// drops into `selectProvider`'s online branch when PocketSyncClient lands. The WRITE flow is fully live.
+/// B2 composition root (warden #261831): the real reasoning coordinator + phone-write flow. Network providers are
+/// composed only when this build carries a valid trusted gateway origin; otherwise reasoning stays on its labeled
+/// cache and writes refuse. No source-baked host participates in this boundary.
 struct PhoneRootView: View {
     @StateObject private var reasoning: RealReasoningCoordinator
     @StateObject private var write: PhoneWriteViewModel
@@ -94,29 +91,26 @@ struct PhoneRootView: View {
         let checkpointId = bundle?.checkpointId
         let cached = CachedReasoningProvider(cachedBriefing: PocketFixtures.briefingPlan,
                                              cachedEvidence: bundle?.evidence ?? [])
+        let gatewayURL = GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_GATEWAY_URL"])
         // ONLINE → real gateway reasoning (GatewayReasoningHTTPClient → relay's gated /brief+/answer, bearer session
         // token). It reasons the moment relay's backend + a key/Gemma are live; until then /brief 501/503 → the driver
-        // surfaces .failed honestly (never a fabricated brief). OFFLINE/reconnecting → the honest Cached floor.
-        let online = GatewayReasoningProvider(client: GatewayReasoningHTTPClient(apiBaseURL: Self.gatewayURL()))
+        // surfaces .failed honestly (never a fabricated brief). A build with no trusted gateway stays on the honest
+        // cached floor even if reachability says "online"; it never invents a destination.
+        let online = gatewayURL.map {
+            GatewayReasoningProvider(client: GatewayReasoningHTTPClient(apiBaseURL: $0))
+        }
         _reasoning = StateObject(wrappedValue: RealReasoningCoordinator(
             sessionId: sessionId, checkpointId: checkpointId,
-            selectProvider: { isOnline in isOnline ? (online as ReasoningProvider) : (cached as ReasoningProvider) }))
+            selectProvider: { isOnline in
+                if isOnline, let online { return online as ReasoningProvider }
+                return cached as ReasoningProvider
+            }))
         _write = StateObject(wrappedValue: PhoneWriteViewModel(
             sessionId: sessionId,
-            client: PocketWriteClient(apiBaseURL: Self.gatewayURL())))
+            client: PocketWriteClient(apiBaseURL: gatewayURL)))
     }
 
     var body: some View { PocketPhoneView(reasoning: reasoning, write: write) }
-
-    /// Item 5: the gateway URL is a CONFIG value (ephemeral cloudflared tunnel, forge re-publishes on churn), read
-    /// from Info.plist `SENTI_GATEWAY_URL` so forge re-points WITHOUT a code change. Falls back to the current tunnel.
-    private static func gatewayURL() -> URL {
-        let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
-        let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let chosen = (configured.map { $0.isEmpty ? fallback : $0 }) ?? fallback
-        return URL(string: chosen) ?? URL(string: fallback)!
-    }
 }
 
 #if DEBUG

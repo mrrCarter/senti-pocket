@@ -5,9 +5,9 @@ import PocketContracts
 import PocketReasoning
 import PocketDialVoice
 
-// DialHost — the app-lifetime composition wiring for DIALS (Forge, onAnswered hookup part-b). Owns the
-// SentiCallManager (its PKPushRegistry delegate must live the whole app) + the DialCoordinator, and installs the
-// two adapters + the three governed DI seams warden's part-b gate specifies:
+// DialHost — the app-lifetime composition wiring for DIALS (Forge, onAnswered hookup part-b). With a trusted gateway
+// configured, it owns SentiCallManager (its PKPushRegistry delegate must live the whole app) + DialCoordinator and
+// installs the two adapters + three governed DI seams warden's part-b gate specifies:
 //   • push-receive  → coordinator.received(state, dialId)         (adapter 1)
 //   • answer        → coordinator.answered(dialId, callUUID)      (adapter 2)  — dialId+UUID only, never .message
 //   • hydrate seam  = the AUTHED DialHydrationClient (governed content from the GET, never the push)
@@ -21,39 +21,55 @@ import PocketDialVoice
 // → listen() degrades to "" → the orchestrator briefs but can't capture — nothing posts (the same fail-safe as before).
 @MainActor
 final class DialHost: ObservableObject {
-    let callManager = SentiCallManager()
-    private let coordinator: DialCoordinator
-    private let registrar: DeviceRingRegistrar
+    let callManager: SentiCallManager?
+    private let coordinator: DialCoordinator?
+    private let registrar: DeviceRingRegistrar?
 
-    init(gatewayURL: URL = DialHost.gatewayURL()) {
-        let cm = callManager
-        let dialClient = DialHydrationClient(apiBaseURL: gatewayURL)   // default tokenProvider = real Keychain SessionTokenStore
+    init(gatewayURL: URL? = DialHost.gatewayURL()) {
+        guard let gatewayURL else {
+            // The default/unconfigured build does not start PushKit token acquisition or construct any gateway client.
+            // A later configured launch builds the complete, app-lifetime call stack below.
+            callManager = nil
+            coordinator = nil
+            registrar = nil
+            return
+        }
+
+        let cm = SentiCallManager()
+        let dialClient = DialHydrationClient(apiBaseURL: gatewayURL)
         let coord = DialCoordinator(
             hydrate: { try await dialClient.hydrate($0) },
             runDial: { await DialHost.run($0, gatewayURL: gatewayURL) },
             endCall: { [weak cm] uuid in cm?.end(uuid) }
         )
-        self.coordinator = coord
+
         // Device VoIP-register (PR 2, onto the live login #103): a ring can only be ADDRESSED to this device once the
-        // gateway knows its APNs VoIP token. Register when the token arrives/rotates (adapter 3 below) AND on login
-        // (onLoginCompleted, wired from SignInCoordinator.onAuthenticated by SentiPocketApp) — covers both orderings.
-        // sessionId = the app-PRIMARY session (same derivation as PhoneRootView) — a member session the gateway accepts.
+        // gateway knows its APNs VoIP token. sessionId is the app-primary session, matching PhoneRootView.
         let sessionId = FixtureLoader.canonicalBundle()?.sessionId ?? "6cf7e861-546a-4b9f-b937-39182a5bd395"
-        let reg = DeviceRingRegistrar(client: DeviceRingRegistrationClient(apiBaseURL: gatewayURL), sessionId: sessionId)
+        let reg = DeviceRingRegistrar(
+            client: DeviceRingRegistrationClient(apiBaseURL: gatewayURL),
+            sessionId: sessionId
+        )
+
+        self.callManager = cm
+        self.coordinator = coord
         self.registrar = reg
         // Adapter 1 — store the state decoded at push-receive (governed content fetched on answer).
-        callManager.onDialReceived = { coord.received($0, dialId: $1) }
+        cm.onDialReceived = { coord.received($0, dialId: $1) }
         // Adapter 2 — hydrate + run off the dialId + CallKit UUID ONLY; never off IncomingDecisionCall.message.
-        callManager.onAnswered = { call in
+        cm.onAnswered = { call in
             Task { @MainActor in await coord.answered(dialId: call.dialId, callUUID: call.id) }
         }
         // Adapter 3 — register this device's VoIP token when PKPushRegistry delivers or ROTATES it (authed POST).
-        callManager.onVoipToken = { [reg] token in _ = reg.tokenUpdated(token) }
+        cm.onVoipToken = { [weak self] token in
+            guard let registrar = self?.registrar else { return }
+            _ = registrar.tokenUpdated(token)
+        }
     }
 
     /// Register (or re-register) the device's cached VoIP token now login has persisted a Bearer. Wired from
     /// SignInCoordinator.onAuthenticated by SentiPocketApp — the other half of the register trigger.
-    func onLoginCompleted() { registrar.loginCompleted() }
+    func onLoginCompleted() { registrar?.loginCompleted() }
 
     /// Build + run the governed flow for a HYDRATED ring. DialRequest is built from the ring's core (authed), NEVER
     /// the push. modelURL is resolved by WhisperModelLocator (App Support side-load / bundle); it nil-degrades
@@ -76,14 +92,10 @@ final class DialHost: ObservableObject {
         return await DialOrchestrator(voice: voice, writer: writer).run(request)
     }
 
-    /// Gateway URL config (Info.plist SENTI_GATEWAY_URL; ephemeral cloudflared tunnel, forge re-points on churn).
-    /// `nonisolated` so it's usable as the init's default arg (evaluated off the main actor) — it touches no state.
-    nonisolated static func gatewayURL() -> URL {
-        let fallback = "https://experienced-disposal-urge-approved.trycloudflare.com"
-        let configured = (Bundle.main.object(forInfoDictionaryKey: "SENTI_GATEWAY_URL") as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let chosen = (configured.map { $0.isEmpty ? fallback : $0 }) ?? fallback
-        return URL(string: chosen) ?? URL(string: fallback)!
+    /// `nonisolated` keeps the default argument usable off the main actor. Missing or invalid configuration is nil,
+    /// so the initializer never creates the PushKit/CallKit stack or any gateway client.
+    nonisolated static func gatewayURL() -> URL? {
+        GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_GATEWAY_URL"])
     }
 }
 #endif
