@@ -56,6 +56,7 @@ struct SentiPocketApp: App {
     private func wireRegistrarToLogin() {
         #if !DEBUG
         signIn.onAuthenticated = { [weak dialHost] in dialHost?.onLoginCompleted() }
+        signIn.onAuthenticationRevoked = { [weak dialHost] in dialHost?.onAuthenticationInvalidated() }
         dialHost.installAuthenticationExpiryHandler { [weak signIn] in
             signIn?.invalidateAuthentication()
         }
@@ -77,7 +78,6 @@ struct SentiPocketApp: App {
                 authenticationEpoch: signIn.authenticationEpoch,
                 onReauthenticationRequired: { expectedEpoch in
                     guard signIn.isCurrentAuthentication(expectedEpoch) else { return }
-                    dialHost.onAuthenticationInvalidated()
                     signIn.invalidateAuthentication(expectedEpoch: expectedEpoch)
                 },
                 onSessionSelectionChanged: { expectedEpoch, sessionId in

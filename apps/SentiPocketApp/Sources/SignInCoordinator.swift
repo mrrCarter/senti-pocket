@@ -38,6 +38,8 @@ final class SignInCoordinator: ObservableObject {
     /// Fired AFTER a login that leaves a real token in the store (and once at launch if already signed in is handled
     /// by the caller). The device VoIP-register hooks here — it needs the fresh Bearer to POST /dial/register.
     var onAuthenticated: (() -> Void)?
+    /// App-lifetime protected services must revoke selected-session authority on every accepted 401 or sign-out.
+    var onAuthenticationRevoked: (() -> Void)?
 
     private var loginTask: Task<Void, Never>?
 
@@ -81,6 +83,7 @@ final class SignInCoordinator: ObservableObject {
         authenticationEpoch &+= 1
         loginTask?.cancel()
         loginTask = nil
+        onAuthenticationRevoked?()
         clearProtectedLocalState()
         signOutAction()
         phase = .reauthenticationRequired
@@ -101,6 +104,7 @@ final class SignInCoordinator: ObservableObject {
         case .signOut:
             loginTask?.cancel(); loginTask = nil
             authenticationEpoch &+= 1
+            onAuthenticationRevoked?()
             phase = .signingOut
             clearProtectedLocalState()
             signOutAction()
