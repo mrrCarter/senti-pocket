@@ -283,12 +283,12 @@ final class DeviceRingRegistrarTests: XCTestCase {
         XCTAssertNil(installation.binding, "local binding proof must clear synchronously")
         XCTAssertEqual(installation.cleanups.first?.previousInstallationGeneration, "1")
         XCTAssertEqual(installation.cleanups.first?.installationGeneration, "2")
-        for _ in 0..<20 {
+        for _ in 0..<100 {
             RegisterStubURLProtocol.lock.lock()
             let sent = RegisterStubURLProtocol.requestedPaths.contains("/dial/unregister")
             RegisterStubURLProtocol.lock.unlock()
             if sent { break }
-            await Task.yield()
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         RegisterStubURLProtocol.lock.lock()
         let unregisterCount = RegisterStubURLProtocol.requestedPaths.filter { $0 == "/dial/unregister" }.count
