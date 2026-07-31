@@ -211,6 +211,23 @@ final class SessionHTTPTransportTests: XCTestCase {
         }
     }
 
+    func test_response_is_cancelled_when_bearer_changes_while_request_is_suspended() async {
+        let validBody = Data(
+            #"{"sessions":[],"count":0,"include_archived":false,"next_cursor":null,"has_more":false}"#.utf8
+        )
+        for status in [200, 401] {
+            let token = LockedToken("principal-a")
+            let transport = makeTransport(token: { token.value }) { request in
+                token.set("principal-b")
+                return (self.http(request, status: status), validBody)
+            }
+
+            await expect(.cancelled) {
+                try await transport.listSessions(includeArchived: false, limit: 50, cursor: nil)
+            }
+        }
+    }
+
     func test_not_found_taxonomy_preserves_session_existence_boundary_only() async {
         let transport = makeTransport { request in
             (self.http(request, status: 404), Data(#"{"private":"must-not-surface"}"#.utf8))
@@ -259,6 +276,27 @@ final class SessionHTTPTransportTests: XCTestCase {
         } catch {
             XCTFail("unexpected error \(error)", file: file, line: line)
         }
+    }
+}
+
+private final class LockedToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: String
+
+    init(_ value: String) {
+        storage = value
+    }
+
+    var value: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func set(_ value: String) {
+        lock.lock()
+        storage = value
+        lock.unlock()
     }
 }
 

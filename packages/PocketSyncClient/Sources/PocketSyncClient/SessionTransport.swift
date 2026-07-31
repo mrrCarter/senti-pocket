@@ -227,6 +227,13 @@ public final class HTTPSessionTransport: SessionTransport, @unchecked Sendable {
             throw SessionTransportError.network
         }
 
+        // The bearer is part of the response's authorization identity. A logout, login, or token rotation while the
+        // request is suspended makes every eventual status/body stale — including a 401 that must not sign out the
+        // newer principal and a 2xx body that must not publish into that principal's UI.
+        guard tokenProvider() == token else {
+            throw SessionTransportError.cancelled
+        }
+
         guard let http = response as? HTTPURLResponse else {
             throw SessionTransportError.invalidResponse
         }

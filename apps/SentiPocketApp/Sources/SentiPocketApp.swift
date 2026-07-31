@@ -85,6 +85,7 @@ struct SentiPocketApp: App {
                     dialHost.selectSession(sessionId)
                 }
             )
+            .id(signIn.authenticationEpoch)
             #else
             AuthenticatedRootView(
                 authenticationEpoch: signIn.authenticationEpoch,
@@ -92,6 +93,7 @@ struct SentiPocketApp: App {
                     signIn.invalidateAuthentication(expectedEpoch: expectedEpoch)
                 }
             )
+            .id(signIn.authenticationEpoch)
             #endif
         } else {
             PocketSignInView(phase: signIn.phase, send: signIn.send)
@@ -119,8 +121,10 @@ struct SentiPocketApp: App {
 /// Release composition of the authenticated repository-backed Sessions surface and the selected-session Pocket flow.
 private struct AuthenticatedRootView: View {
     @StateObject private var sessions: SessionListCoordinator
+    @StateObject private var details: SelectedSessionDetailCoordinator
+    @StateObject private var revocationRelay: AuthenticatedSessionRevocationRelay
     @State private var selectedTab: PocketTab = .sessions
-    private let onReauthenticationRequired: @MainActor @Sendable () -> Void
+    private let authenticationRevision: UInt64
 
     init(
         authenticationEpoch: UInt64,
@@ -130,19 +134,43 @@ private struct AuthenticatedRootView: View {
         let guardedReauthentication: @MainActor @Sendable () -> Void = {
             onReauthenticationRequired(authenticationEpoch)
         }
-        self.onReauthenticationRequired = guardedReauthentication
         let apiURL = GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_API_URL", "SENTI_GATEWAY_URL"])
         let transport = HTTPSessionTransport(
             apiBaseURL: apiURL,
             tokenProvider: { SessionTokenStore.load() }
         )
-        _sessions = StateObject(wrappedValue: SessionListCoordinator(
+        let revocationRelay = AuthenticatedSessionRevocationRelay(
+            onReauthenticationRequired: guardedReauthentication
+        )
+        let details = SelectedSessionDetailCoordinator(
+            transport: transport,
+            onReauthenticationRequired: {
+                revocationRelay.invalidateAuthentication()
+            },
+            onSelectionRevoked: { sessionId in
+                revocationRelay.revokeSelection(expectedSessionId: sessionId)
+            }
+        )
+        let sessions = SessionListCoordinator(
             repository: SessionRepository(transport: transport),
-            onReauthenticationRequired: guardedReauthentication,
+            onReauthenticationRequired: {
+                revocationRelay.invalidateAuthentication()
+            },
             onSelectionChanged: { sessionId in
+                details.setSelectedSession(
+                    sessionId,
+                    authenticationRevision: authenticationEpoch
+                )
                 onSessionSelectionChanged(authenticationEpoch, sessionId)
             }
-        ))
+        )
+        revocationRelay.sessions = sessions
+        revocationRelay.details = details
+
+        _sessions = StateObject(wrappedValue: sessions)
+        _details = StateObject(wrappedValue: details)
+        _revocationRelay = StateObject(wrappedValue: revocationRelay)
+        self.authenticationRevision = authenticationEpoch
     }
 
     var body: some View {
@@ -166,17 +194,53 @@ private struct AuthenticatedRootView: View {
                 )
             },
             activity: {
-                SelectedSessionActivityBoundary(sessions: sessions)
+                SelectedSessionActivityBoundary(
+                    sessions: sessions,
+                    details: details
+                )
             }
         )
-        .onAppear { sessions.start() }
-        .onDisappear { sessions.clearSelection() }
+        .onAppear {
+            details.setSelectedSession(
+                sessions.selectedSessionId,
+                authenticationRevision: authenticationRevision
+            )
+            sessions.start()
+        }
+        .onDisappear {
+            sessions.clearSelection()
+            details.clearSelection()
+        }
     }
 
     @MainActor
     private func invalidateProtectedAuthentication() {
-        sessions.invalidateAuthentication()
+        revocationRelay.invalidateAuthentication()
+    }
+}
+
+/// Breaks the construction cycle between the session allowlist and its selected-session detail coordinator while
+/// keeping revocation synchronous on the main actor. References are weak; the authenticated root owns both objects.
+@MainActor
+private final class AuthenticatedSessionRevocationRelay: ObservableObject {
+    weak var sessions: SessionListCoordinator?
+    weak var details: SelectedSessionDetailCoordinator?
+
+    private let onReauthenticationRequired: @MainActor @Sendable () -> Void
+
+    init(onReauthenticationRequired: @escaping @MainActor @Sendable () -> Void) {
+        self.onReauthenticationRequired = onReauthenticationRequired
+    }
+
+    func invalidateAuthentication() {
+        sessions?.invalidateAuthentication()
+        details?.invalidateAuthentication()
         onReauthenticationRequired()
+    }
+
+    func revokeSelection(expectedSessionId: String) {
+        guard sessions?.selectedSessionId == expectedSessionId else { return }
+        sessions?.clearSelection()
     }
 }
 
@@ -207,21 +271,108 @@ private struct SelectedSessionPocketView: View {
     }
 }
 
-/// Activity transport exists in PocketSyncClient, but this atom does not manufacture an unreviewed detail state.
 private struct SelectedSessionActivityBoundary: View {
     @ObservedObject var sessions: SessionListCoordinator
+    @ObservedObject var details: SelectedSessionDetailCoordinator
 
+    @ViewBuilder
     var body: some View {
         NavigationStack {
-            StatusView(
-                title: sessions.selectedSessionId == nil ? "Choose a session" : "Activity sync not composed yet",
+            if sessions.selectedSessionId == nil {
+                StatusView(
+                    title: "Choose a session",
+                    systemImage: "waveform.path.ecg",
+                    message: "Select an authorized session before loading its activity or room checkpoints."
+                )
+                .navigationTitle("Activity")
+            } else {
+                activityContent
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            NavigationLink {
+                                checkpointContent
+                            } label: {
+                                Label("Room checkpoints", systemImage: "tray.full")
+                                    .labelStyle(.iconOnly)
+                            }
+                            .accessibilityLabel("Room checkpoints")
+                        }
+                    }
+            }
+        }
+        .id(sessions.selectedSessionId)
+    }
+
+    @ViewBuilder
+    private var activityContent: some View {
+        if let state = details.activityState {
+            SessionActivityView(state: state) { intent in
+                details.send(intent)
+            }
+        } else {
+            loadStatus(
+                details.activityLoadState,
+                emptyTitle: "No activity loaded",
                 systemImage: "waveform.path.ecg",
-                message: sessions.selectedSessionId == nil
-                    ? "Select an authorized session to establish the Activity boundary."
-                    : "The selected session is authorized. Its activity and checkpoint screens remain a separate reviewed slice."
+                retry: { details.refreshActivity() }
             )
             .navigationTitle("Activity")
         }
+    }
+
+    @ViewBuilder
+    private var checkpointContent: some View {
+        if let state = details.checkpointState {
+            SessionCheckpointListView(state: state) { intent in
+                details.send(intent)
+            }
+        } else {
+            loadStatus(
+                details.checkpointLoadState,
+                emptyTitle: "No room checkpoints loaded",
+                systemImage: "tray.full",
+                retry: { details.refreshCheckpoints() }
+            )
+            .navigationTitle("Room checkpoints")
+        }
+    }
+
+    private func loadStatus(
+        _ loadState: SelectedSessionDetailLoadState,
+        emptyTitle: String,
+        systemImage: String,
+        retry: @escaping () -> Void
+    ) -> some View {
+        let title: String
+        let message: String
+        let actionTitle: String?
+        let action: (() -> Void)?
+
+        switch loadState {
+        case .loading:
+            title = "Loading"
+            message = "Fetching the selected session through your current Senti authorization."
+            actionTitle = nil
+            action = nil
+        case .failed(let failure):
+            title = failure.title
+            message = failure.detail
+            actionTitle = "Try again"
+            action = retry
+        case .idle, .loaded:
+            title = emptyTitle
+            message = "Refresh to load the currently selected authorized session."
+            actionTitle = "Refresh"
+            action = retry
+        }
+
+        return StatusView(
+            title: title,
+            systemImage: loadState.isLoading ? "arrow.triangle.2.circlepath" : systemImage,
+            message: message,
+            actionTitle: actionTitle,
+            action: action
+        )
     }
 }
 
@@ -379,11 +530,32 @@ private struct StatusView: View {
     let title: String
     let systemImage: String
     let message: String
+    let actionTitle: String?
+    let action: (() -> Void)?
+
+    init(
+        title: String,
+        systemImage: String,
+        message: String,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
+    ) {
+        self.title = title
+        self.systemImage = systemImage
+        self.message = message
+        self.actionTitle = actionTitle
+        self.action = action
+    }
+
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: systemImage).font(.largeTitle).foregroundStyle(.secondary)
             Text(title).font(.headline)
             Text(message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.borderedProminent)
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
