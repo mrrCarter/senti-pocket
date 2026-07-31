@@ -428,9 +428,13 @@ final class GatewayEndpointTests: XCTestCase {
 
         viewModel.draft("Principal A request")
         viewModel.confirm()
-        for _ in 0..<40 {
+        // URLProtocol callbacks arrive on a session-owned queue. `Task.yield()` alone does not
+        // guarantee that queue gets scheduled before this MainActor test resumes, especially on
+        // a freshly booted CI simulator. Use a bounded number of real-time suspensions while
+        // still failing closed if the stale-response transition never arrives.
+        for _ in 0..<100 {
             if case .refused = viewModel.state { break }
-            await Task.yield()
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
         guard case .refused(let refusal) = viewModel.state else {
