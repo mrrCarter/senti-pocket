@@ -347,9 +347,11 @@ final class GatewayEndpointTests: XCTestCase {
 
         viewModel.draft("Keep this confirmed intent for after sign-in")
         viewModel.confirm()
-        for _ in 0..<40 {
+        // URLProtocol completes on a session-owned queue; zero-time yields can repeatedly resume
+        // this MainActor test before that queue publishes the 401 transition on hosted simulators.
+        for _ in 0..<100 {
             if invalidationCount == 1 { break }
-            await Task.yield()
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
         XCTAssertEqual(invalidationCount, 1)
