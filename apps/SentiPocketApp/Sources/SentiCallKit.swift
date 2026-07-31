@@ -63,7 +63,7 @@ public final class SentiCallManager: NSObject {
 
     private let provider: CXProvider
     private let pushRegistry: PKPushRegistry?
-    private let reportIncomingCall: (
+    private let reportIncomingCall: @MainActor (
         UUID,
         CXCallUpdate,
         @escaping @MainActor @Sendable (Bool) -> Void
@@ -110,7 +110,7 @@ public final class SentiCallManager: NSObject {
     /// Hermetic lifecycle-test initializer: no PushKit registration and no real CallKit report side effects.
     init(
         provider: CXProvider,
-        reportIncomingCall: @escaping (
+        reportIncomingCall: @escaping @MainActor (
             UUID,
             CXCallUpdate,
             @escaping @MainActor @Sendable (Bool) -> Void
