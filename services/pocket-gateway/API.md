@@ -47,17 +47,42 @@ Body: `{ text, voiceId?, modelId?, outputFormat?, tone? }` (`text` 1..8192 UTF-8
   on API Gateway. The voice-provider key lives ONLY server-side — it never reaches the phone.
 - 400 text required · 413 text > 8192 bytes · 501 not configured · 502 backend error.
 
-### `POST /dial/register` — Registry V2 (scope `pocket:dial`)
+### `GET /dial/register/context` — Registry V2 owner bootstrap (authenticated)
+
+This auth-only read resolves the stable registry owner for the exact bearer being used by the phone. It requires neither
+`pocket:dial` scope nor session membership, accepts no request body, and grants no binding or ring authority.
+
+```json
+{
+  "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<canonical 43-character unpadded base64url>",
+  "serverTime": "2026-08-04T22:00:00.000Z"
+}
+```
+
+`ownerHandle` is a versioned, domain-separated server HMAC over the verifier-owned principal and human identity. It is
+stable across bearer refresh for the same authenticated owner and changes for a different owner. It is pseudonymous
+correlation data—not authority: every mutation still requires a valid bearer, and the server recomputes and compares
+the handle. Clients must bind any cached context to the exact bearer digest and local auth generation, then recheck both
+after the response. All success and error responses carry `Cache-Control: no-store` and `Pragma: no-cache`; deployments
+must also enforce a shared, verified-principal-aware rate bound for this route. 401 means the bearer is absent/invalid,
+501 means Registry V2 is disabled, and malformed adapter output or context failure returns a generic 502.
+
+### `POST /dial/register` — Registry V2 (scope `pocket:dial` for new writes)
 
 Membership-gated registration of one installation's current PushKit routing intent. The authenticated principal and
 human identity come only from the bearer; neither is accepted in the body.
 
 Deployment remains fail-closed on V1 until the V2 iOS registrar/binding gate is released and the operator explicitly
-sets `DEVICE_REGISTRY_CLIENT_V2_READY=1`; the legacy shipping client cannot satisfy this contract.
+sets every migration/outcome/admission/owner-continuity acknowledgement documented in `DEPLOY.md`; the legacy shipping client cannot
+satisfy this contract.
 
 ```json
 {
   "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<value returned for this exact authenticated owner>",
   "installationId": "<32 random bytes, canonical unpadded base64url>",
   "idempotencyKey": "<UUID>",
   "voipToken": "<opaque PushKit token>",
@@ -70,9 +95,20 @@ sets `DEVICE_REGISTRY_CLIENT_V2_READY=1`; the legacy shipping client cannot sati
 }
 ```
 
-`expectedBindingId` and `expectedBindingRevision` may be omitted together for a genuinely new installation item or for
-an exact same-intent replay/lease renewal. For any changed principal/session/token/platform intent, send the exact last
-server binding tuple. Same-intent operations preserve the binding id/revision, even when the idempotency key is new.
+`ownerVersion` and `ownerHandle` are required on every Registry V2 mutation and are included unchanged in every
+successful, recovery, denied-before-commit, binding-conflict, and token-claim-conflict receipt. The server derives the
+expected handle again from the authenticated principal. A mismatch against either that derivation or a protected stored
+base/claim/outcome row returns exact **409**
+`{"error":"registry owner does not match authenticated principal","reason":"registry-owner-conflict"}`. That generic
+body intentionally exposes no current handle or fence. A freshly issued bearer for the same principal resolves the same
+handle and may resume exact cleanup; a different account cannot use copied local installation/fence values.
+
+`expectedBindingId` and `expectedBindingRevision` may be omitted together only for a genuinely new installation item or
+an exact retry of the same idempotency operation. Every distinct operation against an existing installation must send
+the exact last server binding tuple, even when principal/session/token/platform intent is unchanged. A distinct
+same-intent operation preserves the stable binding id but advances the binding revision and token-claim generation;
+an exact same-operation retry alone preserves the revision. This makes each operation's cleanup fence unique and stops
+a delayed operation with a stale fence from superseding a newer grant.
 
 The token-claim pair is a separate compare-and-swap fence. Omit it while the requested token is unclaimed or is already
 owned by this installation's exact current binding. If the server returns `token-claim-conflict`, retry with the returned
@@ -86,6 +122,8 @@ Success is strict and versioned:
 {
   "registered": true,
   "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<exact request owner handle>",
   "sessionId": "…",
   "platform": "apns",
   "bindingId": "bind_…",
@@ -93,20 +131,63 @@ Success is strict and versioned:
   "tokenClaimId": "claim_…",
   "tokenClaimRevision": 10,
   "expiresAt": "2026-08-07T07:00:00.000Z",
+  "serverTime": "2026-07-31T07:00:00.000Z",
   "idempotent": false
 }
 ```
 
-- **409 `binding-conflict`** returns only `currentBinding:{bindingId,bindingRevision,expiresAt}` (or `null`). A client
+`serverTime` is generated after the registry operation from the same injected server clock. Clients must derive the
+lease duration from `expiresAt - serverTime`, conservatively subtract request round-trip time, and count the remainder
+down with a sleep-inclusive monotonic clock. Device wall time is not lease authority.
+
+An exact retry (same authenticated owner, installation, idempotency key, and semantic request fingerprint) is first
+reconciled with strong reads and never renews or mutates registry state. It receives the normal 200 receipt only while
+the caller still has both `pocket:dial` and session membership. If either authority disappeared after the write
+committed, the exact retry receives strict **409 `registration-committed-but-unauthorized`** instead:
+
+```json
+{
+  "registered": false,
+  "committed": true,
+  "authorized": false,
+  "revocationRequired": true,
+  "reason": "registration-committed-but-unauthorized",
+  "error": "registration committed but current authorization is missing",
+  "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<exact request owner handle>",
+  "sessionId": "…",
+  "platform": "apns",
+  "bindingId": "bind_…",
+  "bindingRevision": 5,
+  "tokenClaimId": "claim_…",
+  "tokenClaimRevision": 10,
+  "expiresAt": "2026-08-07T07:00:00.000Z",
+  "serverTime": "2026-07-31T07:00:00.000Z",
+  "idempotent": true
+}
+```
+
+This is a revocation receipt, not lease authority: clients must persist the fences only long enough to call DELETE and
+must not make the route eligible for rings. An exact physically retained replay at or after logical expiry has the same
+strict body fields with **410 `registration-expired`** and `error: "registration lease expired"`. Changed, absent,
+invalid, and non-V2 requests cannot use this recovery path; without scope they remain the ordinary 403. A reconcile
+read/corruption failure is generic retryable 502 so the client retains its pending request rather than treating it as a
+definitive miss.
+
+- **409 `binding-conflict`** returns exactly `ownerVersion`, `ownerHandle`, and
+  `currentBinding:{bindingId,bindingRevision,expiresAt}` (or `null`). A client
   may retry with that tuple only while the same local auth/session/token intent is still current. A superseded task must
   not reconcile or retry.
-- **409 `token-claim-conflict`** returns only
+- **409 `token-claim-conflict`** returns exactly `ownerVersion`, `ownerHandle`, and
   `currentTokenClaim:{tokenClaimId,tokenClaimRevision,expiresAt}` (or `null`) for the explicit token-owner CAS above.
   `expiresAt` is the logical route expiry and can already be in the past during reclaim grace; it is not an
   automatic-reuse timestamp, and the returned tuple remains the explicit transfer fence.
-- **409 `idempotency-conflict`** means the installation's latest stored idempotency key was reused for different semantic
-  intent. Registry V2 retains the latest key, not an unbounded historical key ledger; the binding and token-claim CAS
-  fences remain the authority for every state change.
+- **409 `idempotency-conflict`** means the same principal + installation + operation UUID was reused for different
+  semantic intent. Each operation has one HMAC-addressed terminal outcome row retained for a bounded lease/retry
+  horizon; raw principal, installation, session, token, and UUID are not stored in that row. Production V2 cannot boot
+  until distributed unique-operation admission is independently verified, so arbitrary UUIDs cannot create unbounded
+  journal cardinality.
 - **409 `target-capacity`** means the authenticated human/session already has 20 active installations. Renewals,
   rotations, and same-target token-owner replacement net their exact removals before this check; no existing member is
   arbitrarily evicted.
@@ -115,21 +196,122 @@ Success is strict and versioned:
 - **409 `revision-exhausted`** is permanent for the current V2 namespace. Do not auto-retry; operator intervention and a
   versioned schema migration are required before that Registry V2 record can advance.
 - A lease becomes unroutable exactly at `expiresAtEpochSec`. Registry rows remain physically TTL-eligible only after a
-  fixed five-minute reclaim grace. During that grace, the same exact owner may renew; another installation must use the
-  returned token-claim tuple so the displaced base/directory state moves atomically. Automatic unclaimed-token reuse
-  begins only after the grace, when a worker clock up to five minutes behind also considers the old route expired.
-- 400 malformed/non-canonical/unknown field · 403 non-member/missing scope · 426 unversioned request · 501 V2 not
-  configured · 502 registry failure.
+  fixed five-minute reclaim grace. Through that physical TTL, only the same owner may renew/rebind or transfer a
+  protected base/claim with its exact CAS fence; a different owner receives the generic owner conflict even if it copied
+  every identifier. At or after physical TTL, a still-retained base/claim is treated as reclaimable without waiting for
+  DynamoDB's asynchronous deletion. Same-owner token movement during grace still requires the returned claim tuple so
+  displaced base/directory state moves atomically.
+- 400 malformed/non-canonical/unknown field · 403 non-member/missing scope · 410 exact committed lease expired · 426
+  unversioned request · 429 `operation-rate-limited` at the required admission boundary · 501 V2 not configured · 502
+  registry failure.
 - The raw installation id and token are never returned. The server persists only an HMAC of installation identity;
   the opaque PushKit token necessarily remains protected at rest because APNs cannot route using only a hash.
 
-### `DELETE /dial/register` — exact conditional revoke (scope `pocket:dial`)
+A missing scope or membership response is definitive 403 only after the server has durably written a `DENIED` outcome
+for that exact operation. The original registration transaction and the denial contend on the same operation row. If
+denial wins, any held/late original write returns 409 `registration-denied-before-commit` with no authority fences. If
+commit wins, the unauthorized retry returns the strict 409/410 revocation receipt above, never a false 403. Storage,
+corruption, or exhausted-contention failures are retryable 5xx and the phone retains its pending operation.
+
+Both the definitive 403 and a late writer's 409 return the exact no-authority terminal envelope below. The 403 preserves
+its authorization error (`missing scope pocket:dial` or `not a known session for this user`); the 409 uses the generic
+error shown in the example. A different-fingerprint request that reuses an operation UUID is not exact terminal proof:
+without authorization it remains the ordinary generic 403 and never receives stored outcome, owner, or authority fields.
+
+The denied-before-commit body is exact:
+
+```json
+{
+  "registered": false,
+  "committed": false,
+  "authorized": false,
+  "revocationRequired": false,
+  "reason": "registration-denied-before-commit",
+  "error": "registration operation was denied before commit",
+  "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<exact request owner handle>",
+  "sessionId": "…",
+  "platform": "apns",
+  "idempotent": true
+}
+```
+
+It is terminal proof that this exact UUID created no binding. The phone may clear only the matching pending operation
+and, if the same authorized intent is still current, mint a new UUID; it must not treat this response as lease authority.
+
+### `POST /dial/register/reconcile` — authenticated digest-only cleanup
+
+This endpoint is deliberately subtractive and requires a valid bearer but neither current `pocket:dial` scope nor
+session membership. It exists for sign-out/access-loss recovery when iOS retained a pending operation but PushKit has
+already invalidated and erased the raw token.
+
+The request has exactly these eight fields:
+
+```json
+{
+  "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<value returned for this exact authenticated owner>",
+  "installationId": "<32 random bytes, canonical unpadded base64url>",
+  "idempotencyKey": "<UUID>",
+  "tokenDigest": "<canonical unpadded base64url SHA-256>",
+  "sessionId": "…",
+  "platform": "apns"
+}
+```
+
+`tokenDigest` is exactly `base64url-unpadded(SHA-256(UTF-8(voipToken)))`, where `voipToken` is the same wire string sent
+to `POST /dial/register`; it is not a hash of decoded hex/token bytes. Raw `voipToken`, binding/claim fences, unknown
+fields, padded/noncanonical digests, and non-version-2 bodies are rejected before storage.
+
+The server derives the same HMAC operation key/fingerprint as the original request. An absent operation becomes a
+durable `DENIED` barrier. A committed operation is compare-deleted using only its stored exact binding revision. A
+newer operation—including a same-intent renewal—has a newer revision and cannot be erased by stale cleanup. Replays are
+existence-oblivious and never grant lease authority.
+
+The only successful body is exact:
+
+```json
+{
+  "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<exact request owner handle>",
+  "idempotencyKey": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "sessionId": "…",
+  "platform": "apns",
+  "registered": false,
+  "authorized": false,
+  "cleanupComplete": true,
+  "serverTime": "2026-08-04T22:00:00.000Z"
+}
+```
+
+- 200 means the exact operation is durably denied or its exact committed binding is absent/deleted. It contains no
+  binding id/revision, token-claim fence, expiry, renewal, or `idempotent` field.
+- 409 `idempotency-conflict` means that UUID already names different registration bytes; retain local state and do not
+  treat it as cleanup success.
+- 409 `registry-owner-conflict` means the authenticated owner differs from the requested or protected stored owner;
+  retain local state, expose no handle/fence from the server response, and require the correct account.
+- 503 `registration-cleanup-conflict` means the barrier/delete could not serialize; retry the identical request.
+- 400 malformed/noncanonical/unknown field · 401 invalid bearer · 429 `operation-rate-limited` at the required admission
+  boundary · 501 V2 unavailable · 502 storage/corruption/adapter failure. Every non-200 retains the pending operation on
+  the phone.
+
+For both registration endpoints, the external admission boundary's 429 response is exact JSON
+`{"error":"registration operation rate limited","reason":"operation-rate-limited"}` with a positive integer
+`Retry-After` header in seconds. It keys the shared quota by the verifier-owned principal/human plus installation and
+idempotency UUID—not by IP, mutable request fingerprint, or UUID alone—and returns before any registry mutation.
+
+### `DELETE /dial/register` — authenticated exact conditional revoke
 
 Body:
 
 ```json
 {
   "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<exact authenticated owner handle>",
   "installationId": "…",
   "sessionId": "…",
   "bindingId": "bind_…",
@@ -137,10 +319,24 @@ Body:
 }
 ```
 
-This route intentionally does not require current session membership, so sign-out/access-loss can revoke with the old
-bearer before credentials are cleared. It is existence-oblivious: a valid request returns 200 even if already absent.
-Deletion occurs only when authenticated target + installation + binding id + revision all still match; a stale A revoke
-cannot delete a newer B binding. Registry operations use a schema-bounded 21-attempt serialization budget
+The only 200 body is exact:
+
+```json
+{
+  "unregistered": true,
+  "registrationVersion": 2,
+  "ownerVersion": 1,
+  "ownerHandle": "<exact request owner handle>",
+  "sessionId": "…"
+}
+```
+
+This route intentionally requires neither current `pocket:dial` scope nor session membership, so sign-out/access-loss
+can revoke with the still-authenticated bearer before credentials are cleared. It is existence-oblivious: a valid
+request returns 200 even if already absent. Deletion occurs only when authenticated target + installation + binding id
++ revision + owner all still match; a stale A revoke cannot delete a newer B binding, and another account cannot delete
+the protected row even with a copied exact fence. Owner mismatch returns the same generic 409 body documented above.
+Registry operations use a schema-bounded 21-attempt serialization budget
 (`20 installations + 1`), with bounded jitter between retryable CAS conflicts. If that budget is exhausted while the
 exact tuple remains present, the server returns retryable **503 `unregistration-conflict`**; the phone must retain its
 local binding and retry.
