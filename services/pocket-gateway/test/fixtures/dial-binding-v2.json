@@ -1,0 +1,31 @@
+{
+  "_doc": "Additive Registry V2 push proof. The legacy dial-payload-v1 fixture remains byte-for-byte unchanged; this separate fixture is decoded by both Node and Swift.",
+  "nowMs": 1770000000000,
+  "input": {
+    "humanId": "human-A",
+    "sessionId": "session-shared",
+    "message": "Registry V2 proof.",
+    "id": "dial_binding_v2",
+    "kind": "info",
+    "bindingVersion": 2,
+    "bindingId": "iiiiiiiiiiiiiiiiiiiiiiii",
+    "bindingRevision": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+    "installationGeneration": "7"
+  },
+  "payload": {
+    "v": 1,
+    "id": "dial_binding_v2",
+    "kind": "info",
+    "priority": "medium",
+    "callerName": "Senti needs you",
+    "who": "senti-pocket",
+    "sessionId": "session-shared",
+    "bindingVersion": 2,
+    "bindingId": "iiiiiiiiiiiiiiiiiiiiiiii",
+    "bindingRevision": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+    "installationGeneration": "7",
+    "fetch": false,
+    "ts": "2026-02-02T02:40:00.000Z",
+    "message": "Registry V2 proof."
+  }
+}

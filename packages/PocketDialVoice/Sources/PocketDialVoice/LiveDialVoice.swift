@@ -73,18 +73,38 @@ public final class LiveDialVoice: DialVoice {
         try! VoiceActivityConfiguration()
     }()
 
+    /// Bridge CallKit's ownership callbacks into PocketVoice's shared lease manager. While this flag is active,
+    /// synthesizer/player/microphone releases never call `AVAudioSession.setActive(false)` behind CallKit's back.
+    public static func prepareCallKitAudioSession() throws {
+        try CallKitAudioSessionOwnership.prepareForAnswer()
+    }
+
+    public static func callKitDidActivateAudioSession() {
+        CallKitAudioSessionOwnership.didActivate()
+    }
+
+    public static func callKitDidDeactivateAudioSession() {
+        CallKitAudioSessionOwnership.didDeactivate()
+    }
+
     // MARK: - DialVoice
 
     public func speak(_ text: String) async {
+        guard !Task.isCancelled else { return }
         guard let request = try? SpeechSynthesisRequest(text: text, tone: tone) else { return }
         _ = try? await synthesizer.speak(request)
     }
 
     public func listen() async -> String {
+        guard !Task.isCancelled else { return "" }
         guard await ensureModel() else { return "" }
+        guard !Task.isCancelled else { return "" }
         guard await requestPermission() else { return "" }
+        guard !Task.isCancelled else { return "" }
         guard let request = await captureUtterance() else { return "" }
+        guard !Task.isCancelled else { return "" }
         guard let result = try? await recognizer.transcribe(request) else { return "" }
+        guard !Task.isCancelled else { return "" }
         return result.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -123,6 +143,7 @@ public final class LiveDialVoice: DialVoice {
 
         do {
             for try await frame in stream {
+                if Task.isCancelled { break }
                 try accumulator.append(frame)
                 let update = try detector.process(samples: frame.samples, sampleRate: frame.sampleRate)
                 if update.transition == .speechStarted { speechStarted = true }
@@ -133,6 +154,7 @@ public final class LiveDialVoice: DialVoice {
         }
         await microphone.stop()
 
+        guard !Task.isCancelled else { return nil }
         return try? accumulator.transcriptionRequest()
     }
 }

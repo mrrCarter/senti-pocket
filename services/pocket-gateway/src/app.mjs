@@ -16,6 +16,9 @@ import { lambdaHandler } from './lambda.mjs';
 /**
  * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID,
  *                        ELEVENLABS_API_KEY; GEMMA_BASE_URL + GEMMA_MODEL [+ optional GEMMA_API_KEY] to wire /answer+/brief to Gemma;
+ *                        DIAL_REGISTRY_HMAC_KEY (>=32 bytes) enables installation-owned Registry V2;
+ *                        DIAL_REGISTRY_TOKEN_SCOPE identifies the APNs topic/environment for global token claims;
+ *                        DIAL_REGISTRY_V2_REQUIRED=1 fails boot without it; DIAL_REGISTRY_ALLOW_V1/READ_V1=0 cut legacy after migration;
  *                        RESVG_BIN + FFMPEG_BIN + RESVG_EGRESS_SANDBOXED=1 to enable /deck?format=video — the ack asserts
  *                        the deploy runs resvg network-egress-disabled (the SSRF backstop); without it, video 501s)
  * @param {object} deps   injected externals the deploy owns:
@@ -47,6 +50,12 @@ export function createProdGateway(env = {}, deps = {}) {
   if (!deps.dynamoClient || !deps.signingKey || typeof deps.knownSessionIdsFor !== 'function' || typeof deps.fetch !== 'function') {
     throw new Error('pocket-gateway prod deps missing: dynamoClient + signingKey + knownSessionIdsFor + fetch are required');
   }
+  if (env.DIAL_REGISTRY_V2_REQUIRED === '1' && !env.DIAL_REGISTRY_HMAC_KEY) {
+    throw new Error('pocket-gateway prod config missing: DIAL_REGISTRY_HMAC_KEY is required when DIAL_REGISTRY_V2_REQUIRED=1');
+  }
+  if (env.DIAL_REGISTRY_HMAC_KEY && !env.DIAL_REGISTRY_TOKEN_SCOPE) {
+    throw new Error('pocket-gateway prod config missing: DIAL_REGISTRY_TOKEN_SCOPE is required whenever Registry V2 is enabled');
+  }
   const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
   // Pocket-native auth (B3): pocket-gateway is Pocket-PRIVATE — all routes are Pocket-app routes, NO external-MCP/DPoP
   // resource-server surface — so it authenticates the caller's ONE SENTI user-session token by CALLING the api
@@ -75,7 +84,13 @@ export function createProdGateway(env = {}, deps = {}) {
   // existing DynamoDB table — zero new infra) so /dial/register works out of the box; a deploy may override it. /dial
   // DISPATCH additionally needs deps.apnsSend (the VoIP push transport, cert-bound): absent, /dial honestly 501s
   // (dial-not-configured) while /dial/register still records tokens for when APNs is wired.
-  const deviceRegistry = deps.deviceRegistry || createStoreDeviceRegistry({ store });
+  const deviceRegistry = deps.deviceRegistry || createStoreDeviceRegistry({
+    store,
+    installationHmacKey: env.DIAL_REGISTRY_HMAC_KEY,
+    tokenScope: env.DIAL_REGISTRY_TOKEN_SCOPE || 'legacy-default',
+    allowLegacyRegistration: env.DIAL_REGISTRY_ALLOW_V1 !== '0',
+    readLegacy: env.DIAL_REGISTRY_READ_V1 !== '0',
+  });
   // DIAL hydration store (PR-B2): a LEAN ring (dialPayloadV1 fetch=true) sheds all governed content; the phone re-loads
   // the full signal via GET /dial?id=, which reads what /dial dispatch persisted here. Rides the SAME store (zero new
   // infra), constructed UNCONDITIONALLY so GET /dial?id= serves a stored signal even before apnsSend (dispatch) is wired.

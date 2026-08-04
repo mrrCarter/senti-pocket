@@ -43,6 +43,36 @@ test('createProdGateway + createLambda boot with complete config', () => {
   assert.equal(typeof createLambda(FULL_ENV, FULL_DEPS), 'function');
 });
 
+test('Registry V2 production config fails closed on a missing/weak HMAC key and boots with a strong non-secret-length contract', () => {
+  assert.throws(
+    () => createProdGateway({ ...FULL_ENV, DIAL_REGISTRY_V2_REQUIRED: '1' }, FULL_DEPS),
+    /DIAL_REGISTRY_HMAC_KEY is required/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...FULL_ENV,
+      DIAL_REGISTRY_V2_REQUIRED: '1',
+      DIAL_REGISTRY_HMAC_KEY: 'too-short',
+      DIAL_REGISTRY_TOKEN_SCOPE: 'com.plexaura.sentipocket.app:development',
+    }, FULL_DEPS),
+    /at least 32 bytes/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...FULL_ENV,
+      DIAL_REGISTRY_V2_REQUIRED: '1',
+      DIAL_REGISTRY_HMAC_KEY: 'v2-registry-hmac-key-material-at-least-32-bytes',
+    }, FULL_DEPS),
+    /DIAL_REGISTRY_TOKEN_SCOPE is required/,
+  );
+  assert.equal(typeof createProdGateway({
+    ...FULL_ENV,
+    DIAL_REGISTRY_V2_REQUIRED: '1',
+    DIAL_REGISTRY_HMAC_KEY: 'v2-registry-hmac-key-material-at-least-32-bytes',
+    DIAL_REGISTRY_TOKEN_SCOPE: 'com.plexaura.sentipocket.app:development',
+  }, FULL_DEPS).handle, 'function');
+});
+
 // DIAL-ME prod wiring: a valid session must reach /dial* (pocket:dial in the verifier's granted set), the device binds
 // under the VERIFIED identity, and /dial rings via deps.apnsSend — else honestly 501.
 const dialFetch = (id = 'u1') => async (url) => (String(url).includes('/auth/me')
@@ -60,6 +90,7 @@ test('createProdGateway wires DIAL-ME: /dial/register binds under the VERIFIED h
   const reg = await gw.handle({ method: 'POST', path: '/dial/register', headers: { authorization: 'Bearer t' }, body: { voipToken: 'tok', sessionId: 'sess-1' } });
   assert.equal(reg.status, 200, 'a valid session reaches /dial/register (pocket:dial is granted)');
   assert.equal(registered[0].humanId, 'u1', 'device bound to the /auth/me identity, never the body');
+  assert.match(registered[0].principal, /^pocket\.principal\.senti\.v1\n/, 'durable target receives the full verified principal namespace');
   const dial = await gw.handle({ method: 'POST', path: '/dial', headers: { authorization: 'Bearer t' }, body: { message: 'ring', sessionId: 'sess-1' } });
   assert.equal(dial.status, 200);
   assert.equal(apnsSent[0].voipToken, 'tok', 'the registered token is resolved + rung');

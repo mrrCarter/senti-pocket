@@ -441,7 +441,16 @@ export function createGateway(deps) {
     // context may echo session text -> best-effort scrub + bound before it leaves via the push payload.
     const context = typeof body.context === 'string' ? scrubText(body.context).text.slice(0, 2048) : undefined;
     let out;
-    try { out = await deps.pushBackend({ message, context, priority, sessionId, humanId: ctx.humanId }); }
+    try {
+      out = await deps.pushBackend({
+        message,
+        context,
+        priority,
+        sessionId,
+        humanId: ctx.humanId,
+        principal: ctx.principal || ctx.humanId,
+      });
+    }
     catch { return json(502, { error: 'dial backend error', reason: 'dispatch-failed' }); }
     const dispatched = !!(out && out.dispatched);
     const dialId = out && typeof out.dialId === 'string' ? out.dialId : null;
@@ -503,7 +512,13 @@ export function createGateway(deps) {
       const mapped = mapSignalToPushInput(signal, { humanId: ctx.humanId });
       if (!mapped.ring) return { status: 422, body: { error: 'signal not rung', reason: mapped.reason, ...(mapped.error ? { detail: mapped.error } : {}) } };
       let out;
-      try { out = await deps.pushBackend({ ...mapped.input, storedSignal: mapped.storedSignal }); }
+      try {
+        out = await deps.pushBackend({
+          ...mapped.input,
+          principal: ctx.principal || ctx.humanId,
+          storedSignal: mapped.storedSignal,
+        });
+      }
       catch { return { status: 502, body: { error: 'dial backend error', reason: 'dispatch-failed' } }; }
       const dispatched = !!(out && out.dispatched);
       const dialId = (out && typeof out.dialId === 'string' ? out.dialId : null) || mapped.input.id;
@@ -579,8 +594,25 @@ export function createGateway(deps) {
     if (!body) return json(400, { error: 'invalid JSON body' });
     const r = await dialReg.register({
       humanId: ctx.humanId,
+      principal: ctx.principal || ctx.humanId,
       body,
       isMember: async (sid) => { const known = await deps.knownSessionIdsFor(ctx.humanId); return Array.isArray(known) && known.includes(sid); },
+    });
+    return json(r.status, r.body);
+  }
+
+  // POST /dial/unregister — advance THIS installation to a V2 tombstone and revoke only the exact prior binding.
+  // No current membership check: a user who just lost room access must still be able to revoke their own device.
+  // humanId remains token-derived, and the registry verifies installation + prior generation + binding id/revision.
+  // Every stale/missing compare-delete is an idempotent 200, so this route is not a binding-existence oracle.
+  async function handleDialUnregister(req, ctx) {
+    if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    const r = await dialReg.unregister({
+      humanId: ctx.humanId,
+      principal: ctx.principal || ctx.humanId,
+      body,
     });
     return json(r.status, r.body);
   }
@@ -643,6 +675,7 @@ export function createGateway(deps) {
         if (method === 'POST' && path === '/dial/ring-owner') return await handleRingOwner(req, ctx);
         if (method === 'GET' && path === '/dial') return await handleDialFetch(req, ctx);
         if (method === 'POST' && path === '/dial/register') return await handleDialRegister(req, ctx);
+        if (method === 'POST' && path === '/dial/unregister') return await handleDialUnregister(req, ctx);
         return json(404, { error: 'not found' });
       } catch {
         return json(500, { error: 'internal error' }); // no stack/detail leaked to the client

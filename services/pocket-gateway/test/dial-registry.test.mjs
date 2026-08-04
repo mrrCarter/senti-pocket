@@ -5,12 +5,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  createDialRegistry, createDialPushBackend, createStoreDeviceRegistry, validateRegistration, buildDialPayload, computeDialId,
-  DIAL_LIMITS, DIAL_PRIORITIES, DIAL_PUSHKIT_CAP, DIAL_PAYLOAD_MAX_BYTES,
+  createDialRegistry, createDialPushBackend, createStoreDeviceRegistry, validateRegistration, validateUnregistration,
+  buildDialPayload, computeDialId, DIAL_LIMITS, DIAL_PRIORITIES, DIAL_PUSHKIT_CAP, DIAL_PAYLOAD_MAX_BYTES,
 } from '../src/dial-registry.mjs';
+import { createInMemoryStore } from '../src/store.mjs';
 
 // Shared byte fixtures — the SAME file forge's Swift decoder byte-matches (KAV parity). Generated from buildDialPayload.
 const fixtures = JSON.parse(readFileSync(new URL('./fixtures/dial-payload-v1.json', import.meta.url), 'utf8'));
+const bindingV2Fixture = JSON.parse(readFileSync(new URL('./fixtures/dial-binding-v2.json', import.meta.url), 'utf8'));
 
 const NOW = 1_770_000_000_000; // fixed injected clock
 const fakeRegistry = () => {
@@ -426,4 +428,872 @@ test('pushBackend: duplicate voipToken records ring the device ONCE (dedup — n
   assert.equal(sent.length, 1, 'the duplicate token is rung exactly once');
   assert.equal(out.devices, 1, 'device count reflects DISTINCT devices');
   assert.equal(out.dispatched, true);
+});
+
+// ---- Registry V2: installation-owned monotonic lease + exact push proof -------------------------------------------
+
+const V2_HMAC_KEY = 'registry-v2-test-key-material-32-bytes-minimum';
+const INSTALL_A = 'A'.repeat(43);
+const INSTALL_B = 'B'.repeat(43);
+const INSTALL_C = 'C'.repeat(43);
+const v2Input = (overrides = {}) => ({
+  humanId: 'human-A',
+  sessionId: 'session-shared',
+  voipToken: 'token-A',
+  platform: 'apns',
+  installationId: INSTALL_A,
+  installationGeneration: '1',
+  ...overrides,
+});
+
+test('Registry V2 validators require a complete versioned tuple and canonical uint64 generations', () => {
+  const valid = validateRegistration({
+    voipToken: 'token-A',
+    sessionId: 'session-shared',
+    platform: 'apns',
+    registryVersion: 2,
+    installationId: INSTALL_A,
+    installationGeneration: '18446744073709551615',
+  });
+  assert.equal(valid.ok, true);
+  assert.equal(valid.value.installationGeneration, '18446744073709551615', 'generation stays an exact decimal string');
+  assert.equal(validateRegistration({
+    voipToken: 't', sessionId: 's', registryVersion: 2, installationId: INSTALL_A, installationGeneration: 1,
+  }).ok, false, 'JSON number generations are rejected before JavaScript precision can matter');
+  assert.equal(validateRegistration({
+    voipToken: 't', sessionId: 's', installationId: INSTALL_A,
+  }).ok, false, 'a partial V2 tuple never downgrades to V1');
+
+  const unreg = validateUnregistration({
+    registryVersion: 2,
+    installationId: INSTALL_A,
+    installationGeneration: '2',
+    previousInstallationGeneration: '1',
+    bindingId: 'i'.repeat(24),
+    bindingRevision: 'r'.repeat(32),
+    sessionId: 'session-shared',
+  });
+  assert.equal(unreg.ok, true);
+  assert.equal(validateUnregistration({
+    registryVersion: 2,
+    installationId: INSTALL_A,
+    installationGeneration: '1',
+    previousInstallationGeneration: '1',
+    bindingId: 'i'.repeat(24),
+    bindingRevision: 'r'.repeat(32),
+    sessionId: 'session-shared',
+  }).ok, false, 'unregister must advance the durable installation generation');
+});
+
+test('Registry V2 additive push fixture is reproduced exactly without changing legacy fixture bytes', () => {
+  assert.deepEqual(
+    buildDialPayload(bindingV2Fixture.input, bindingV2Fixture.nowMs),
+    bindingV2Fixture.payload,
+  );
+});
+
+test('createDialRegistry V2 returns only a validated server binding; unregister is auth-bound but not membership-bound', async () => {
+  const calls = [];
+  const deviceRegistry = {
+    async registerV2(input) {
+      calls.push(['register', input]);
+      return {
+        deviceCount: 1,
+        installationGeneration: input.installationGeneration,
+        bindingId: 'i'.repeat(24),
+        bindingRevision: 'r'.repeat(32),
+        leaseExpiresAtSec: Math.floor(NOW / 1000) + 60,
+      };
+    },
+    async unregisterV2(input) { calls.push(['unregister', input]); return { unregistered: true }; },
+  };
+  const service = createDialRegistry({ deviceRegistry, now: () => NOW });
+  const registered = await service.register({
+    humanId: 'verified-human',
+    principal: 'issuer:site:pairwise-human',
+    isMember: async () => true,
+    body: {
+      registryVersion: 2,
+      installationId: INSTALL_A,
+      installationGeneration: '1',
+      voipToken: 'token-A',
+      sessionId: 'session-shared',
+      platform: 'apns',
+    },
+  });
+  assert.equal(registered.status, 200);
+  assert.equal(registered.body.registryVersion, 2);
+  assert.equal(registered.body.bindingRevision, 'r'.repeat(32));
+  assert.equal(calls[0][1].humanId, 'verified-human', 'humanId is still derived from auth, never the body');
+  assert.equal(calls[0][1].principal, 'issuer:site:pairwise-human');
+
+  const unregistered = await service.unregister({
+    humanId: 'verified-human',
+    principal: 'issuer:site:pairwise-human',
+    body: {
+      registryVersion: 2,
+      installationId: INSTALL_A,
+      installationGeneration: '2',
+      previousInstallationGeneration: '1',
+      bindingId: 'i'.repeat(24),
+      bindingRevision: 'r'.repeat(32),
+      sessionId: 'session-shared',
+    },
+  });
+  assert.deepEqual(unregistered, { status: 200, body: { unregistered: true } });
+  assert.equal(calls[1][1].humanId, 'verified-human');
+  assert.equal(calls[1][1].principal, 'issuer:site:pairwise-human');
+});
+
+test('Registry V2 same-generation retry is idempotent; changed binding conflicts; A→B same-session rebind is global', async () => {
+  const store = createInMemoryStore();
+  const registry = createStoreDeviceRegistry({ store, now: () => NOW, installationHmacKey: V2_HMAC_KEY });
+  const first = await registry.registerV2(v2Input());
+  const retry = await registry.registerV2(v2Input());
+  assert.equal(retry.bindingId, first.bindingId);
+  assert.equal(retry.bindingRevision, first.bindingRevision, 'an exact retry renews the same server revision');
+
+  await assert.rejects(
+    registry.registerV2(v2Input({ voipToken: 'changed-at-same-generation' })),
+    (error) => error.registryStatus === 409 && error.registryReason === 'binding-generation-conflict',
+  );
+
+  const second = await registry.registerV2(v2Input({
+    humanId: 'human-B',
+    voipToken: 'token-B',
+    installationGeneration: '2',
+  }));
+  assert.notEqual(second.bindingRevision, first.bindingRevision);
+  assert.deepEqual(await registry.lookup({ humanId: 'human-A', sessionId: 'session-shared' }), [],
+    'A stale target index is inert after the durable installation head moves to B');
+  const rowsB = await registry.lookup({ humanId: 'human-B', sessionId: 'session-shared' });
+  assert.equal(rowsB.length, 1);
+  assert.equal(rowsB[0].voipToken, 'token-B');
+  assert.equal(rowsB[0].installationGeneration, '2');
+  await assert.rejects(
+    registry.registerV2(v2Input()),
+    (error) => error.registryStatus === 409 && error.registryReason === 'binding-superseded',
+    'a delayed A register cannot roll the durable head back after B completes',
+  );
+
+  for (const key of store._records.keys()) {
+    assert.equal(key.includes(INSTALL_A), false, 'raw installation id never appears in a store key');
+    assert.equal(key.includes('human-A'), false, 'raw human id never appears in a store key');
+    assert.equal(key.includes('session-shared'), false, 'raw session id never appears in a store key');
+  }
+});
+
+test('Registry V2 logical TTL excludes a lease even while the in-memory/Dynamo record physically remains', async () => {
+  let clock = NOW;
+  const store = createInMemoryStore();
+  const registry = createStoreDeviceRegistry({
+    store,
+    now: () => clock,
+    installationHmacKey: V2_HMAC_KEY,
+    leaseSeconds: 10,
+  });
+  await registry.registerV2(v2Input());
+  assert.equal((await registry.lookup({ humanId: 'human-A', sessionId: 'session-shared' })).length, 1);
+  const physicalRecords = store._records.size;
+  clock += 10_000;
+  assert.deepEqual(await registry.lookup({ humanId: 'human-A', sessionId: 'session-shared' }), []);
+  assert.equal(store._records.size, physicalRecords, 'test store still physically contains TTL records; lookup enforced logical expiry');
+});
+
+test('Registry V2 unregister tombstone blocks resurrection; stale cleanup cannot remove a newer B binding', async () => {
+  const registry = createStoreDeviceRegistry({
+    store: createInMemoryStore(),
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const first = await registry.registerV2(v2Input());
+  const cleanup = {
+    humanId: 'human-A',
+    sessionId: 'session-shared',
+    installationId: INSTALL_A,
+    previousInstallationGeneration: '1',
+    installationGeneration: '2',
+    bindingId: first.bindingId,
+    bindingRevision: first.bindingRevision,
+  };
+  await registry.unregisterV2(cleanup);
+  assert.deepEqual(await registry.lookup({ humanId: 'human-A', sessionId: 'session-shared' }), []);
+  await assert.rejects(
+    registry.registerV2(v2Input()),
+    (error) => error.registryStatus === 409 && error.registryReason === 'binding-superseded',
+    'the durable tombstone rejects a delayed generation-1 retry',
+  );
+
+  const principalB = await registry.registerV2(v2Input({
+    humanId: 'human-B',
+    voipToken: 'token-B',
+    installationGeneration: '3',
+  }));
+  await registry.unregisterV2(cleanup); // delayed duplicate A cleanup after B won
+  const rowsB = await registry.lookup({ humanId: 'human-B', sessionId: 'session-shared' });
+  assert.equal(rowsB.length, 1, 'stale compare-delete must retain B even when the physical installation is the same');
+  assert.equal(rowsB[0].bindingRevision, principalB.bindingRevision);
+});
+
+test('Registry V2 bounded target index enforces the device cap before lookup fan-out', async () => {
+  const registry = createStoreDeviceRegistry({
+    store: createInMemoryStore(),
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+    maxDevices: 2,
+  });
+  await registry.registerV2(v2Input({ installationId: INSTALL_A, voipToken: 'one' }));
+  await registry.registerV2(v2Input({ installationId: INSTALL_B, voipToken: 'two' }));
+  await assert.rejects(
+    registry.registerV2(v2Input({ installationId: INSTALL_C, voipToken: 'three' })),
+    (error) => error.registryStatus === 409 && error.registryReason === 'device-cap-reached',
+  );
+  assert.equal((await registry.lookup({ humanId: 'human-A', sessionId: 'session-shared', limit: 99 })).length, 2);
+});
+
+test('Registry V2 namespaces device targets by full principal while membership remains humanId-based', async () => {
+  const registry = createStoreDeviceRegistry({
+    store: createInMemoryStore(),
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  await registry.registerV2(v2Input({
+    principal: 'issuer-A:site-A:pairwise-1',
+    installationId: INSTALL_A,
+    voipToken: 'site-A-token',
+  }));
+  await registry.registerV2(v2Input({
+    principal: 'issuer-A:site-B:pairwise-1',
+    installationId: INSTALL_B,
+    voipToken: 'site-B-token',
+  }));
+
+  const siteA = await registry.lookup({
+    humanId: 'human-A',
+    principal: 'issuer-A:site-A:pairwise-1',
+    sessionId: 'session-shared',
+  });
+  const siteB = await registry.lookup({
+    humanId: 'human-A',
+    principal: 'issuer-A:site-B:pairwise-1',
+    sessionId: 'session-shared',
+  });
+  assert.deepEqual(siteA.map((row) => row.voipToken), ['site-A-token']);
+  assert.deepEqual(siteB.map((row) => row.voipToken), ['site-B-token']);
+  assert.deepEqual(
+    await registry.lookup({ humanId: 'human-A', sessionId: 'session-shared' }),
+    [],
+    'the humanId compatibility namespace cannot see either full-principal target',
+  );
+
+  const sender = createDialPushBackend({
+    deviceRegistry: {
+      async lookup() { return [{ voipToken: 'token', platform: 'apns' }]; },
+      async revalidate() { return true; },
+    },
+    apnsSend: async () => ({ delivered: true }),
+    now: () => NOW,
+  });
+  const dialA = await sender({
+    humanId: 'human-A',
+    principal: 'issuer-A:site-A:pairwise-1',
+    sessionId: 'session-shared',
+    message: 'same message',
+  });
+  const dialB = await sender({
+    humanId: 'human-A',
+    principal: 'issuer-A:site-B:pairwise-1',
+    sessionId: 'session-shared',
+    message: 'same message',
+  });
+  assert.notEqual(dialA.dialId, dialB.dialId, 'durable dial/signal identity is full-principal namespaced too');
+});
+
+test('Registry V1 migration fallback is exact-principal scoped and ignores untagged historical rows', async () => {
+  const store = createInMemoryStore();
+  const registry = createStoreDeviceRegistry({
+    store,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const principalA = 'issuer-A:site-A:same-human';
+  const principalB = 'issuer-A:site-B:same-human';
+  await registry.register({
+    humanId: 'same-human',
+    principal: principalA,
+    sessionId: 'same-session',
+    voipToken: 'legacy-site-a-token',
+    platform: 'apns',
+  });
+
+  const siteA = await registry.lookup({
+    humanId: 'same-human',
+    principal: principalA,
+    sessionId: 'same-session',
+  });
+  assert.deepEqual(siteA.map((row) => row.voipToken), ['legacy-site-a-token']);
+  assert.deepEqual(
+    await registry.lookup({
+      humanId: 'same-human',
+      principal: principalB,
+      sessionId: 'same-session',
+    }),
+    [],
+    'an equal humanId at another site cannot see the V1 fallback',
+  );
+  assert.equal(await registry.revalidate({
+    humanId: 'same-human',
+    principal: principalB,
+    sessionId: 'same-session',
+    device: siteA[0],
+  }), false, 'lookup-to-send revalidation keeps the same full-principal fence');
+
+  await store.put('dial:dev:10:same-human:historical-session', {
+    voipToken: 'untagged-historical-token',
+    platform: 'apns',
+    registeredAt: new Date(NOW).toISOString(),
+    expiresAtSec: Math.floor(NOW / 1000) + 60,
+  });
+  assert.deepEqual(
+    await registry.lookup({
+      humanId: 'same-human',
+      principal: principalA,
+      sessionId: 'historical-session',
+    }),
+    [],
+    'historical rows without a principal tag fail closed instead of becoming cross-site authority',
+  );
+});
+
+test('Registry V2 target-cap rejection happens before head/lease mutation and preserves the old target', async () => {
+  const store = createInMemoryStore();
+  const registry = createStoreDeviceRegistry({
+    store,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+    maxDevices: 1,
+  });
+  const old = await registry.registerV2(v2Input({
+    principal: 'principal-A',
+    sessionId: 'session-old',
+    voipToken: 'old-authoritative-token',
+  }));
+  await registry.registerV2(v2Input({
+    principal: 'principal-B',
+    humanId: 'human-B',
+    installationId: INSTALL_B,
+    sessionId: 'session-full',
+    voipToken: 'capacity-winner-token',
+  }));
+
+  await assert.rejects(
+    registry.registerV2(v2Input({
+      principal: 'principal-B',
+      sessionId: 'session-full',
+      voipToken: 'must-never-enter-a-lease',
+      installationGeneration: '2',
+    })),
+    (error) => error.registryStatus === 409 && error.registryReason === 'device-cap-reached',
+  );
+  const stillOld = await registry.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-old',
+  });
+  assert.equal(stillOld.length, 1);
+  assert.equal(stillOld[0].bindingRevision, old.bindingRevision);
+  assert.equal(stillOld[0].voipToken, 'old-authoritative-token');
+  assert.equal(
+    [...store._records.values()].some((value) =>
+      JSON.stringify(value).includes('must-never-enter-a-lease')
+    ),
+    false,
+    'a capacity loser leaves no raw-token lease behind',
+  );
+});
+
+test('Registry V2 concurrent contenders for the last target slot produce one durable winner', async () => {
+  const store = createInMemoryStore();
+  const registry = createStoreDeviceRegistry({
+    store,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+    maxDevices: 1,
+  });
+  const results = await Promise.allSettled([
+    registry.registerV2(v2Input({ installationId: INSTALL_A, voipToken: 'contender-A' })),
+    registry.registerV2(v2Input({ installationId: INSTALL_B, voipToken: 'contender-B' })),
+  ]);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  const loser = results.find((result) => result.status === 'rejected');
+  assert.equal(loser.reason.registryReason, 'device-cap-reached');
+  const rows = await registry.lookup({ humanId: 'human-A', sessionId: 'session-shared' });
+  assert.equal(rows.length, 1);
+  assert.equal(
+    ['contender-A', 'contender-B'].includes(rows[0].voipToken),
+    true,
+  );
+  const losingToken = rows[0].voipToken === 'contender-A' ? 'contender-B' : 'contender-A';
+  assert.equal(
+    [...store._records.values()].some((value) => JSON.stringify(value).includes(losingToken)),
+    false,
+    'the losing raw APNs token never enters a lease',
+  );
+});
+
+test('Registry V2 token claim has one installation owner and stale cleanup cannot release its successor', async () => {
+  const registry = createStoreDeviceRegistry({
+    store: createInMemoryStore(),
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+    tokenScope: 'com.plexaura.sentipocket.app:development',
+  });
+  const first = await registry.registerV2(v2Input({
+    principal: 'principal-A',
+    voipToken: 'shared-apns-token',
+  }));
+  await assert.rejects(
+    registry.registerV2(v2Input({
+      humanId: 'human-B',
+      principal: 'principal-B',
+      installationId: INSTALL_B,
+      voipToken: 'shared-apns-token',
+    })),
+    (error) => error.registryStatus === 409 && error.registryReason === 'device-token-claimed',
+  );
+  assert.equal((await registry.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-shared',
+  })).length, 1);
+
+  const staleCleanup = {
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-shared',
+    installationId: INSTALL_A,
+    previousInstallationGeneration: '1',
+    installationGeneration: '2',
+    bindingId: first.bindingId,
+    bindingRevision: first.bindingRevision,
+  };
+  await registry.unregisterV2(staleCleanup);
+  const successor = await registry.registerV2(v2Input({
+    humanId: 'human-B',
+    principal: 'principal-B',
+    installationId: INSTALL_B,
+    voipToken: 'shared-apns-token',
+  }));
+  await registry.unregisterV2(staleCleanup);
+  const rows = await registry.lookup({
+    humanId: 'human-B',
+    principal: 'principal-B',
+    sessionId: 'session-shared',
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].bindingRevision, successor.bindingRevision);
+  await assert.rejects(
+    registry.registerV2(v2Input({
+      principal: 'principal-A',
+      voipToken: 'shared-apns-token',
+    })),
+    (error) => error.registryStatus === 409 && error.registryReason === 'binding-superseded',
+    'the old installation cannot reclaim the transferred token with its delayed generation',
+  );
+});
+
+test('Registry V2 duplicate-token loser releases its target reservation for an unrelated valid device', async () => {
+  const registry = createStoreDeviceRegistry({
+    store: createInMemoryStore(),
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+    tokenScope: 'com.plexaura.sentipocket.app:development',
+    maxDevices: 1,
+  });
+  await registry.registerV2(v2Input({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-A',
+    installationId: INSTALL_A,
+    voipToken: 'already-owned-token',
+  }));
+  await assert.rejects(
+    registry.registerV2(v2Input({
+      humanId: 'human-B',
+      principal: 'principal-B',
+      sessionId: 'session-B',
+      installationId: INSTALL_B,
+      voipToken: 'already-owned-token',
+    })),
+    (error) => error.registryStatus === 409 && error.registryReason === 'device-token-claimed',
+  );
+  assert.deepEqual(
+    await registry.lookup({
+      humanId: 'human-B',
+      principal: 'principal-B',
+      sessionId: 'session-B',
+    }),
+    [],
+    'the token-claim loser has no authoritative target binding',
+  );
+
+  const winner = await registry.registerV2(v2Input({
+    humanId: 'human-B',
+    principal: 'principal-B',
+    sessionId: 'session-B',
+    installationId: INSTALL_C,
+    voipToken: 'independent-token',
+  }));
+  const rows = await registry.lookup({
+    humanId: 'human-B',
+    principal: 'principal-B',
+    sessionId: 'session-B',
+  });
+  assert.equal(rows.length, 1, 'the synchronous loser did not poison the one-slot target for the reservation TTL');
+  assert.equal(rows[0].bindingRevision, winner.bindingRevision);
+  assert.equal(rows[0].voipToken, 'independent-token');
+});
+
+test('Registry V2 rollback cannot erase an exact same-generation sibling that is about to activate', async () => {
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const base = createInMemoryStore();
+  const aAtSecondTokenClaim = deferred();
+  const resumeA = deferred();
+  const bAtHeadActivation = deferred();
+  const resumeB = deferred();
+  let aTokenCasCount = 0;
+  const storeA = {
+    ...base,
+    async compareAndSwap(key, expectedVersion, value) {
+      if (key.startsWith('dial:v2:token:')) {
+        aTokenCasCount += 1;
+        if (aTokenCasCount === 2) {
+          aAtSecondTokenClaim.resolve();
+          await resumeA.promise;
+          throw new Error('injected ambiguous token CAS failure');
+        }
+      }
+      return base.compareAndSwap(key, expectedVersion, value);
+    },
+  };
+  let bPaused = false;
+  const storeB = {
+    ...base,
+    async advanceGeneration(key, value) {
+      if (!bPaused) {
+        bPaused = true;
+        bAtHeadActivation.resolve();
+        await resumeB.promise;
+      }
+      return base.advanceGeneration(key, value);
+    },
+  };
+  const registryA = createStoreDeviceRegistry({
+    store: storeA,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const registryB = createStoreDeviceRegistry({
+    store: storeB,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+
+  const attemptA = registryA.registerV2(v2Input());
+  await aAtSecondTokenClaim.promise;
+  const attemptB = registryB.registerV2(v2Input());
+  await bAtHeadActivation.promise;
+  resumeA.resolve();
+  await assert.rejects(attemptA, /injected ambiguous token CAS failure/);
+  resumeB.resolve();
+  const accepted = await attemptB;
+
+  const rows = await registryB.lookup({
+    humanId: 'human-A',
+    sessionId: 'session-shared',
+  });
+  assert.equal(rows.length, 1, 'the fulfilled sibling remains reachable through its shared target index');
+  assert.equal(rows[0].bindingRevision, accepted.bindingRevision);
+  assert.equal(rows[0].voipToken, 'token-A');
+});
+
+test('Registry V2 equal-generation stale unregister cannot erase an about-to-activate register', async () => {
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const base = createInMemoryStore();
+  const stable = createStoreDeviceRegistry({
+    store: base,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const first = await stable.registerV2(v2Input());
+  const atTokenActivation = deferred();
+  const resumeActivation = deferred();
+  let paused = false;
+  const pausingStore = {
+    ...base,
+    async compareAndSwap(key, expectedVersion, value) {
+      if (!paused &&
+          key.startsWith('dial:v2:token:') &&
+          value?.active?.generation === '2' &&
+          value?.pending === null) {
+        paused = true;
+        atTokenActivation.resolve();
+        await resumeActivation.promise;
+      }
+      return base.compareAndSwap(key, expectedVersion, value);
+    },
+  };
+  const rotating = createStoreDeviceRegistry({
+    store: pausingStore,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const rotation = rotating.registerV2(v2Input({
+    installationGeneration: '2',
+    voipToken: 'rotated-token',
+  }));
+  await atTokenActivation.promise;
+
+  await stable.unregisterV2({
+    humanId: 'human-A',
+    sessionId: 'session-shared',
+    installationId: INSTALL_A,
+    previousInstallationGeneration: '1',
+    installationGeneration: '2',
+    bindingId: first.bindingId,
+    bindingRevision: first.bindingRevision,
+  });
+  resumeActivation.resolve();
+  const accepted = await rotation;
+
+  const rows = await stable.lookup({
+    humanId: 'human-A',
+    sessionId: 'session-shared',
+  });
+  assert.equal(rows.length, 1, 'the in-flight generation-2 register retains its target candidate');
+  assert.equal(rows[0].bindingRevision, accepted.bindingRevision);
+  assert.equal(rows[0].voipToken, 'rotated-token');
+});
+
+test('Registry V2 token migration fence suppresses only the matching legacy device through unregister', async () => {
+  const matchingStore = createInMemoryStore();
+  const matching = createStoreDeviceRegistry({
+    store: matchingStore,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  await matching.register(v2Input({ voipToken: 'migrated-token' }));
+  const accepted = await matching.registerV2(v2Input({ voipToken: 'migrated-token' }));
+  assert.equal((await matching.lookup({
+    humanId: 'human-A',
+    sessionId: 'session-shared',
+  })).length, 1, 'the matching V1 record is suppressed as soon as its token enters V2');
+  await matching.unregisterV2({
+    humanId: 'human-A',
+    sessionId: 'session-shared',
+    installationId: INSTALL_A,
+    previousInstallationGeneration: '1',
+    installationGeneration: '2',
+    bindingId: accepted.bindingId,
+    bindingRevision: accepted.bindingRevision,
+  });
+  assert.deepEqual(
+    await matching.lookup({ humanId: 'human-A', sessionId: 'session-shared' }),
+    [],
+    'the durable token claim/tombstone prevents matching V1 resurrection after logout',
+  );
+
+  const distinct = createStoreDeviceRegistry({
+    store: createInMemoryStore(),
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  await distinct.register(v2Input({ voipToken: 'older-distinct-device' }));
+  const v2 = await distinct.registerV2(v2Input({ voipToken: 'new-v2-device' }));
+  assert.deepEqual(
+    (await distinct.lookup({ humanId: 'human-A', sessionId: 'session-shared' }))
+      .map((row) => row.voipToken)
+      .sort(),
+    ['new-v2-device', 'older-distinct-device'],
+    'an unrelated legacy device remains available during the explicit grace window',
+  );
+  await distinct.unregisterV2({
+    humanId: 'human-A',
+    sessionId: 'session-shared',
+    installationId: INSTALL_A,
+    previousInstallationGeneration: '1',
+    installationGeneration: '2',
+    bindingId: v2.bindingId,
+    bindingRevision: v2.bindingRevision,
+  });
+  assert.deepEqual(
+    (await distinct.lookup({ humanId: 'human-A', sessionId: 'session-shared' }))
+      .map((row) => row.voipToken),
+    ['older-distinct-device'],
+  );
+});
+
+test('Registry V2 lease-write failure after reservations keeps old authority and exact retry rolls forward', async () => {
+  const base = createInMemoryStore();
+  const stable = createStoreDeviceRegistry({
+    store: base,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const old = await stable.registerV2(v2Input({
+    principal: 'principal-A',
+    sessionId: 'session-old',
+    voipToken: 'same-device-token',
+  }));
+  let failLeaseOnce = true;
+  const faulting = {
+    ...base,
+    async put(key, value, options) {
+      if (failLeaseOnce && key.startsWith('dial:v2:lease:')) {
+        failLeaseOnce = false;
+        throw new Error('injected lease write failure');
+      }
+      return base.put(key, value, options);
+    },
+  };
+  const registry = createStoreDeviceRegistry({
+    store: faulting,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const replacementInput = v2Input({
+    principal: 'principal-A',
+    sessionId: 'session-new',
+    voipToken: 'same-device-token',
+    installationGeneration: '2',
+  });
+  await assert.rejects(registry.registerV2(replacementInput), /injected lease write failure/);
+  const stillOld = await stable.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-old',
+  });
+  assert.equal(stillOld.length, 1);
+  assert.equal(stillOld[0].bindingRevision, old.bindingRevision);
+
+  const replacement = await registry.registerV2(replacementInput);
+  assert.equal(replacement.installationGeneration, '2');
+  assert.deepEqual(await registry.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-old',
+  }), []);
+  assert.equal((await registry.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-new',
+  })).length, 1);
+});
+
+test('Registry V2 token-activation failure is fail-closed and exact retry completes the prepared head', async () => {
+  const base = createInMemoryStore();
+  const stable = createStoreDeviceRegistry({
+    store: base,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  await stable.registerV2(v2Input({
+    principal: 'principal-A',
+    sessionId: 'session-old',
+    voipToken: 'activation-token',
+  }));
+
+  let tokenClaimCas = 0;
+  const faulting = {
+    ...base,
+    async compareAndSwap(key, expectedVersion, value) {
+      if (key.startsWith('dial:v2:token:')) {
+        tokenClaimCas += 1;
+        if (tokenClaimCas === 3) throw new Error('injected token activation failure');
+      }
+      return base.compareAndSwap(key, expectedVersion, value);
+    },
+  };
+  const registry = createStoreDeviceRegistry({
+    store: faulting,
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const replacementInput = v2Input({
+    principal: 'principal-A',
+    sessionId: 'session-new',
+    voipToken: 'activation-token',
+    installationGeneration: '2',
+  });
+  await assert.rejects(registry.registerV2(replacementInput), /injected token activation failure/);
+  assert.deepEqual(await registry.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-old',
+  }), [], 'the new head invalidates old authority, but an unactivated token can never ring');
+  assert.deepEqual(await registry.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-new',
+  }), [], 'the partially committed head remains fail-closed until exact retry');
+
+  const recovered = await registry.registerV2(replacementInput);
+  assert.equal(recovered.installationGeneration, '2');
+  assert.equal((await registry.lookup({
+    humanId: 'human-A',
+    principal: 'principal-A',
+    sessionId: 'session-new',
+  })).length, 1);
+});
+
+test('Registry V2 push carries the exact per-device proof and pre-send revalidation closes a lookup/rebind race', async () => {
+  const registry = createStoreDeviceRegistry({
+    store: createInMemoryStore(),
+    now: () => NOW,
+    installationHmacKey: V2_HMAC_KEY,
+  });
+  const first = await registry.registerV2(v2Input());
+  const sent = [];
+  const normal = createDialPushBackend({
+    deviceRegistry: registry,
+    apnsSend: async (request) => { sent.push(request); return { delivered: true }; },
+    now: () => NOW,
+  });
+  assert.equal((await normal({ humanId: 'human-A', sessionId: 'session-shared', message: 'ring' })).dispatched, true);
+  assert.equal(sent[0].payload.bindingVersion, 2);
+  assert.equal(sent[0].payload.bindingId, first.bindingId);
+  assert.equal(sent[0].payload.bindingRevision, first.bindingRevision);
+  assert.equal(sent[0].payload.installationGeneration, '1');
+
+  let switched = false;
+  const racingRegistry = {
+    async lookup(args) {
+      const captured = await registry.lookup(args);
+      await registry.registerV2(v2Input({
+        humanId: 'human-B',
+        voipToken: 'token-B',
+        installationGeneration: '2',
+      }));
+      switched = true;
+      return captured;
+    },
+    revalidate: registry.revalidate,
+  };
+  let racedSends = 0;
+  const raced = await createDialPushBackend({
+    deviceRegistry: racingRegistry,
+    apnsSend: async () => { racedSends += 1; return { delivered: true }; },
+    now: () => NOW,
+  })({ humanId: 'human-A', sessionId: 'session-shared', message: 'must not reach B' });
+  assert.equal(switched, true);
+  assert.equal(raced.reason, 'stale-device-binding');
+  assert.equal(racedSends, 0, 'a row captured before B rebind is revalidated immediately before transport');
 });
