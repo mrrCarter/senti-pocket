@@ -22,7 +22,9 @@
 import { createHash } from 'node:crypto';
 import {
   DEVICE_REGISTRATION_VERSION,
+  DEVICE_REGISTRY_OWNER_VERSION,
   DeviceRegistryV2Error,
+  validateDeviceRegistrationCleanupV2,
   validateDeviceRegistrationV2,
   validateDeviceUnregistrationV2,
 } from './device-registry-v2.mjs';
@@ -36,6 +38,25 @@ export const DIAL_LIMITS = Object.freeze({
 // Priority set kept in SYNC with warden's /dial validate (low|medium|high|urgent). buildDialPayload defaults to medium.
 export const DIAL_PRIORITIES = Object.freeze(['low', 'medium', 'high', 'urgent']);
 export const DIAL_PLATFORMS = Object.freeze(['apns', 'fcm']);
+
+const DEVICE_REGISTRY_V2_METHODS = Object.freeze([
+  'registrationContext',
+  'register',
+  'reconcileRegistration',
+  'denyRegistration',
+  'unregister',
+  'lookup',
+]);
+
+export function assertDeviceRegistryV2Capabilities(deviceRegistry, owner = 'Registry V2') {
+  const missing = DEVICE_REGISTRY_V2_METHODS.filter((method) => typeof deviceRegistry?.[method] !== 'function');
+  if (deviceRegistry?.operationOutcomeVersion !== 1 || missing.length > 0) {
+    throw new Error(
+      `${owner} requires operationOutcomeVersion=1 and ${DEVICE_REGISTRY_V2_METHODS.join(', ')}`,
+    );
+  }
+  return deviceRegistry;
+}
 
 const utf8 = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
 const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -224,12 +245,469 @@ export function buildVoipPushDictionary(payload, aps = {}) {
  * The /dial/register handler logic over an injected deviceRegistry. Pure of transport: returns {status, body} so the
  * handlers.mjs wire is a thin adapter (auth + scope check, then call this). Kept OUT of handlers.mjs to avoid colliding
  * with warden's concurrent /dial route edits — the wire is a 3-line addition alongside his route.
- * @param {{ deviceRegistry?: {register:Function, lookup?:Function}, now?: ()=>number }} deps
+ * @param {{ deviceRegistry?: {register:Function, reconcileRegistration?:Function, lookup?:Function}, now?: ()=>number }} deps
  */
 export function createDialRegistry({ deviceRegistry, now } = {}) {
   const clock = typeof now === 'function' ? now : () => Date.now();
   const usesRegistryV2 = deviceRegistry?.protocolVersion === DEVICE_REGISTRATION_VERSION;
+  if (usesRegistryV2) assertDeviceRegistryV2Capabilities(deviceRegistry);
+  const exactObject = (value, keys) =>
+    value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key));
+  const canonicalOwnerHandle = (value) =>
+    typeof value === 'string' &&
+    /^[A-Za-z0-9_-]{43}$/.test(value) &&
+    Buffer.from(value, 'base64url').length === 32 &&
+    Buffer.from(value, 'base64url').toString('base64url') === value;
+  const ownerFieldsAreValid = (ownerVersion, ownerHandle) =>
+    ownerVersion === DEVICE_REGISTRY_OWNER_VERSION && canonicalOwnerHandle(ownerHandle);
+  const ownerConflict = () => ({
+    status: 409,
+    body: {
+      error: 'registry owner does not match authenticated principal',
+      reason: 'registry-owner-conflict',
+    },
+  });
+  const authorityResultKeys = [
+    'ownerVersion',
+    'ownerHandle',
+    'bindingId',
+    'bindingRevision',
+    'expiresAtEpochSec',
+    'idempotent',
+    'renewed',
+    'tokenClaimId',
+    'tokenClaimRevision',
+  ];
+  const validExpiryEpochSec = (value) => {
+    const milliseconds = value * 1000;
+    return (
+      Number.isSafeInteger(value) &&
+      value > 0 &&
+      Number.isSafeInteger(milliseconds) &&
+      Number.isFinite(new Date(milliseconds).getTime())
+    );
+  };
+  // The registry is an adapter boundary, including when production injects a non-reference implementation. Snapshot
+  // every returned field once, require the exact wire, and never let arbitrary adapter values become lease authority.
+  const authorityRegistration = (
+    result,
+    {
+      allowExpiredMarker = false,
+      requireReplaySemantics = false,
+      requireUnexpired = false,
+      expectedOwner,
+      nowMs,
+    } = {},
+  ) => {
+    const hasExpiredMarker =
+      allowExpiredMarker && result && typeof result === 'object' && Object.hasOwn(result, 'expired');
+    const expectedKeys = hasExpiredMarker ? [...authorityResultKeys, 'expired'] : authorityResultKeys;
+    if (!exactObject(result, expectedKeys)) return null;
+    const snapshot = {
+      ownerVersion: result.ownerVersion,
+      ownerHandle: result.ownerHandle,
+      bindingId: result.bindingId,
+      bindingRevision: result.bindingRevision,
+      expiresAtEpochSec: result.expiresAtEpochSec,
+      idempotent: result.idempotent,
+      renewed: result.renewed,
+      tokenClaimId: result.tokenClaimId,
+      tokenClaimRevision: result.tokenClaimRevision,
+      ...(hasExpiredMarker ? { expired: result.expired } : {}),
+    };
+    if (
+      !ownerFieldsAreValid(snapshot.ownerVersion, snapshot.ownerHandle) ||
+      typeof snapshot.bindingId !== 'string' || !/^bind_[0-9a-f]{32}$/.test(snapshot.bindingId) ||
+      !Number.isSafeInteger(snapshot.bindingRevision) || snapshot.bindingRevision <= 0 ||
+      typeof snapshot.tokenClaimId !== 'string' || !/^claim_[0-9a-f]{32}$/.test(snapshot.tokenClaimId) ||
+      !Number.isSafeInteger(snapshot.tokenClaimRevision) || snapshot.tokenClaimRevision <= 0 ||
+      !validExpiryEpochSec(snapshot.expiresAtEpochSec) ||
+      typeof snapshot.idempotent !== 'boolean' || typeof snapshot.renewed !== 'boolean' ||
+      (requireReplaySemantics && (snapshot.idempotent !== true || snapshot.renewed !== false)) ||
+      (hasExpiredMarker && snapshot.expired !== true) ||
+      (expectedOwner &&
+        (snapshot.ownerVersion !== expectedOwner.ownerVersion || snapshot.ownerHandle !== expectedOwner.ownerHandle))
+    ) {
+      return null;
+    }
+    if (allowExpiredMarker || requireUnexpired) {
+      const nowEpochSec = Math.floor(nowMs / 1000);
+      if (
+        !Number.isFinite(nowMs) ||
+        !Number.isSafeInteger(nowEpochSec) ||
+        nowEpochSec <= 0 ||
+        !Number.isFinite(new Date(nowMs).getTime())
+      ) {
+        return null;
+      }
+      const expiredAtObservation = nowEpochSec >= snapshot.expiresAtEpochSec;
+      if ((allowExpiredMarker && hasExpiredMarker !== expiredAtObservation) ||
+          (requireUnexpired && expiredAtObservation)) {
+        return null;
+      }
+    }
+    return snapshot;
+  };
+  const bindingConflictDetail = (error) => {
+    try {
+      const details = error.details;
+      if (!exactObject(details, ['currentBinding'])) return null;
+      const current = details.currentBinding;
+      if (current === null) return { value: null };
+      if (!exactObject(current, [
+        'bindingId', 'bindingRevision', 'expiresAtEpochSec', 'idempotent', 'renewed',
+      ])) return null;
+      const value = {
+        bindingId: current.bindingId,
+        bindingRevision: current.bindingRevision,
+        expiresAtEpochSec: current.expiresAtEpochSec,
+      };
+      if (
+        typeof value.bindingId !== 'string' || !/^bind_[0-9a-f]{32}$/.test(value.bindingId) ||
+        !Number.isSafeInteger(value.bindingRevision) || value.bindingRevision <= 0 ||
+        !validExpiryEpochSec(value.expiresAtEpochSec) ||
+        current.idempotent !== false || current.renewed !== false
+      ) return null;
+      return { value };
+    } catch {
+      return null;
+    }
+  };
+  const tokenClaimConflictDetail = (error) => {
+    try {
+      const details = error.details;
+      if (!exactObject(details, ['currentTokenClaim'])) return null;
+      const current = details.currentTokenClaim;
+      if (current === null) return { value: null };
+      if (!exactObject(current, ['tokenClaimId', 'tokenClaimRevision', 'expiresAtEpochSec'])) return null;
+      const value = {
+        tokenClaimId: current.tokenClaimId,
+        tokenClaimRevision: current.tokenClaimRevision,
+        expiresAtEpochSec: current.expiresAtEpochSec,
+      };
+      if (
+        typeof value.tokenClaimId !== 'string' || !/^claim_[0-9a-f]{32}$/.test(value.tokenClaimId) ||
+        !Number.isSafeInteger(value.tokenClaimRevision) || value.tokenClaimRevision <= 0 ||
+        !validExpiryEpochSec(value.expiresAtEpochSec)
+      ) return null;
+      return { value };
+    } catch {
+      return null;
+    }
+  };
+  const registrationFenceFields = (value, result, receiptNowMs) => ({
+    registrationVersion: DEVICE_REGISTRATION_VERSION,
+    ownerVersion: result.ownerVersion,
+    ownerHandle: result.ownerHandle,
+    sessionId: value.sessionId,
+    platform: value.platform,
+    bindingId: result.bindingId,
+    bindingRevision: result.bindingRevision,
+    tokenClaimId: result.tokenClaimId,
+    tokenClaimRevision: result.tokenClaimRevision,
+    expiresAt: new Date(result.expiresAtEpochSec * 1000).toISOString(),
+    // Authoritative receipt time for clients to convert the absolute lease into a monotonic countdown. This is
+    // generated after the registry operation; clients conservatively subtract request round-trip duration.
+    serverTime: new Date(receiptNowMs).toISOString(),
+    idempotent: result.idempotent === true,
+  });
+  const recoveryReceipt = (value, result, { status, reason, error }, receiptNowMs = clock()) => ({
+    status,
+    body: {
+      registered: false,
+      committed: true,
+      authorized: false,
+      revocationRequired: true,
+      reason,
+      error,
+      ...registrationFenceFields(value, result, receiptNowMs),
+    },
+  });
+  const deniedBeforeCommitReceipt = (value, { status, error }) => ({
+    status,
+    body: {
+      registered: false,
+      committed: false,
+      authorized: false,
+      revocationRequired: false,
+      reason: 'registration-denied-before-commit',
+      error,
+      registrationVersion: DEVICE_REGISTRATION_VERSION,
+      ownerVersion: value.ownerVersion,
+      ownerHandle: value.ownerHandle,
+      sessionId: value.sessionId,
+      platform: value.platform,
+      idempotent: true,
+    },
+  });
+  const registrationReceipt = (value, result, receiptNowMs = clock()) => {
+    if (Math.floor(receiptNowMs / 1000) >= result.expiresAtEpochSec) {
+      return recoveryReceipt(
+        value,
+        result,
+        {
+          status: 410,
+          reason: 'registration-expired',
+          error: 'registration lease expired',
+        },
+        receiptNowMs,
+      );
+    }
+    return {
+      status: 200,
+      body: {
+        registered: true,
+        ...registrationFenceFields(value, result, receiptNowMs),
+      },
+    };
+  };
+  const readExactRegistration = async ({ principal, humanId, body } = {}) => {
+    if (!usesRegistryV2 || typeof deviceRegistry?.reconcileRegistration !== 'function') return null;
+    const validated = validateDeviceRegistrationV2(body);
+    if (!validated.ok) return null;
+    const rawResult = await deviceRegistry.reconcileRegistration({
+      principal: principal || humanId,
+      humanId,
+      ...validated.value,
+    });
+    if (rawResult === null) return null;
+    const result = authorityRegistration(rawResult, {
+      allowExpiredMarker: true,
+      requireReplaySemantics: true,
+      expectedOwner: validated.value,
+      nowMs: clock(),
+    });
+    if (!result) throw new Error('device registry returned an invalid reconciliation result');
+    return result ? { value: validated.value, result } : null;
+  };
+  const cleanupIntentForRegistration = (value) => ({
+    registrationVersion: value.registrationVersion,
+    ownerVersion: value.ownerVersion,
+    ownerHandle: value.ownerHandle,
+    installationId: value.installationId,
+    idempotencyKey: value.idempotencyKey,
+    tokenDigest: createHash('sha256').update(value.voipToken, 'utf8').digest('base64url'),
+    sessionId: value.sessionId,
+    platform: value.platform,
+  });
+  const committedOutcomeRegistration = (outcome, expectedOwner) => {
+    const outerKeys = ['state', 'registration'];
+    if (!exactObject(outcome, outerKeys) || outcome.state !== 'committed' ||
+        !exactObject(outcome.registration, authorityResultKeys)) return null;
+    return authorityRegistration(outcome.registration, { requireReplaySemantics: true, expectedOwner });
+  };
+  const isDeniedOutcome = (outcome, expectedOwner) =>
+    exactObject(outcome, ['state', 'ownerVersion', 'ownerHandle']) &&
+    outcome.state === 'denied' &&
+    ownerFieldsAreValid(outcome.ownerVersion, outcome.ownerHandle) &&
+    outcome.ownerVersion === expectedOwner.ownerVersion &&
+    outcome.ownerHandle === expectedOwner.ownerHandle;
+  const isUnregisterOutcome = (outcome, expectedOwner) =>
+    exactObject(outcome, ['removed', 'ownerVersion', 'ownerHandle']) &&
+    typeof outcome.removed === 'boolean' &&
+    ownerFieldsAreValid(outcome.ownerVersion, outcome.ownerHandle) &&
+    outcome.ownerVersion === expectedOwner.ownerVersion &&
+    outcome.ownerHandle === expectedOwner.ownerHandle;
+  const recoveryForCommittedOutcome = (value, result) => {
+    const receiptNowMs = clock();
+    return Math.floor(receiptNowMs / 1000) >= result.expiresAtEpochSec
+      ? recoveryReceipt(
+          value,
+          result,
+          { status: 410, reason: 'registration-expired', error: 'registration lease expired' },
+          receiptNowMs,
+        )
+      : recoveryReceipt(
+          value,
+          result,
+          {
+            status: 409,
+            reason: 'registration-committed-but-unauthorized',
+            error: 'registration committed but current authorization is missing',
+          },
+          receiptNowMs,
+        );
+  };
+  const persistDenial = async ({ principal, humanId, value, deniedError }) => {
+    if (!usesRegistryV2 || typeof deviceRegistry?.denyRegistration !== 'function') {
+      return {
+        status: 501,
+        body: { error: 'dial registry v2 outcome protocol not configured', reason: 'dial-registry-v2-not-configured' },
+      };
+    }
+    try {
+      const outcome = await deviceRegistry.denyRegistration({
+        principal: principal || humanId,
+        humanId,
+        ...cleanupIntentForRegistration(value),
+      });
+      if (outcome?.state === 'committed') {
+        const registration = committedOutcomeRegistration(outcome, value);
+        if (!registration) {
+          return { status: 502, body: { error: 'registry denial failed', reason: 'registry-denial-failed' } };
+        }
+        return recoveryForCommittedOutcome(value, registration);
+      }
+      if (isDeniedOutcome(outcome, value)) {
+        return deniedBeforeCommitReceipt(value, { status: 403, error: deniedError });
+      }
+      return { status: 502, body: { error: 'registry denial failed', reason: 'registry-denial-failed' } };
+    } catch (error) {
+      if (error instanceof DeviceRegistryV2Error && error.code === 'registry-owner-conflict') {
+        return ownerConflict();
+      }
+      if (error instanceof DeviceRegistryV2Error && error.code === 'idempotency-conflict') {
+        // A different semantic intent already owns this operation key and may have committed. Never claim that the
+        // conflicting request is exact terminal proof or reveal the stored outcome to an unauthorized caller.
+        return { status: 403, body: { error: deniedError } };
+      }
+      if (error instanceof DeviceRegistryV2Error && error.code === 'registration-outcome-conflict') {
+        return {
+          status: 503,
+          body: { error: 'registration denial could not be serialized', reason: 'registration-outcome-conflict' },
+        };
+      }
+      return { status: 502, body: { error: 'registry denial failed', reason: 'registry-denial-failed' } };
+    }
+  };
+  const reconcileRegistration = async (args = {}) => {
+    const replay = await readExactRegistration(args);
+    if (!replay) return null;
+    return replay.result.expired === true
+      ? recoveryReceipt(replay.value, replay.result, {
+          status: 410,
+          reason: 'registration-expired',
+          error: 'registration lease expired',
+        })
+      : recoveryReceipt(replay.value, replay.result, {
+          status: 409,
+          reason: 'registration-committed-but-unauthorized',
+          error: 'registration committed but current authorization is missing',
+        });
+  };
   return {
+    async registrationContext({ principal, humanId } = {}) {
+      if (!usesRegistryV2 || typeof deviceRegistry?.registrationContext !== 'function') {
+        return {
+          status: 501,
+          body: { error: 'dial registry v2 not configured', reason: 'dial-registry-v2-not-configured' },
+        };
+      }
+      try {
+        const raw = await deviceRegistry.registrationContext({ principal: principal || humanId, humanId });
+        if (!exactObject(raw, ['registrationVersion', 'ownerVersion', 'ownerHandle'])) {
+          return { status: 502, body: { error: 'registry context failed', reason: 'registry-context-failed' } };
+        }
+        const context = {
+          registrationVersion: raw.registrationVersion,
+          ownerVersion: raw.ownerVersion,
+          ownerHandle: raw.ownerHandle,
+        };
+        const receiptNowMs = clock();
+        if (
+          context.registrationVersion !== DEVICE_REGISTRATION_VERSION ||
+          !ownerFieldsAreValid(context.ownerVersion, context.ownerHandle) ||
+          !Number.isFinite(receiptNowMs) ||
+          !Number.isFinite(new Date(receiptNowMs).getTime())
+        ) {
+          return { status: 502, body: { error: 'registry context failed', reason: 'registry-context-failed' } };
+        }
+        return {
+          status: 200,
+          body: { ...context, serverTime: new Date(receiptNowMs).toISOString() },
+        };
+      } catch {
+        return { status: 502, body: { error: 'registry context failed', reason: 'registry-context-failed' } };
+      }
+    },
+    // Handler-facing, read-only recovery seam. Missing-scope callers receive a non-authorizing revocation receipt only
+    // when they prove the exact request that committed; invalid, changed, absent, and non-V2 requests collapse to null.
+    reconcileRegistration,
+    async denyRegistration({ principal, humanId, body, deniedError = 'registration is not authorized' } = {}) {
+      const validated = validateDeviceRegistrationV2(body);
+      if (!validated.ok) return null;
+      return persistDenial({ principal, humanId, value: validated.value, deniedError });
+    },
+    async cleanupRegistration({ principal, humanId, body } = {}) {
+      if (!usesRegistryV2 || typeof deviceRegistry?.denyRegistration !== 'function' ||
+          typeof deviceRegistry?.unregister !== 'function') {
+        return {
+          status: 501,
+          body: { error: 'dial registry v2 cleanup not configured', reason: 'dial-registry-v2-not-configured' },
+        };
+      }
+      const validated = validateDeviceRegistrationCleanupV2(body);
+      if (!validated.ok) {
+        return { status: validated.status, body: { error: validated.error, reason: 'registration-cleanup-v2-required' } };
+      }
+      const value = validated.value;
+      try {
+        const outcome = await deviceRegistry.denyRegistration({
+          principal: principal || humanId,
+          humanId,
+          ...value,
+        });
+        if (outcome?.state === 'committed') {
+          const registration = committedOutcomeRegistration(outcome, value);
+          if (!registration) {
+            return { status: 502, body: { error: 'registry cleanup failed', reason: 'registry-cleanup-failed' } };
+          }
+          const deletion = await deviceRegistry.unregister({
+            principal: principal || humanId,
+            humanId,
+            registrationVersion: DEVICE_REGISTRATION_VERSION,
+            ownerVersion: value.ownerVersion,
+            ownerHandle: value.ownerHandle,
+            installationId: value.installationId,
+            sessionId: value.sessionId,
+            bindingId: registration.bindingId,
+            bindingRevision: registration.bindingRevision,
+          });
+          if (!isUnregisterOutcome(deletion, value)) {
+            return { status: 502, body: { error: 'registry cleanup failed', reason: 'registry-cleanup-failed' } };
+          }
+        } else if (!isDeniedOutcome(outcome, value)) {
+          return { status: 502, body: { error: 'registry cleanup failed', reason: 'registry-cleanup-failed' } };
+        }
+      } catch (error) {
+        if (error instanceof DeviceRegistryV2Error && error.code === 'registry-owner-conflict') {
+          return ownerConflict();
+        }
+        if (error instanceof DeviceRegistryV2Error && error.code === 'idempotency-conflict') {
+          return {
+            status: 409,
+            body: { error: 'idempotency key was reused for different registration data', reason: 'idempotency-conflict' },
+          };
+        }
+        if (error instanceof DeviceRegistryV2Error &&
+            ['registration-outcome-conflict', 'unregistration-conflict'].includes(error.code)) {
+          return {
+            status: 503,
+            body: { error: 'registration cleanup could not be serialized', reason: 'registration-cleanup-conflict' },
+          };
+        }
+        return { status: 502, body: { error: 'registry cleanup failed', reason: 'registry-cleanup-failed' } };
+      }
+      return {
+        status: 200,
+        body: {
+          registrationVersion: DEVICE_REGISTRATION_VERSION,
+          ownerVersion: value.ownerVersion,
+          ownerHandle: value.ownerHandle,
+          idempotencyKey: value.idempotencyKey,
+          sessionId: value.sessionId,
+          platform: value.platform,
+          registered: false,
+          authorized: false,
+          cleanupComplete: true,
+          serverTime: new Date(clock()).toISOString(),
+        },
+      };
+    },
     /**
      * @param {{ humanId:string, body:object, isMember:(sessionId:string)=>Promise<boolean> }} args
      * @returns {Promise<{status:number, body:object}>}
@@ -237,6 +715,8 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
     async register({ principal, humanId, body, isMember } = {}) {
       const requestedV2 = body && typeof body === 'object' && (
         Object.hasOwn(body, 'registrationVersion') ||
+        Object.hasOwn(body, 'ownerVersion') ||
+        Object.hasOwn(body, 'ownerHandle') ||
         Object.hasOwn(body, 'installationId') ||
         Object.hasOwn(body, 'idempotencyKey') ||
         Object.hasOwn(body, 'expectedBindingId') ||
@@ -247,15 +727,71 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
       if (usesRegistryV2) {
         const v = validateDeviceRegistrationV2(body);
         if (!v.ok) return { status: v.status, body: { error: v.error, reason: 'registration-v2-required' } };
+        let replay;
+        try {
+          replay = await readExactRegistration({ principal, humanId, body: v.value });
+        } catch (error) {
+          if (error instanceof DeviceRegistryV2Error && error.code === 'registry-owner-conflict') {
+            return ownerConflict();
+          }
+          return {
+            status: 502,
+            body: { error: 'registry reconciliation failed', reason: 'registry-reconciliation-failed' },
+          };
+        }
+        if (replay?.result.expired === true) {
+          return recoveryReceipt(replay.value, replay.result, {
+            status: 410,
+            reason: 'registration-expired',
+            error: 'registration lease expired',
+          });
+        }
         let member = false;
         try { member = await isMember(v.value.sessionId); }
         catch { return { status: 500, body: { error: 'authorization lookup failed' } }; }
-        if (!member) return { status: 403, body: { error: 'not a known session for this user' } };
+        if (replay && !member) {
+          return recoveryForCommittedOutcome(replay.value, replay.result);
+        }
+        if (replay) return registrationReceipt(replay.value, replay.result);
+        if (!member) {
+          return persistDenial({
+            principal,
+            humanId,
+            value: v.value,
+            deniedError: 'not a known session for this user',
+          });
+        }
         let res;
-        try { res = await deviceRegistry.register({ principal: principal || humanId, humanId, ...v.value }); }
-        catch (error) {
+        let receiptNowMs;
+        try {
+          const rawResult = await deviceRegistry.register({ principal: principal || humanId, humanId, ...v.value });
+          receiptNowMs = clock();
+          res = authorityRegistration(rawResult, {
+            requireUnexpired: true,
+            expectedOwner: v.value,
+            nowMs: receiptNowMs,
+          });
+          if (!res) {
+            return { status: 502, body: { error: 'registry write failed', reason: 'registry-write-failed' } };
+          }
+        } catch (error) {
+          if (error instanceof DeviceRegistryV2Error && error.code === 'registry-owner-conflict') {
+            return ownerConflict();
+          }
           if (error instanceof DeviceRegistryV2Error && error.code === 'idempotency-conflict') {
-            return { status: 409, body: { error: error.message, reason: 'idempotency-conflict' } };
+            return {
+              status: 409,
+              body: {
+                error: 'idempotency key was reused for different registration data',
+                reason: 'idempotency-conflict',
+              },
+            };
+          }
+          if (error instanceof DeviceRegistryV2Error && error.code === 'registration-operation-denied') {
+            return deniedBeforeCommitReceipt(v.value, {
+              status: 409,
+              error: 'registration operation was denied before commit',
+            });
           }
           if (error instanceof DeviceRegistryV2Error &&
               ['revision-exhausted', 'registration-conflict'].includes(error.code)) {
@@ -271,12 +807,18 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
             };
           }
           if (error instanceof DeviceRegistryV2Error && error.code === 'binding-conflict') {
-            const current = error.details?.currentBinding;
+            const parsed = bindingConflictDetail(error);
+            if (!parsed) {
+              return { status: 502, body: { error: 'registry write failed', reason: 'registry-write-failed' } };
+            }
+            const current = parsed.value;
             return {
               status: 409,
               body: {
                 error: 'registration expected binding is no longer current',
                 reason: 'binding-conflict',
+                ownerVersion: v.value.ownerVersion,
+                ownerHandle: v.value.ownerHandle,
                 currentBinding: current ? {
                   bindingId: current.bindingId,
                   bindingRevision: current.bindingRevision,
@@ -286,12 +828,18 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
             };
           }
           if (error instanceof DeviceRegistryV2Error && error.code === 'token-claim-conflict') {
-            const current = error.details?.currentTokenClaim;
+            const parsed = tokenClaimConflictDetail(error);
+            if (!parsed) {
+              return { status: 502, body: { error: 'registry write failed', reason: 'registry-write-failed' } };
+            }
+            const current = parsed.value;
             return {
               status: 409,
               body: {
                 error: 'registration expected token claim is no longer current',
                 reason: 'token-claim-conflict',
+                ownerVersion: v.value.ownerVersion,
+                ownerHandle: v.value.ownerHandle,
                 currentTokenClaim: current ? {
                   tokenClaimId: current.tokenClaimId,
                   tokenClaimRevision: current.tokenClaimRevision,
@@ -302,21 +850,7 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
           }
           return { status: 502, body: { error: 'registry write failed', reason: 'registry-write-failed' } };
         }
-        return {
-          status: 200,
-          body: {
-            registered: true,
-            registrationVersion: DEVICE_REGISTRATION_VERSION,
-            sessionId: v.value.sessionId,
-            platform: v.value.platform,
-            bindingId: res.bindingId,
-            bindingRevision: res.bindingRevision,
-            tokenClaimId: res.tokenClaimId,
-            tokenClaimRevision: res.tokenClaimRevision,
-            expiresAt: new Date(res.expiresAtEpochSec * 1000).toISOString(),
-            idempotent: res.idempotent === true,
-          },
-        };
+        return registrationReceipt(v.value, res, receiptNowMs);
       }
       if (requestedV2) {
         return {
@@ -360,8 +894,16 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
       }
       const v = validateDeviceUnregistrationV2(body);
       if (!v.ok) return { status: v.status, body: { error: v.error, reason: 'unregistration-v2-required' } };
-      try { await deviceRegistry.unregister({ principal: principal || humanId, humanId, ...v.value }); }
+      try {
+        const deletion = await deviceRegistry.unregister({ principal: principal || humanId, humanId, ...v.value });
+        if (!isUnregisterOutcome(deletion, v.value)) {
+          return { status: 502, body: { error: 'registry delete failed', reason: 'registry-delete-failed' } };
+        }
+      }
       catch (error) {
+        if (error instanceof DeviceRegistryV2Error && error.code === 'registry-owner-conflict') {
+          return ownerConflict();
+        }
         if (error instanceof DeviceRegistryV2Error && error.code === 'unregistration-conflict') {
           return {
             status: 503,
@@ -378,6 +920,8 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
         body: {
           unregistered: true,
           registrationVersion: DEVICE_REGISTRATION_VERSION,
+          ownerVersion: v.value.ownerVersion,
+          ownerHandle: v.value.ownerHandle,
           sessionId: v.value.sessionId,
         },
       };

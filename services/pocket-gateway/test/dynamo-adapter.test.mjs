@@ -8,7 +8,12 @@
 //   (2) real DynamoDB TTL deletion behavior; (3) the table's TTL attribute is configured on `ttl`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DEVICE_REGISTRATION_VERSION, createDynamoDeviceRegistryV2 } from '../src/device-registry-v2.mjs';
+import {
+  DEVICE_REGISTRATION_VERSION,
+  DEVICE_REGISTRY_OWNER_VERSION,
+  createDynamoDeviceRegistryV2,
+  deriveDeviceOwnerHandle,
+} from '../src/device-registry-v2.mjs';
 import { createDynamoClientAdapter, createDynamoStore, withLock } from '../src/store.mjs';
 
 // Fake v3 lib-dynamodb Command classes — capture the params + tag which command (the real classes carry `.input`).
@@ -78,9 +83,10 @@ test('factory validates its inputs (fail-closed)', () => {
 });
 
 test('Registry V2 retries the real JavaScript message-form cancellation through the v3 adapter seam', async () => {
+  const hmacKey = Buffer.alloc(32, 0x5a);
   const cancellation = Object.assign(
     new Error(
-      'Transaction cancelled, please refer cancellation reasons for specific reasons [None, ConditionalCheckFailed, None]',
+      'Transaction cancelled, please refer cancellation reasons for specific reasons [None, ConditionalCheckFailed, None, None]',
     ),
     {
       name: 'TransactionCanceledException',
@@ -108,7 +114,7 @@ test('Registry V2 retries the real JavaScript message-form cancellation through 
   const registry = createDynamoDeviceRegistryV2({
     client: createDynamoClientAdapter(doc, V2_COMMANDS),
     table: 'Pocket',
-    hmacKey: Buffer.alloc(32, 0x5a),
+    hmacKey,
     now: () => Date.parse('2026-07-31T06:00:00.000Z'),
     retryDelay: async (attempt) => {
       delays.push(attempt);
@@ -118,6 +124,8 @@ test('Registry V2 retries the real JavaScript message-form cancellation through 
     principal: 'principal',
     humanId: 'human',
     registrationVersion: DEVICE_REGISTRATION_VERSION,
+    ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+    ownerHandle: deriveDeviceOwnerHandle(hmacKey, 'principal', 'human'),
     installationId: Buffer.alloc(32, 0x31).toString('base64url'),
     idempotencyKey: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
     voipToken: 'aabbccddeeff',

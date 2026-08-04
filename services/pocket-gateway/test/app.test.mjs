@@ -17,6 +17,9 @@ const V2_ENV = {
   DEVICE_REGISTRY_MODE: 'v2',
   DEVICE_REGISTRY_V1_PURGED: '1',
   DEVICE_REGISTRY_CLIENT_V2_READY: '1',
+  DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY: '1',
+  DEVICE_REGISTRY_OPERATION_ADMISSION_READY: '1',
+  DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '1',
   DEVICE_REGISTRY_HMAC_KEY_B64: Buffer.alloc(32, 0x51).toString('base64'),
 };
 const V2_DYNAMO = {
@@ -24,6 +27,16 @@ const V2_DYNAMO = {
   async put() { return {}; },
   async delete() { return {}; },
   async transactWrite() { return {}; },
+};
+const V2_REGISTRY = {
+  protocolVersion: 2,
+  operationOutcomeVersion: 1,
+  async registrationContext() { return { registrationVersion: 2, ownerVersion: 1, ownerHandle: Buffer.alloc(32).toString('base64url') }; },
+  async register() {},
+  async reconcileRegistration() { return null; },
+  async denyRegistration() { return { state: 'denied' }; },
+  async unregister() { return { removed: false }; },
+  async lookup() { return []; },
 };
 
 test('createProdGateway FAILS BOOT on any missing production binding', () => {
@@ -59,12 +72,9 @@ test('createProdGateway + createLambda boot with complete config', () => {
 test('createProdGateway Registry V2 requires mode, migration gates, secret, and transactional client', () => {
   assert.equal(typeof createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }).handle, 'function');
   assert.throws(
-    () => createProdGateway({
-      ...FULL_ENV,
-      DEVICE_REGISTRY_MODE: 'v2',
-      DEVICE_REGISTRY_V1_PURGED: '1',
-      DEVICE_REGISTRY_CLIENT_V2_READY: '1',
-    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_HMAC_KEY_B64: undefined }, {
+      ...FULL_DEPS, dynamoClient: V2_DYNAMO,
+    }),
     /requires DEVICE_REGISTRY_HMAC_KEY_B64/,
   );
   assert.throws(
@@ -77,6 +87,32 @@ test('createProdGateway Registry V2 requires mode, migration gates, secret, and 
       DEVICE_REGISTRY_CLIENT_V2_READY: '0',
     }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
     /DEVICE_REGISTRY_CLIENT_V2_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...V2_ENV,
+      DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...V2_ENV,
+      DEVICE_REGISTRY_OPERATION_ADMISSION_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...V2_ENV,
+      DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...FULL_ENV, DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '1' }, FULL_DEPS),
+    /Registry V2 settings require DEVICE_REGISTRY_MODE=v2/,
+    'the owner-continuity gate is never accepted as a partial V1 setting',
   );
   assert.throws(
     () => createProdGateway({ ...FULL_ENV, DEVICE_REGISTRY_HMAC_KEY_B64: V2_ENV.DEVICE_REGISTRY_HMAC_KEY_B64 }, FULL_DEPS),
@@ -112,6 +148,27 @@ test('createProdGateway Registry V2 requires mode, migration gates, secret, and 
     }),
     /requires a Registry V2 implementation/,
   );
+  assert.equal(
+    typeof createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: V2_DYNAMO, deviceRegistry: V2_REGISTRY }).handle,
+    'function',
+  );
+  for (const missingCapability of [
+    'operationOutcomeVersion',
+    'registrationContext',
+    'register',
+    'reconcileRegistration',
+    'denyRegistration',
+    'unregister',
+    'lookup',
+  ]) {
+    const partial = { ...V2_REGISTRY };
+    delete partial[missingCapability];
+    assert.throws(
+      () => createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: V2_DYNAMO, deviceRegistry: partial }),
+      /requires operationOutcomeVersion=1 and registrationContext, register, reconcileRegistration, denyRegistration, unregister, lookup/,
+      `an injected V2 registry missing ${missingCapability} must fail production boot`,
+    );
+  }
 });
 
 // DIAL-ME prod wiring: a valid session must reach /dial* (pocket:dial in the verifier's granted set), the device binds

@@ -1,19 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import {
   DEVICE_REGISTRATION_VERSION,
+  DEVICE_REGISTRY_OWNER_VERSION,
   DEVICE_REGISTRATION_RECLAIM_GRACE_SECONDS,
   DEVICE_REGISTRY_MAX_SERIALIZATION_ATTEMPTS,
   DeviceRegistryV2Error,
   createDynamoDeviceRegistryV2,
   createInMemoryDeviceRegistryV2,
   deriveDeviceInstallationKey,
+  deriveDeviceOwnerHandle,
+  deriveDeviceRegistrationOperationKey,
   deriveDeviceTargetKey,
   deriveDeviceTokenKey,
+  validateDeviceRegistrationCleanupV2,
   validateDeviceRegistrationV2,
   validateDeviceUnregistrationV2,
 } from '../src/device-registry-v2.mjs';
+
+const cleanupKav = JSON.parse(
+  readFileSync(new URL('./fixtures/device-registration-cleanup-v2.json', import.meta.url), 'utf8'),
+);
 
 const NOW = Date.parse('2026-07-31T06:00:00.000Z');
 const KEY = Buffer.alloc(32, 0x5a);
@@ -22,6 +31,10 @@ const IDEM_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const IDEM_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const IDEM_C = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const IDEM_D = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const ownerFields = (principal = 'p', humanId = 'u') => ({
+  ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+  ownerHandle: deriveDeviceOwnerHandle(KEY, principal, humanId),
+});
 const physicalTtl = (expiresAtEpochSec) => expiresAtEpochSec + DEVICE_REGISTRATION_RECLAIM_GRACE_SECONDS;
 const javascriptTransactionCancellation = (codes) =>
   Object.assign(
@@ -41,6 +54,7 @@ const javascriptTransactionCancellation = (codes) =>
 
 const registration = (overrides = {}) => ({
   registrationVersion: DEVICE_REGISTRATION_VERSION,
+  ...ownerFields(),
   installationId: INSTALLATION_ID,
   idempotencyKey: IDEM_A,
   voipToken: 'aabbccddeeff',
@@ -92,6 +106,12 @@ test('V2 validators require the exact versioned wire and reject confused-deputy/
     'unversioned registration fails closed',
   );
   assert.equal(validateDeviceRegistrationV2({ ...registration(), humanId: 'attacker' }).status, 400);
+  assert.equal(validateDeviceRegistrationV2({ ...registration(), ownerVersion: 2 }).status, 426);
+  assert.equal(
+    validateDeviceRegistrationV2({ ...registration(), ownerHandle: `${'A'.repeat(42)}B` }).status,
+    400,
+    'non-canonical owner handle pad bits are rejected',
+  );
   assert.equal(validateDeviceRegistrationV2({ ...registration(), installationId: 'raw-device-id' }).status, 400);
   assert.equal(
     validateDeviceRegistrationV2({
@@ -122,9 +142,52 @@ test('V2 validators require the exact versioned wire and reject confused-deputy/
   );
 });
 
+test('V2 cleanup validation accepts only the durable digest-only operation identity', () => {
+  const body = cleanupRegistration();
+  assert.deepEqual(validateDeviceRegistrationCleanupV2(body), { ok: true, value: body });
+  assert.equal(validateDeviceRegistrationCleanupV2({ ...body, tokenDigest: 'not-a-digest' }).status, 400);
+  assert.equal(validateDeviceRegistrationCleanupV2({ ...body, voipToken: registration().voipToken }).status, 400);
+  assert.equal(validateDeviceRegistrationCleanupV2({ ...body, expectedBindingRevision: 1 }).status, 400);
+  assert.equal(validateDeviceRegistrationCleanupV2({ ...body, ownerVersion: 2 }).status, 426);
+  assert.equal(validateDeviceRegistrationCleanupV2({ ...body, ownerHandle: `${'A'.repeat(42)}B` }).status, 400);
+});
+
+test('shared cleanup KAV binds the UTF-8 token wire string to the exact digest-only request', () => {
+  assert.deepEqual(Object.keys(cleanupKav).sort(), ['schema', 'vectors', 'version']);
+  assert.equal(cleanupKav.schema, 'device-registration-cleanup-v2-kav');
+  assert.equal(cleanupKav.version, 2);
+  assert.equal(cleanupKav.vectors.length, 2);
+  for (const vector of cleanupKav.vectors) {
+    assert.equal(
+      createHash('sha256').update(vector.voipTokenWireString, 'utf8').digest('base64url'),
+      vector.request.tokenDigest,
+      `${vector.name} hashes the exact UTF-8 wire string rather than decoded token bytes`,
+    );
+    assert.deepEqual(
+      validateDeviceRegistrationCleanupV2(vector.request),
+      { ok: true, value: vector.request },
+      `${vector.name} is an exact valid cleanup request`,
+    );
+    assert.deepEqual(
+      Object.keys(vector.request).sort(),
+      [
+        'idempotencyKey',
+        'installationId',
+        'ownerHandle',
+        'ownerVersion',
+        'platform',
+        'registrationVersion',
+        'sessionId',
+        'tokenDigest',
+      ],
+    );
+  }
+});
+
 test('V2 unregister requires exact server binding identity/revision and rejects unknown fields', () => {
   const body = {
     registrationVersion: 2,
+    ...ownerFields(),
     installationId: INSTALLATION_ID,
     sessionId: 'session-a',
     bindingId: 'bind_0123456789abcdef0123456789abcdef',
@@ -134,13 +197,19 @@ test('V2 unregister requires exact server binding identity/revision and rejects 
   assert.equal(validateDeviceUnregistrationV2({ ...body, bindingRevision: 0 }).status, 400);
   assert.equal(validateDeviceUnregistrationV2({ ...body, bindingId: 'client-made' }).status, 400);
   assert.equal(validateDeviceUnregistrationV2({ ...body, generation: 7 }).status, 400);
+  assert.equal(validateDeviceUnregistrationV2({ ...body, ownerVersion: 2 }).status, 426);
+  assert.equal(validateDeviceUnregistrationV2({ ...body, ownerHandle: `${'A'.repeat(42)}B` }).status, 400);
 });
 
 test('installation and target keys are domain-separated HMACs; raw installation/human/session never appear', () => {
   const installationKey = deriveDeviceInstallationKey(KEY, INSTALLATION_ID);
+  const ownerHandle = deriveDeviceOwnerHandle(KEY, 'principal-a', 'human-a');
+  const operationKey = deriveDeviceRegistrationOperationKey(KEY, 'principal-a', 'human-a', INSTALLATION_ID, IDEM_A);
   const targetKey = deriveDeviceTargetKey(KEY, 'principal-a', 'human-a', 'session-a');
   const tokenKey = deriveDeviceTokenKey(KEY, 'apns', 'aabbccddeeff');
   assert.match(installationKey, /^dial:install:v2:[A-Za-z0-9_-]{43}$/);
+  assert.match(ownerHandle, /^[A-Za-z0-9_-]{43}$/);
+  assert.match(operationKey, /^dial:regop:v2:[A-Za-z0-9_-]{43}$/);
   assert.match(targetKey, /^dial:target:v2:[A-Za-z0-9_-]{43}$/);
   assert.match(tokenKey, /^dial:token:v2:[A-Za-z0-9_-]{43}$/);
   assert.equal(
@@ -155,16 +224,44 @@ test('installation and target keys are domain-separated HMACs; raw installation/
     'platform-scoped APNs token HMAC KAV is locked',
   );
   assert.notEqual(installationKey, targetKey);
+  assert.notEqual(ownerHandle, deriveDeviceOwnerHandle(KEY, 'principal-b', 'human-a'));
+  assert.notEqual(operationKey, installationKey);
+  assert.notEqual(
+    operationKey,
+    deriveDeviceRegistrationOperationKey(KEY, 'principal-b', 'human-a', INSTALLATION_ID, IDEM_A),
+    'operation outcomes are isolated by verified principal',
+  );
   assert.notEqual(tokenKey, installationKey);
   assert.equal(installationKey.includes(INSTALLATION_ID), false);
+  assert.equal(operationKey.includes(INSTALLATION_ID), false);
+  assert.equal(operationKey.includes('principal-a'), false);
   assert.equal(targetKey.includes('human-a'), false);
   assert.equal(targetKey.includes('session-a'), false);
+});
+
+test('registration context is stable for one authenticated owner and distinct across principals', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  const first = await registry.registrationContext({ principal: 'principal-a', humanId: 'human-a' });
+  const rotatedBearer = await registry.registrationContext({ principal: 'principal-a', humanId: 'human-a' });
+  const otherPrincipal = await registry.registrationContext({ principal: 'principal-b', humanId: 'human-a' });
+  assert.deepEqual(first, {
+    registrationVersion: DEVICE_REGISTRATION_VERSION,
+    ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+    ownerHandle: deriveDeviceOwnerHandle(KEY, 'principal-a', 'human-a'),
+  });
+  assert.deepEqual(rotatedBearer, first);
+  assert.notEqual(otherPrincipal.ownerHandle, first.ownerHandle);
+  assert.deepEqual(Object.keys(first).sort(), ['ownerHandle', 'ownerVersion', 'registrationVersion']);
 });
 
 test('verifier-owned production principal namespaces may contain their canonical newline separator', async () => {
   const principal = 'pocket.principal.senti.v1\n7:user_42';
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
-  await registry.register({ principal, humanId: 'user_42', ...registration() });
+  await registry.register({
+    principal,
+    humanId: 'user_42',
+    ...registration(ownerFields(principal, 'user_42')),
+  });
   assert.equal(
     (
       await registry.lookup({
@@ -177,9 +274,15 @@ test('verifier-owned production principal namespaces may contain their canonical
   );
 });
 
-test('one installation rebinds A -> B by replacing one physical item; A is no longer addressable', async () => {
+test('one installation cannot rebind across stable owners even with stolen exact binding fences', async () => {
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
-  const a = await registry.register({ principal: 'principal-a', humanId: 'same-human', ...registration() });
+  const aOwner = ownerFields('principal-a', 'same-human');
+  const bOwner = ownerFields('principal-b', 'same-human');
+  const a = await registry.register({
+    principal: 'principal-a',
+    humanId: 'same-human',
+    ...registration(aOwner),
+  });
   assert.equal(a.bindingRevision, 1);
   assert.equal(
     (
@@ -192,31 +295,24 @@ test('one installation rebinds A -> B by replacing one physical item; A is no lo
     1,
   );
 
-  const b = await registry.register({
-    principal: 'principal-b',
-    humanId: 'same-human',
-    ...registration({
-      idempotencyKey: IDEM_B,
-      voipToken: 'new-token',
-      expectedBindingId: a.bindingId,
-      expectedBindingRevision: a.bindingRevision,
-    }),
-  });
-  assert.equal(b.bindingRevision, 2);
-  assert.notEqual(b.bindingId, a.bindingId);
-  assert.deepEqual(
-    await registry.lookup({
-      principal: 'principal-a',
+  await assert.rejects(
+    registry.register({
+      principal: 'principal-b',
       humanId: 'same-human',
-      sessionId: 'session-a',
+      ...registration({
+        ...bOwner,
+        idempotencyKey: IDEM_B,
+        voipToken: 'new-token',
+        expectedBindingId: a.bindingId,
+        expectedBindingRevision: a.bindingRevision,
+      }),
     }),
-    [],
+    (error) => error instanceof DeviceRegistryV2Error && error.code === 'registry-owner-conflict',
   );
-  assert.deepEqual(
-    (await registry.lookup({ principal: 'principal-b', humanId: 'same-human', sessionId: 'session-a' })).map(
-      ({ voipToken, bindingId, bindingRevision }) => ({ voipToken, bindingId, bindingRevision }),
-    ),
-    [{ voipToken: 'new-token', bindingId: b.bindingId, bindingRevision: 2 }],
+  assert.equal(
+    (await registry.lookup({ principal: 'principal-a', humanId: 'same-human', sessionId: 'session-a' }))[0]
+      .bindingId,
+    a.bindingId,
   );
   assert.equal(registry._records.size, 1, 'one installation owns exactly one physical binding item');
   assert.equal(
@@ -226,11 +322,55 @@ test('one installation rebinds A -> B by replacing one physical item; A is no lo
   );
 });
 
-test('B-first/A-late: a delayed old expected binding cannot steal the installation back', async () => {
+test('a copied or merely valid foreign owner handle fails before every V2 mutation', async () => {
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
-  const initial = await registry.register({ principal: 'origin', humanId: 'u', ...registration() });
+  const wrongOwner = ownerFields('principal-b', 'same-human');
+  const wrongRegistration = registration({ ...wrongOwner, idempotencyKey: IDEM_B });
+  const wrongCleanup = cleanupRegistration({ ...wrongOwner, idempotencyKey: IDEM_C });
+  const wrongUnregister = {
+    registrationVersion: 2,
+    ...wrongOwner,
+    installationId: INSTALLATION_ID,
+    sessionId: 'session-a',
+    bindingId: 'bind_0123456789abcdef0123456789abcdef',
+    bindingRevision: 1,
+  };
+  for (const operation of [
+    () => registry.register({ principal: 'principal-a', humanId: 'same-human', ...wrongRegistration }),
+    () => registry.reconcileRegistration({ principal: 'principal-a', humanId: 'same-human', ...wrongRegistration }),
+    () => registry.denyRegistration({ principal: 'principal-a', humanId: 'same-human', ...wrongCleanup }),
+    () => registry.unregister({ principal: 'principal-a', humanId: 'same-human', ...wrongUnregister }),
+  ]) {
+    await assert.rejects(
+      operation(),
+      (error) =>
+        error instanceof DeviceRegistryV2Error &&
+        error.code === 'registry-owner-conflict' &&
+        error.message === 'registry owner does not match authenticated principal',
+    );
+  }
+  assert.equal(registry._records.size, 0);
+  assert.equal(registry._tokenClaims.size, 0);
+  assert.equal(registry._targetDirectories.size, 0);
+  assert.equal(registry._operations.size, 0);
+});
+
+test('a non-canonical stored owner handle is corruption, not an ownership conflict', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  await registry.register({ principal: 'p', humanId: 'u', ...registration() });
+  const binding = [...registry._records.values()][0];
+  binding.ownerHandle = `${binding.ownerHandle.slice(0, -1)}B`;
+  await assert.rejects(
+    registry.reconcileRegistration({ principal: 'p', humanId: 'u', ...registration() }),
+    (error) => error instanceof DeviceRegistryV2Error && error.code === 'corrupt-record',
+  );
+});
+
+test('B-first/A-late: a delayed same-owner expected binding cannot steal the installation back', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  const initial = await registry.register({ principal: 'p', humanId: 'u', ...registration() });
   const b = await registry.register({
-    principal: 'principal-b',
+    principal: 'p',
     humanId: 'u',
     ...registration({
       idempotencyKey: IDEM_B,
@@ -242,7 +382,7 @@ test('B-first/A-late: a delayed old expected binding cannot steal the installati
   });
   await assert.rejects(
     registry.register({
-      principal: 'principal-a',
+      principal: 'p',
       humanId: 'u',
       ...registration({
         idempotencyKey: IDEM_C,
@@ -260,7 +400,7 @@ test('B-first/A-late: a delayed old expected binding cannot steal the installati
   assert.equal(
     (
       await registry.lookup({
-        principal: 'principal-b',
+        principal: 'p',
         humanId: 'u',
         sessionId: 'session-b',
       })
@@ -268,8 +408,8 @@ test('B-first/A-late: a delayed old expected binding cannot steal the installati
     b.bindingId,
   );
   assert.deepEqual(
-    await registry.lookup({
-      principal: 'principal-a',
+      await registry.lookup({
+      principal: 'p',
       humanId: 'u',
       sessionId: 'session-a-late',
     }),
@@ -279,7 +419,7 @@ test('B-first/A-late: a delayed old expected binding cannot steal the installati
 
 test('A-first/B-reconcile: the same semantic operation can retry a 409 with the returned current tuple', async () => {
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
-  const initial = await registry.register({ principal: 'origin', humanId: 'u', ...registration() });
+  const initial = await registry.register({ principal: 'p', humanId: 'u', ...registration() });
   const aRequest = registration({
     idempotencyKey: IDEM_B,
     sessionId: 'session-a-wins-first',
@@ -287,7 +427,7 @@ test('A-first/B-reconcile: the same semantic operation can retry a 409 with the 
     expectedBindingId: initial.bindingId,
     expectedBindingRevision: initial.bindingRevision,
   });
-  const a = await registry.register({ principal: 'principal-a', humanId: 'u', ...aRequest });
+  const a = await registry.register({ principal: 'p', humanId: 'u', ...aRequest });
   const bRequest = registration({
     idempotencyKey: IDEM_C,
     sessionId: 'session-b-reconciles',
@@ -296,13 +436,13 @@ test('A-first/B-reconcile: the same semantic operation can retry a 409 with the 
     expectedBindingRevision: initial.bindingRevision,
   });
   let conflict;
-  await assert.rejects(registry.register({ principal: 'principal-b', humanId: 'u', ...bRequest }), (error) => {
+  await assert.rejects(registry.register({ principal: 'p', humanId: 'u', ...bRequest }), (error) => {
     conflict = error;
     return error instanceof DeviceRegistryV2Error && error.code === 'binding-conflict';
   });
   assert.equal(conflict.details.currentBinding.bindingId, a.bindingId);
   const b = await registry.register({
-    principal: 'principal-b',
+    principal: 'p',
     humanId: 'u',
     ...bRequest,
     expectedBindingId: a.bindingId,
@@ -312,7 +452,7 @@ test('A-first/B-reconcile: the same semantic operation can retry a 409 with the 
   assert.equal(
     (
       await registry.lookup({
-        principal: 'principal-b',
+        principal: 'p',
         humanId: 'u',
         sessionId: 'session-b-reconciles',
       })
@@ -320,7 +460,7 @@ test('A-first/B-reconcile: the same semantic operation can retry a 409 with the 
     b.bindingId,
   );
   await assert.rejects(
-    registry.register({ principal: 'principal-a', humanId: 'u', ...aRequest }),
+    registry.register({ principal: 'p', humanId: 'u', ...aRequest }),
     (error) => error instanceof DeviceRegistryV2Error && error.code === 'binding-conflict',
     'the now-stale A task cannot reconcile itself after B wins',
   );
@@ -371,12 +511,116 @@ test('same-intent retry renews the lease without rotating; idempotency-key reuse
   assert.equal(registry._records.size, 1);
 });
 
+test('a durable denial barrier prevents the exact registration from committing and stores no raw identifiers', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  const principal = 'principal-raw-secret';
+  const humanId = 'human-raw-secret';
+  const expectedOwner = ownerFields(principal, humanId);
+  const denied = await registry.denyRegistration({
+    principal,
+    humanId,
+    ...cleanupRegistration(expectedOwner),
+  });
+
+  assert.deepEqual(denied, { state: 'denied', ...expectedOwner });
+  await assert.rejects(
+    registry.register({ principal, humanId, ...registration(expectedOwner) }),
+    (error) => error instanceof DeviceRegistryV2Error && error.code === 'registration-operation-denied',
+  );
+  assert.deepEqual(await registry.lookup({ principal, humanId, sessionId: 'session-a' }), []);
+  assert.equal(registry._operations.size, 1);
+  const serialized = JSON.stringify([...registry._operations.values()]);
+  for (const secret of [principal, humanId, INSTALLATION_ID, 'session-a', 'aabbccddeeff']) {
+    assert.equal(serialized.includes(secret), false, `operation journal must not retain raw ${secret}`);
+  }
+});
+
+test('each retained operation keeps its own barrier; a committed winner returns exact recovery fences', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  const committed = await registry.register({ principal: 'p', humanId: 'u', ...registration() });
+  const recovered = await registry.denyRegistration({ principal: 'p', humanId: 'u', ...cleanupRegistration() });
+
+  assert.deepEqual(recovered, {
+    state: 'committed',
+    registration: { ...committed, idempotent: true, renewed: false },
+  });
+  for (const idempotencyKey of [IDEM_B, IDEM_C, IDEM_D]) {
+    await registry.denyRegistration({
+      principal: 'p',
+      humanId: 'u',
+      ...cleanupRegistration({ idempotencyKey }),
+    });
+  }
+  assert.equal(registry._operations.size, 4, 'a later operation cannot erase an earlier operation barrier');
+  await assert.rejects(
+    registry.register({ principal: 'p', humanId: 'u', ...registration({ idempotencyKey: IDEM_B }) }),
+    (error) => error instanceof DeviceRegistryV2Error && error.code === 'registration-operation-denied',
+  );
+});
+
+test('in-memory exact replay reconciliation is read-only and changed requests reveal no binding', async () => {
+  let now = NOW;
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => now, leaseSeconds: 60 });
+  const first = await registry.register({ principal: 'p', humanId: 'u', ...registration() });
+  const snapshots = {
+    records: structuredClone([...registry._records]),
+    claims: structuredClone([...registry._tokenClaims]),
+    directories: structuredClone([...registry._targetDirectories]),
+  };
+
+  now += 30_000;
+  const replay = await registry.reconcileRegistration({ principal: 'p', humanId: 'u', ...registration() });
+  assert.deepEqual(replay, { ...first, idempotent: true, renewed: false });
+  assert.deepEqual([...registry._records], snapshots.records, 'reconciliation does not renew or rewrite the binding');
+  assert.deepEqual([...registry._tokenClaims], snapshots.claims, 'reconciliation does not rewrite the token claim');
+  assert.deepEqual(
+    [...registry._targetDirectories],
+    snapshots.directories,
+    'reconciliation does not rewrite the target directory',
+  );
+
+  assert.equal(
+    await registry.reconcileRegistration({
+      principal: 'p',
+      humanId: 'u',
+      ...registration({ idempotencyKey: IDEM_B }),
+    }),
+    null,
+    'a different idempotency key cannot recover the prior receipt',
+  );
+  assert.equal(
+    await registry.reconcileRegistration({
+      principal: 'p',
+      humanId: 'u',
+      ...registration({ voipToken: 'changed-token' }),
+    }),
+    null,
+    'the same key with a different fingerprint cannot recover the prior receipt',
+  );
+  await assert.rejects(
+    registry.reconcileRegistration({ principal: '', humanId: 'u', ...registration() }),
+    (error) => error instanceof DeviceRegistryV2Error && error.code === 'invalid-owner',
+  );
+  await assert.rejects(
+    registry.reconcileRegistration({ principal: 'p', humanId: 'u', ...registration({ platform: 'web' }) }),
+    (error) => error instanceof DeviceRegistryV2Error && error.code === 'invalid-input',
+  );
+
+  now = first.expiresAtEpochSec * 1000;
+  assert.deepEqual(
+    await registry.reconcileRegistration({ principal: 'p', humanId: 'u', ...registration() }),
+    { ...first, idempotent: true, renewed: false, expired: true },
+    'an exact physically retained replay is typed as logically expired without renewing it',
+  );
+  assert.deepEqual([...registry._records], snapshots.records);
+});
+
 test('stale unregister cannot delete a newer target/revision; exact current unregister is existence-oblivious', async () => {
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
-  const a = await registry.register({ principal: 'pa', humanId: 'a', ...registration() });
+  const a = await registry.register({ principal: 'p', humanId: 'u', ...registration() });
   const b = await registry.register({
-    principal: 'pb',
-    humanId: 'b',
+    principal: 'p',
+    humanId: 'u',
     ...registration({
       idempotencyKey: IDEM_B,
       sessionId: 'session-b',
@@ -387,29 +631,31 @@ test('stale unregister cannot delete a newer target/revision; exact current unre
 
   assert.deepEqual(
     await registry.unregister({
-      principal: 'pa',
-      humanId: 'a',
+      principal: 'p',
+      humanId: 'u',
       registrationVersion: 2,
+      ...ownerFields(),
       installationId: INSTALLATION_ID,
       sessionId: 'session-a',
       bindingId: a.bindingId,
       bindingRevision: a.bindingRevision,
     }),
-    { removed: false },
+    { removed: false, ...ownerFields() },
   );
-  assert.equal((await registry.lookup({ principal: 'pb', humanId: 'b', sessionId: 'session-b' })).length, 1);
+  assert.equal((await registry.lookup({ principal: 'p', humanId: 'u', sessionId: 'session-b' })).length, 1);
 
   const exact = {
-    principal: 'pb',
-    humanId: 'b',
+    principal: 'p',
+    humanId: 'u',
     registrationVersion: 2,
+    ...ownerFields(),
     installationId: INSTALLATION_ID,
     sessionId: 'session-b',
     bindingId: b.bindingId,
     bindingRevision: b.bindingRevision,
   };
-  assert.deepEqual(await registry.unregister(exact), { removed: true });
-  assert.deepEqual(await registry.unregister(exact), { removed: false });
+  assert.deepEqual(await registry.unregister(exact), { removed: true, ...ownerFields() });
+  assert.deepEqual(await registry.unregister(exact), { removed: false, ...ownerFields() });
 });
 
 test('logical expiry hides a binding immediately without waiting for physical TTL deletion', async () => {
@@ -422,7 +668,92 @@ test('logical expiry hides a binding immediately without waiting for physical TT
   assert.equal(registry._records.size, 1, 'logical expiry is independent of eventual TTL cleanup');
 });
 
-test('reclaim grace hides at logical expiry but forces an exact transfer until skew-safe physical expiry', async () => {
+test('foreign base ownership fences through ttl-1 and becomes reclaimable exactly at ttl in memory', async () => {
+  let now = NOW;
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => now, leaseSeconds: 60 });
+  const aOwner = ownerFields('principal-a', 'same-human');
+  const bOwner = ownerFields('principal-b', 'same-human');
+  const aBody = registration({ ...aOwner, voipToken: 'owner-a-token', sessionId: 'owner-a-session' });
+  const a = await registry.register({ principal: 'principal-a', humanId: 'same-human', ...aBody });
+  const retainedA = structuredClone([...registry._records.values()][0]);
+  const bBody = registration({
+    ...bOwner,
+    idempotencyKey: IDEM_B,
+    voipToken: 'owner-b-token',
+    sessionId: 'owner-b-session',
+  });
+  const bCleanup = cleanupRegistration({
+    ...bOwner,
+    idempotencyKey: IDEM_C,
+    voipToken: bBody.voipToken,
+    sessionId: bBody.sessionId,
+  });
+  const bUnregister = {
+    registrationVersion: 2,
+    ...bOwner,
+    installationId: bBody.installationId,
+    sessionId: bBody.sessionId,
+    bindingId: a.bindingId,
+    bindingRevision: a.bindingRevision,
+  };
+  const expectOwnerConflict = (promise) =>
+    assert.rejects(
+      promise,
+      (error) =>
+        error instanceof DeviceRegistryV2Error &&
+        error.code === 'registry-owner-conflict' &&
+        error.message === 'registry owner does not match authenticated principal',
+    );
+
+  now = (retainedA.ttl - 1) * 1000;
+  await expectOwnerConflict(
+    registry.reconcileRegistration({ principal: 'principal-b', humanId: 'same-human', ...bBody }),
+  );
+  await expectOwnerConflict(
+    registry.denyRegistration({ principal: 'principal-b', humanId: 'same-human', ...bCleanup }),
+  );
+  await expectOwnerConflict(
+    registry.unregister({ principal: 'principal-b', humanId: 'same-human', ...bUnregister }),
+  );
+  await expectOwnerConflict(registry.register({ principal: 'principal-b', humanId: 'same-human', ...bBody }));
+  assert.deepEqual([...registry._records.values()][0], retainedA);
+  assert.equal(registry._operations.size, 1, 'failed foreign operations persist no outcome rows');
+
+  now = retainedA.ttl * 1000;
+  assert.equal(
+    await registry.reconcileRegistration({ principal: 'principal-b', humanId: 'same-human', ...bBody }),
+    null,
+  );
+  assert.deepEqual(
+    await registry.unregister({ principal: 'principal-b', humanId: 'same-human', ...bUnregister }),
+    { removed: false, ...bOwner },
+  );
+  assert.deepEqual([...registry._records.values()][0], retainedA, 'read/cleanup paths leave the old row untouched');
+  assert.deepEqual(
+    await registry.denyRegistration({ principal: 'principal-b', humanId: 'same-human', ...bCleanup }),
+    { state: 'denied', ...bOwner },
+  );
+  assert.deepEqual([...registry._records.values()][0], retainedA, 'denial records only its principal-bound outcome');
+
+  const b = await registry.register({ principal: 'principal-b', humanId: 'same-human', ...bBody });
+  assert.equal(b.bindingRevision, 1, 'reclaim starts a fresh owner-local binding generation');
+  assert.deepEqual({ ownerVersion: b.ownerVersion, ownerHandle: b.ownerHandle }, bOwner);
+  assert.equal(registry._records.size, 1);
+  assert.equal(registry._tokenClaims.size, 1, 'the expired old claim is retired during reclaim');
+  assert.equal(registry._targetDirectories.size, 1, 'the expired old directory member is retired during reclaim');
+  assert.deepEqual(
+    await registry.lookup({ principal: 'principal-a', humanId: 'same-human', sessionId: aBody.sessionId }),
+    [],
+  );
+  assert.equal(
+    (
+      await registry.lookup({ principal: 'principal-b', humanId: 'same-human', sessionId: bBody.sessionId })
+    )[0].bindingId,
+    b.bindingId,
+  );
+});
+
+test('reclaim grace hides at logical expiry but forces an exact same-owner transfer until physical expiry', async () => {
   let now = NOW;
   const sharedToken = 'expiry-shared-token';
   const registry = createInMemoryDeviceRegistryV2({
@@ -450,8 +781,8 @@ test('reclaim grace hides at logical expiry but forces an exact transfer until s
   let conflict;
   await assert.rejects(
     registry.register({
-      principal: 'p2',
-      humanId: 'u2',
+      principal: 'p',
+      humanId: 'u',
       ...indexedRegistration(2, { voipToken: sharedToken, sessionId: 'session-b' }),
     }),
     (error) => {
@@ -466,8 +797,8 @@ test('reclaim grace hides at logical expiry but forces an exact transfer until s
     'the conflict reports logical route expiry, not the later automatic-reclaim boundary',
   );
   const replacement = await registry.register({
-    principal: 'p2',
-    humanId: 'u2',
+    principal: 'p',
+    humanId: 'u',
     ...indexedRegistration(2, {
       voipToken: sharedToken,
       sessionId: 'session-b',
@@ -481,8 +812,8 @@ test('reclaim grace hides at logical expiry but forces an exact transfer until s
   assert.equal(registry._targetDirectories.size, 1, 'explicit transfer removes the displaced directory member');
   assert.deepEqual(
     await registry.lookup({
-      principal: 'p2',
-      humanId: 'u2',
+      principal: 'p',
+      humanId: 'u',
       sessionId: 'session-b',
     }),
     [
@@ -513,12 +844,16 @@ test('same owner can renew during reclaim grace, and exact unregister can revoke
   const renewed = await renewalRegistry.register({
     principal: 'p',
     humanId: 'u',
-    ...registration({ idempotencyKey: IDEM_C }),
+    ...registration({
+      idempotencyKey: IDEM_C,
+      expectedBindingId: first.bindingId,
+      expectedBindingRevision: first.bindingRevision,
+    }),
   });
   assert.equal(renewed.bindingId, first.bindingId);
-  assert.equal(renewed.bindingRevision, first.bindingRevision);
-  assert.equal(renewed.tokenClaimId, first.tokenClaimId);
-  assert.equal(renewed.tokenClaimRevision, first.tokenClaimRevision);
+  assert.equal(renewed.bindingRevision, first.bindingRevision + 1, 'a distinct operation advances the revoke fence');
+  assert.notEqual(renewed.tokenClaimId, first.tokenClaimId);
+  assert.equal(renewed.tokenClaimRevision, first.tokenClaimRevision + 1);
   assert.equal(renewed.expiresAtEpochSec, first.expiresAtEpochSec + 60);
 
   let revokeNow = NOW;
@@ -538,12 +873,13 @@ test('same owner can renew during reclaim grace, and exact unregister can revoke
       principal: 'p',
       humanId: 'u',
       registrationVersion: 2,
+      ...ownerFields(),
       installationId: INSTALLATION_ID,
       sessionId: 'session-a',
       bindingId: revocable.bindingId,
       bindingRevision: revocable.bindingRevision,
     }),
-    { removed: true },
+    { removed: true, ...ownerFields() },
   );
   assert.equal(revokeRegistry._records.size, 0);
   assert.equal(revokeRegistry._tokenClaims.size, 0);
@@ -580,7 +916,11 @@ test('slow workers repair or revoke a binding after a fast worker prunes its dir
   const repaired = await renewalRegistry.register({
     principal: 'p',
     humanId: 'u',
-    ...indexedRegistration(1, { idempotencyKey: IDEM_C }),
+    ...indexedRegistration(1, {
+      idempotencyKey: IDEM_C,
+      expectedBindingId: renewable.bindingId,
+      expectedBindingRevision: renewable.bindingRevision,
+    }),
   });
   assert.equal(repaired.bindingId, renewable.bindingId);
   assert.equal(
@@ -615,12 +955,13 @@ test('slow workers repair or revoke a binding after a fast worker prunes its dir
       principal: 'p',
       humanId: 'u',
       registrationVersion: 2,
+      ...ownerFields(),
       installationId: indexedRegistration(3).installationId,
       sessionId: 'session-a',
       bindingId: revocable.bindingId,
       bindingRevision: revocable.bindingRevision,
     }),
-    { removed: true },
+    { removed: true, ...ownerFields() },
   );
   assert.deepEqual(
     [...revokeRegistry._targetDirectories.values()][0].members.map(({ bindingId }) => bindingId),
@@ -642,7 +983,11 @@ test('directory recovery rejects a present non-exact installation tuple instead 
     registry.register({
       principal: 'p',
       humanId: 'u',
-      ...indexedRegistration(1, { idempotencyKey: IDEM_C }),
+      ...indexedRegistration(1, {
+        idempotencyKey: IDEM_C,
+        expectedBindingId: registered.bindingId,
+        expectedBindingRevision: registered.bindingRevision,
+      }),
     }),
     (error) => error instanceof DeviceRegistryV2Error && error.code === 'corrupt-record',
   );
@@ -788,10 +1133,14 @@ test('renewal and token rotation remain admissible while the target directory is
   const renewed = await registry.register({
     principal: 'p',
     humanId: 'u',
-    ...indexedRegistration(1, { idempotencyKey: IDEM_C }),
+    ...indexedRegistration(1, {
+      idempotencyKey: IDEM_C,
+      expectedBindingId: first.bindingId,
+      expectedBindingRevision: first.bindingRevision,
+    }),
   });
   assert.equal(renewed.bindingId, first.bindingId);
-  assert.equal(renewed.bindingRevision, first.bindingRevision);
+  assert.equal(renewed.bindingRevision, first.bindingRevision + 1);
   const rotated = await registry.register({
     principal: 'p',
     humanId: 'u',
@@ -1051,6 +1400,8 @@ const tokenClaimFor = (binding, overrides = {}) => ({
   pk: deriveDeviceTokenKey(KEY, binding.platform, binding.voipToken),
   sk: 'claim',
   schema: 'dial-device-token-claim-v2',
+  ownerVersion: binding.ownerVersion,
+  ownerHandle: binding.ownerHandle,
   ownerInstallationKey: binding.pk,
   targetKey: binding.targetKey,
   tokenHash: binding.voipTokenHash,
@@ -1063,6 +1414,108 @@ const tokenClaimFor = (binding, overrides = {}) => ({
   expiresAtEpochSec: binding.expiresAtEpochSec,
   ttl: physicalTtl(binding.expiresAtEpochSec),
   ...overrides,
+});
+
+const cleanupRegistration = (overrides = {}) => {
+  const source = registration(overrides);
+  return {
+    registrationVersion: source.registrationVersion,
+    ownerVersion: source.ownerVersion,
+    ownerHandle: source.ownerHandle,
+    installationId: source.installationId,
+    idempotencyKey: source.idempotencyKey,
+    tokenDigest: createHash('sha256').update(source.voipToken, 'utf8').digest('base64url'),
+    sessionId: source.sessionId,
+    platform: source.platform,
+  };
+};
+
+test('Dynamo exact replay reconciliation uses strong reads only and hides changed requests', async () => {
+  const seeded = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  await seeded.register({ principal: 'p', humanId: 'u', ...registration() });
+  const binding = structuredClone([...seeded._records.values()][0]);
+  const claim = tokenClaimFor(binding);
+  const reads = [];
+  let writes = 0;
+  const client = {
+    async get(params) {
+      reads.push(structuredClone(params));
+      if (params.Key.pk === binding.pk && params.Key.sk === binding.sk) return { Item: structuredClone(binding) };
+      if (params.Key.pk === claim.pk && params.Key.sk === claim.sk) return { Item: structuredClone(claim) };
+      return {};
+    },
+    async transactWrite() {
+      writes += 1;
+      throw new Error('reconciliation must never write');
+    },
+  };
+  const registry = createDynamoDeviceRegistryV2({ client, table: 'Pocket', hmacKey: KEY, now: () => NOW });
+
+  const replay = await registry.reconcileRegistration({ principal: 'p', humanId: 'u', ...registration() });
+  assert.deepEqual(replay, {
+    ...ownerFields(),
+    bindingId: binding.bindingId,
+    bindingRevision: binding.bindingRevision,
+    expiresAtEpochSec: binding.expiresAtEpochSec,
+    idempotent: true,
+    renewed: false,
+    tokenClaimId: claim.tokenClaimId,
+    tokenClaimRevision: claim.tokenClaimRevision,
+  });
+  assert.deepEqual(
+    reads.map(({ Key, ConsistentRead }) => ({ Key, ConsistentRead })),
+    [
+      { Key: { pk: binding.pk, sk: 'binding' }, ConsistentRead: true },
+      { Key: { pk: claim.pk, sk: 'claim' }, ConsistentRead: true },
+    ],
+  );
+  assert.equal(writes, 0);
+
+  reads.length = 0;
+  assert.equal(
+    await registry.reconcileRegistration({
+      principal: 'p',
+      humanId: 'u',
+      ...registration({ idempotencyKey: IDEM_B }),
+    }),
+    null,
+  );
+  assert.equal(reads.length, 1, 'an idempotency mismatch does not read a claim');
+  reads.length = 0;
+  assert.equal(
+    await registry.reconcileRegistration({
+      principal: 'p',
+      humanId: 'u',
+      ...registration({ voipToken: 'changed-token' }),
+    }),
+    null,
+  );
+  assert.equal(reads.length, 1, 'a fingerprint mismatch does not read a claim');
+  assert.equal(writes, 0);
+
+  reads.length = 0;
+  const expiredRegistry = createDynamoDeviceRegistryV2({
+    client,
+    table: 'Pocket',
+    hmacKey: KEY,
+    now: () => binding.expiresAtEpochSec * 1000,
+  });
+  assert.deepEqual(
+    await expiredRegistry.reconcileRegistration({ principal: 'p', humanId: 'u', ...registration() }),
+    {
+      ...ownerFields(),
+      bindingId: binding.bindingId,
+      bindingRevision: binding.bindingRevision,
+      expiresAtEpochSec: binding.expiresAtEpochSec,
+      idempotent: true,
+      renewed: false,
+      tokenClaimId: claim.tokenClaimId,
+      tokenClaimRevision: claim.tokenClaimRevision,
+      expired: true,
+    },
+  );
+  assert.equal(reads.length, 2, 'an expired exact replay still returns both revocation fences');
+  assert.equal(writes, 0);
 });
 
 async function sameIntentRenewalSnapshots() {
@@ -1078,7 +1531,11 @@ async function sameIntentRenewalSnapshots() {
   await registry.register({
     principal: 'p',
     humanId: 'u',
-    ...registration({ idempotencyKey: IDEM_C }),
+    ...registration({
+      idempotencyKey: IDEM_C,
+      expectedBindingId: old.binding.bindingId,
+      expectedBindingRevision: old.binding.bindingRevision,
+    }),
   });
   const renewed = {
     binding: structuredClone([...registry._records.values()][0]),
@@ -1101,6 +1558,111 @@ async function expiringRegistrationSnapshot() {
     directory: structuredClone([...registry._targetDirectories.values()][0]),
   };
 }
+
+test('Dynamo foreign base owner conflicts before ttl and is exact-CAS reclaimable at ttl', async () => {
+  const seeded = await expiringRegistrationSnapshot();
+  const itemKey = ({ pk, sk }) => JSON.stringify([pk, sk]);
+  const items = new Map([
+    [itemKey(seeded.binding), structuredClone(seeded.binding)],
+    [itemKey(seeded.claim), structuredClone(seeded.claim)],
+    [itemKey(seeded.directory), structuredClone(seeded.directory)],
+  ]);
+  const transactions = [];
+  const client = {
+    async get({ Key }) {
+      const item = items.get(itemKey(Key));
+      return item ? { Item: structuredClone(item) } : {};
+    },
+    async transactWrite(input) {
+      transactions.push(structuredClone(input));
+    },
+  };
+  let now = (seeded.binding.ttl - 1) * 1000;
+  const registry = createDynamoDeviceRegistryV2({
+    client,
+    table: 'Pocket',
+    hmacKey: KEY,
+    now: () => now,
+    leaseSeconds: 60,
+    retryDelay: async () => {},
+  });
+  const bOwner = ownerFields('principal-b', 'same-human');
+  const bBody = registration({
+    ...bOwner,
+    idempotencyKey: IDEM_B,
+    voipToken: 'dynamo-owner-b-token',
+    sessionId: 'dynamo-owner-b-session',
+  });
+  const bCleanup = cleanupRegistration({
+    ...bOwner,
+    idempotencyKey: IDEM_C,
+    voipToken: bBody.voipToken,
+    sessionId: bBody.sessionId,
+  });
+  const bUnregister = {
+    registrationVersion: 2,
+    ...bOwner,
+    installationId: bBody.installationId,
+    sessionId: bBody.sessionId,
+    bindingId: seeded.binding.bindingId,
+    bindingRevision: seeded.binding.bindingRevision,
+  };
+  const expectOwnerConflict = (promise) =>
+    assert.rejects(promise, (error) => error instanceof DeviceRegistryV2Error && error.code === 'registry-owner-conflict');
+
+  await expectOwnerConflict(
+    registry.reconcileRegistration({ principal: 'principal-b', humanId: 'same-human', ...bBody }),
+  );
+  await expectOwnerConflict(
+    registry.denyRegistration({ principal: 'principal-b', humanId: 'same-human', ...bCleanup }),
+  );
+  await expectOwnerConflict(
+    registry.unregister({ principal: 'principal-b', humanId: 'same-human', ...bUnregister }),
+  );
+  await expectOwnerConflict(registry.register({ principal: 'principal-b', humanId: 'same-human', ...bBody }));
+  assert.equal(transactions.length, 0, 'a protected foreign owner causes no Dynamo transaction');
+
+  now = seeded.binding.ttl * 1000;
+  assert.equal(
+    await registry.reconcileRegistration({ principal: 'principal-b', humanId: 'same-human', ...bBody }),
+    null,
+  );
+  assert.deepEqual(
+    await registry.unregister({ principal: 'principal-b', humanId: 'same-human', ...bUnregister }),
+    { removed: false, ...bOwner },
+  );
+  assert.deepEqual(
+    await registry.denyRegistration({ principal: 'principal-b', humanId: 'same-human', ...bCleanup }),
+    { state: 'denied', ...bOwner },
+  );
+  assert.equal(transactions.length, 1);
+  assert.equal(transactions[0].TransactItems.length, 1, 'denial writes only its own principal-bound outcome row');
+  assert.equal(transactions[0].TransactItems[0].Put.Item.sk, 'outcome');
+
+  const reclaimed = await registry.register({ principal: 'principal-b', humanId: 'same-human', ...bBody });
+  assert.equal(reclaimed.bindingRevision, 1);
+  assert.deepEqual({ ownerVersion: reclaimed.ownerVersion, ownerHandle: reclaimed.ownerHandle }, bOwner);
+  const writes = transactions[1].TransactItems;
+  const basePut = writes[0].Put;
+  assert.equal(basePut.Item.sk, 'binding');
+  assert.equal(basePut.Item.ownerHandle, bOwner.ownerHandle);
+  assert.equal(basePut.ExpressionAttributeValues[':ownerHandle'], seeded.binding.ownerHandle);
+  assert.match(basePut.ConditionExpression, /#ownerHandle = :ownerHandle/);
+  assert.ok(
+    writes.some((entry) => entry.Delete?.Key.pk === seeded.claim.pk && entry.Delete?.Key.sk === 'claim'),
+    'reclaim transaction retires the old owner claim',
+  );
+  assert.ok(
+    writes.some((entry) => entry.Delete?.Key.pk === seeded.directory.pk && entry.Delete?.Key.sk === 'directory'),
+    'reclaim transaction retires the old owner directory',
+  );
+  assert.ok(
+    writes.some(
+      (entry) => entry.Put?.Item.sk === 'directory' && entry.Put.Item.pk !== seeded.directory.pk,
+    ),
+    'reclaim transaction creates only the new owner directory membership',
+  );
+});
 
 test('Dynamo register atomically writes HMAC installation, token claim, and bounded target directory', async () => {
   let transaction;
@@ -1126,10 +1688,11 @@ test('Dynamo register atomically writes HMAC installation, token claim, and boun
     false,
     'logical idempotency UUID is not reused as a Dynamo transaction token across changing lease payloads',
   );
-  assert.equal(transaction.TransactItems.length, 3);
+  assert.equal(transaction.TransactItems.length, 4);
   const basePut = transaction.TransactItems[0].Put;
   const claimPut = transaction.TransactItems[1].Put;
   const directoryPut = transaction.TransactItems[2].Put;
+  const operationPut = transaction.TransactItems[3].Put;
   assert.match(basePut.Item.pk, /^dial:install:v2:/);
   assert.equal(basePut.Item.targetKey, deriveDeviceTargetKey(KEY, 'p', 'u', 'session-a'));
   assert.equal(Object.hasOwn(basePut.Item, 'deviceTargetPk'), false, 'routing correctness has no GSI dependency');
@@ -1158,6 +1721,19 @@ test('Dynamo register atomically writes HMAC installation, token claim, and boun
   ]);
   assert.equal(directoryPut.ConditionExpression, 'attribute_not_exists(#pk)');
   assert.equal(
+    operationPut.Item.pk,
+    deriveDeviceRegistrationOperationKey(KEY, 'p', 'u', INSTALLATION_ID, IDEM_A),
+  );
+  assert.equal(operationPut.Item.sk, 'outcome');
+  assert.equal(operationPut.Item.state, 'committed');
+  assert.equal(operationPut.Item.bindingId, basePut.Item.bindingId);
+  assert.equal(operationPut.Item.tokenClaimId, claimPut.Item.tokenClaimId);
+  assert.equal(operationPut.ConditionExpression, 'attribute_not_exists(#pk)');
+  const serializedOutcome = JSON.stringify(operationPut.Item);
+  for (const raw of ['session-a', INSTALLATION_ID, registration().voipToken]) {
+    assert.equal(serializedOutcome.includes(raw), false, `outcome must not store ${raw}`);
+  }
+  assert.equal(
     JSON.stringify(claimPut.Item).includes(registration().voipToken),
     false,
     'the ownership claim contains only a token HMAC/digest, never the raw APNs token',
@@ -1167,6 +1743,134 @@ test('Dynamo register atomically writes HMAC installation, token claim, and boun
     false,
     'the raw installation identity never reaches Dynamo',
   );
+});
+
+test('Dynamo denial is a one-item conditional terminal barrier derived from digest-only state', async () => {
+  let transaction;
+  const client = {
+    async get() {
+      return {};
+    },
+    async transactWrite(params) {
+      transaction = structuredClone(params);
+    },
+  };
+  const registry = createDynamoDeviceRegistryV2({ client, table: 'Pocket', hmacKey: KEY, now: () => NOW });
+  assert.deepEqual(
+    await registry.denyRegistration({
+      principal: 'principal-raw-secret',
+      humanId: 'human-raw-secret',
+      ...cleanupRegistration(ownerFields('principal-raw-secret', 'human-raw-secret')),
+    }),
+    { state: 'denied', ...ownerFields('principal-raw-secret', 'human-raw-secret') },
+  );
+  assert.equal(transaction.TransactItems.length, 1);
+  const put = transaction.TransactItems[0].Put;
+  assert.equal(put.ConditionExpression, 'attribute_not_exists(#pk)');
+  assert.equal(put.Item.state, 'denied');
+  assert.equal(
+    put.Item.pk,
+    deriveDeviceRegistrationOperationKey(
+      KEY,
+      'principal-raw-secret',
+      'human-raw-secret',
+      INSTALLATION_ID,
+      IDEM_A,
+    ),
+  );
+  const serialized = JSON.stringify(put.Item);
+  for (const raw of ['principal-raw-secret', 'human-raw-secret', INSTALLATION_ID, 'session-a', registration().voipToken]) {
+    assert.equal(serialized.includes(raw), false, `denial outcome must not store ${raw}`);
+  }
+});
+
+test('Dynamo commit and denial race on the same operation row, so exactly one terminal outcome wins', async () => {
+  const itemKey = ({ pk, sk }) => JSON.stringify([pk, sk]);
+  const makeAtomicClient = ({ holdFirstRegistration = false } = {}) => {
+    let items = new Map();
+    let releaseHeld;
+    let markHeld;
+    const held = new Promise((resolve) => {
+      markHeld = resolve;
+    });
+    const release = new Promise((resolve) => {
+      releaseHeld = resolve;
+    });
+    let shouldHold = holdFirstRegistration;
+    return {
+      held,
+      release: () => releaseHeld(),
+      items: () => items,
+      client: {
+        async get({ Key }) {
+          const item = items.get(itemKey(Key));
+          return item ? { Item: structuredClone(item) } : {};
+        },
+        async transactWrite({ TransactItems }) {
+          if (shouldHold && TransactItems.length > 1) {
+            shouldHold = false;
+            markHeld();
+            await release;
+          }
+          const conflictIndex = TransactItems.findIndex((entry) => {
+            const put = entry.Put;
+            return put?.ConditionExpression === 'attribute_not_exists(#pk)' && items.has(itemKey(put.Item));
+          });
+          if (conflictIndex !== -1) {
+            throw javascriptTransactionCancellation(
+              TransactItems.map((_, index) => (index === conflictIndex ? 'ConditionalCheckFailed' : 'None')),
+            );
+          }
+          const next = new Map(items);
+          for (const entry of TransactItems) {
+            if (entry.Put) next.set(itemKey(entry.Put.Item), structuredClone(entry.Put.Item));
+            else if (entry.Delete) next.delete(itemKey(entry.Delete.Key));
+            else assert.fail('unexpected transaction action');
+          }
+          items = next;
+        },
+      },
+    };
+  };
+
+  const denialWinsStore = makeAtomicClient({ holdFirstRegistration: true });
+  const denialWinsRegistry = createDynamoDeviceRegistryV2({
+    client: denialWinsStore.client,
+    table: 'Pocket',
+    hmacKey: KEY,
+    now: () => NOW,
+    retryDelay: async () => {},
+  });
+  const lateCommit = denialWinsRegistry.register({ principal: 'p', humanId: 'u', ...registration() });
+  await denialWinsStore.held;
+  assert.deepEqual(
+    await denialWinsRegistry.denyRegistration({ principal: 'p', humanId: 'u', ...cleanupRegistration() }),
+    { state: 'denied', ...ownerFields() },
+  );
+  denialWinsStore.release();
+  await assert.rejects(
+    lateCommit,
+    (error) => error instanceof DeviceRegistryV2Error && error.code === 'registration-operation-denied',
+  );
+  assert.deepEqual(
+    [...denialWinsStore.items().values()].map(({ state, sk }) => ({ state, sk })),
+    [{ state: 'denied', sk: 'outcome' }],
+    'denial-first leaves no binding, claim, or directory side effect',
+  );
+
+  const commitWinsStore = makeAtomicClient();
+  const commitWinsRegistry = createDynamoDeviceRegistryV2({
+    client: commitWinsStore.client,
+    table: 'Pocket',
+    hmacKey: KEY,
+    now: () => NOW,
+  });
+  const committed = await commitWinsRegistry.register({ principal: 'p', humanId: 'u', ...registration() });
+  assert.deepEqual(
+    await commitWinsRegistry.denyRegistration({ principal: 'p', humanId: 'u', ...cleanupRegistration() }),
+    { state: 'committed', registration: { ...committed, idempotent: true, renewed: false } },
+  );
+  assert.equal(commitWinsStore.items().size, 4, 'commit-first atomically keeps outcome + binding + claim + directory');
 });
 
 test('Dynamo automatic token reclaim waits through grace, so a maximally slow worker already hides the old route', async () => {
@@ -1189,8 +1893,8 @@ test('Dynamo automatic token reclaim waits through grace, so a maximally slow wo
   });
   await assert.rejects(
     earlyRegistry.register({
-      principal: 'p2',
-      humanId: 'u2',
+      principal: 'p',
+      humanId: 'u',
       ...indexedRegistration(2, {
         voipToken: expiring.binding.voipToken,
         sessionId: 'session-b',
@@ -1221,8 +1925,8 @@ test('Dynamo automatic token reclaim waits through grace, so a maximally slow wo
     },
   });
   await fastRegistry.register({
-    principal: 'p2',
-    humanId: 'u2',
+    principal: 'p',
+    humanId: 'u',
     ...indexedRegistration(2, {
       voipToken: expiring.binding.voipToken,
       sessionId: 'session-b',
@@ -1294,8 +1998,8 @@ test('Dynamo retries when an observed claim crosses its reclaim boundary mid-att
     },
   });
   await registry.register({
-    principal: 'p2',
-    humanId: 'u2',
+    principal: 'p',
+    humanId: 'u',
     ...indexedRegistration(2, {
       voipToken: expiring.binding.voipToken,
       sessionId: 'session-b',
@@ -1404,7 +2108,11 @@ test('Dynamo slow-worker renewal repairs a directory member pruned by a fast wor
   const repaired = await registry.register({
     principal: 'p',
     humanId: 'u',
-    ...indexedRegistration(1, { idempotencyKey: IDEM_C }),
+    ...indexedRegistration(1, {
+      idempotencyKey: IDEM_C,
+      expectedBindingId: old.bindingId,
+      expectedBindingRevision: old.bindingRevision,
+    }),
   });
   const directoryPut = transaction.TransactItems.find((item) => item.Put?.Item.sk === 'directory').Put;
   assert.deepEqual(
@@ -1452,11 +2160,12 @@ test('Dynamo explicit token transfer atomically deletes the displaced base and r
     expectedTokenClaimId: a.tokenClaimId,
     expectedTokenClaimRevision: a.tokenClaimRevision,
   });
-  assert.equal(transaction.TransactItems.length, 4);
+  assert.equal(transaction.TransactItems.length, 5);
   const winnerBase = transaction.TransactItems[0].Put.Item;
   const winnerClaim = transaction.TransactItems[1].Put.Item;
   const victimDelete = transaction.TransactItems[2].Delete;
   const directoryPut = transaction.TransactItems[3].Put;
+  const operationPut = transaction.TransactItems[4].Put;
   assert.equal(winnerBase.pk, installationKeyB);
   assert.equal(winnerClaim.ownerInstallationKey, installationKeyB);
   assert.deepEqual(victimDelete.Key, { pk: bindingA.pk, sk: 'binding' });
@@ -1469,6 +2178,8 @@ test('Dynamo explicit token transfer atomically deletes the displaced base and r
       expiresAtEpochSec: b.expiresAtEpochSec,
     },
   ]);
+  assert.equal(operationPut.Item.state, 'committed');
+  assert.equal(operationPut.Item.bindingId, b.bindingId);
   assert.equal(
     directoryPut.Item.members.some(({ installationKey }) => installationKey === bindingA.pk),
     false,
@@ -1536,30 +2247,50 @@ test('Dynamo concurrent same-tuple renewals re-read after CAS loss, so a slower 
     binding: { ...[...memory._records.values()][0] },
     claim: { ...[...memory._tokenClaims.values()][0] },
     directory: structuredClone([...memory._targetDirectories.values()][0]),
+    operations: new Map(),
   };
   const conditionalCancellation = () =>
     Object.assign(new Error('transaction CAS lost'), {
       name: 'TransactionCanceledException',
-      CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }, { Code: 'None' }],
+      CancellationReasons: [
+        { Code: 'ConditionalCheckFailed' },
+        { Code: 'None' },
+        { Code: 'None' },
+        { Code: 'None' },
+      ],
     });
   const applyTransaction = (params) => {
-    const [basePut, claimPut, directoryPut] = params.TransactItems.map((item) => item.Put);
+    const [basePut, claimPut, directoryPut, operationPut] = params.TransactItems.map((item) => item.Put);
     const expectedBase = basePut.ExpressionAttributeValues;
     const expectedClaim = claimPut.ExpressionAttributeValues;
     const expectedDirectory = directoryPut.ExpressionAttributeValues;
+    const currentOperation = state.operations.get(operationPut.Item.pk);
+    const expectedOperation = operationPut.ExpressionAttributeValues;
+    const operationMatches = operationPut.ConditionExpression === 'attribute_not_exists(#pk)'
+      ? currentOperation === undefined
+      : currentOperation?.schema === expectedOperation[':schema'] &&
+        currentOperation?.state === expectedOperation[':state'] &&
+        currentOperation?.requestFingerprint === expectedOperation[':fingerprint'] &&
+        currentOperation?.bindingId === expectedOperation[':bindingId'] &&
+        currentOperation?.bindingRevision === expectedOperation[':bindingRevision'] &&
+        currentOperation?.tokenClaimId === expectedOperation[':claimId'] &&
+        currentOperation?.tokenClaimRevision === expectedOperation[':claimRevision'] &&
+        currentOperation?.expiresAtEpochSec === expectedOperation[':expires'];
     if (
       state.binding.expiresAtEpochSec !== expectedBase[':expires'] ||
       state.binding.requestFingerprint !== expectedBase[':fingerprint'] ||
       state.claim.tokenClaimId !== expectedClaim[':claimId'] ||
       state.claim.tokenClaimRevision !== expectedClaim[':claimRevision'] ||
       state.directory.directoryId !== expectedDirectory[':directoryId'] ||
-      state.directory.revision !== expectedDirectory[':revision']
+      state.directory.revision !== expectedDirectory[':revision'] ||
+      !operationMatches
     ) {
       throw conditionalCancellation();
     }
     state.binding = { ...basePut.Item };
     state.claim = { ...claimPut.Item };
     state.directory = structuredClone(directoryPut.Item);
+    state.operations.set(operationPut.Item.pk, structuredClone(operationPut.Item));
   };
   let initialRace = true;
   const waiting = [];
@@ -1568,6 +2299,10 @@ test('Dynamo concurrent same-tuple renewals re-read after CAS loss, so a slower 
       if (Key.sk === 'binding') return { Item: { ...state.binding } };
       if (Key.sk === 'claim') return { Item: { ...state.claim } };
       if (Key.sk === 'directory') return { Item: structuredClone(state.directory) };
+      if (Key.sk === 'outcome') {
+        const operation = state.operations.get(Key.pk);
+        return operation ? { Item: structuredClone(operation) } : {};
+      }
       return {};
     },
     async transactWrite(params) {
@@ -1609,12 +2344,12 @@ test('Dynamo concurrent same-tuple renewals re-read after CAS loss, so a slower 
     fast.register({
       principal: 'p',
       humanId: 'u',
-      ...registration({ idempotencyKey: IDEM_C }),
+      ...registration(),
     }),
     slow.register({
       principal: 'p',
       humanId: 'u',
-      ...registration({ idempotencyKey: IDEM_D }),
+      ...registration(),
     }),
   ]);
   const expectedMax = Math.floor((NOW + 60_000) / 1000) + 7 * 24 * 60 * 60;
@@ -1653,13 +2388,18 @@ test('Dynamo target-directory CAS fences delete/recreate ABA with directoryId pl
       },
       async transactWrite(params) {
         attempts += 1;
-        const directoryPut = params.TransactItems.at(-1).Put;
+        const directoryPut = params.TransactItems.find((item) => item.Put?.Item.sk === 'directory').Put;
         if (attempts === 1) {
           assert.equal(directoryPut.ExpressionAttributeValues[':directoryId'], originalDirectoryId);
           state.directory = { ...state.directory, directoryId: recreatedDirectoryId };
           throw Object.assign(new Error('stale directory generation'), {
             name: 'TransactionCanceledException',
-            CancellationReasons: [{ Code: 'None' }, { Code: 'None' }, { Code: 'ConditionalCheckFailed' }],
+            CancellationReasons: [
+              { Code: 'None' },
+              { Code: 'None' },
+              { Code: 'ConditionalCheckFailed' },
+              { Code: 'None' },
+            ],
           });
         }
         assert.equal(
@@ -1673,7 +2413,11 @@ test('Dynamo target-directory CAS fences delete/recreate ABA with directoryId pl
   await registry.register({
     principal: 'p',
     humanId: 'u',
-    ...registration({ idempotencyKey: IDEM_C }),
+    ...registration({
+      idempotencyKey: IDEM_C,
+      expectedBindingId: state.binding.bindingId,
+      expectedBindingRevision: state.binding.bindingRevision,
+    }),
   });
   assert.equal(attempts, 2);
 });
@@ -1709,7 +2453,7 @@ test('Dynamo register retries a torn base/claim renewal snapshot instead of retu
     principal: 'p',
     humanId: 'u',
     ...registration({
-      idempotencyKey: IDEM_D,
+      idempotencyKey: IDEM_C,
       expectedTokenClaimId: old.claim.tokenClaimId,
       expectedTokenClaimRevision: old.claim.tokenClaimRevision,
     }),
@@ -1721,7 +2465,7 @@ test('Dynamo register retries a torn base/claim renewal snapshot instead of retu
   assert.equal(transactions, 1, 'the torn read never reached a transaction');
 });
 
-test('Dynamo unregister retries a torn base/claim renewal snapshot and removes the exact renewed tuple', async () => {
+test('Dynamo unregister retries a torn base/claim renewal snapshot and preserves the newer revision', async () => {
   const { old, renewed, now } = await sameIntentRenewalSnapshots();
   let baseReads = 0;
   let transactions = 0;
@@ -1752,14 +2496,15 @@ test('Dynamo unregister retries a torn base/claim renewal snapshot and removes t
     principal: 'p',
     humanId: 'u',
     registrationVersion: 2,
+    ...ownerFields(),
     installationId: INSTALLATION_ID,
     sessionId: 'session-a',
     bindingId: old.binding.bindingId,
     bindingRevision: old.binding.bindingRevision,
   });
-  assert.deepEqual(result, { removed: true });
+  assert.deepEqual(result, { removed: false, ...ownerFields() });
   assert.deepEqual(delays, [1]);
-  assert.equal(transactions, 1);
+  assert.equal(transactions, 0, 'the stale fence never reaches a delete transaction');
 });
 
 test('Dynamo lookup retries old-directory/new-binding skew and an absent-directory appearance', async () => {
@@ -1841,15 +2586,19 @@ test('Dynamo same-owner renewal repairs a retained base and directory after inde
   const result = await registry.register({
     principal: 'p',
     humanId: 'u',
-    ...registration({ idempotencyKey: IDEM_C }),
+    ...registration({
+      idempotencyKey: IDEM_C,
+      expectedBindingId: expiring.binding.bindingId,
+      expectedBindingRevision: expiring.binding.bindingRevision,
+    }),
   });
   assert.equal(result.bindingId, expiring.binding.bindingId);
-  assert.equal(result.bindingRevision, expiring.binding.bindingRevision);
+  assert.equal(result.bindingRevision, expiring.binding.bindingRevision + 1);
   assert.equal(result.tokenClaimRevision, 1);
   assert.equal(result.expiresAtEpochSec, nowEpochSec + 60);
   assert.deepEqual(delays, []);
   assert.equal(claimReads, 1);
-  assert.equal(transaction.TransactItems.length, 3);
+  assert.equal(transaction.TransactItems.length, 4);
   const claimPut = transaction.TransactItems.find((item) => item.Put?.Item.sk === 'claim').Put;
   assert.equal(claimPut.Item.expiresAtEpochSec, nowEpochSec + 60);
   assert.equal(claimPut.ConditionExpression, '(attribute_not_exists(#pk) OR #ttl <= :now)');
@@ -1904,12 +2653,13 @@ test('Dynamo unregister cleans retained old base and directory after automatic t
       principal: 'p',
       humanId: 'u',
       registrationVersion: 2,
+      ...ownerFields(),
       installationId: INSTALLATION_ID,
       sessionId: 'session-a',
       bindingId: expiring.binding.bindingId,
       bindingRevision: expiring.binding.bindingRevision,
     }),
-    { removed: true },
+    { removed: true, ...ownerFields() },
   );
   assert.deepEqual(delays, []);
   assert.equal(
@@ -2009,6 +2759,7 @@ test('Dynamo lookup strongly reads the bounded directory, base, and token claim 
     pk: installationKey,
     sk: 'binding',
     schema: 'dial-device-binding-v2',
+    ...ownerFields('pb', 'same-human'),
     targetKey: targetB,
     voipToken: 'current-token',
     voipTokenHash: createHash('sha256').update('current-token').digest('base64url'),
@@ -2198,6 +2949,7 @@ test('Dynamo unregister transactionally deletes the exact binding, token claim, 
     principal: 'p',
     humanId: 'u',
     registrationVersion: 2,
+    ...ownerFields(),
     installationId: INSTALLATION_ID,
     sessionId: 'session-a',
     bindingId: registered.bindingId,
@@ -2207,7 +2959,7 @@ test('Dynamo unregister transactionally deletes the exact binding, token claim, 
       ...common,
       bindingRevision: registered.bindingRevision + 1,
     }),
-    { removed: false },
+    { removed: false, ...ownerFields() },
   );
   assert.equal(transactions.length, 0, 'a stale tuple cannot reach a delete transaction');
   assert.deepEqual(
@@ -2215,7 +2967,7 @@ test('Dynamo unregister transactionally deletes the exact binding, token claim, 
       ...common,
       bindingRevision: registered.bindingRevision,
     }),
-    { removed: true },
+    { removed: true, ...ownerFields() },
   );
   assert.equal(transactions[0].TransactItems.length, 3);
   const [baseDelete, claimDelete, directoryDelete] = transactions[0].TransactItems.map((item) => item.Delete);
@@ -2264,6 +3016,7 @@ test('Dynamo unregister exhaustion never reports success while the exact binding
       principal: 'p',
       humanId: 'u',
       registrationVersion: 2,
+      ...ownerFields(),
       installationId: INSTALLATION_ID,
       sessionId: 'session-a',
       bindingId: registered.bindingId,
@@ -2278,7 +3031,7 @@ test('Dynamo retries TransactionConflict with a fresh clock but propagates mixed
   let wallMs = NOW;
   const transactions = [];
   const delays = [];
-  const conflict = () => javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']);
+  const conflict = () => javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']);
   const registry = createDynamoDeviceRegistryV2({
     table: 'Pocket',
     hmacKey: KEY,
@@ -2310,7 +3063,12 @@ test('Dynamo retries TransactionConflict with a fresh clock but propagates mixed
 
   const mixed = Object.assign(new Error('validation plus overlap'), {
     name: 'TransactionCanceledException',
-    CancellationReasons: [{ Code: 'TransactionConflict' }, { Code: 'ValidationError' }, { Code: 'None' }],
+    CancellationReasons: [
+      { Code: 'TransactionConflict' },
+      { Code: 'ValidationError' },
+      { Code: 'None' },
+      { Code: 'None' },
+    ],
   });
   let mixedTransactions = 0;
   let mixedDelays = 0;
@@ -2340,34 +3098,45 @@ test('Dynamo retries TransactionConflict with a fresh clock but propagates mixed
 });
 
 test('Dynamo transaction retry classifier propagates unsafe or malformed JavaScript cancellation messages', async () => {
-  const structuredNull = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']);
+  const structuredNull = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']);
   structuredNull.CancellationReasons = null;
-  const structuredNonArray = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']);
+  const structuredNonArray = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']);
   structuredNonArray.CancellationReasons = 'TransactionConflict,None,None';
-  const structuredMissingCode = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']);
-  structuredMissingCode.CancellationReasons = [{ Code: 'TransactionConflict' }, {}, { Code: 'None' }];
-  const structuredNonStringCode = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']);
-  structuredNonStringCode.CancellationReasons = [{ Code: 'TransactionConflict' }, { Code: 7 }, { Code: 'None' }];
-  const structuredUnsafe = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']);
+  const structuredMissingCode = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']);
+  structuredMissingCode.CancellationReasons = [
+    { Code: 'TransactionConflict' },
+    {},
+    { Code: 'None' },
+    { Code: 'None' },
+  ];
+  const structuredNonStringCode = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']);
+  structuredNonStringCode.CancellationReasons = [
+    { Code: 'TransactionConflict' },
+    { Code: 7 },
+    { Code: 'None' },
+    { Code: 'None' },
+  ];
+  const structuredUnsafe = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']);
   structuredUnsafe.CancellationReasons = [
     { Code: 'TransactionConflict' },
     { Code: 'ProvisionedThroughputExceeded' },
     { Code: 'None' },
+    { Code: 'None' },
   ];
-  const structuredGetterFailure = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']);
+  const structuredGetterFailure = javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']);
   Object.defineProperty(structuredGetterFailure, 'CancellationReasons', {
     get() {
       throw new Error('untrusted error getter');
     },
   });
   const cancellations = [
-    javascriptTransactionCancellation(['ThrottlingError', 'None', 'None']),
-    javascriptTransactionCancellation(['ProvisionedThroughputExceeded', 'None', 'None']),
-    javascriptTransactionCancellation(['TransactionConflict', 'ValidationError', 'None']),
-    javascriptTransactionCancellation(['TransactionConflict', 'UnknownReason', 'None']),
-    javascriptTransactionCancellation(['None', 'None', 'None']),
-    javascriptTransactionCancellation(['TransactionConflict', 'None']),
-    javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None']),
+    javascriptTransactionCancellation(['ThrottlingError', 'None', 'None', 'None']),
+    javascriptTransactionCancellation(['ProvisionedThroughputExceeded', 'None', 'None', 'None']),
+    javascriptTransactionCancellation(['TransactionConflict', 'ValidationError', 'None', 'None']),
+    javascriptTransactionCancellation(['TransactionConflict', 'UnknownReason', 'None', 'None']),
+    javascriptTransactionCancellation(['None', 'None', 'None', 'None']),
+    javascriptTransactionCancellation(['TransactionConflict', 'None', 'None']),
+    javascriptTransactionCancellation(['TransactionConflict', 'None', 'None', 'None', 'None']),
     Object.assign(
       new Error(
         'wrapper: Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict, None]',
@@ -2458,7 +3227,7 @@ test('Dynamo Registry V2 fails construction on partial infrastructure or weak HM
   );
 });
 
-test('different operation id with the same semantic intent renews without rotating the binding', async () => {
+test('different operation id with the same semantic intent advances the revocation revision', async () => {
   let now = NOW;
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => now, leaseSeconds: 60 });
   const one = await registry.register({ principal: 'p', humanId: 'u', ...registration() });
@@ -2472,9 +3241,86 @@ test('different operation id with the same semantic intent renews without rotati
       expectedBindingRevision: one.bindingRevision,
     }),
   });
-  assert.equal(two.bindingRevision, one.bindingRevision);
+  assert.equal(two.bindingRevision, one.bindingRevision + 1);
   assert.equal(two.bindingId, one.bindingId);
   assert.equal(two.expiresAtEpochSec, one.expiresAtEpochSec + 10);
   assert.equal(two.idempotent, false);
   assert.equal(two.renewed, true);
+});
+
+test('distinct same-intent operations require the exact current binding fence', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  const a = await registry.register({ principal: 'p', humanId: 'u', ...registration() });
+  const b = await registry.register({
+    principal: 'p',
+    humanId: 'u',
+    ...registration({
+      idempotencyKey: IDEM_C,
+      expectedBindingId: a.bindingId,
+      expectedBindingRevision: a.bindingRevision,
+    }),
+  });
+
+  for (const candidate of [
+    registration({ idempotencyKey: IDEM_D }),
+    registration({
+      idempotencyKey: IDEM_D,
+      expectedBindingId: a.bindingId,
+      expectedBindingRevision: a.bindingRevision,
+    }),
+  ]) {
+    await assert.rejects(
+      registry.register({ principal: 'p', humanId: 'u', ...candidate }),
+      (error) => error instanceof DeviceRegistryV2Error &&
+        error.code === 'binding-conflict' &&
+        error.details?.currentBinding?.bindingRevision === b.bindingRevision,
+    );
+  }
+  assert.equal([...registry._records.values()][0].bindingRevision, b.bindingRevision);
+  assert.equal([...registry._records.values()][0].idempotencyKey, IDEM_C);
+});
+
+test('Dynamo distinct same-intent operation rejects missing or stale binding fences before write', async () => {
+  const memory = createInMemoryDeviceRegistryV2({ hmacKey: KEY, now: () => NOW });
+  const a = await memory.register({ principal: 'p', humanId: 'u', ...registration() });
+  const b = await memory.register({
+    principal: 'p',
+    humanId: 'u',
+    ...registration({
+      idempotencyKey: IDEM_C,
+      expectedBindingId: a.bindingId,
+      expectedBindingRevision: a.bindingRevision,
+    }),
+  });
+  const binding = structuredClone([...memory._records.values()][0]);
+  let transactions = 0;
+  const registry = createDynamoDeviceRegistryV2({
+    table: 'Pocket',
+    hmacKey: KEY,
+    now: () => NOW,
+    client: {
+      async get({ Key }) {
+        if (Key.sk === 'binding') return { Item: structuredClone(binding) };
+        return {};
+      },
+      async transactWrite() { transactions += 1; },
+    },
+  });
+
+  for (const candidate of [
+    registration({ idempotencyKey: IDEM_D }),
+    registration({
+      idempotencyKey: IDEM_D,
+      expectedBindingId: a.bindingId,
+      expectedBindingRevision: a.bindingRevision,
+    }),
+  ]) {
+    await assert.rejects(
+      registry.register({ principal: 'p', humanId: 'u', ...candidate }),
+      (error) => error instanceof DeviceRegistryV2Error &&
+        error.code === 'binding-conflict' &&
+        error.details?.currentBinding?.bindingRevision === b.bindingRevision,
+    );
+  }
+  assert.equal(transactions, 0);
 });

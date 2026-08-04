@@ -3,23 +3,107 @@
 // fail-closed (no registry -> 501), and a stable/testable payload for forge decode() (id/who/priority).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import {
   createDialRegistry, createDialPushBackend, createStoreDeviceRegistry, validateRegistration, buildDialPayload, computeDialId,
   DIAL_LIMITS, DIAL_PRIORITIES, DIAL_PUSHKIT_CAP, DIAL_PAYLOAD_MAX_BYTES,
 } from '../src/dial-registry.mjs';
 import {
+  DEVICE_REGISTRY_OWNER_VERSION,
   DeviceRegistryV2Error,
   createInMemoryDeviceRegistryV2,
+  deriveDeviceOwnerHandle,
 } from '../src/device-registry-v2.mjs';
 
 // Shared byte fixtures — the SAME file forge's Swift decoder byte-matches (KAV parity). Generated from buildDialPayload.
 const fixtures = JSON.parse(readFileSync(new URL('./fixtures/dial-payload-v1.json', import.meta.url), 'utf8'));
+const cleanupKav = JSON.parse(
+  readFileSync(new URL('./fixtures/device-registration-cleanup-v2.json', import.meta.url), 'utf8'),
+);
 
 const NOW = 1_770_000_000_000; // fixed injected clock
 const V2_KEY = Buffer.alloc(32, 0x41);
 const V2_INSTALLATION = Buffer.alloc(32, 0x42).toString('base64url');
 const V2_IDEMPOTENCY = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const V2_OWNER = deriveDeviceOwnerHandle(V2_KEY, 'principal-a', 'verified-human');
+const v2Registration = (overrides = {}) => ({
+  registrationVersion: 2,
+  ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+  ownerHandle: V2_OWNER,
+  installationId: V2_INSTALLATION,
+  idempotencyKey: V2_IDEMPOTENCY,
+  voipToken: 'private-routing-token',
+  sessionId: 'session-v2',
+  platform: 'apns',
+  ...overrides,
+});
+const v2DeniedReceipt = (body, error) => ({
+  registered: false,
+  committed: false,
+  authorized: false,
+  revocationRequired: false,
+  reason: 'registration-denied-before-commit',
+  error,
+  registrationVersion: body.registrationVersion,
+  ownerVersion: body.ownerVersion,
+  ownerHandle: body.ownerHandle,
+  sessionId: body.sessionId,
+  platform: body.platform,
+  idempotent: true,
+});
+const v2Cleanup = (overrides = {}) => {
+  const source = v2Registration(overrides);
+  return {
+    registrationVersion: source.registrationVersion,
+    ownerVersion: source.ownerVersion,
+    ownerHandle: source.ownerHandle,
+    installationId: source.installationId,
+    idempotencyKey: source.idempotencyKey,
+    tokenDigest: createHash('sha256').update(source.voipToken, 'utf8').digest('base64url'),
+    sessionId: source.sessionId,
+    platform: source.platform,
+  };
+};
+const v2Unregister = (bindingId, bindingRevision, overrides = {}) => ({
+  registrationVersion: 2,
+  ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+  ownerHandle: V2_OWNER,
+  installationId: V2_INSTALLATION,
+  sessionId: 'session-v2',
+  bindingId,
+  bindingRevision,
+  ...overrides,
+});
+const completeV2Registry = (overrides = {}) => ({
+  protocolVersion: 2,
+  operationOutcomeVersion: 1,
+  async registrationContext() {
+    return { registrationVersion: 2, ownerVersion: DEVICE_REGISTRY_OWNER_VERSION, ownerHandle: V2_OWNER };
+  },
+  async register() { throw new Error('unexpected register'); },
+  async reconcileRegistration() { return null; },
+  async denyRegistration() {
+    return { state: 'denied', ownerVersion: DEVICE_REGISTRY_OWNER_VERSION, ownerHandle: V2_OWNER };
+  },
+  async unregister() {
+    return { removed: false, ownerVersion: DEVICE_REGISTRY_OWNER_VERSION, ownerHandle: V2_OWNER };
+  },
+  async lookup() { return []; },
+  ...overrides,
+});
+const v2AuthorityResult = (overrides = {}) => ({
+  ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+  ownerHandle: V2_OWNER,
+  bindingId: 'bind_0123456789abcdef0123456789abcdef',
+  bindingRevision: 3,
+  expiresAtEpochSec: Math.floor(NOW / 1000) + 60,
+  idempotent: false,
+  renewed: false,
+  tokenClaimId: 'claim_0123456789abcdef0123456789abcdef',
+  tokenClaimRevision: 4,
+  ...overrides,
+});
 const fakeRegistry = () => {
   const records = [];
   return {
@@ -28,6 +112,81 @@ const fakeRegistry = () => {
     async lookup({ humanId, sessionId }) { return records.filter((x) => x.humanId === humanId && x.sessionId === sessionId).map((x) => ({ voipToken: x.voipToken, platform: x.platform })); },
   };
 };
+
+test('createDialRegistry fails boot on a partial Registry V2 outcome interface', () => {
+  assert.doesNotThrow(() => createDialRegistry({ deviceRegistry: completeV2Registry() }));
+  for (const missingCapability of [
+    'operationOutcomeVersion',
+    'registrationContext',
+    'register',
+    'reconcileRegistration',
+    'denyRegistration',
+    'unregister',
+    'lookup',
+  ]) {
+    const partial = completeV2Registry();
+    delete partial[missingCapability];
+    assert.throws(
+      () => createDialRegistry({ deviceRegistry: partial }),
+      /requires operationOutcomeVersion=1 and registrationContext, register, reconcileRegistration, denyRegistration, unregister, lookup/,
+      `missing ${missingCapability} must fail boot`,
+    );
+  }
+});
+
+test('registration context returns one strict stable owner bootstrap and rejects malformed adapters', async (t) => {
+  const calls = [];
+  const service = createDialRegistry({
+    deviceRegistry: completeV2Registry({
+      async registrationContext(args) {
+        calls.push(args);
+        return { registrationVersion: 2, ownerVersion: DEVICE_REGISTRY_OWNER_VERSION, ownerHandle: V2_OWNER };
+      },
+    }),
+    now: () => NOW,
+  });
+  const expected = {
+    status: 200,
+    body: {
+      registrationVersion: 2,
+      ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+      ownerHandle: V2_OWNER,
+      serverTime: new Date(NOW).toISOString(),
+    },
+  };
+  assert.deepEqual(
+    await service.registrationContext({ principal: 'principal-a', humanId: 'verified-human' }),
+    expected,
+  );
+  assert.deepEqual(
+    await service.registrationContext({ principal: 'principal-a', humanId: 'verified-human' }),
+    expected,
+  );
+  assert.deepEqual(calls, [
+    { principal: 'principal-a', humanId: 'verified-human' },
+    { principal: 'principal-a', humanId: 'verified-human' },
+  ]);
+
+  const malformed = [
+    undefined,
+    { registrationVersion: 2, ownerVersion: DEVICE_REGISTRY_OWNER_VERSION, ownerHandle: V2_OWNER, extra: true },
+    { registrationVersion: 1, ownerVersion: DEVICE_REGISTRY_OWNER_VERSION, ownerHandle: V2_OWNER },
+    { registrationVersion: 2, ownerVersion: 2, ownerHandle: V2_OWNER },
+    { registrationVersion: 2, ownerVersion: DEVICE_REGISTRY_OWNER_VERSION, ownerHandle: `${'A'.repeat(42)}B` },
+  ];
+  for (const [index, value] of malformed.entries()) {
+    await t.test(`malformed adapter ${index + 1}`, async () => {
+      const malformedService = createDialRegistry({
+        deviceRegistry: completeV2Registry({ async registrationContext() { return value; } }),
+        now: () => NOW,
+      });
+      assert.deepEqual(
+        await malformedService.registrationContext({ principal: 'principal-a', humanId: 'verified-human' }),
+        { status: 502, body: { error: 'registry context failed', reason: 'registry-context-failed' } },
+      );
+    });
+  }
+});
 
 test('computeDialId: deterministic, prefixed, and injective over its inputs', () => {
   const id = computeDialId('u', 'sess-1', 'ring', NOW);
@@ -271,16 +430,10 @@ test('register: happy path binds token to the token-derived humanId (never the b
 test('register V2: membership-gated response returns only server binding/token-claim fences, never installation/token', async () => {
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => NOW });
   const service = createDialRegistry({ deviceRegistry: registry, now: () => NOW });
-  const body = {
-    registrationVersion: 2,
-    installationId: V2_INSTALLATION,
-    idempotencyKey: V2_IDEMPOTENCY,
-    voipToken: 'private-routing-token',
-    sessionId: 'session-v2',
-    platform: 'apns',
-  };
+  const body = v2Registration();
   let membershipSession;
   const response = await service.register({
+    principal: 'principal-a',
     humanId: 'verified-human',
     body,
     isMember: async (sessionId) => { membershipSession = sessionId; return true; },
@@ -293,8 +446,619 @@ test('register V2: membership-gated response returns only server binding/token-c
   assert.match(response.body.tokenClaimId, /^claim_[0-9a-f]{32}$/);
   assert.equal(response.body.tokenClaimRevision, 1);
   assert.equal(response.body.idempotent, false);
+  assert.equal(response.body.serverTime, new Date(NOW).toISOString());
+  assert.deepEqual(Object.keys(response.body).sort(), [
+    'bindingId',
+    'bindingRevision',
+    'expiresAt',
+    'idempotent',
+    'ownerHandle',
+    'ownerVersion',
+    'platform',
+    'registered',
+    'registrationVersion',
+    'serverTime',
+    'sessionId',
+    'tokenClaimId',
+    'tokenClaimRevision',
+  ]);
   assert.equal(Object.hasOwn(response.body, 'installationId'), false);
   assert.equal(Object.hasOwn(response.body, 'voipToken'), false);
+});
+
+test('register V2 fails closed on malformed adapter authority results without echoing them', async (t) => {
+  const rawSecret = 'raw-adapter-authority-secret';
+  const invalidResults = [
+    ['missing result', undefined],
+    ['extra field', v2AuthorityResult({ adapterDetail: rawSecret })],
+    ['wrong owner version', v2AuthorityResult({ ownerVersion: 2 })],
+    ['wrong owner handle', v2AuthorityResult({ ownerHandle: deriveDeviceOwnerHandle(V2_KEY, 'other', 'owner') })],
+    ['invalid binding id', v2AuthorityResult({ bindingId: rawSecret })],
+    ['invalid binding revision', v2AuthorityResult({ bindingRevision: 0 })],
+    ['invalid token-claim id', v2AuthorityResult({ tokenClaimId: rawSecret })],
+    ['invalid token-claim revision', v2AuthorityResult({ tokenClaimRevision: 0 })],
+    ['invalid expiry type', v2AuthorityResult({ expiresAtEpochSec: String(Math.floor(NOW / 1000) + 60) })],
+    ['unrepresentable expiry', v2AuthorityResult({ expiresAtEpochSec: 8_640_000_000_001 })],
+    ['expired at response time', v2AuthorityResult({ expiresAtEpochSec: Math.floor(NOW / 1000) })],
+    ['invalid idempotent type', v2AuthorityResult({ idempotent: 'false' })],
+    ['invalid renewed type', v2AuthorityResult({ renewed: 1 })],
+  ];
+  for (const [name, adapterResult] of invalidResults) {
+    await t.test(name, async () => {
+      let membershipCalls = 0;
+      const service = createDialRegistry({
+        deviceRegistry: completeV2Registry({ async register() { return adapterResult; } }),
+        now: () => NOW,
+      });
+      const response = await service.register({
+        principal: 'principal-a',
+        humanId: 'verified-human',
+        body: v2Registration(),
+        isMember: async () => { membershipCalls += 1; return true; },
+      });
+      assert.deepEqual(response, {
+        status: 502,
+        body: { error: 'registry write failed', reason: 'registry-write-failed' },
+      });
+      assert.equal(membershipCalls, 1);
+      assert.equal(JSON.stringify(response).includes(rawSecret), false);
+    });
+  }
+});
+
+test('register V2 accepts the reference adapter ordinary renewal semantics', async () => {
+  const service = createDialRegistry({
+    deviceRegistry: completeV2Registry({
+      async register() { return v2AuthorityResult({ idempotent: true, renewed: true }); },
+    }),
+    now: () => NOW,
+  });
+  const response = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Registration(),
+    isMember: async () => true,
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.idempotent, true);
+  assert.deepEqual(Object.keys(response.body).sort(), [
+    'bindingId', 'bindingRevision', 'expiresAt', 'idempotent', 'ownerHandle', 'ownerVersion',
+    'platform', 'registered', 'registrationVersion', 'serverTime', 'sessionId',
+    'tokenClaimId', 'tokenClaimRevision',
+  ]);
+});
+
+test('register V2 accepts only a strict, time-consistent reconcile adapter result', async (t) => {
+  const rawSecret = 'raw-reconcile-authority-secret';
+  const validReplay = v2AuthorityResult({ idempotent: true, renewed: false });
+  const invalidResults = [
+    ['undefined is not an authoritative miss', undefined],
+    ['extra field', { ...validReplay, adapterDetail: rawSecret }],
+    ['wrong owner echo', { ...validReplay, ownerHandle: deriveDeviceOwnerHandle(V2_KEY, 'other', 'owner') }],
+    ['invalid binding id', { ...validReplay, bindingId: rawSecret }],
+    ['non-idempotent replay', { ...validReplay, idempotent: false }],
+    ['renewing replay', { ...validReplay, renewed: true }],
+    ['false expired marker', { ...validReplay, expired: false }],
+    ['premature expired marker', { ...validReplay, expired: true }],
+    ['missing expired marker at logical expiry', {
+      ...validReplay,
+      expiresAtEpochSec: Math.floor(NOW / 1000),
+    }],
+  ];
+  for (const [name, adapterResult] of invalidResults) {
+    await t.test(name, async () => {
+      let membershipCalls = 0;
+      let writes = 0;
+      const service = createDialRegistry({
+        deviceRegistry: completeV2Registry({
+          async reconcileRegistration() { return adapterResult; },
+          async register() { writes += 1; return v2AuthorityResult(); },
+        }),
+        now: () => NOW,
+      });
+      const response = await service.register({
+        principal: 'principal-a',
+        humanId: 'verified-human',
+        body: v2Registration(),
+        isMember: async () => { membershipCalls += 1; return true; },
+      });
+      assert.deepEqual(response, {
+        status: 502,
+        body: { error: 'registry reconciliation failed', reason: 'registry-reconciliation-failed' },
+      });
+      assert.equal(membershipCalls, 0);
+      assert.equal(writes, 0);
+      assert.equal(JSON.stringify(response).includes(rawSecret), false);
+    });
+  }
+
+  await t.test('expired true is the only valid optional replay form at logical expiry', async () => {
+    let membershipCalls = 0;
+    const expiredReplay = {
+      ...validReplay,
+      expiresAtEpochSec: Math.floor(NOW / 1000),
+      expired: true,
+    };
+    const service = createDialRegistry({
+      deviceRegistry: completeV2Registry({ async reconcileRegistration() { return expiredReplay; } }),
+      now: () => NOW,
+    });
+    const response = await service.register({
+      principal: 'principal-a',
+      humanId: 'verified-human',
+      body: v2Registration(),
+      isMember: async () => { membershipCalls += 1; return true; },
+    });
+    assert.equal(response.status, 410);
+    assert.equal(response.body.reason, 'registration-expired');
+    assert.equal(response.body.bindingId, expiredReplay.bindingId);
+    assert.equal(response.body.tokenClaimId, expiredReplay.tokenClaimId);
+    assert.equal(response.body.idempotent, true);
+    assert.equal(membershipCalls, 0);
+  });
+});
+
+test('register V2: exact replay is read-only; lost membership returns revocation-only fences, not authority', async () => {
+  let now = NOW;
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => now, leaseSeconds: 60 });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => now });
+  const body = v2Registration();
+  const first = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => true,
+  });
+  const snapshots = {
+    records: structuredClone([...registry._records]),
+    claims: structuredClone([...registry._tokenClaims]),
+    directories: structuredClone([...registry._targetDirectories]),
+  };
+
+  now += 30_000;
+  let membershipCalls = 0;
+  const authorizedReplay = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => { membershipCalls += 1; return true; },
+  });
+  assert.equal(authorizedReplay.status, 200);
+  assert.equal(authorizedReplay.body.idempotent, true);
+  assert.equal(authorizedReplay.body.bindingId, first.body.bindingId);
+  assert.equal(authorizedReplay.body.tokenClaimId, first.body.tokenClaimId);
+  assert.equal(authorizedReplay.body.expiresAt, first.body.expiresAt, 'read-only replay does not renew the lease');
+  assert.equal(membershipCalls, 1, 'a normal 200 replay still requires current membership');
+  assert.deepEqual([...registry._records], snapshots.records);
+  assert.deepEqual([...registry._tokenClaims], snapshots.claims);
+  assert.deepEqual([...registry._targetDirectories], snapshots.directories);
+
+  membershipCalls = 0;
+  const revokedReplay = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => { membershipCalls += 1; return false; },
+  });
+  assert.equal(revokedReplay.status, 409);
+  assert.deepEqual(revokedReplay.body, {
+    registered: false,
+    committed: true,
+    authorized: false,
+    revocationRequired: true,
+    reason: 'registration-committed-but-unauthorized',
+    error: 'registration committed but current authorization is missing',
+    registrationVersion: 2,
+    ownerVersion: body.ownerVersion,
+    ownerHandle: body.ownerHandle,
+    sessionId: body.sessionId,
+    platform: body.platform,
+    bindingId: first.body.bindingId,
+    bindingRevision: first.body.bindingRevision,
+    tokenClaimId: first.body.tokenClaimId,
+    tokenClaimRevision: first.body.tokenClaimRevision,
+    expiresAt: first.body.expiresAt,
+    serverTime: new Date(now).toISOString(),
+    idempotent: true,
+  });
+  assert.equal(membershipCalls, 1);
+  assert.deepEqual([...registry._records], snapshots.records);
+  assert.deepEqual([...registry._tokenClaims], snapshots.claims);
+  assert.deepEqual([...registry._targetDirectories], snapshots.directories);
+});
+
+test('register V2: membership lookup crossing lease expiry returns one response-time 410 receipt', async () => {
+  let now = NOW;
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => now, leaseSeconds: 60 });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => now });
+  const body = v2Registration();
+  const first = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => true,
+  });
+  const expiryMs = Date.parse(first.body.expiresAt);
+  now = expiryMs - 1;
+  const response = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => {
+      now = expiryMs;
+      return false;
+    },
+  });
+  assert.equal(response.status, 410);
+  assert.equal(response.body.reason, 'registration-expired');
+  assert.equal(response.body.serverTime, new Date(expiryMs).toISOString());
+  assert.equal(response.body.expiresAt, first.body.expiresAt);
+  assert.equal(response.body.bindingId, first.body.bindingId);
+  assert.equal(response.body.authorized, false);
+});
+
+test('register V2: changed requests still require membership and reveal no committed fences', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => NOW });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => NOW });
+  const body = v2Registration();
+  await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => true,
+  });
+  const snapshots = {
+    records: structuredClone([...registry._records]),
+    claims: structuredClone([...registry._tokenClaims]),
+    directories: structuredClone([...registry._targetDirectories]),
+  };
+  let membershipCalls = 0;
+  for (const [changed, expectedBody] of [
+    [
+      { ...body, idempotencyKey: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' },
+      v2DeniedReceipt(
+        { ...body, idempotencyKey: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' },
+        'not a known session for this user',
+      ),
+    ],
+    [{ ...body, voipToken: 'different-token' }, { error: 'not a known session for this user' }],
+  ]) {
+    const response = await service.register({
+      principal: 'principal-a',
+      humanId: 'verified-human',
+      body: changed,
+      isMember: async () => { membershipCalls += 1; return false; },
+    });
+    assert.deepEqual(response, {
+      status: 403,
+      body: expectedBody,
+    });
+    assert.equal(Object.hasOwn(response.body, 'bindingId'), false);
+    assert.equal(Object.hasOwn(response.body, 'tokenClaimId'), false);
+  }
+  assert.equal(membershipCalls, 2);
+  assert.deepEqual([...registry._records], snapshots.records);
+  assert.deepEqual([...registry._tokenClaims], snapshots.claims);
+  assert.deepEqual([...registry._targetDirectories], snapshots.directories);
+});
+
+test('register V2: exact replay at logical expiry is a typed 410 with revocation fences and no renewal', async () => {
+  let now = NOW;
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => now, leaseSeconds: 60 });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => now });
+  const body = v2Registration();
+  const first = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => true,
+  });
+  now = Date.parse(first.body.expiresAt);
+  let membershipCalls = 0;
+  const expired = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body,
+    isMember: async () => { membershipCalls += 1; return true; },
+  });
+  assert.equal(expired.status, 410);
+  assert.equal(expired.body.reason, 'registration-expired');
+  assert.equal(expired.body.registered, false);
+  assert.equal(expired.body.committed, true);
+  assert.equal(expired.body.authorized, false);
+  assert.equal(expired.body.revocationRequired, true);
+  assert.equal(expired.body.bindingId, first.body.bindingId);
+  assert.equal(expired.body.tokenClaimId, first.body.tokenClaimId);
+  assert.equal(expired.body.expiresAt, first.body.expiresAt);
+  assert.equal(membershipCalls, 0, 'logical expiry is definitive before an authorization lookup');
+});
+
+test('cleanup V2: digest-only absent operation is durably denied and replays one strict non-authorizing receipt', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => NOW });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => NOW });
+  const body = v2Cleanup();
+  const expected = {
+    registrationVersion: 2,
+    ownerVersion: body.ownerVersion,
+    ownerHandle: body.ownerHandle,
+    idempotencyKey: body.idempotencyKey,
+    sessionId: body.sessionId,
+    platform: body.platform,
+    registered: false,
+    authorized: false,
+    cleanupComplete: true,
+    serverTime: new Date(NOW).toISOString(),
+  };
+
+  assert.deepEqual(
+    await service.cleanupRegistration({ principal: 'principal-a', humanId: 'verified-human', body }),
+    { status: 200, body: expected },
+  );
+  assert.deepEqual(
+    await service.cleanupRegistration({ principal: 'principal-a', humanId: 'verified-human', body }),
+    { status: 200, body: expected },
+    'a lost cleanup response is safely replayable',
+  );
+  assert.equal(registry._operations.size, 1);
+  assert.equal(registry._records.size, 0);
+  const deniedRetry = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Registration(),
+    isMember: async () => true,
+  });
+  assert.equal(deniedRetry.status, 409);
+  assert.equal(deniedRetry.body.reason, 'registration-denied-before-commit');
+  assert.equal(deniedRetry.body.committed, false);
+});
+
+test('cleanup V2 shared KAV produces the exact strict non-authorizing success wire', async () => {
+  for (const vector of cleanupKav.vectors) {
+    const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => NOW });
+    const service = createDialRegistry({ deviceRegistry: registry, now: () => NOW });
+    assert.deepEqual(
+      await service.cleanupRegistration({
+        principal: 'kav-principal',
+        humanId: 'verified-human',
+        body: vector.request,
+      }),
+      { status: 200, body: vector.successResponse },
+    );
+    assert.deepEqual(
+      Object.keys(vector.successResponse).sort(),
+      [
+        'authorized', 'cleanupComplete', 'idempotencyKey', 'ownerHandle', 'ownerVersion',
+        'platform', 'registered', 'registrationVersion', 'serverTime', 'sessionId',
+      ],
+    );
+  }
+});
+
+test('cleanup V2: a committed operation is exact-deleted, while stale cleanup cannot delete a newer binding', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => NOW });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => NOW });
+  const aBody = v2Registration();
+  const a = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: aBody,
+    isMember: async () => true,
+  });
+  assert.equal(a.status, 200);
+  const bBody = v2Registration({
+    idempotencyKey: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    voipToken: 'newer-routing-token',
+    expectedBindingId: a.body.bindingId,
+    expectedBindingRevision: a.body.bindingRevision,
+  });
+  const b = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: bBody,
+    isMember: async () => true,
+  });
+  assert.equal(b.status, 200);
+
+  const staleCleanup = await service.cleanupRegistration({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Cleanup(),
+  });
+  assert.equal(staleCleanup.status, 200);
+  assert.deepEqual(
+    (await registry.lookup({ principal: 'principal-a', humanId: 'verified-human', sessionId: 'session-v2' })).map(
+      ({ bindingId }) => bindingId,
+    ),
+    [b.body.bindingId],
+    'A cleanup compares A fences and cannot delete the newer B binding',
+  );
+
+  const currentCleanup = await service.cleanupRegistration({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Cleanup({ idempotencyKey: bBody.idempotencyKey, voipToken: bBody.voipToken }),
+  });
+  assert.equal(currentCleanup.status, 200);
+  assert.deepEqual(
+    await registry.lookup({ principal: 'principal-a', humanId: 'verified-human', sessionId: 'session-v2' }),
+    [],
+  );
+});
+
+test('cleanup V2: stale operation cannot delete a newer same-intent renewal', async () => {
+  let now = NOW;
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => now, leaseSeconds: 60 });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => now });
+  const aBody = v2Registration();
+  const a = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: aBody,
+    isMember: async () => true,
+  });
+  assert.equal(a.status, 200);
+
+  now += 10_000;
+  const bBody = v2Registration({
+    idempotencyKey: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    expectedBindingId: a.body.bindingId,
+    expectedBindingRevision: a.body.bindingRevision,
+  });
+  const b = await service.register({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: bBody,
+    isMember: async () => true,
+  });
+  assert.equal(b.status, 200);
+  assert.equal(b.body.bindingId, a.body.bindingId, 'same semantic route keeps its stable identity');
+  assert.equal(b.body.bindingRevision, a.body.bindingRevision + 1, 'new operation advances the cleanup fence');
+
+  assert.equal((await service.cleanupRegistration({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Cleanup(),
+  })).status, 200);
+  assert.deepEqual(
+    (await registry.lookup({ principal: 'principal-a', humanId: 'verified-human', sessionId: 'session-v2' })).map(
+      ({ bindingRevision }) => bindingRevision,
+    ),
+    [b.body.bindingRevision],
+    'cleanup A is fenced away from the newer same-intent B grant',
+  );
+
+  assert.equal((await service.cleanupRegistration({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Cleanup({ idempotencyKey: bBody.idempotencyKey }),
+  })).status, 200);
+  assert.deepEqual(
+    await registry.lookup({ principal: 'principal-a', humanId: 'verified-human', sessionId: 'session-v2' }),
+    [],
+  );
+});
+
+test('cleanup V2 rejects raw-token/unknown-field bodies and never returns lease-authority fences', async () => {
+  const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => NOW });
+  const service = createDialRegistry({ deviceRegistry: registry, now: () => NOW });
+  const invalid = await service.cleanupRegistration({
+    principal: 'p',
+    humanId: 'u',
+    body: { ...v2Cleanup(), voipToken: 'must-not-be-accepted' },
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.reason, 'registration-cleanup-v2-required');
+  const response = await service.cleanupRegistration({
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Cleanup(),
+  });
+  for (const forbidden of ['bindingId', 'bindingRevision', 'tokenClaimId', 'tokenClaimRevision', 'expiresAt', 'idempotent']) {
+    assert.equal(Object.hasOwn(response.body, forbidden), false, `cleanup response cannot grant ${forbidden}`);
+  }
+});
+
+test('cleanup V2 maps adapter conflicts and malformed outcomes without authority leakage', async () => {
+  const committedRegistration = {
+    ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+    ownerHandle: V2_OWNER,
+    bindingId: 'bind_0123456789abcdef0123456789abcdef',
+    bindingRevision: 3,
+    expiresAtEpochSec: Math.floor(NOW / 1000) + 60,
+    idempotent: true,
+    renewed: false,
+    tokenClaimId: 'claim_0123456789abcdef0123456789abcdef',
+    tokenClaimRevision: 4,
+  };
+  const cases = [
+    {
+      registry: completeV2Registry({
+        async denyRegistration() { throw new DeviceRegistryV2Error('idempotency-conflict', 'different intent'); },
+      }),
+      status: 409,
+      reason: 'idempotency-conflict',
+    },
+    {
+      registry: completeV2Registry({
+        async denyRegistration() {
+          throw new DeviceRegistryV2Error('registration-outcome-conflict', 'contended');
+        },
+      }),
+      status: 503,
+      reason: 'registration-cleanup-conflict',
+    },
+    {
+      registry: completeV2Registry({ async denyRegistration() { return { state: 'unknown' }; } }),
+      status: 502,
+      reason: 'registry-cleanup-failed',
+    },
+    {
+      registry: completeV2Registry({
+        async denyRegistration() { return { state: 'committed', registration: {} }; },
+      }),
+      status: 502,
+      reason: 'registry-cleanup-failed',
+    },
+    {
+      registry: completeV2Registry({
+        async denyRegistration() { return { state: 'denied', extra: true }; },
+      }),
+      status: 502,
+      reason: 'registry-cleanup-failed',
+    },
+    {
+      registry: completeV2Registry({
+        async denyRegistration() {
+          return {
+            state: 'denied',
+            ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+            ownerHandle: deriveDeviceOwnerHandle(V2_KEY, 'other', 'owner'),
+          };
+        },
+      }),
+      status: 502,
+      reason: 'registry-cleanup-failed',
+    },
+    {
+      registry: completeV2Registry({
+        async denyRegistration() { return { state: 'committed', registration: committedRegistration }; },
+        async unregister() { throw new DeviceRegistryV2Error('unregistration-conflict', 'contended'); },
+      }),
+      status: 503,
+      reason: 'registration-cleanup-conflict',
+    },
+    {
+      registry: completeV2Registry({
+        async denyRegistration() { return { state: 'committed', registration: committedRegistration }; },
+        async unregister() { return undefined; },
+      }),
+      status: 502,
+      reason: 'registry-cleanup-failed',
+    },
+    {
+      registry: completeV2Registry({
+        async denyRegistration() { return { state: 'committed', registration: committedRegistration }; },
+        async unregister() {
+          return {
+            removed: false,
+            ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+            ownerHandle: deriveDeviceOwnerHandle(V2_KEY, 'other', 'owner'),
+          };
+        },
+      }),
+      status: 502,
+      reason: 'registry-cleanup-failed',
+    },
+  ];
+  for (const entry of cases) {
+    const response = await createDialRegistry({ deviceRegistry: entry.registry, now: () => NOW })
+      .cleanupRegistration({ principal: 'p', humanId: 'u', body: v2Cleanup() });
+    assert.equal(response.status, entry.status);
+    assert.equal(response.body.reason, entry.reason);
+    for (const forbidden of ['bindingId', 'bindingRevision', 'tokenClaimId', 'tokenClaimRevision', 'expiresAt']) {
+      assert.equal(Object.hasOwn(response.body, forbidden), false);
+    }
+  }
 });
 
 test('register V2: unversioned migration fails closed; V2 request on legacy registry is honestly unavailable', async () => {
@@ -311,14 +1075,7 @@ test('register V2: unversioned migration fails closed; V2 request on legacy regi
   const legacy = createDialRegistry({ deviceRegistry: fakeRegistry(), now: () => NOW });
   const response = await legacy.register({
     humanId: 'u',
-    body: {
-      registrationVersion: 2,
-      installationId: V2_INSTALLATION,
-      idempotencyKey: V2_IDEMPOTENCY,
-      voipToken: 't',
-      sessionId: 's',
-      platform: 'apns',
-    },
+    body: v2Registration({ voipToken: 't', sessionId: 's' }),
     isMember: async () => true,
   });
   assert.equal(response.status, 501);
@@ -346,34 +1103,74 @@ test('register V2: unversioned migration fails closed; V2 request on legacy regi
 });
 
 test('register V2 maps idempotency reuse to 409 and does not leak registry internals', async () => {
+  const rawSecret = 'raw-idempotency-adapter-message';
   const service = createDialRegistry({
-    deviceRegistry: {
-      protocolVersion: 2,
+    deviceRegistry: completeV2Registry({
       async register() {
-        throw new DeviceRegistryV2Error('idempotency-conflict', 'same operation key has different bytes');
+        throw new DeviceRegistryV2Error('idempotency-conflict', rawSecret);
       },
-    },
+    }),
   });
   const response = await service.register({
     humanId: 'u',
-    body: {
-      registrationVersion: 2,
-      installationId: V2_INSTALLATION,
-      idempotencyKey: V2_IDEMPOTENCY,
-      voipToken: 't',
-      sessionId: 's',
-      platform: 'apns',
-    },
+    body: v2Registration({ voipToken: 't', sessionId: 's' }),
     isMember: async () => true,
   });
-  assert.equal(response.status, 409);
-  assert.equal(response.body.reason, 'idempotency-conflict');
+  assert.deepEqual(response, {
+    status: 409,
+    body: {
+      error: 'idempotency key was reused for different registration data',
+      reason: 'idempotency-conflict',
+    },
+  });
+  assert.equal(JSON.stringify(response).includes(rawSecret), false);
+});
+
+test('register V2 maps a strict binding conflict fence and exact null without adapter metadata', async (t) => {
+  const currentBinding = {
+    bindingId: 'bind_0123456789abcdef0123456789abcdef',
+    bindingRevision: 7,
+    expiresAtEpochSec: Math.floor(NOW / 1000) + 60,
+    idempotent: false,
+    renewed: false,
+  };
+  for (const [name, detail, expected] of [
+    ['current', { currentBinding }, {
+      bindingId: currentBinding.bindingId,
+      bindingRevision: currentBinding.bindingRevision,
+      expiresAt: new Date(NOW + 60_000).toISOString(),
+    }],
+    ['absent', { currentBinding: null }, null],
+  ]) {
+    await t.test(name, async () => {
+      const service = createDialRegistry({
+        deviceRegistry: completeV2Registry({
+          async register() { throw new DeviceRegistryV2Error('binding-conflict', 'private detail', detail); },
+        }),
+        now: () => NOW,
+      });
+      const response = await service.register({
+        humanId: 'u',
+        body: v2Registration(),
+        isMember: async () => true,
+      });
+      assert.deepEqual(response, {
+        status: 409,
+        body: {
+          error: 'registration expected binding is no longer current',
+          reason: 'binding-conflict',
+          ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+          ownerHandle: V2_OWNER,
+          currentBinding: expected,
+        },
+      });
+    });
+  }
 });
 
 test('register V2 maps token-owner conflict to the exact retry CAS tuple without leaking its owner', async () => {
   const service = createDialRegistry({
-    deviceRegistry: {
-      protocolVersion: 2,
+    deviceRegistry: completeV2Registry({
       async register() {
         throw new DeviceRegistryV2Error(
           'token-claim-conflict',
@@ -383,23 +1180,15 @@ test('register V2 maps token-owner conflict to the exact retry CAS tuple without
               tokenClaimId: 'claim_0123456789abcdef0123456789abcdef',
               tokenClaimRevision: 7,
               expiresAtEpochSec: Math.floor(NOW / 1000) + 60,
-              ownerInstallationKey: 'must-not-leak',
             },
           },
         );
       },
-    },
+    }),
   });
   const response = await service.register({
     humanId: 'u',
-    body: {
-      registrationVersion: 2,
-      installationId: V2_INSTALLATION,
-      idempotencyKey: V2_IDEMPOTENCY,
-      voipToken: 't',
-      sessionId: 's',
-      platform: 'apns',
-    },
+    body: v2Registration({ voipToken: 't', sessionId: 's' }),
     isMember: async () => true,
   });
   assert.equal(response.status, 409);
@@ -409,28 +1198,118 @@ test('register V2 maps token-owner conflict to the exact retry CAS tuple without
     expiresAt: new Date(NOW + 60_000).toISOString(),
   });
   assert.equal(response.body.reason, 'token-claim-conflict');
-  assert.equal(JSON.stringify(response.body).includes('must-not-leak'), false);
+  assert.equal(response.body.ownerVersion, DEVICE_REGISTRY_OWNER_VERSION);
+  assert.equal(response.body.ownerHandle, V2_OWNER);
+  assert.deepEqual(Object.keys(response.body.currentTokenClaim).sort(), [
+    'expiresAt', 'tokenClaimId', 'tokenClaimRevision',
+  ]);
+});
+
+test('register V2 accepts an exact null token conflict fence', async () => {
+  const service = createDialRegistry({
+    deviceRegistry: completeV2Registry({
+      async register() {
+        throw new DeviceRegistryV2Error(
+          'token-claim-conflict',
+          'private detail',
+          { currentTokenClaim: null },
+        );
+      },
+    }),
+    now: () => NOW,
+  });
+  const response = await service.register({
+    humanId: 'u',
+    body: v2Registration(),
+    isMember: async () => true,
+  });
+  assert.deepEqual(response, {
+    status: 409,
+    body: {
+      error: 'registration expected token claim is no longer current',
+      reason: 'token-claim-conflict',
+      ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+      ownerHandle: V2_OWNER,
+      currentTokenClaim: null,
+    },
+  });
+});
+
+test('register V2 rejects malformed conflict details as typed 502 without echo or date throws', async (t) => {
+  const rawSecret = 'raw-conflict-adapter-secret';
+  const binding = {
+    bindingId: 'bind_0123456789abcdef0123456789abcdef',
+    bindingRevision: 7,
+    expiresAtEpochSec: Math.floor(NOW / 1000) + 60,
+    idempotent: false,
+    renewed: false,
+  };
+  const claim = {
+    tokenClaimId: 'claim_0123456789abcdef0123456789abcdef',
+    tokenClaimRevision: 8,
+    expiresAtEpochSec: Math.floor(NOW / 1000) + 60,
+  };
+  const cases = [
+    ['binding missing detail', 'binding-conflict', undefined],
+    ['binding throwing detail shape', 'binding-conflict', new Proxy({}, {
+      ownKeys() { throw new Error(rawSecret); },
+    })],
+    ['binding extra detail', 'binding-conflict', { currentBinding: binding, adapterDetail: rawSecret }],
+    ['binding extra fence field', 'binding-conflict', {
+      currentBinding: { ...binding, adapterDetail: rawSecret },
+    }],
+    ['binding bad id', 'binding-conflict', { currentBinding: { ...binding, bindingId: rawSecret } }],
+    ['binding bad revision', 'binding-conflict', { currentBinding: { ...binding, bindingRevision: 0 } }],
+    ['binding bad metadata semantics', 'binding-conflict', {
+      currentBinding: { ...binding, idempotent: true },
+    }],
+    ['binding invalid expiry', 'binding-conflict', {
+      currentBinding: { ...binding, expiresAtEpochSec: 8_640_000_000_001 },
+    }],
+    ['claim missing detail', 'token-claim-conflict', undefined],
+    ['claim extra detail', 'token-claim-conflict', { currentTokenClaim: claim, adapterDetail: rawSecret }],
+    ['claim extra fence field', 'token-claim-conflict', {
+      currentTokenClaim: { ...claim, ownerInstallationKey: rawSecret },
+    }],
+    ['claim bad id', 'token-claim-conflict', { currentTokenClaim: { ...claim, tokenClaimId: rawSecret } }],
+    ['claim bad revision', 'token-claim-conflict', { currentTokenClaim: { ...claim, tokenClaimRevision: 0 } }],
+    ['claim invalid expiry', 'token-claim-conflict', {
+      currentTokenClaim: { ...claim, expiresAtEpochSec: 'not-an-epoch' },
+    }],
+  ];
+  for (const [name, code, details] of cases) {
+    await t.test(name, async () => {
+      const service = createDialRegistry({
+        deviceRegistry: completeV2Registry({
+          async register() { throw new DeviceRegistryV2Error(code, rawSecret, details); },
+        }),
+        now: () => NOW,
+      });
+      const response = await service.register({
+        humanId: 'u',
+        body: v2Registration(),
+        isMember: async () => true,
+      });
+      assert.deepEqual(response, {
+        status: 502,
+        body: { error: 'registry write failed', reason: 'registry-write-failed' },
+      });
+      assert.equal(JSON.stringify(response).includes(rawSecret), false);
+    });
+  }
 });
 
 test('register V2 maps bounded target admission to a typed 409', async () => {
   const service = createDialRegistry({
-    deviceRegistry: {
-      protocolVersion: 2,
+    deviceRegistry: completeV2Registry({
       async register() {
         throw new DeviceRegistryV2Error('target-capacity', 'full');
       },
-    },
+    }),
   });
   const response = await service.register({
     humanId: 'u',
-    body: {
-      registrationVersion: 2,
-      installationId: V2_INSTALLATION,
-      idempotencyKey: V2_IDEMPOTENCY,
-      voipToken: 't',
-      sessionId: 's',
-      platform: 'apns',
-    },
+    body: v2Registration({ voipToken: 't', sessionId: 's' }),
     isMember: async () => true,
   });
   assert.deepEqual(response, {
@@ -445,24 +1324,16 @@ test('register V2 maps bounded target admission to a typed 409', async () => {
 test('register V2 preserves bounded-contention and permanent-revision 409 reasons', async () => {
   for (const reason of ['registration-conflict', 'revision-exhausted']) {
     const service = createDialRegistry({
-      deviceRegistry: {
-        protocolVersion: 2,
+      deviceRegistry: completeV2Registry({
         async register() {
           throw new DeviceRegistryV2Error(reason, 'internal detail');
         },
-      },
+      }),
     });
     assert.deepEqual(
       await service.register({
         humanId: 'u',
-        body: {
-          registrationVersion: 2,
-          installationId: V2_INSTALLATION,
-          idempotencyKey: V2_IDEMPOTENCY,
-          voipToken: 't',
-          sessionId: 's',
-          platform: 'apns',
-        },
+        body: v2Registration({ voipToken: 't', sessionId: 's' }),
         isMember: async () => true,
       }),
       {
@@ -480,51 +1351,41 @@ test('unregister V2 is membership-independent, exact-fenced, idempotent, and exi
   const registry = createInMemoryDeviceRegistryV2({ hmacKey: V2_KEY, now: () => NOW });
   const service = createDialRegistry({ deviceRegistry: registry, now: () => NOW });
   const registered = await service.register({
-    humanId: 'u',
-    body: {
-      registrationVersion: 2,
-      installationId: V2_INSTALLATION,
-      idempotencyKey: V2_IDEMPOTENCY,
-      voipToken: 't',
-      sessionId: 'lost-room',
-      platform: 'apns',
-    },
+    principal: 'principal-a',
+    humanId: 'verified-human',
+    body: v2Registration({ voipToken: 't', sessionId: 'lost-room' }),
     isMember: async () => true,
   });
-  const body = {
-    registrationVersion: 2,
-    installationId: V2_INSTALLATION,
+  const body = v2Unregister(registered.body.bindingId, registered.body.bindingRevision, {
     sessionId: 'lost-room',
-    bindingId: registered.body.bindingId,
-    bindingRevision: registered.body.bindingRevision,
+  });
+  const expected = {
+    status: 200,
+    body: {
+      unregistered: true,
+      registrationVersion: 2,
+      ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+      ownerHandle: V2_OWNER,
+      sessionId: 'lost-room',
+    },
   };
-  assert.deepEqual(await service.unregister({ humanId: 'u', body }), {
-    status: 200,
-    body: { unregistered: true, registrationVersion: 2, sessionId: 'lost-room' },
-  });
-  assert.deepEqual(await service.unregister({ humanId: 'u', body }), {
-    status: 200,
-    body: { unregistered: true, registrationVersion: 2, sessionId: 'lost-room' },
-  });
+  const args = { principal: 'principal-a', humanId: 'verified-human', body };
+  assert.deepEqual(await service.unregister(args), expected);
+  assert.deepEqual(await service.unregister(args), expected);
 });
 
 test('unregister V2 validation uses operation-specific reason and operation-neutral unknown-field text', async () => {
   const service = createDialRegistry({
-    deviceRegistry: {
-      protocolVersion: 2,
+    deviceRegistry: completeV2Registry({
       async unregister() {
         throw new Error('invalid requests must not reach the registry');
       },
-    },
+    }),
   });
   const response = await service.unregister({
     humanId: 'u',
     body: {
-      registrationVersion: 2,
-      installationId: V2_INSTALLATION,
-      sessionId: 's',
-      bindingId: 'bind_0123456789abcdef0123456789abcdef',
-      bindingRevision: 1,
+      ...v2Unregister('bind_0123456789abcdef0123456789abcdef', 1, { sessionId: 's' }),
       generation: 7,
     },
   });
@@ -537,24 +1398,39 @@ test('unregister V2 validation uses operation-specific reason and operation-neut
   });
 });
 
+test('unregister V2 rejects a malformed owner echo from an injected adapter', async () => {
+  const service = createDialRegistry({
+    deviceRegistry: completeV2Registry({
+      async unregister() {
+        return {
+          removed: false,
+          ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+          ownerHandle: deriveDeviceOwnerHandle(V2_KEY, 'other', 'owner'),
+        };
+      },
+    }),
+  });
+  assert.deepEqual(
+    await service.unregister({
+      principal: 'principal-a',
+      humanId: 'verified-human',
+      body: v2Unregister('bind_0123456789abcdef0123456789abcdef', 1),
+    }),
+    { status: 502, body: { error: 'registry delete failed', reason: 'registry-delete-failed' } },
+  );
+});
+
 test('unregister V2 keeps local state retryable when the exact active tuple cannot serialize', async () => {
   const service = createDialRegistry({
-    deviceRegistry: {
-      protocolVersion: 2,
+    deviceRegistry: completeV2Registry({
       async unregister() {
         throw new DeviceRegistryV2Error('unregistration-conflict', 'still active');
       },
-    },
+    }),
   });
   const response = await service.unregister({
     humanId: 'u',
-    body: {
-      registrationVersion: 2,
-      installationId: V2_INSTALLATION,
-      sessionId: 's',
-      bindingId: 'bind_0123456789abcdef0123456789abcdef',
-      bindingRevision: 1,
-    },
+    body: v2Unregister('bind_0123456789abcdef0123456789abcdef', 1, { sessionId: 's' }),
   });
   assert.deepEqual(response, {
     status: 503,
@@ -617,6 +1493,8 @@ test('pushBackend V2 places the exact versioned server binding fence inside the 
     principal: 'u',
     humanId: 'u',
     registrationVersion: 2,
+    ownerVersion: DEVICE_REGISTRY_OWNER_VERSION,
+    ownerHandle: deriveDeviceOwnerHandle(V2_KEY, 'u', 'u'),
     installationId: V2_INSTALLATION,
     idempotencyKey: V2_IDEMPOTENCY,
     voipToken: 'tok-v2',

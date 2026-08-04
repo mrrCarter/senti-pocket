@@ -8,7 +8,11 @@ import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
 import { createDynamoStore } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
-import { createDialPushBackend, createStoreDeviceRegistry } from './dial-registry.mjs';
+import {
+  assertDeviceRegistryV2Capabilities,
+  createDialPushBackend,
+  createStoreDeviceRegistry,
+} from './dial-registry.mjs';
 import { createDynamoDeviceRegistryV2 } from './device-registry-v2.mjs';
 import { createDialSignalStore } from './dial-signal-store.mjs';
 import { createDeckVideoBackend } from './deck/deck-video-backend.mjs';
@@ -37,8 +41,12 @@ import { lambdaHandler } from './lambda.mjs';
  *     at the top level; nesting makes top-level `id` absent and every ring rejects silently.
  *   - deviceRegistry / pushBackend: OPTIONAL overrides for the store-backed defaults (a dedicated device table, etc.)
  *     Registry V2 requires explicit DEVICE_REGISTRY_MODE=v2, DEVICE_REGISTRY_V1_PURGED=1,
- *     DEVICE_REGISTRY_CLIENT_V2_READY=1, and an HMAC key. The acknowledgements prevent a deployment from
- *     claiming A->B privacy closure while durable V1 rows can still ring or the installed iOS client still speaks V1.
+ *     DEVICE_REGISTRY_CLIENT_V2_READY=1, DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1,
+ *     DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1, DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1, and an HMAC key. The
+ *     acknowledgements prevent a deployment from
+ *     claiming closure while durable V1 rows can still ring, the installed iOS client still speaks V1, a pre-outcome
+ *     V2 worker can still write, the auth-only operation journal lacks distributed unique-operation admission, or
+ *     rotated bearer credentials cannot prove a stable registry owner before reaching admission.
  *     The injected dynamoClient must then expose get/transactWrite (plus the legacy store methods). Partial config
  *     fails boot.
  */
@@ -87,7 +95,9 @@ export function createProdGateway(env = {}, deps = {}) {
     throw new Error('pocket-gateway DEVICE_REGISTRY_MODE must be v1 or v2');
   }
   if (registryMode === 'v1' && (
-    v2HmacKey || env.DEVICE_REGISTRY_V1_PURGED || env.DEVICE_REGISTRY_CLIENT_V2_READY
+    v2HmacKey || env.DEVICE_REGISTRY_V1_PURGED || env.DEVICE_REGISTRY_CLIENT_V2_READY ||
+    env.DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY || env.DEVICE_REGISTRY_OPERATION_ADMISSION_READY ||
+    env.DEVICE_REGISTRY_OWNER_CONTINUITY_READY
   )) {
     throw new Error('pocket-gateway Registry V2 settings require DEVICE_REGISTRY_MODE=v2');
   }
@@ -97,6 +107,21 @@ export function createProdGateway(env = {}, deps = {}) {
   if (registryMode === 'v2' && env.DEVICE_REGISTRY_CLIENT_V2_READY !== '1') {
     throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_CLIENT_V2_READY=1 after the V2 iOS client ships');
   }
+  if (registryMode === 'v2' && env.DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY !== '1') {
+    throw new Error(
+      'pocket-gateway Registry V2 requires DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1 after a quiesced homogeneous outcome-protocol cutover',
+    );
+  }
+  if (registryMode === 'v2' && env.DEVICE_REGISTRY_OPERATION_ADMISSION_READY !== '1') {
+    throw new Error(
+      'pocket-gateway Registry V2 requires DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1 after distributed unique-operation admission is verified',
+    );
+  }
+  if (registryMode === 'v2' && env.DEVICE_REGISTRY_OWNER_CONTINUITY_READY !== '1') {
+    throw new Error(
+      'pocket-gateway Registry V2 requires DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1 after stable owner continuity is verified',
+    );
+  }
 
   let deviceRegistry = deps.deviceRegistry;
   if (deviceRegistry) {
@@ -105,6 +130,9 @@ export function createProdGateway(env = {}, deps = {}) {
     }
     if (registryMode === 'v1' && deviceRegistry.protocolVersion === 2) {
       throw new Error('pocket-gateway Registry V2 implementation requires DEVICE_REGISTRY_MODE=v2');
+    }
+    if (registryMode === 'v2') {
+      assertDeviceRegistryV2Capabilities(deviceRegistry, 'pocket-gateway Registry V2 implementation');
     }
   } else {
     if (registryMode === 'v2' && !v2HmacKey) {
