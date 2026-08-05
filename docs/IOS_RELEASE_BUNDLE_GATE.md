@@ -1,21 +1,30 @@
 # iOS unsigned Release bundle gate
 
 `scripts/ios/verify_unsigned_release.py` verifies bounded, reusable evidence from an unsigned device build when it is
-invoked. It consumes target-specific `xcodebuild -showBuildSettings -json` output, binds `TARGET_BUILD_DIR` to an
-independently supplied products root, and verifies the built Release `.app`. The same commands can run in hosted CI or
-on Forge's Mac without an Apple account or signing material.
+invoked. It consumes the exact generated Xcode project and target-specific `xcodebuild -showBuildSettings -json`
+output, binds `TARGET_BUILD_DIR` to an independently supplied products root, and verifies the built Release `.app`.
+The same commands can run in hosted CI or on Forge's Mac without an Apple account or signing material.
 
 ## What the gate proves
 
 - Debug resolves the development APNs build setting and Release resolves production.
+- Debug defines the Swift `DEBUG` compilation condition; Release proves `DEBUG` absent from both resolved
+  `SWIFT_ACTIVE_COMPILATION_CONDITIONS` and `OTHER_SWIFT_FLAGS`. The generated app project must contain no per-file
+  `COMPILER_FLAGS`, closing the source-level Swift condition surface that build settings do not expose.
 - Signing is explicitly disabled, the Team ID is empty, and the intended bundle/version/build/origins resolve exactly.
 - Release excludes the canonical DEBUG fixture before compilation.
 - The built `.app` contains the expected expanded `Info.plist`, a structurally bounded executable-mode thin arm64
   `MH_EXECUTE` Mach-O with a file-backed `__TEXT` segment, exact `audio` + `voip` background modes, and a type-sensitive
   semantic copy of the source privacy manifest.
-- The unsigned bundle contains no canonical fixture; `ggml-*.bin`, `*whisper*.bin`, `.gguf`, `.tflite`, `.litertlm`, or
-  `.task` model artifact; embedded provisioning profile; `_CodeSignature`; symlink; Apple
-  `.p8`/`.p12`/`.pfx`/`.pkcs12`/profile artifact; environment file; `credentials.json`; or `*.credentials.json`.
+- The unsigned bundle contains no symlink and no path whose case-insensitive basename or suffix matches the gate's
+  enumerated fixture, model, provisioning, signing, environment, or credential filename patterns (including
+  `canonical_checkpoint.json`, `ggml-*.bin`, `*whisper*.bin`, `.gguf`, `.tflite`, `.litertlm`, `.task`,
+  `embedded.mobileprovision`, `_CodeSignature`, `.p8`, `.p12`, `.pfx`, `.pkcs12`, profile suffixes, `.env`,
+  `credentials.json`, and `*.credentials.json`).
+
+The artifact check is deliberately a bounded filename policy, not a content classifier: it does not prove that bytes
+copied under an unrelated filename are absent. Signing inputs and private model files must remain outside the app target;
+this verifier provides no content-level assurance beyond the enumerated filename patterns.
 
 The `https://*.ci.invalid` origins used by hosted CI are compile-time sentinels. This gate proves exact expansion only;
 it does not claim that those hosts are reachable or deployed. Privacy-manifest equality proves resource packaging, not
@@ -69,6 +78,7 @@ Verify resolved settings:
 ```bash
 python3 scripts/ios/verify_unsigned_release.py settings \
   --settings-json "$settings_json" \
+  --project-file apps/SentiPocketApp/SentiPocketApp.xcodeproj/project.pbxproj \
   --configuration Release --aps-environment production \
   --bundle-id com.plexaura.sentipocket.app \
   --marketing-version 0.1.0 --build-number 4242 \
@@ -97,6 +107,7 @@ Then verify its `.app` (the verifier derives the final path from the bound setti
 ```bash
 python3 scripts/ios/verify_unsigned_release.py bundle \
   --settings-json "$settings_json" \
+  --project-file apps/SentiPocketApp/SentiPocketApp.xcodeproj/project.pbxproj \
   --source-privacy apps/SentiPocketApp/Resources/PrivacyInfo.xcprivacy \
   --configuration Release --aps-environment production \
   --bundle-id com.plexaura.sentipocket.app \

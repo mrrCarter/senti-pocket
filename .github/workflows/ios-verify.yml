@@ -141,6 +141,7 @@ jobs:
 
             python3 scripts/ios/verify_unsigned_release.py settings \
               --settings-json "$settings_json" \
+              --project-file apps/SentiPocketApp/SentiPocketApp.xcodeproj/project.pbxproj \
               --configuration "$configuration" \
               --aps-environment "$aps_environment" \
               --bundle-id "$IOS_BUNDLE_ID" \
@@ -182,6 +183,7 @@ jobs:
         run: |
           python3 scripts/ios/verify_unsigned_release.py bundle \
             --settings-json "$RUNNER_TEMP/SentiPocketApp-Release-settings.json" \
+            --project-file apps/SentiPocketApp/SentiPocketApp.xcodeproj/project.pbxproj \
             --source-privacy apps/SentiPocketApp/Resources/PrivacyInfo.xcprivacy \
             --configuration Release \
             --aps-environment production \

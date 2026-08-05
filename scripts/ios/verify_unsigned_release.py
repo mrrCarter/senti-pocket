@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
+MAX_PROJECT_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_ENTRIES = 100_000
 FIXTURE_NAME = "canonical_checkpoint.json"
 ENTITLEMENTS_SUFFIX = "Sources/SentiPocketApp.entitlements"
@@ -70,6 +71,8 @@ BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 MARKETING_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,2}$")
 BUILD_NUMBER_RE = re.compile(r"^[1-9][0-9]*$")
 DNS_LABEL_RE = re.compile(r"^(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9])$")
+SWIFT_CONDITION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SWIFT_DEBUG_FLAG_RE = re.compile(r"(?:^|=)-D=?DEBUG(?:$|=)")
 SENSITIVE_SETTING_KEYS = frozenset({"SENTI_API_URL", "SENTI_GATEWAY_URL"})
 
 
@@ -85,6 +88,7 @@ class Expectations:
     gateway_url: str
     deployment_target: str
     products_root: Path
+    project_file: Path
 
 
 def _safe_repr(value: Any) -> str:
@@ -189,6 +193,13 @@ def validate_expectations(expected: Expectations) -> list[str]:
         or any(ord(character) < 0x20 for character in str(products_root))
     ):
         errors.append("products_root must be an absolute path below a named directory")
+    project_file = expected.project_file
+    if (
+        not isinstance(project_file, Path)
+        or project_file.name != "project.pbxproj"
+        or project_file.parent.name != "SentiPocketApp.xcodeproj"
+    ):
+        errors.append("project_file must name SentiPocketApp.xcodeproj/project.pbxproj")
     return errors
 
 
@@ -202,6 +213,35 @@ def _read_json(path: Path) -> tuple[Any | None, list[str]]:
             return json.load(stream), []
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         return None, [f"settings JSON could not be decoded: {type(exc).__name__}"]
+
+
+def _generated_project_errors(path: Path) -> list[str]:
+    try:
+        project_stat = path.lstat()
+        if stat.S_ISLNK(project_stat.st_mode) or not stat.S_ISREG(project_stat.st_mode):
+            return ["generated Xcode project is not a regular file"]
+        if project_stat.st_size > MAX_PROJECT_BYTES:
+            return ["generated Xcode project exceeds the 16 MiB verification limit"]
+        with path.open("rb") as stream:
+            encoded_project = stream.read(MAX_PROJECT_BYTES + 1)
+        if len(encoded_project) > MAX_PROJECT_BYTES:
+            return ["generated Xcode project exceeds the 16 MiB verification limit"]
+        project = encoded_project.decode("utf-8")
+    except FileNotFoundError:
+        return ["generated Xcode project is not a regular file"]
+    except (OSError, UnicodeError) as exc:
+        return [f"generated Xcode project could not be decoded: {type(exc).__name__}"]
+
+    errors: list[str] = []
+    if not project.startswith("// !$*UTF8*$!") or "\x00" in project:
+        errors.append("generated Xcode project has an invalid text envelope")
+    # XcodeGen's per-source `compilerFlags` are serialized as PBXBuildFile
+    # COMPILER_FLAGS and do not appear in `xcodebuild -showBuildSettings`.
+    # This app currently needs none, so rejecting the entire surface is both
+    # simpler and stronger than attempting to interpret OpenStep quoting.
+    if "COMPILER_FLAGS" in project:
+        errors.append("generated Xcode project contains per-file compiler flags")
+    return errors
 
 
 def _read_plist(path: Path, label: str) -> tuple[dict[str, Any] | None, list[str]]:
@@ -267,6 +307,53 @@ def _require_exact(
                 )
 
 
+def _resolved_setting_tokens(
+    settings: Mapping[str, Any], key: str, errors: list[str]
+) -> tuple[str, ...] | None:
+    raw = settings.get(key, "")
+    if not isinstance(raw, str):
+        errors.append(f"{key} must resolve to a string")
+        return None
+    try:
+        tokens = tuple(shlex.split(raw))
+    except ValueError:
+        errors.append(f"{key} contains invalid shell-style quoting")
+        return None
+    if any(token.startswith("@") for token in tokens):
+        errors.append(f"{key} must not contain an opaque response-file argument")
+        return None
+    return tokens
+
+
+def _verify_swift_compilation_conditions(
+    settings: Mapping[str, Any], configuration: str, errors: list[str]
+) -> None:
+    active = _resolved_setting_tokens(
+        settings, "SWIFT_ACTIVE_COMPILATION_CONDITIONS", errors
+    )
+    if active is not None:
+        if any(not SWIFT_CONDITION_RE.fullmatch(token) for token in active):
+            errors.append(
+                "SWIFT_ACTIVE_COMPILATION_CONDITIONS contains an invalid condition"
+            )
+        debug_is_active = "DEBUG" in active
+        if configuration == "Debug" and not debug_is_active:
+            errors.append("Debug configuration must define DEBUG")
+        if configuration == "Release" and debug_is_active:
+            errors.append("Release configuration must not define DEBUG")
+
+    other_flags = _resolved_setting_tokens(settings, "OTHER_SWIFT_FLAGS", errors)
+    if configuration == "Release" and other_flags is not None:
+        defines_debug = any(
+            token == "DEBUG"
+            or token.startswith("DEBUG=")
+            or SWIFT_DEBUG_FLAG_RE.search(token)
+            for token in other_flags
+        )
+        if defines_debug:
+            errors.append("Release OTHER_SWIFT_FLAGS must not define DEBUG")
+
+
 def verify_settings_file(
     settings_path: Path, expected: Expectations
 ) -> tuple[dict[str, Any] | None, list[str]]:
@@ -276,6 +363,8 @@ def verify_settings_file(
     settings, load_errors = load_target_settings(settings_path, expected.target)
     if load_errors or settings is None:
         return None, load_errors
+
+    errors.extend(_generated_project_errors(expected.project_file))
 
     _require_exact(
         settings,
@@ -299,6 +388,8 @@ def verify_settings_file(
 
     if settings.get("DEVELOPMENT_TEAM", "") != "":
         errors.append("DEVELOPMENT_TEAM must be empty for unsigned verification")
+
+    _verify_swift_compilation_conditions(settings, expected.configuration, errors)
 
     info_plist = settings.get("INFOPLIST_FILE")
     if info_plist != INFO_PLIST_SUFFIX:
@@ -607,6 +698,7 @@ def verify_bundle(
 
 def _add_expectation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--settings-json", required=True, type=Path)
+    parser.add_argument("--project-file", required=True, type=Path)
     parser.add_argument("--target", default="SentiPocketApp")
     parser.add_argument("--configuration", required=True, choices=("Debug", "Release"))
     parser.add_argument(
@@ -633,6 +725,7 @@ def _expectations_from_args(args: argparse.Namespace) -> Expectations:
         gateway_url=args.gateway_url,
         deployment_target=args.deployment_target,
         products_root=args.products_root,
+        project_file=args.project_file,
     )
 
 

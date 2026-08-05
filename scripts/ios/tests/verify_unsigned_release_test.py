@@ -29,6 +29,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.settings_path = self.root / "settings.json"
+        self.project_file = self.root / "SentiPocketApp.xcodeproj" / "project.pbxproj"
         self.source_privacy_path = self.root / "PrivacyInfo.xcprivacy"
         self.products_root = self.root / "Build" / "Products"
         self.expected = verify.Expectations(
@@ -42,7 +43,9 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             gateway_url="https://gateway.ci.invalid",
             deployment_target="16.0",
             products_root=self.products_root,
+            project_file=self.project_file,
         )
+        self.write_valid_project()
         self.settings = self.valid_settings()
         self.write_settings(self.settings)
         self.app_path = (
@@ -69,6 +72,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             "IPHONEOS_DEPLOYMENT_TARGET": self.expected.deployment_target,
             "INFOPLIST_FILE": "Sources/Info.plist",
             "CODE_SIGN_ENTITLEMENTS": "Sources/SentiPocketApp.entitlements",
+            "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "" if is_release else "DEBUG",
+            "OTHER_SWIFT_FLAGS": "",
             "EXCLUDED_SOURCE_FILE_NAMES": "canonical_checkpoint.json"
             if is_release
             else "",
@@ -84,6 +89,19 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         if duplicate:
             records.append({"target": "SentiPocketApp", "buildSettings": settings})
         self.settings_path.write_text(json.dumps(records), encoding="utf-8")
+
+    def write_valid_project(self) -> None:
+        self.project_file.parent.mkdir(parents=True, exist_ok=True)
+        self.project_file.write_text(
+            "// !$*UTF8*$!\n"
+            "{\n"
+            "\tarchiveVersion = 1;\n"
+            "\tobjectVersion = 77;\n"
+            "\tobjects = {};\n"
+            "\trootObject = AAAAAAAAAAAAAAAAAAAAAAAA;\n"
+            "}\n",
+            encoding="utf-8",
+        )
 
     def write_valid_bundle(self, fmt: int = plistlib.FMT_BINARY) -> None:
         self.app_path.mkdir(parents=True, exist_ok=True)
@@ -229,6 +247,106 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                     self.settings_path, self.expected
                 )
                 self.assertTrue(errors, f"mutation for {key} unexpectedly passed")
+
+    def test_settings_reject_release_debug_compilation_condition_injection(
+        self,
+    ) -> None:
+        injections = (
+            ("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "DEBUG"),
+            ("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "FEATURE DEBUG TRACE"),
+            ("OTHER_SWIFT_FLAGS", "-DDEBUG"),
+            ("OTHER_SWIFT_FLAGS", "-D DEBUG"),
+            ("OTHER_SWIFT_FLAGS", "-D DEBUG=1"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend -DDEBUG"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend=-DDEBUG"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend -D -Xfrontend DEBUG"),
+            ("OTHER_SWIFT_FLAGS", "-D'DEBUG'"),
+        )
+        for key, value in injections:
+            with self.subTest(key=key, value=value):
+                changed = dict(self.settings)
+                changed[key] = value
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, "DEBUG")
+
+    def test_settings_allow_distinct_release_compilation_conditions(self) -> None:
+        release = dict(self.settings)
+        release["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "RELEASE DEBUG_FEATURE"
+        release["OTHER_SWIFT_FLAGS"] = "-DRELEASE_FEATURE -DDEBUG_FEATURE"
+        self.write_settings(release)
+        resolved, errors = verify.verify_settings_file(
+            self.settings_path, self.expected
+        )
+        self.assertEqual([], errors)
+        self.assertEqual(release, resolved)
+
+    def test_settings_require_debug_condition_only_for_debug_configuration(
+        self,
+    ) -> None:
+        debug = self.valid_settings("Debug")
+        debug["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "TRACE"
+        self.write_settings(debug)
+        expected = self.expected_with(
+            configuration="Debug",
+            aps_environment="development",
+        )
+        _, errors = verify.verify_settings_file(self.settings_path, expected)
+        self.assert_error_contains(errors, "Debug configuration must define DEBUG")
+
+    def test_settings_reject_opaque_or_malformed_swift_condition_surfaces(self) -> None:
+        mutations: tuple[tuple[str, object], ...] = (
+            ("SWIFT_ACTIVE_COMPILATION_CONDITIONS", ["DEBUG"]),
+            ("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "'unterminated"),
+            ("OTHER_SWIFT_FLAGS", ["-DDEBUG"]),
+            ("OTHER_SWIFT_FLAGS", "'unterminated"),
+            ("OTHER_SWIFT_FLAGS", "@opaque-response-file"),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                changed = dict(self.settings)
+                changed[key] = value
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assertTrue(errors, f"opaque condition surface {key} passed")
+
+    def test_settings_reject_generated_project_per_file_compiler_flags(self) -> None:
+        self.project_file.write_text(
+            "// !$*UTF8*$!\n"
+            "{ objects = {\n"
+            "A1 /* SentiPocketApp.swift in Sources */ = {isa = PBXBuildFile; "
+            'settings = {COMPILER_FLAGS = "-DDEBUG"; }; };\n'
+            "}; }\n",
+            encoding="utf-8",
+        )
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "per-file compiler flags")
+
+    def test_settings_reject_malformed_or_oversized_generated_project(self) -> None:
+        self.project_file.write_bytes(b"\xff\xfe")
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "could not be decoded")
+
+        self.write_valid_project()
+        with mock.patch.object(verify, "MAX_PROJECT_BYTES", 1):
+            _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "verification limit")
+
+        self.project_file.unlink()
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "not a regular file")
+
+    def test_settings_reject_generated_project_symlink(self) -> None:
+        outside = self.root / "outside.pbxproj"
+        outside.write_text("// !$*UTF8*$!\n{}\n", encoding="utf-8")
+        self.project_file.unlink()
+        self.symlink_or_skip(outside, self.project_file)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "not a regular file")
 
     def test_settings_bind_exact_source_and_products_paths(self) -> None:
         mutations = (
@@ -497,6 +615,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             "bundle",
             "--settings-json",
             str(self.settings_path),
+            "--project-file",
+            str(self.project_file),
             "--source-privacy",
             str(self.source_privacy_path),
             "--configuration",
@@ -536,6 +656,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             "settings",
             "--settings-json",
             str(self.settings_path),
+            "--project-file",
+            str(self.project_file),
             "--configuration",
             "Release",
             "--aps-environment",
