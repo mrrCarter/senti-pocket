@@ -148,6 +148,7 @@ private struct AuthenticatedRootView: View {
     @StateObject private var sessions: SessionListCoordinator
     @StateObject private var details: SelectedSessionDetailCoordinator
     @StateObject private var checkpointPocket: CheckpointPocketCoordinator
+    @StateObject private var checkpointNarrationRevocation: VerifiedCheckpointNarrationRevocationRelay
     @StateObject private var revocationRelay: AuthenticatedSessionRevocationRelay
     @State private var selectedTab: PocketTab = .sessions
     private let authenticationRevision: UInt64
@@ -174,6 +175,7 @@ private struct AuthenticatedRootView: View {
         let revocationRelay = AuthenticatedSessionRevocationRelay(
             onReauthenticationRequired: guardedReauthentication
         )
+        let checkpointNarrationRevocation = VerifiedCheckpointNarrationRevocationRelay()
         let checkpointPocket = CheckpointPocketCoordinator(
             transport: checkpointTransport,
             onReauthenticationRequired: {
@@ -181,6 +183,9 @@ private struct AuthenticatedRootView: View {
             },
             onSelectionRevoked: { sessionId in
                 revocationRelay.revokeSelection(expectedSessionId: sessionId)
+            },
+            onProtectedContentRevoked: { [weak checkpointNarrationRevocation] in
+                _ = checkpointNarrationRevocation?.revoke()
             }
         )
         let details = SelectedSessionDetailCoordinator(
@@ -219,6 +224,7 @@ private struct AuthenticatedRootView: View {
         _sessions = StateObject(wrappedValue: sessions)
         _details = StateObject(wrappedValue: details)
         _checkpointPocket = StateObject(wrappedValue: checkpointPocket)
+        _checkpointNarrationRevocation = StateObject(wrappedValue: checkpointNarrationRevocation)
         _revocationRelay = StateObject(wrappedValue: revocationRelay)
         self.authenticationRevision = authenticationEpoch
     }
@@ -241,6 +247,7 @@ private struct AuthenticatedRootView: View {
                 SelectedSessionPocketView(
                     sessions: sessions,
                     checkpointPocket: checkpointPocket,
+                    checkpointNarrationRevocation: checkpointNarrationRevocation,
                     onCheckpointDone: {
                         checkpointPocket.clear()
                         selectedTab = .activity
@@ -318,6 +325,7 @@ private final class AuthenticatedSessionRevocationRelay: ObservableObject {
 private struct SelectedSessionPocketView: View {
     @ObservedObject var sessions: SessionListCoordinator
     @ObservedObject var checkpointPocket: CheckpointPocketCoordinator
+    @ObservedObject var checkpointNarrationRevocation: VerifiedCheckpointNarrationRevocationRelay
     let onCheckpointDone: @MainActor () -> Void
     let onReauthenticationRequired: @MainActor @Sendable () -> Void
 
@@ -345,8 +353,12 @@ private struct SelectedSessionPocketView: View {
 
         case .ready(_, let verifiedBundle):
             NavigationStack {
-                VerifiedCheckpointBriefingView(verifiedBundle: verifiedBundle)
-                    .toolbar { checkpointDoneToolbar }
+                VerifiedCheckpointNarrationView(
+                    verifiedBundle: verifiedBundle,
+                    revocationRelay: checkpointNarrationRevocation,
+                    onDone: onCheckpointDone
+                )
+                .id(VerifiedCheckpointNarrationIdentity(verifiedBundle: verifiedBundle))
             }
 
         case .idle:

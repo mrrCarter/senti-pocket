@@ -46,6 +46,34 @@ final class DialHostTests: XCTestCase {
         }
     }
 
+    private final class ManualGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var isOpen = false
+
+        func wait() async {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if isOpen {
+                    lock.unlock()
+                    continuation.resume()
+                } else {
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func open() {
+            lock.lock()
+            isOpen = true
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume()
+        }
+    }
+
     private let fence = DeviceRingBindingFence(
         id: "bind_0123456789abcdef0123456789abcdef",
         revision: 7
@@ -307,6 +335,97 @@ final class DialHostTests: XCTestCase {
         XCTAssertEqual(startedCallUUIDs, [call.id])
         XCTAssertEqual(audioEvents, ["prepare", "activate", "deactivate"])
         XCTAssertNotNil(host.callManager)
+    }
+
+    func test_call_audio_preempts_checkpoint_audio_before_governed_dial_starts() async {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        let manager = SentiCallManager(provider: provider)
+        let stopGate = ManualGate()
+        let started = expectation(description: "governed dial starts after checkpoint audio stops")
+        var runCalls = 0
+        var revocations = 0
+        let coordinator = coordinator(
+            runDial: { _, _ in
+                runCalls += 1
+                started.fulfill()
+                return .posted
+            },
+            endCall: { manager.end($0) }
+        )
+        let host = DialHost(
+            callManager: manager,
+            coordinator: coordinator,
+            selectedSessionId: "session-a"
+        )
+        let revokerId = host.installPreemptibleAudioRevoker {
+            revocations += 1
+            return Task { await stopGate.wait() }
+        }
+        let call = call("dial-audio-owner")
+
+        manager.ring(call)
+        manager.onDialReceived?(.renderable(ring("dial-audio-owner")), "dial-audio-owner", call.id)
+        XCTAssertEqual(revocations, 1)
+        XCTAssertTrue(host.callAudioReservationIsActive)
+        XCTAssertFalse(host.permitsPreemptibleAudio)
+
+        manager.provider(provider, perform: CXAnswerCallAction(call: call.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        await Task.yield()
+        XCTAssertEqual(runCalls, 0, "dial speech/capture must wait for the preempted narration stop barrier")
+
+        stopGate.open()
+        await fulfillment(of: [started], timeout: 1)
+        manager.provider(provider, didDeactivate: AVAudioSession.sharedInstance())
+        host.removePreemptibleAudioRevoker(revokerId)
+        XCTAssertTrue(host.permitsPreemptibleAudio)
+    }
+
+    func test_removed_checkpoint_audio_owner_still_blocks_immediate_governed_dial_until_stop_finishes() async {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        let manager = SentiCallManager(provider: provider)
+        let stopGate = ManualGate()
+        let started = expectation(description: "governed dial starts after removed checkpoint owner finishes stopping")
+        var runCalls = 0
+        var revocations = 0
+        let coordinator = coordinator(
+            runDial: { _, _ in
+                runCalls += 1
+                started.fulfill()
+                return .posted
+            },
+            endCall: { manager.end($0) }
+        )
+        let host = DialHost(
+            callManager: manager,
+            coordinator: coordinator,
+            selectedSessionId: "session-a"
+        )
+        let revokerId = host.installPreemptibleAudioRevoker {
+            revocations += 1
+            return Task { await stopGate.wait() }
+        }
+
+        host.removePreemptibleAudioRevoker(revokerId)
+        XCTAssertEqual(revocations, 1, "owner teardown must synchronously fence its asynchronous stop")
+
+        let call = call("dial-after-checkpoint-teardown")
+        manager.ring(call)
+        manager.onDialReceived?(
+            .renderable(ring("dial-after-checkpoint-teardown")),
+            "dial-after-checkpoint-teardown",
+            call.id
+        )
+        manager.provider(provider, perform: CXAnswerCallAction(call: call.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+        await Task.yield()
+        XCTAssertEqual(runCalls, 0, "an immediate call must retain the removed owner's pending stop barrier")
+
+        stopGate.open()
+        await fulfillment(of: [started], timeout: 1)
+        manager.provider(provider, didDeactivate: AVAudioSession.sharedInstance())
+        XCTAssertEqual(revocations, 1)
+        XCTAssertTrue(host.permitsPreemptibleAudio)
     }
 
     func test_audio_preparation_failure_ends_call_without_starting_governed_dial() {
