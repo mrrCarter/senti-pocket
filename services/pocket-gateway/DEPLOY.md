@@ -190,6 +190,66 @@ ownerless V2 rows, the stable-handle KAV and same-owner/different-owner/TTL-boun
 cache/rate controls below are live. These acknowledgements are boot gates, not automatic proof—the
 release/purge/cutover checks remain operator-owned.
 
+The operator-only cutover utility under `deploy/gateway` makes that purge reviewable without pretending that a
+strongly consistent DynamoDB `Scan` is a cross-page snapshot. It is not part of the Lambda bundle and it cannot create
+the required writer fence. Before running it, retain two canonical evidence bundles:
+
+1. a **writer-fence bundle** proving registration and ring ingress are disabled, every V1 alias/weighted target and
+   stale invoke permission is removed, and the V1 writer's table mutation authority is revoked or otherwise fenced;
+2. a **drain bundle** proving the maximum Lambda timeout plus control-plane/ingress propagation interval elapsed and no
+   old invocation remained.
+
+Hash each retained bundle separately as lowercase SHA-256; the two digests must differ. The apply command records them,
+but a digest is only a tamper-evident checksum: the utility does not authenticate the evidence or turn
+`--traffic-quiesced` into a writer fence. If the external fence is absent, do not run apply.
+
+Use short-lived operator credentials limited to `dynamodb:DescribeTable`, `dynamodb:Scan`, and `dynamodb:DeleteItem` on
+the one exact table ARN; do not add scan permission to the gateway runtime role. From `deploy/gateway`, create the
+read-only plan only after the fence and drain are complete:
+
+```sh
+npm ci
+npm --silent run registry:plan -- \
+  --table-name '<exact-table-name>' \
+  --table-arn '<exact-table-arn>' \
+  --account-id '<12-digit-account-id>' \
+  --region '<exact-region>' > registry-cutover-plan.json
+```
+
+The client ignores ambient configured endpoint overrides and sends every request to the supplied region and exact
+table ARN with one SDK attempt. Planning requires an `ACTIVE`, non-global table with no secondary indexes and the exact
+String `pk` HASH / `sk` RANGE schema, and binds the table's `TableId` plus creation time so delete/recreate under the
+same name/ARN cannot reuse the plan. It performs a sequential, fully paginated, strongly consistent base-table key
+scan. The JSON contains only sanitized counts and domain-separated hashes of the table identity, page cursors,
+inventories, and AWS request IDs. Raw key values, including embedded identifiers, exist only transiently in process
+memory and exact DynamoDB cursor/delete requests; they never enter this utility's stdout, stderr, application logs, or
+retained cutover evidence.
+The key-only projection never requests non-key row data or tokens.
+
+Inspect and retain that JSON, then pass its exact lowercase `digest` within the fixed five-minute window:
+
+```sh
+npm --silent run registry:apply -- \
+  --table-name '<exact-table-name>' \
+  --table-arn '<exact-table-arn>' \
+  --account-id '<12-digit-account-id>' \
+  --region '<exact-region>' \
+  --plan-file registry-cutover-plan.json \
+  --plan-digest '<plan.digest>' \
+  --writer-fence-evidence-digest '<lowercase-sha256>' \
+  --drain-evidence-digest '<lowercase-sha256>' \
+  --allow-v1-purge \
+  --traffic-quiesced
+```
+
+Apply re-describes the same table incarnation, requires an exact six-prefix inventory match and all four V2 prefixes
+empty before the first mutation, and independently refuses any delete outside `dial:dev:` or `dial:v1:dev:`. Deletes
+are single-attempt conditional requests that return no prior item image. Any deadline, page/cursor, duplicate-key,
+drift, conditional, request-evidence, or partial-delete failure exits nonzero and emits no zero proof. Two new complete
+strongly consistent scans must both report all six prefixes empty before the sanitized result can carry a zero proof.
+The command never changes Terraform, Lambda versions, routes, readiness flags, secrets, APNs, or DNS. A failure after
+some V1 deletes requires a fresh retained fence/drain check and a new plan; never reuse or edit an old plan.
+
 `GET /dial/register/context` is auth-only and intentionally returns the stable pseudonymous owner handle for the exact
 verified principal. Preserve the gateway's `Cache-Control: no-store` and `Pragma: no-cache` headers on every 200/4xx/5xx,
 disable CDN/API-Gateway caching for the route, and do not include the bearer or handle in access logs. Put a documented,

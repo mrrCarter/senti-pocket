@@ -51,6 +51,11 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
   nested `v:2` binding fence and perform one bounded exact-route snapshot immediately before concurrent APNs fanout.
   The V1 migration lane is exact-principal scoped, expiring, and ignores historical untagged rows. Registry V2 remains
   disabled until the explicit backend/iOS/purge acknowledgements in `API.md` and `DEPLOY.md` are satisfied.
+- **Registry cutover evidence tooling (code-complete, live-unexecuted):** `deploy/gateway/scripts/registry-cutover.mjs`
+  performs a read-only sanitized six-prefix plan and a separately gated V1-only purge. Exact table-incarnation binding,
+  a fixed five-minute plan checksum, external writer-fence/drain evidence digests, single-attempt conditional deletes,
+  and two independent final empty scans fail closed without changing deployment/readiness state. A real writer fence is
+  still operator-owned because strongly consistent scans are not cross-page snapshots.
 - **Registry V2 operation admission (code-complete, dark/deploy-unverified):** `src/operation-admission*.mjs` plus
   `deploy/operation-admission` enforce one cross-instance opaque CAS ledger per authenticated owner (256 live, 30 new
   per rolling minute, 60 total requests per rolling minute), exact replay handling, reusable-Senti-only auth, pinned
@@ -68,8 +73,9 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 - **Backends/adapters (done):** `src/lambda.mjs` (API Gateway HTTP API v2 ⇄ gateway, base64 binary, DPoP url/method), `src/tts.mjs` (ElevenLabs backend; key server-side only, `fetch` injected), `src/app.mjs` (deploy composition → `createLambda(env, deps)`).
 - **Writeback (done):** governed writeback (snapshot-frozen deterministic target → single-use confirm bound to proposal hash → server-time freshness → reserve-before-post exactly-once → `sl session reply` → read-back verify → signed `ActionReceipt`; offline ⇒ `pendingConnectivity`). Live-proven twice.
 - **Open (deploy/cross-lane):** merge/deploy/smoke-prove the target-membership API prerequisite; provision the private
-  gateway and admission stacks with reviewed signed artifacts/AWS inputs; Registry V1 row purge + immutable HMAC
-  secret; real APNs provider secret, matching entitlement/device token, and handset proof;
+  gateway and admission stacks with reviewed signed artifacts/AWS inputs; execute and retain the fenced Registry V1
+  purge/zero proof; provision the immutable Registry HMAC secret; real APNs provider secret, matching
+  entitlement/device token, and handset proof;
   JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled
   `sl` or senti API client); bind checkpoint provenance/`contentTrust` into the SIGNED bundle canonical (Atlas's
   contract); LLM-enriched summary prose (same grounded evidence); Swift/Xcode build, simulator, device, and signing
