@@ -473,7 +473,7 @@ final class VerifiedGatewayReasoningProviderTests: XCTestCase {
         }
     }
 
-    func test_unavailable_rejects_duplicate_or_foreign_topics() async {
+    func test_unavailable_rejects_duplicate_topics_at_unbound_boundary_and_foreign_topics_at_verified_boundary() async {
         let duplicate = AnswerWire(
             status: "unavailable",
             answer: nil,
@@ -496,14 +496,20 @@ final class VerifiedGatewayReasoningProviderTests: XCTestCase {
             contractsVersion: PocketContracts.version
         )
 
-        for wire in [duplicate, foreign] {
-            let provider = provider(
-                tokenBox: VerifiedReasoningTokenBox("token-a"),
-                answer: wire
-            )
-            await assertFails(.invalidAnswer) {
-                _ = try await provider.answer("question", sessionId: "s1", checkpointId: "cp1")
-            }
+        let duplicateProvider = provider(
+            tokenBox: VerifiedReasoningTokenBox("token-a"),
+            answer: duplicate
+        )
+        await assertGatewayFails(.malformedAnswer) {
+            _ = try await duplicateProvider.answer("question", sessionId: "s1", checkpointId: "cp1")
+        }
+
+        let foreignProvider = provider(
+            tokenBox: VerifiedReasoningTokenBox("token-a"),
+            answer: foreign
+        )
+        await assertFails(.invalidAnswer) {
+            _ = try await foreignProvider.answer("question", sessionId: "s1", checkpointId: "cp1")
         }
     }
 
@@ -687,6 +693,22 @@ final class VerifiedGatewayReasoningProviderTests: XCTestCase {
             try await operation()
             XCTFail("expected failure \(expected)", file: file, line: line)
         } catch let error as VerifiedGatewayReasoningError {
+            XCTAssertEqual(error, expected, file: file, line: line)
+        } catch {
+            XCTFail("unexpected error: \(error)", file: file, line: line)
+        }
+    }
+
+    private func assertGatewayFails(
+        _ expected: GatewayReasoningProviderError,
+        operation: () async throws -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            try await operation()
+            XCTFail("expected failure \(expected)", file: file, line: line)
+        } catch let error as GatewayReasoningProviderError {
             XCTAssertEqual(error, expected, file: file, line: line)
         } catch {
             XCTFail("unexpected error: \(error)", file: file, line: line)

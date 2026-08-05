@@ -138,7 +138,7 @@ final class SessionListCoordinatorTests: XCTestCase {
                        "dial registration must be revoked when the authorized row disappears")
     }
 
-    func test_canonical_variant_not_present_as_an_exact_row_cannot_be_selected() async throws {
+    func test_non_ascii_session_identity_is_rejected_before_selection() async throws {
         let composed = "room-caf\u{00E9}"
         let decomposed = "room-cafe\u{0301}"
         XCTAssertEqual(composed, decomposed, "precondition: ordinary String comparison is canonical")
@@ -150,28 +150,30 @@ final class SessionListCoordinatorTests: XCTestCase {
         coordinator.send(.selectSession(sessionId: decomposed))
 
         XCTAssertNil(coordinator.selectedSessionId)
-        XCTAssertEqual(coordinator.state.rows.count, 1)
-        XCTAssertTrue(coordinator.state.rows[0].sessionId.utf8.elementsEqual(composed.utf8))
+        XCTAssertTrue(coordinator.state.rows.isEmpty)
+        XCTAssertEqual(coordinator.state.failure, .invalidData)
+        guard case .unavailable = coordinator.state.provenance else {
+            return XCTFail("a non-ASCII wire session identity must fail closed before presentation")
+        }
     }
 
-    func test_refresh_replacing_selection_with_canonical_variant_revokes_exact_authority() async throws {
-        let composed = "room-caf\u{00E9}"
-        let decomposed = "room-cafe\u{0301}"
+    func test_refresh_replacing_selection_with_distinct_valid_identifier_revokes_authority() async throws {
+        let original = "room-Case"
+        let replacement = "room-case"
+        XCTAssertNotEqual(original, replacement)
         let selection = SessionSelectionProbe()
         let coordinator = makeCoordinator([
-            .page(try page(ids: [composed], nextCursor: nil, hasMore: false)),
-            .page(try page(ids: [decomposed], nextCursor: nil, hasMore: false)),
+            .page(try page(ids: [original], nextCursor: nil, hasMore: false)),
+            .page(try page(ids: [replacement], nextCursor: nil, hasMore: false)),
         ], onSelectionChanged: { selection.values.append($0) })
 
         await coordinator.start()?.value
-        coordinator.send(.selectSession(sessionId: composed))
+        coordinator.send(.selectSession(sessionId: original))
         await coordinator.refreshSessions().value
 
         XCTAssertNil(coordinator.selectedSessionId)
-        XCTAssertEqual(selection.values.count, 2)
-        XCTAssertTrue(selection.values[0]?.utf8.elementsEqual(composed.utf8) == true)
-        XCTAssertNil(selection.values[1])
-        XCTAssertTrue(coordinator.state.rows[0].sessionId.utf8.elementsEqual(decomposed.utf8))
+        XCTAssertEqual(selection.values, [original, nil])
+        XCTAssertEqual(coordinator.state.rows.map(\.sessionId), [replacement])
     }
 
     func test_service_failure_after_success_keeps_rows_but_revokes_live_provenance() async throws {
