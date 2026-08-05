@@ -4,8 +4,8 @@ import PocketContracts
 
 /// Locks the load-bearing invariants of DialHydration.merge — the LEAN-push → authed-fetch → RenderableRing seam.
 /// Two things must hold, forever:
-///  1. GOVERNED CONTENT PROVENANCE — message/options/evidenceSeqs/confidence come ONLY from the authed-fetched
-///     signal, never the push core (warden's LEAN/doorbell ruling #319761).
+///  1. AUTHENTICATED PROVENANCE — kind/priority/caller plus message/options/evidence/confidence come ONLY from the
+///     fetched signal, never the push core (warden's LEAN/doorbell ruling #319761).
 ///  2. SUBSTITUTION REFUSAL — a fetched signal that doesn't match the ring the push announced (id / session /
 ///     checkpoint) is REFUSED, so an authed fetch returning a different signal can never paint onto this ring.
 final class DialHydrationTests: XCTestCase {
@@ -13,11 +13,13 @@ final class DialHydrationTests: XCTestCase {
     // MARK: - fixtures
 
     private func core(id: String = "need_1",
-                      kind: String = "decision-yours",
+                      kind: String = "decisionYours",
+                      priority: String = "high",
+                      callerName: String = "Senti · claude-warden needs your decision",
                       sessionId: String = "6cf7e861",
                       checkpointId: String? = "cp_9") -> RingCore {
-        RingCore(id: id, kind: kind, priority: "high",
-                 callerName: "Senti · claude-warden needs your decision",
+        RingCore(id: id, kind: kind, priority: priority,
+                 callerName: callerName,
                  sessionId: sessionId, checkpointId: checkpointId)
     }
 
@@ -40,20 +42,36 @@ final class DialHydrationTests: XCTestCase {
 
     func test_happy_merge_pulls_governed_content_from_the_fetch() throws {
         let r = try DialHydration.merge(
-            core: core(kind: "pick-option"),
+            core: core(kind: "pickOption"),
             fetched: signal(kind: .pickOption(["Merge now", "Wait for forge"]),
                             question: "Which path?", evidenceSeqs: [1, 2], confidence: 0.8)
         )
-        // core (from the push) is preserved
+        // routing identity remains bound to the push/fetch agreement; semantic presentation is authenticated-fetch only
         XCTAssertEqual(r.core.id, "need_1")
-        XCTAssertEqual(r.core.kind, "pick-option")                 // display slug carried straight from the push core
-        XCTAssertEqual(r.core.priority, "high")
+        XCTAssertEqual(r.core.kind, "pickOption")
+        XCTAssertEqual(r.core.priority, "medium")
+        XCTAssertEqual(r.core.callerName, "Senti · claude-warden needs you to choose")
         XCTAssertEqual(r.core.sessionId, "6cf7e861")
         // governed content (from the AUTHED FETCH only)
         XCTAssertEqual(r.message, "Which path?")
         XCTAssertEqual(r.options, ["Merge now", "Wait for forge"]) // options derive from signal.kind, not the push
         XCTAssertEqual(r.evidenceSeqs, [1, 2])
         XCTAssertEqual(r.confidence ?? -1, 0.8, accuracy: 1e-9)
+    }
+
+    func test_authenticated_signal_overwrites_push_semantic_fields() throws {
+        let ring = try DialHydration.merge(
+            core: core(
+                kind: "decisionYours",
+                priority: "high",
+                callerName: "Attacker-controlled push label"
+            ),
+            fetched: signal(kind: .info)
+        )
+
+        XCTAssertEqual(ring.core.kind, "info")
+        XCTAssertEqual(ring.core.priority, "medium")
+        XCTAssertEqual(ring.core.callerName, "Senti · update from claude-warden")
     }
 
     func test_non_pickOption_kind_has_no_options() throws {
@@ -64,7 +82,7 @@ final class DialHydrationTests: XCTestCase {
     func test_hydration_preserves_the_already_authorized_binding_proof() throws {
         let authorized = RingCore(
             id: "need_1",
-            kind: "decision-yours",
+            kind: "decisionYours",
             priority: "high",
             callerName: "Senti",
             sessionId: "6cf7e861",

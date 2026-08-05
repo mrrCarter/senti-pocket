@@ -55,6 +55,14 @@ final class NeedCarterSignalTests: XCTestCase {
         XCTAssertEqual(NeedCarterKind.checkpointReady.dialPriority, "medium")
     }
 
+    func test_dial_wire_kind_preserves_frozen_camel_case_vocabulary() {
+        XCTAssertEqual(NeedCarterKind.go.dialWireKind, "go")
+        XCTAssertEqual(NeedCarterKind.decisionYours.dialWireKind, "decisionYours")
+        XCTAssertEqual(NeedCarterKind.pickOption(["A"]).dialWireKind, "pickOption")
+        XCTAssertEqual(NeedCarterKind.info.dialWireKind, "info")
+        XCTAssertEqual(NeedCarterKind.checkpointReady.dialWireKind, "checkpointReady")
+    }
+
     func test_confidence_floor_blocks_a_low_confidence_ring() {
         // The magical detector must NOT ring Carter on a weak "maybe needed" — the anti-false-ring gate.
         XCTAssertFalse(signal(kind: .go, confidence: 0.4).clearsRingFloor)
