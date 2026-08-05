@@ -9,6 +9,7 @@ private final class GatewayEndpointStubURLProtocol: URLProtocol {
     private static let lock = NSLock()
     private(set) static var requestCount = 0
     private(set) static var lastHost: String?
+    private(set) static var lastTimeoutInterval: TimeInterval?
     private static var responseStatus: Int?
     private static var responseBody = Data()
     private static var requestHook: (@Sendable () -> Void)?
@@ -17,6 +18,7 @@ private final class GatewayEndpointStubURLProtocol: URLProtocol {
         lock.lock()
         requestCount = 0
         lastHost = nil
+        lastTimeoutInterval = nil
         responseStatus = nil
         responseBody = Data()
         requestHook = nil
@@ -42,6 +44,7 @@ private final class GatewayEndpointStubURLProtocol: URLProtocol {
         Self.lock.lock()
         Self.requestCount += 1
         Self.lastHost = request.url?.host
+        Self.lastTimeoutInterval = request.timeoutInterval
         let status = Self.responseStatus
         let body = Self.responseBody
         let requestHook = Self.requestHook
@@ -394,6 +397,31 @@ final class GatewayEndpointTests: XCTestCase {
         }
 
         XCTAssertEqual(signal.value, 1)
+    }
+
+    func test_reasoning_request_uses_endpoint_specific_deadline_under_shared_resource_wall() async throws {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        GatewayEndpointStubURLProtocol.respond(
+            status: 200,
+            body: Data(
+                #"{"segments":[],"grounded":false,"checkpointId":"cp-1","contractsVersion":"0.1.8"}"#.utf8
+            )
+        )
+        let configuration = SentiHTTPTransportPolicy.makeConfiguration()
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let client = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: { "valid-token" }
+        )
+
+        _ = try await client.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+
+        XCTAssertEqual(configuration.timeoutIntervalForRequest, 15, accuracy: 0.001)
+        XCTAssertEqual(configuration.timeoutIntervalForResource, 60, accuracy: 0.001)
+        XCTAssertEqual(GatewayEndpointStubURLProtocol.lastTimeoutInterval ?? 0, 45, accuracy: 0.001)
+        XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 1)
     }
 
     @MainActor

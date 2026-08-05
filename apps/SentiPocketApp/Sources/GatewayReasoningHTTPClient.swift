@@ -64,6 +64,11 @@ enum GatewayReasoningError: LocalizedError {
 }
 
 struct GatewayReasoningHTTPClient: GatewayReasoningClient {
+    /// `/brief` and `/answer` are non-streaming: the gateway can spend up to 5s authenticating and 30s waiting for
+    /// Gemma before the first response byte. Keep that healthy path inside the shared session's 60s resource wall
+    /// without weakening the 15s default used by the app's ordinary interactive requests.
+    private static let reasoningRequestTimeout: TimeInterval = 45
+
     private let apiBaseURL: URL
     private let urlSession: URLSession
     /// Injected so tests / offline can supply the token without a Keychain; defaults to the real session store.
@@ -99,7 +104,7 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
             throw GatewayReasoningError.notLoggedIn
         }
         guard let url = URL(string: path, relativeTo: apiBaseURL) else { throw GatewayReasoningError.network("bad url \(path)") }
-        var req = URLRequest(url: url)
+        var req = URLRequest(url: url, timeoutInterval: Self.reasoningRequestTimeout)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
