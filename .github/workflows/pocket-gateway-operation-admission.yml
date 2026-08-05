@@ -58,6 +58,14 @@ jobs:
           set -euo pipefail
           node --test
 
+      - name: Prove Registry cutover tooling is hermetic and fail-closed
+        working-directory: services/pocket-gateway/deploy/gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run registry:test
+          npm run registry:plan -- --help
+
       - name: Prove the Node 22 gateway unsigned source ZIP is reproducible
         working-directory: services/pocket-gateway/deploy/gateway
         shell: bash
