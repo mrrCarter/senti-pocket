@@ -3,8 +3,9 @@
 Backend for Senti Pocket. Owner: **claude-pocket-relay**. Consumes `PocketContracts` v0.1 (does not edit it).
 
 The core is Node ESM with **zero external deps** (uses `node:child_process`, `node:crypto`, `node:test`) and runs on
-Node ≥20 with no install. The isolated production admission artifact under `deploy/operation-admission` targets Node 22
-and pins its AWS SDK/build dependencies in a separate lockfile; those dependencies do not enter the core package.
+Node ≥20 with no install. The isolated production artifacts under `deploy/gateway` and `deploy/operation-admission`
+target Node 22 and pin their AWS SDK/build dependencies in separate lockfiles; those dependencies do not enter the core
+package.
 
 ## Pipeline
 ```
@@ -32,6 +33,13 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
   higher before any durable mutation, runner, post, or push. Production composition never accepts a static membership
   allowlist. Keep the gateway route dark until sentinelayer-api PR #783 is merged, deployed, and smoke-proven with an
   exact known-member 200 plus a uniform nonmember 404.
+- **Private gateway deployment boundary (code-complete, dark/unprovisioned):** `deploy/gateway` resolves only immutable
+  receipt-signing, Registry HMAC, and optional APNs secret versions at cold start, then composes the production gateway
+  without a legacy membership adapter. `infra/terraform/gateway` defaults disabled and APNs-off, owns the encrypted
+  table/logs/runtime role and one signed numeric Lambda version, and creates no route, Function URL, alias, invocation
+  permission, or DNS. CI builds the deterministic unsigned source ZIP and validates the topology without AWS OIDC,
+  signing, upload, or deployment. Real signed-object, AWS, API #783 smoke, APNs, and physical-device evidence remain
+  release gates.
 - **Store (done):** `src/store.mjs` — async store: in-memory (dev/tests) + `createDynamoStore` (real conditional-put,
   OWNER-FENCED lock + `putIfAbsent` + TTL; deploy injects the `@aws-sdk/lib-dynamodb` client → package stays zero-dep)
   + `createStoreReplayGuard` (cross-instance single-use for DPoP and internal admission-assertion JTIs).
@@ -59,9 +67,10 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
   bucket supports the protected lane's 60-request contract across cold/multi-instance egress.
 - **Backends/adapters (done):** `src/lambda.mjs` (API Gateway HTTP API v2 ⇄ gateway, base64 binary, DPoP url/method), `src/tts.mjs` (ElevenLabs backend; key server-side only, `fetch` injected), `src/app.mjs` (deploy composition → `createLambda(env, deps)`).
 - **Writeback (done):** governed writeback (snapshot-frozen deterministic target → single-use confirm bound to proposal hash → server-time freshness → reserve-before-post exactly-once → `sl session reply` → read-back verify → signed `ActionReceipt`; offline ⇒ `pendingConnectivity`). Live-proven twice.
-- **Open (deploy/cross-lane):** merge/deploy/smoke-prove the target-membership API prerequisite; DynamoDB table/TTL +
-  IAM + AWS creds; Registry V1 row purge + HMAC secret; real APNs
-  VoIP transport; JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled
+- **Open (deploy/cross-lane):** merge/deploy/smoke-prove the target-membership API prerequisite; provision the private
+  gateway and admission stacks with reviewed signed artifacts/AWS inputs; Registry V1 row purge + immutable HMAC
+  secret; real APNs provider secret, matching entitlement/device token, and handset proof;
+  JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled
   `sl` or senti API client); bind checkpoint provenance/`contentTrust` into the SIGNED bundle canonical (Atlas's
   contract); LLM-enriched summary prose (same grounded evidence); Swift/Xcode build, simulator, device, and signing
   validation on a Mac.
@@ -76,6 +85,11 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 ## Test
 ```
 cd services/pocket-gateway && node --test
+
+cd deploy/gateway
+npm ci
+npm test
+npm run package
 
 cd deploy/operation-admission
 npm ci

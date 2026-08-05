@@ -1,0 +1,23 @@
+{
+  "name": "@senti-pocket/gateway-lambda",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "package": "npm run build",
+    "test": "node --test ../../test/gateway-entrypoint.test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "3.1103.0",
+    "@aws-sdk/client-secrets-manager": "3.1103.0",
+    "@aws-sdk/lib-dynamodb": "3.1103.0",
+    "@smithy/node-http-handler": "4.9.13"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}
