@@ -172,6 +172,37 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
         XCTAssertEqual(prepared.call.dialId, payload["id"] as? String)
     }
 
+    func test_selected_rich_write_kind_is_generic_and_never_retained() throws {
+        let source = try loadFixture("dial-payload-v1.json")
+        guard let cases = source["cases"] as? [String: Any],
+              let raw = cases["rich_info"] as? [String: Any],
+              var payload = raw["payload"] as? [String: Any],
+              let sessionId = payload["sessionId"] as? String else {
+            return XCTFail("source fixture missing rich_info payload")
+        }
+        payload["kind"] = "decisionYours"
+        payload["fetch"] = false
+        payload["message"] = "UNTRUSTED PUSH DECISION"
+        payload = v2(payload)
+        var authorizationCalls = 0
+
+        let prepared = SentiCallManager.prepareIncomingPush(
+            payload,
+            isBindingAuthorized: { candidate, fence in
+                authorizationCalls += 1
+                return candidate == sessionId && fence.id == self.bindingId && fence.revision == 7
+            }
+        )
+
+        XCTAssertEqual(authorizationCalls, 1, "the exact V2 fence is valid; the content-policy guard must reject next")
+        XCTAssertEqual(prepared.call.callerDisplayName, "Senti")
+        XCTAssertEqual(prepared.call.message, "")
+        XCTAssertNil(prepared.call.context)
+        XCTAssertEqual(prepared.call.priority, "medium")
+        XCTAssertNil(prepared.state, "a contradictory rich write-kind must never arm answer-time hydration or execution")
+        XCTAssertNil(prepared.dialId)
+    }
+
     func test_v1_or_malformed_binding_is_generic_before_display_decode() throws {
         let source = try loadFixture("dial-payload-v1.json")
         guard let cases = source["cases"] as? [String: Any],

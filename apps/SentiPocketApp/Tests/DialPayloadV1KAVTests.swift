@@ -18,6 +18,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
     // MARK: - shared fixture loading (repo-root-relative, resolved from this source file's compile-time path)
 
     private static let kavRelativePath = "services/pocket-gateway/test/fixtures/dial-payload-v1.json"
+    private static let registryV2BindingId = "bind_0123456789abcdef0123456789abcdef"
 
     /// Walk up from this source file until relay's canonical dial-payload KAV is found; return its `cases` dict.
     /// Fails LOUD (never silently skips) if the monorepo sibling is absent — a skip would let the very drift this
@@ -52,6 +53,14 @@ final class DialPayloadV1KAVTests: XCTestCase {
         return try JSONSerialization.data(withJSONObject: payload)
     }
 
+    /// Upgrade an adversarial V1 fixture object to the exact production Registry V2 envelope accepted by `receive`.
+    private func productionV2Data(_ payload: [String: Any]) throws -> Data {
+        var result = payload
+        result["v"] = 2
+        result["binding"] = ["v": 2, "id": Self.registryV2BindingId, "revision": 7]
+        return try JSONSerialization.data(withJSONObject: result)
+    }
+
     // MARK: - write-kinds are ALWAYS LEAN → needsHydration (governed content shed, never pre-auth)
 
     func test_writekind_decision_lean_needs_hydration() throws {
@@ -84,11 +93,44 @@ final class DialPayloadV1KAVTests: XCTestCase {
             payload["message"] = "UNTRUSTED PUSH CONTENT"
             payload["options"] = ["Approve attacker content"]
 
-            let state = DialReceive.receiveLegacyV1(try JSONSerialization.data(withJSONObject: payload))
-            guard case .rejected(let reason) = state else {
-                return XCTFail("rich write-kind \(kind) must be rejected, got \(state)")
+            let legacyData = try JSONSerialization.data(withJSONObject: payload)
+            let states = [
+                ("legacy-v1", DialReceive.receiveLegacyV1(legacyData)),
+                ("production-v2", DialReceive.receive(try productionV2Data(payload)))
+            ]
+            for (lane, state) in states {
+                guard case .rejected(let reason) = state else {
+                    return XCTFail("\(lane) rich write-kind \(kind) must be rejected, got \(state)")
+                }
+                XCTAssertEqual(reason, "write-kind dial payload requires fetch=true", "\(lane) \(kind)")
             }
-            XCTAssertEqual(reason, "write-kind dial payload requires fetch=true")
+        }
+    }
+
+    func test_all_lean_write_kinds_ignore_stray_governed_fields_and_require_hydration() throws {
+        let cases = try loadCases()
+        guard let seed = payloadObject("rich_info", in: cases),
+              let expectedId = seed["id"] as? String else { return }
+
+        for kind in ["go", "decisionYours", "pickOption"] {
+            var payload = seed
+            payload["kind"] = kind
+            payload["fetch"] = true
+            payload["message"] = "UNTRUSTED STRAY CONTENT"
+            payload["options"] = ["UNTRUSTED STRAY OPTION"]
+
+            let legacyData = try JSONSerialization.data(withJSONObject: payload)
+            let states = [
+                ("legacy-v1", DialReceive.receiveLegacyV1(legacyData)),
+                ("production-v2", DialReceive.receive(try productionV2Data(payload)))
+            ]
+            for (lane, state) in states {
+                guard case .needsHydration(let id, let core) = state else {
+                    return XCTFail("\(lane) LEAN write-kind \(kind) must require hydration, got \(state)")
+                }
+                XCTAssertEqual(id, expectedId, "\(lane) \(kind)")
+                XCTAssertEqual(core.kind, kind, "\(lane) \(kind)")
+            }
         }
     }
 
@@ -100,11 +142,17 @@ final class DialPayloadV1KAVTests: XCTestCase {
             var payload = seed
             payload["kind"] = "futureWriteKind"
             payload["fetch"] = fetch
-            let state = DialReceive.receiveLegacyV1(try JSONSerialization.data(withJSONObject: payload))
-            guard case .rejected(let reason) = state else {
-                return XCTFail("unknown kind with fetch=\(fetch) must be rejected, got \(state)")
+            let legacyData = try JSONSerialization.data(withJSONObject: payload)
+            let states = [
+                ("legacy-v1", DialReceive.receiveLegacyV1(legacyData)),
+                ("production-v2", DialReceive.receive(try productionV2Data(payload)))
+            ]
+            for (lane, state) in states {
+                guard case .rejected(let reason) = state else {
+                    return XCTFail("\(lane) unknown kind with fetch=\(fetch) must be rejected, got \(state)")
+                }
+                XCTAssertEqual(reason, "dial payload has unknown kind", "\(lane) fetch=\(fetch)")
             }
-            XCTAssertEqual(reason, "dial payload has unknown kind")
         }
     }
 
@@ -123,16 +171,42 @@ final class DialPayloadV1KAVTests: XCTestCase {
         XCTAssertEqual(r.confidence ?? -1, 0.8, accuracy: 1e-9)
     }
 
+    func test_rich_checkpoint_ready_remains_renderable_in_both_decoder_lanes() throws {
+        let cases = try loadCases()
+        guard var payload = payloadObject("rich_info", in: cases) else { return }
+        payload["kind"] = "checkpointReady"
+
+        let legacyData = try JSONSerialization.data(withJSONObject: payload)
+        let states = [
+            ("legacy-v1", DialReceive.receiveLegacyV1(legacyData)),
+            ("production-v2", DialReceive.receive(try productionV2Data(payload)))
+        ]
+        for (lane, state) in states {
+            guard case .renderable(let ring) = state else {
+                return XCTFail("\(lane) checkpointReady RICH payload must remain renderable, got \(state)")
+            }
+            XCTAssertEqual(ring.core.kind, "checkpointReady", lane)
+            XCTAssertEqual(ring.message, "Deploy finished; all green.", lane)
+            XCTAssertEqual(ring.options, [], lane)
+        }
+    }
+
     func test_rich_display_kind_cannot_smuggle_options_into_spoken_content() throws {
         let cases = try loadCases()
         guard var payload = payloadObject("rich_info", in: cases) else { return }
         payload["options"] = ["UNTRUSTED OPTION"]
 
-        let state = DialReceive.receiveLegacyV1(try JSONSerialization.data(withJSONObject: payload))
-        guard case .rejected(let reason) = state else {
-            return XCTFail("display-only RICH payload with options must be rejected, got \(state)")
+        let legacyData = try JSONSerialization.data(withJSONObject: payload)
+        let states = [
+            ("legacy-v1", DialReceive.receiveLegacyV1(legacyData)),
+            ("production-v2", DialReceive.receive(try productionV2Data(payload)))
+        ]
+        for (lane, state) in states {
+            guard case .rejected(let reason) = state else {
+                return XCTFail("\(lane) display-only RICH payload with options must be rejected, got \(state)")
+            }
+            XCTAssertEqual(reason, "display-only RICH dial payload must not carry options", lane)
         }
-        XCTAssertEqual(reason, "display-only RICH dial payload must not carry options")
     }
 
     // MARK: - overflow + hostile-byte cases still decode (fetch=true → hydrate regardless of kind/bytes)
