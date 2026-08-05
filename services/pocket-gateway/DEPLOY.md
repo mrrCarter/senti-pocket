@@ -2,15 +2,17 @@
 
 The core gateway is a **zero-dependency ESM Lambda**. Its core (`createGateway`) takes a `{method,path,query,headers,body}`
 request and returns `{status,headers,body}` — no framework, no ambient I/O. Everything it touches (DynamoDB, the signing
-key, `fetch`, the senti runner, the feature backends) is an **injected external** the deploy owns. V1 needs the four core
-AWS resources below. Registry V2 additionally uses the body-reading service in `operation-admission*.mjs`, a separate
-admission table, and the dark Terraform boundary under `infra/terraform/operation-admission`. The core and admission
-Lambdas remain separate compute; every network/AWS boundary is explicit and injected.
+key, `fetch`, the senti runner, the feature backends) is an **injected external** the deploy owns. The production
+entrypoint under `deploy/gateway` and private module under `infra/terraform/gateway` package that boundary without
+creating public ingress. Registry V2 additionally uses the body-reading service in `operation-admission*.mjs`, a
+separate admission table, and the dark Terraform boundary under `infra/terraform/operation-admission`. The core and
+admission Lambdas remain separate compute; every network/AWS boundary is explicit and injected.
 
-> **Honesty note:** this documents the deploy *contract*. The core gateway is tested (`node --test`), but it is **not
-> live** until this runbook is executed against a real AWS account. The admission source and dark IaC are implemented,
-> but Registry V2 is not deploy-complete until live two-instance Dynamo, route/IAM, auth, and cutover evidence is
-> retained; keep V2 disabled. Each optional feature backend
+> **Honesty note:** this documents the deploy *contract*. The core and both isolated Lambda artifacts are tested, and
+> the private gateway plus admission IaC are implemented, but none of that is evidence of a live AWS deployment. The
+> gateway stays private and APNs-off by default. Registry V2 is not deploy-complete until the prerequisite API and live
+> two-instance Dynamo, route/IAM, auth, cutover, APNs, and physical-device evidence are retained; keep V2 disabled. Each
+> optional feature backend
 > below fails **closed** (a `501` with a typed reason) until its dependency is wired—never a fabricated response.
 
 ---
@@ -19,7 +21,7 @@ Lambdas remain separate compute; every network/AWS boundary is explicit and inje
 
 | Resource | Purpose | Notes |
 |---|---|---|
-| **Lambda** (Node 20+, ESM) | runs `createLambda(process.env, deps)` | immutable numeric versions behind explicit API Gateway routes; no Function URL in Registry V2 |
+| **Lambda** (Node 22, ESM) | runs the locked `deploy/gateway` artifact | immutable numeric versions behind explicit API Gateway routes; no Function URL in Registry V2 |
 | **DynamoDB table** | durable state: idempotency/emitted markers + cross-instance locks + proof-jti replay records | single-table, schema below |
 | **Secrets Manager secrets** | the Ed25519 **signing key** (receipts/bundles), plus the Registry V2 HMAC key when V2 is enabled | KMS asymmetric does **not** do EdDSA — store the PKCS#8 PEM and independent 32-byte-or-longer HMAC key in separate secrets |
 | **API Gateway (HTTP API)** | sole public HTTPS ingress | explicit routes only; no `$default`, Function URL, or public gateway-Lambda integration for either protected POST |
@@ -379,83 +381,53 @@ is an explicit key-id + dual-read/write migration before the first normal rotati
 
 ---
 
-## 3. Gateway handler (reference `index.mjs`)
+## 3. Production gateway artifact + private dark Terraform
 
-This is the only glue the deploy writes. It resolves the real externals and hands them to `createLambda`:
-
-```js
-import { createLambda } from './src/app.mjs';
-import { createDynamoClientAdapter } from './src/store.mjs';
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import {
-  DynamoDBDocumentClient,
-  GetCommand,
-  PutCommand,
-  DeleteCommand,
-  TransactWriteCommand,
-} from '@aws-sdk/lib-dynamodb';
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
-import { createPrivateKey } from 'node:crypto';
-
-// DynamoDB v3 -> the base store plus Registry V2 transaction surface.
-const doc = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-const dynamoClient = createDynamoClientAdapter(doc, {
-  GetCommand,
-  PutCommand,
-  DeleteCommand,
-  TransactWriteCommand,
-});
-
-// Ed25519 signing key (PKCS#8 PEM) from Secrets Manager.
-const sm = new SecretsManagerClient({});
-const pem = (await sm.send(new GetSecretValueCommand({ SecretId: process.env.SIGNING_KEY_SECRET_ARN }))).SecretString;
-const signingKey = createPrivateKey(pem);
-
-// Registry V2's HMAC key is resolved at cold start and passed only to createLambda; it is not written back to the
-// Lambda environment, source, or logs. V1 does not retrieve or require this optional secret.
-let runtimeEnv = process.env;
-if (process.env.DEVICE_REGISTRY_MODE === 'v2') {
-  if (!process.env.DEVICE_REGISTRY_HMAC_SECRET_ARN || !process.env.DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID) {
-    throw new Error('a pinned Registry V2 HMAC secret ARN + version id are required');
-  }
-  const configuredVersionId = process.env.DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID;
-  const hmacResponse = await sm.send(new GetSecretValueCommand({
-    SecretId: process.env.DEVICE_REGISTRY_HMAC_SECRET_ARN,
-    VersionId: configuredVersionId,
-  }));
-  if (hmacResponse.VersionId !== configuredVersionId || !hmacResponse.SecretString) {
-    throw new Error('Registry V2 pinned HMAC secret is unavailable');
-  }
-  const hmacKey = hmacResponse.SecretString;
-  runtimeEnv = { ...process.env, DEVICE_REGISTRY_HMAC_KEY_B64: hmacKey };
-}
-
-export const handler = createLambda(runtimeEnv, {
-  dynamoClient,
-  signingKey,
-  fetch,                                   // validates sessions/target roles + posts the human write
-  run: /* senti writeback runner */,       // shells the bundled `sl` or a senti API client (POST /actions/execute)
-  bundleStore: /* { listForHuman(humanId, since) } */,        // signed bundles for GET /sync
-  // optional feature deps (see §4):
-  // apnsSend, rasterize, encodeVideo,
-});
-```
+`deploy/gateway` is the reviewed Node 22 executable glue. It snapshots only owned scalar configuration, constructs
+one-attempt AWS clients with hard transport deadlines, reads each required `SecretString` by complete ARN plus immutable
+`VersionId`, validates Ed25519/P-256 key types, and then hands the resulting `KeyObject`s and Dynamo adapter to
+`createLambda`. Secret values never enter the Lambda environment, Terraform, logs, metrics, errors, or CI output.
+Bootstrap failures return one identifier-free 503 and a low-cardinality metric; a failed cold start is retryable and a
+successful cold start is single-flight cached.
 
 `createProdGateway` constructs the fixed-origin, role-preserving target-membership resolver from
-`SENTI_API_BASE_URL + fetch`; production has no static/list allowlist injection. It **fails boot** if any baseline
-dependency (`dynamoClient / signingKey / fetch`)
-or required baseline environment value is missing. Registry V2 additionally requires its HMAC key, exact secret
-ARN/VersionId, readiness acknowledgements, and private admission-assertion verifier/replay store; a misconfigured
-deployment never starts half-wired.
+`SENTI_API_BASE_URL + fetch`; production exposes no static/list membership-adapter seam. Registry V2 additionally
+requires the exact HMAC pin, all four readiness acknowledgements, and a numeric AWS-owned function version. APNs is
+absent/`0` by default: that path does not validate or read the APNs secret and injects no `apnsSend` function.
 
-The target-membership API route is a hard release dependency. Keep the gateway route dark until sentinelayer-api PR
-#783 is merged and deployed, then smoke-prove one exact known-member 200 and one uniform nonmember 404 before promoting
-a numeric gateway version. A pre-prerequisite 404 fails closed as nonmembership; it is not evidence the deploy works.
+Build and verify the deterministic unsigned source artifact from the locked directory:
 
-**IAM:** the Lambda role needs `dynamodb:{GetItem,PutItem,DeleteItem}` on the table. DynamoDB authorizes each
-`TransactWriteItems` sub-operation through its underlying `PutItem` / `DeleteItem` permission (there is no separate
-`dynamodb:TransactWriteItems` policy action). Also grant
-`secretsmanager:GetSecretValue` on the signing-key secret and, when V2 is enabled, the separate HMAC-key secret.
+```sh
+cd services/pocket-gateway/deploy/gateway
+npm ci
+npm audit --audit-level=low
+npm test
+npm run package
+```
+
+The output ZIP contains exactly `index.mjs`. CI packages it twice and compares both the bundle and ZIP digests, but has
+no AWS OIDC token and does not upload, sign, or deploy. Production must pass `infra/terraform/gateway` one immutable
+**signed** S3 object `VersionId` and its canonical base64 SHA-256; mutable stages/objects are not release evidence.
+
+The gateway Terraform module defaults `enabled=false` and `apns_voip_enabled=false`. When explicitly enabled it owns
+the encrypted/PITR/TTL Dynamo table, precreated encrypted log group, runtime role, alarms, code-signing policy, Lambda,
+and one published numeric version. Production code signing allows exactly one active AWS Signer profile version and
+uses `Enforce`. The module deliberately creates no API Gateway resource, Lambda Function URL, Lambda permission,
+Lambda alias, DNS record, or mutable traffic target. Its function name, numeric version, qualified ARN, artifact digest,
+secret pins, and APNs state are non-secret outputs for the separate operation-admission/cutover evidence.
+
+**IAM:** the runtime role can call only `dynamodb:{GetItem,PutItem,DeleteItem}` on its one table. DynamoDB authorizes
+each `TransactWriteItems` sub-operation through the underlying item actions; there is no separate
+`dynamodb:TransactWriteItems` IAM action. Secret reads are separate exact-resource statements: receipt signing always,
+Registry HMAC only in V2, and APNs `.p8` only when APNs is enabled, each conditioned on its immutable
+`secretsmanager:VersionId`. The corresponding KMS decrypt grant is limited to the exact key, Secrets Manager
+`ViaService`, and matching `SecretARN` encryption context. The role also has only precreated-log writes, optional X-Ray
+emission, and decrypt access to the module-owned Lambda environment key. It has no scan/query or wildcard-secret grant.
+
+The target-membership API route remains a hard release dependency. A private numeric version may be provisioned dark,
+but do not create/promote a route until sentinelayer-api PR #783 is merged and deployed, then smoke-prove one exact
+known-member 200 and one uniform nonmember 404. A pre-prerequisite 404 fails closed as nonmembership; it is not evidence
+the deploy works.
 
 ---
 
@@ -518,9 +490,11 @@ a numeric gateway version. A pre-prerequisite 404 fails closed as nonmembership;
   environment, and bounded retry/unregistered metadata. Raw device token, JWT, private key, payload, response body, and
   causes are deliberately absent. Keep each registry namespace scoped to the same APNs environment/topic, use a
   separate environment-scoped provider key operationally, and call `apns.close()` during controlled worker shutdown or
-  tests. The next deployment PR must add the exact-version secret bootstrap, KMS/Secrets Manager least-privilege IAM,
-  explicit enable flag defaulting off, alarms, signed dark artifact, and rollback evidence; none of those permissions
-  belong on the operation-admission role.
+  tests. The committed dark deployment boundary now includes exact-version secret bootstrap, conditional
+  KMS/Secrets Manager least-privilege IAM, an explicit APNs enable flag defaulting off, alarms, and a signed-object
+  Terraform input. None of those permissions belong on the operation-admission role. This is still unprovisioned:
+  actual Apple/AWS pins, signed artifact, dark runtime evidence, rollback evidence, and physical-device proof must be
+  retained before APNs or public traffic is enabled.
 
   The legacy `delivered: true` field means APNs accepted the HTTP/2 request; it never proves handset receipt or CallKit
   presentation. The live APNs smoke gate must assert the exact outbound serialized byte count and a device-side

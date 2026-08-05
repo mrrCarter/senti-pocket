@@ -1,4 +1,4 @@
-name: Pocket Gateway Operation Admission CI
+name: Pocket Gateway Deployment CI
 
 on:
   push:
@@ -13,8 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  operation-admission:
-    name: Operation Admission Verification
+  gateway-deployment:
+    name: Gateway Deployment Verification
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     permissions:
@@ -31,7 +31,17 @@ jobs:
         with:
           node-version: 22.23.2
           cache: npm
-          cache-dependency-path: services/pocket-gateway/deploy/operation-admission/package-lock.json
+          cache-dependency-path: |
+            services/pocket-gateway/deploy/gateway/package-lock.json
+            services/pocket-gateway/deploy/operation-admission/package-lock.json
+
+      - name: Install and audit locked gateway dependencies
+        working-directory: services/pocket-gateway/deploy/gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm audit --audit-level=low
 
       - name: Install and audit locked admission dependencies
         working-directory: services/pocket-gateway/deploy/operation-admission
@@ -47,6 +57,18 @@ jobs:
         run: |
           set -euo pipefail
           node --test
+
+      - name: Prove the Node 22 gateway unsigned source ZIP is reproducible
+        working-directory: services/pocket-gateway/deploy/gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run package
+          test "$(unzip -Z1 dist/gateway.zip)" = "index.mjs"
+          node --input-type=module -e "const artifact = await import('./dist/index.mjs'); if (typeof artifact.handler !== 'function') throw new Error('gateway artifact does not export handler');"
+          sha256sum dist/index.mjs dist/gateway.zip | tee "${RUNNER_TEMP}/gateway-unsigned-source.sha256"
+          npm run package
+          sha256sum --check "${RUNNER_TEMP}/gateway-unsigned-source.sha256"
 
       - name: Prove the Node 22 unsigned source ZIP is reproducible
         working-directory: services/pocket-gateway/deploy/operation-admission
@@ -66,7 +88,17 @@ jobs:
           terraform_version: 1.9.8
           terraform_wrapper: false
 
-      - name: Validate the dark Terraform topology
+      - name: Validate the private dark gateway Terraform topology
+        working-directory: services/pocket-gateway/infra/terraform/gateway
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform fmt -check -diff -recursive
+          terraform init -backend=false -input=false -lockfile=readonly
+          terraform validate -no-color
+          terraform test -no-color
+
+      - name: Validate the operation-admission Terraform topology
         working-directory: services/pocket-gateway/infra/terraform/operation-admission
         shell: bash
         run: |
