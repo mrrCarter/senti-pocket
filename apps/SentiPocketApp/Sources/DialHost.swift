@@ -37,6 +37,9 @@ final class DialHost: ObservableObject {
     private var callLifecycle = DialCallLifecycle()
     /// Runtime observation only. Registry authority remains exclusively in DeviceRingRegistrar/secure state.
     private var observedVoipToken: String?
+    private let prepareCallKitAudioSession: () throws -> Void
+    private let callKitDidActivateAudioSession: () -> Void
+    private let callKitDidDeactivateAudioSession: () -> Void
 
     init(
         gatewayURL: URL? = DialHost.gatewayURL(),
@@ -49,6 +52,9 @@ final class DialHost: ObservableObject {
         self.authenticationExpiry = authenticationExpiry
         self.callAuthorizationGate = callAuthorizationGate
         self.registryStateStore = registryStateStore
+        self.prepareCallKitAudioSession = { try LiveDialVoice.prepareCallKitAudioSession() }
+        self.callKitDidActivateAudioSession = { LiveDialVoice.callKitDidActivateAudioSession() }
+        self.callKitDidDeactivateAudioSession = { LiveDialVoice.callKitDidDeactivateAudioSession() }
         guard let gatewayURL else {
             // The default/unconfigured build does not start PushKit token acquisition or construct any gateway client.
             // A later configured launch builds the complete, app-lifetime call stack below.
@@ -137,7 +143,10 @@ final class DialHost: ObservableObject {
         callManager: SentiCallManager,
         coordinator: DialCoordinator,
         selectedSessionId: String,
-        registryStateStore: DeviceRingRegistryStateStore = DeviceRingRegistryStateStore()
+        registryStateStore: DeviceRingRegistryStateStore = DeviceRingRegistryStateStore(),
+        prepareCallKitAudioSession: @escaping () throws -> Void = {},
+        callKitDidActivateAudioSession: @escaping () -> Void = {},
+        callKitDidDeactivateAudioSession: @escaping () -> Void = {}
     ) {
         let selectionGate = DialSessionSelectionGate()
         selectionGate.select(selectedSessionId)
@@ -149,6 +158,9 @@ final class DialHost: ObservableObject {
         self.selectionGate = selectionGate
         self.authenticationExpiry = AuthenticationExpiryRelay()
         self.callAuthorizationGate = DialCallAuthorizationGate()
+        self.prepareCallKitAudioSession = prepareCallKitAudioSession
+        self.callKitDidActivateAudioSession = callKitDidActivateAudioSession
+        self.callKitDidDeactivateAudioSession = callKitDidDeactivateAudioSession
         self.selectedSessionId = selectedSessionId
         self.authenticated = true
         installCallLifecycle(on: callManager, coordinator: coordinator)
@@ -361,7 +373,7 @@ final class DialHost: ObservableObject {
             do {
                 // Configure play-and-record/voiceChat before SentiCallManager fulfills CXAnswerCallAction. CallKit,
                 // not PocketVoice, remains the owner that activates/deactivates the audio session.
-                try LiveDialVoice.prepareCallKitAudioSession()
+                try prepareCallKitAudioSession()
             } catch {
                 coordinator.discard(callUUID: callUUID)
                 callEnded(callUUID)
@@ -375,14 +387,14 @@ final class DialHost: ObservableObject {
     }
 
     private func callKitAudioActivated(_ callUUID: UUID) {
-        LiveDialVoice.callKitDidActivateAudioSession()
+        callKitDidActivateAudioSession()
         if let ready = callLifecycle.audioActivated(callUUID: callUUID) {
             startDial(ready)
         }
     }
 
     private func callKitAudioDeactivated(_ callUUID: UUID) {
-        LiveDialVoice.callKitDidDeactivateAudioSession()
+        callKitDidDeactivateAudioSession()
         guard callLifecycle.audioDeactivated(callUUID: callUUID) != nil else { return }
         coordinator?.discard(callUUID: callUUID)
         callAuthorizationGate.close(callUUID)

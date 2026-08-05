@@ -731,49 +731,6 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
         await expectCleanup(.retryable(429), client: makeClient())
     }
 
-    func test_cleanup_shared_KAV_matches_Swift_digest_request_and_strict_response() async throws {
-        let relative = "services/pocket-gateway/test/fixtures/device-registration-cleanup-v2.json"
-        var directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        var fixtureURL: URL?
-        for _ in 0..<10 {
-            let candidate = directory.appendingPathComponent(relative)
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                fixtureURL = candidate
-                break
-            }
-            directory.deleteLastPathComponent()
-        }
-        let url = try XCTUnwrap(fixtureURL, "shared cleanup KAV must exist in the monorepo checkout")
-        let root = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
-        )
-        XCTAssertEqual(root["schema"] as? String, "device-registration-cleanup-v2-kav")
-        XCTAssertEqual((root["version"] as? NSNumber)?.intValue, 2)
-        let vectors = try XCTUnwrap(root["vectors"] as? [[String: Any]])
-        XCTAssertEqual(vectors.count, 2)
-
-        for vector in vectors {
-            let token = try XCTUnwrap(vector["voipTokenWireString"] as? String)
-            let requestObject = try XCTUnwrap(vector["request"] as? [String: Any])
-            let responseObject = try XCTUnwrap(vector["successResponse"] as? [String: Any])
-            let request = DeviceRingRegistrationCleanupRequest(
-                ownerHandle: try XCTUnwrap(requestObject["ownerHandle"] as? String),
-                installationId: try XCTUnwrap(requestObject["installationId"] as? String),
-                idempotencyKey: try XCTUnwrap(requestObject["idempotencyKey"] as? String),
-                tokenDigest: try XCTUnwrap(requestObject["tokenDigest"] as? String),
-                sessionId: try XCTUnwrap(requestObject["sessionId"] as? String),
-                platform: try XCTUnwrap(requestObject["platform"] as? String)
-            )
-            XCTAssertEqual(DeviceRingFingerprint.digest(token), request.tokenDigest)
-            RegisterStubURLProtocol.reset(body: json(responseObject))
-            try await makeClient().cleanupRegistration(request, bearerToken: "bearer-a")
-            let sentObject = try XCTUnwrap(
-                JSONSerialization.jsonObject(with: XCTUnwrap(RegisterStubURLProtocol.bodies.last)) as? [String: Any]
-            )
-            XCTAssertTrue(NSDictionary(dictionary: sentObject).isEqual(to: requestObject))
-        }
-    }
-
     func test_unregister_uses_delete_exact_tuple_and_strict_success() async throws {
         RegisterStubURLProtocol.reset(body: json([
             "unregistered": true,

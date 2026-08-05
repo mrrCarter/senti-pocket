@@ -278,6 +278,7 @@ final class DialHostTests: XCTestCase {
         let started = expectation(description: "governed dial started after audio activation")
         let call = call("dial-a")
         var startedCallUUIDs: [UUID] = []
+        var audioEvents: [String] = []
         let coordinator = coordinator(
             runDial: { _, callUUID in
                 startedCallUUIDs.append(callUUID)
@@ -289,7 +290,10 @@ final class DialHostTests: XCTestCase {
         let host = DialHost(
             callManager: manager,
             coordinator: coordinator,
-            selectedSessionId: "session-a"
+            selectedSessionId: "session-a",
+            prepareCallKitAudioSession: { audioEvents.append("prepare") },
+            callKitDidActivateAudioSession: { audioEvents.append("activate") },
+            callKitDidDeactivateAudioSession: { audioEvents.append("deactivate") }
         )
         manager.ring(call)
         manager.onDialReceived?(.renderable(ring("dial-a")), "dial-a", call.id)
@@ -301,6 +305,39 @@ final class DialHostTests: XCTestCase {
         await fulfillment(of: [started], timeout: 1)
         manager.provider(provider, didDeactivate: AVAudioSession.sharedInstance())
         XCTAssertEqual(startedCallUUIDs, [call.id])
+        XCTAssertEqual(audioEvents, ["prepare", "activate", "deactivate"])
+        XCTAssertNotNil(host.callManager)
+    }
+
+    func test_audio_preparation_failure_ends_call_without_starting_governed_dial() {
+        let provider = CXProvider(configuration: CXProviderConfiguration())
+        var reportedEnds: [UUID] = []
+        let manager = SentiCallManager(
+            provider: provider,
+            reportEndedCall: { reportedEnds.append($0) }
+        )
+        var runCalls = 0
+        let coordinator = coordinator { _, _ in
+            runCalls += 1
+            return .posted
+        }
+        let host = DialHost(
+            callManager: manager,
+            coordinator: coordinator,
+            selectedSessionId: "session-a",
+            prepareCallKitAudioSession: {
+                throw NSError(domain: "DialHostTests.AudioSession", code: 1)
+            }
+        )
+        let call = call("dial-audio-setup-failed")
+        manager.ring(call)
+        manager.onDialReceived?(.renderable(ring("dial-audio-setup-failed")), "dial-audio-setup-failed", call.id)
+
+        manager.provider(provider, perform: CXAnswerCallAction(call: call.id))
+        manager.provider(provider, didActivate: AVAudioSession.sharedInstance())
+
+        XCTAssertEqual(runCalls, 0)
+        XCTAssertEqual(reportedEnds, [call.id])
         XCTAssertNotNil(host.callManager)
     }
 
