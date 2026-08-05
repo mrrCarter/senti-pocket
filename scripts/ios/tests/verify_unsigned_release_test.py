@@ -72,6 +72,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             "IPHONEOS_DEPLOYMENT_TARGET": self.expected.deployment_target,
             "INFOPLIST_FILE": "Sources/Info.plist",
             "CODE_SIGN_ENTITLEMENTS": "Sources/SentiPocketApp.entitlements",
+            "PROJECT_FILE_PATH": str(self.project_file.parent.resolve(strict=False)),
             "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "" if is_release else "DEBUG",
             "OTHER_SWIFT_FLAGS": "",
             "EXCLUDED_SOURCE_FILE_NAMES": "canonical_checkpoint.json"
@@ -233,6 +234,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             "IPHONEOS_DEPLOYMENT_TARGET": "17.0",
             "INFOPLIST_FILE": "Other/Info.plist",
             "CODE_SIGN_ENTITLEMENTS": "Other/Entitlements.plist",
+            "PROJECT_FILE_PATH": str(self.root / "Decoy.xcodeproj"),
             "EXCLUDED_SOURCE_FILE_NAMES": "",
             "TARGET_BUILD_DIR": "relative/build",
             "WRAPPER_NAME": "../Wrong.app",
@@ -260,6 +262,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             ("OTHER_SWIFT_FLAGS", "-Xfrontend -DDEBUG"),
             ("OTHER_SWIFT_FLAGS", "-Xfrontend=-DDEBUG"),
             ("OTHER_SWIFT_FLAGS", "-Xfrontend -D -Xfrontend DEBUG"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend=-D -Xfrontend=DEBUG"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend -D -Xfrontend=DEBUG"),
             ("OTHER_SWIFT_FLAGS", "-D'DEBUG'"),
         )
         for key, value in injections:
@@ -303,6 +307,9 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             ("OTHER_SWIFT_FLAGS", ["-DDEBUG"]),
             ("OTHER_SWIFT_FLAGS", "'unterminated"),
             ("OTHER_SWIFT_FLAGS", "@opaque-response-file"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend=@opaque-response-file"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend="),
         )
         for key, value in mutations:
             with self.subTest(key=key, value=value):
@@ -325,6 +332,16 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         )
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
         self.assert_error_contains(errors, "per-file compiler flags")
+
+    def test_settings_reject_decoy_generated_project_path(self) -> None:
+        decoy = self.root / "decoy" / "SentiPocketApp.xcodeproj" / "project.pbxproj"
+        decoy.parent.mkdir(parents=True)
+        decoy.write_text("// !$*UTF8*$!\n{ objects = {}; }\n", encoding="utf-8")
+        expected = self.expected_with(project_file=decoy)
+
+        _, errors = verify.verify_settings_file(self.settings_path, expected)
+
+        self.assert_error_contains(errors, "PROJECT_FILE_PATH")
 
     def test_settings_reject_malformed_or_oversized_generated_project(self) -> None:
         self.project_file.write_bytes(b"\xff\xfe")

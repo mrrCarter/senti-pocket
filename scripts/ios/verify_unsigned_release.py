@@ -325,6 +325,35 @@ def _resolved_setting_tokens(
     return tokens
 
 
+def _forwarded_frontend_tokens(
+    tokens: tuple[str, ...], key: str, errors: list[str]
+) -> tuple[str, ...] | None:
+    forwarded: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-Xfrontend":
+            index += 1
+            if index >= len(tokens):
+                errors.append(f"{key} contains an incomplete -Xfrontend argument")
+                return None
+            forwarded.append(tokens[index])
+        elif token.startswith("-Xfrontend="):
+            value = token.partition("=")[2]
+            if not value:
+                errors.append(f"{key} contains an empty -Xfrontend argument")
+                return None
+            forwarded.append(value)
+        else:
+            forwarded.append(token)
+        index += 1
+
+    if any(token.startswith("@") for token in forwarded):
+        errors.append(f"{key} must not forward an opaque response-file argument")
+        return None
+    return tuple(forwarded)
+
+
 def _verify_swift_compilation_conditions(
     settings: Mapping[str, Any], configuration: str, errors: list[str]
 ) -> None:
@@ -343,6 +372,10 @@ def _verify_swift_compilation_conditions(
             errors.append("Release configuration must not define DEBUG")
 
     other_flags = _resolved_setting_tokens(settings, "OTHER_SWIFT_FLAGS", errors)
+    if configuration == "Release" and other_flags is not None:
+        other_flags = _forwarded_frontend_tokens(
+            other_flags, "OTHER_SWIFT_FLAGS", errors
+        )
     if configuration == "Release" and other_flags is not None:
         defines_debug = any(
             token == "DEBUG"
@@ -365,6 +398,16 @@ def verify_settings_file(
         return None, load_errors
 
     errors.extend(_generated_project_errors(expected.project_file))
+    project_file_path = settings.get("PROJECT_FILE_PATH")
+    if (
+        not isinstance(project_file_path, str)
+        or not Path(project_file_path).is_absolute()
+    ):
+        errors.append("PROJECT_FILE_PATH must resolve to an absolute project path")
+    elif Path(project_file_path).resolve(
+        strict=False
+    ) != expected.project_file.parent.resolve(strict=False):
+        errors.append("PROJECT_FILE_PATH does not match the inspected Xcode project")
 
     _require_exact(
         settings,
