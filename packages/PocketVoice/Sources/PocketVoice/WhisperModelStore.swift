@@ -237,6 +237,16 @@ extension WhisperModelStore {
             guard sourceURL.lastPathComponent == descriptor.fileName else {
                 throw WhisperModelStoreError.sourceNameMismatch
             }
+            let didAccessSecurityScope = sourceURL.startAccessingSecurityScopedResource()
+            defer {
+                if didAccessSecurityScope {
+                    sourceURL.stopAccessingSecurityScopedResource()
+                }
+            }
+            // Do not hand attacker-controlled special files to Foundation. In particular,
+            // coordinating a FIFO can block before the accessor reaches our O_NONBLOCK open.
+            // The coordinated copy repeats all path/descriptor checks as the TOCTOU authority.
+            try requireRegularSourcePath(sourceURL)
             let directory = try openPrivateDirectory(rootDirectory, create: true)
             defer {
                 _ = Darwin.close(directory.root)
@@ -269,12 +279,6 @@ extension WhisperModelStore {
             stagingFD = try createStagingFile(in: directory.root, named: stagingLeaf)
             stagingExists = true
 
-            let didAccessSecurityScope = sourceURL.startAccessingSecurityScopedResource()
-            defer {
-                if didAccessSecurityScope {
-                    sourceURL.stopAccessingSecurityScopedResource()
-                }
-            }
             try requireLocallyMaterializedSource(sourceURL)
 
             try await coordinatedCopy(
@@ -707,6 +711,28 @@ extension WhisperModelStore {
                 throw error
             } catch {
                 throw WhisperModelStoreError.sourceUnavailable
+            }
+        }
+
+        private static func requireRegularSourcePath(_ sourceURL: URL) throws {
+            let identity: POSIXFileIdentity
+            do {
+                guard let sourceIdentity = try pathIdentity(sourceURL) else {
+                    throw WhisperModelStoreError.sourceUnavailable
+                }
+                identity = sourceIdentity
+            } catch let error as WhisperModelStoreError {
+                switch error {
+                case .sourceUnavailable:
+                    throw error
+                default:
+                    throw WhisperModelStoreError.sourceUnavailable
+                }
+            } catch {
+                throw WhisperModelStoreError.sourceUnavailable
+            }
+            guard identity.isRegularFile else {
+                throw WhisperModelStoreError.sourceNotRegularFile
             }
         }
 
