@@ -369,44 +369,46 @@ test('401/403, 429, and outages are typed and never cached', async () => {
 });
 
 test('deadline aborts a hanging fetch without exposing transport details', async () => {
-  const resolver = createSentiTargetMembershipResolver({
-    apiBaseUrl: BASE,
-    timeoutMs: 5,
-    fetch: async (_url, { signal }) => new Promise((resolve, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('deadline-transport-secret')), { once: true });
-    }),
-  });
-  await assert.rejects(
-    resolver({ sessionId: SESSION, authorization: AUTHORIZATION }),
-    (error) => error instanceof SentiTargetMembershipUnavailableError && !String(error).includes('secret'),
-  );
-
-  let cancelled = 0;
-  const bodyResolver = createSentiTargetMembershipResolver({
-    apiBaseUrl: BASE,
-    timeoutMs: 5,
-    fetch: async () => ({
-      status: 200,
-      headers: new Headers(CONTRACT_HEADERS),
-      body: {
-        getReader: () => ({
-          read: () => new Promise(() => {}),
-          cancel: () => { cancelled += 1; return Promise.resolve(); },
-          releaseLock() {},
-        }),
-      },
-    }),
-  });
-  const keepEventLoopAlive = setInterval(() => {}, 50);
+  // AbortSignal.timeout() deliberately uses an unref'd timer. Keep one referenced handle for both deliberately hanging
+  // seams so Node cannot declare the test complete before the native abort fires (as hosted CI correctly caught).
+  const keepEventLoopAlive = setInterval(() => {}, 1_000);
   try {
+    const resolver = createSentiTargetMembershipResolver({
+      apiBaseUrl: BASE,
+      timeoutMs: 5,
+      fetch: async (_url, { signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('deadline-transport-secret')), { once: true });
+      }),
+    });
+    await assert.rejects(
+      resolver({ sessionId: SESSION, authorization: AUTHORIZATION }),
+      (error) => error instanceof SentiTargetMembershipUnavailableError && !String(error).includes('secret'),
+    );
+
+    let cancelled = 0;
+    const bodyResolver = createSentiTargetMembershipResolver({
+      apiBaseUrl: BASE,
+      timeoutMs: 5,
+      fetch: async () => ({
+        status: 200,
+        headers: new Headers(CONTRACT_HEADERS),
+        body: {
+          getReader: () => ({
+            read: () => new Promise(() => {}),
+            cancel: () => { cancelled += 1; return Promise.resolve(); },
+            releaseLock() {},
+          }),
+        },
+      }),
+    });
     await assert.rejects(
       bodyResolver({ sessionId: SESSION, authorization: AUTHORIZATION }),
       SentiTargetMembershipUnavailableError,
     );
+    assert.ok(cancelled >= 1, 'the same deadline also cancels a body stalled after response headers');
   } finally {
     clearInterval(keepEventLoopAlive);
   }
-  assert.ok(cancelled >= 1, 'the same deadline also cancels a body stalled after response headers');
 });
 
 test('positive cache isolates exact credential+target, expires, and evicts by bounded LRU', async () => {
