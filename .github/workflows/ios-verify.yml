@@ -70,6 +70,12 @@ jobs:
     name: Hosted app build and tests
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      IOS_BUNDLE_ID: "com.plexaura.sentipocket.app"
+      IOS_MARKETING_VERSION: "0.1.0"
+      IOS_BUILD_NUMBER: "4242"
+      IOS_API_URL: "https://api.ci.invalid"
+      IOS_GATEWAY_URL: "https://gateway.ci.invalid"
     steps:
       - uses: actions/checkout@v4
       - name: Validate iOS release tooling
@@ -88,6 +94,8 @@ jobs:
               exit 1
             fi
           done
+      - name: Run unsigned verifier synthetic tests
+        run: python3 scripts/ios/tests/verify_unsigned_release_test.py
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project
@@ -102,7 +110,55 @@ jobs:
           -scheme SentiPocketApp
           -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
           -resolvePackageDependencies
+      - name: Capture and verify unsigned device build settings
+        shell: bash
+        run: |
+          set -u
+
+          capture_and_verify_settings() {
+            configuration="$1"
+            aps_environment="$2"
+            derived_data="$3"
+            settings_json="$4"
+
+            xcodebuild -quiet \
+              -project apps/SentiPocketApp/SentiPocketApp.xcodeproj \
+              -scheme SentiPocketApp \
+              -configuration "$configuration" \
+              -destination 'generic/platform=iOS' \
+              -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+              -derivedDataPath "$derived_data" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              DEVELOPMENT_TEAM= \
+              ONLY_ACTIVE_ARCH=NO \
+              "PRODUCT_BUNDLE_IDENTIFIER=$IOS_BUNDLE_ID" \
+              "MARKETING_VERSION=$IOS_MARKETING_VERSION" \
+              "CURRENT_PROJECT_VERSION=$IOS_BUILD_NUMBER" \
+              "SENTI_API_URL=$IOS_API_URL" \
+              "SENTI_GATEWAY_URL=$IOS_GATEWAY_URL" \
+              -showBuildSettings -json >"$settings_json"
+
+            python3 scripts/ios/verify_unsigned_release.py settings \
+              --settings-json "$settings_json" \
+              --configuration "$configuration" \
+              --aps-environment "$aps_environment" \
+              --bundle-id "$IOS_BUNDLE_ID" \
+              --marketing-version "$IOS_MARKETING_VERSION" \
+              --build-number "$IOS_BUILD_NUMBER" \
+              --api-url "$IOS_API_URL" \
+              --gateway-url "$IOS_GATEWAY_URL" \
+              --products-root "$derived_data/Build/Products"
+          }
+
+          capture_and_verify_settings Debug development \
+            "$RUNNER_TEMP/DebugDeviceDerivedData" \
+            "$RUNNER_TEMP/SentiPocketApp-Debug-settings.json"
+          capture_and_verify_settings Release production \
+            "$RUNNER_TEMP/ReleaseDeviceDerivedData" \
+            "$RUNNER_TEMP/SentiPocketApp-Release-settings.json"
       - name: Build unsigned Release device closure
+        shell: bash
         run: >-
           xcodebuild
           -project apps/SentiPocketApp/SentiPocketApp.xcodeproj
@@ -115,10 +171,26 @@ jobs:
           CODE_SIGNING_REQUIRED=NO
           DEVELOPMENT_TEAM=
           ONLY_ACTIVE_ARCH=NO
-          APS_ENVIRONMENT=production
-          SENTI_API_URL=https://api.ci.invalid
-          SENTI_GATEWAY_URL=https://gateway.ci.invalid
+          "PRODUCT_BUNDLE_IDENTIFIER=$IOS_BUNDLE_ID"
+          "MARKETING_VERSION=$IOS_MARKETING_VERSION"
+          "CURRENT_PROJECT_VERSION=$IOS_BUILD_NUMBER"
+          "SENTI_API_URL=$IOS_API_URL"
+          "SENTI_GATEWAY_URL=$IOS_GATEWAY_URL"
           build
+      - name: Verify unsigned Release bundle
+        shell: bash
+        run: |
+          python3 scripts/ios/verify_unsigned_release.py bundle \
+            --settings-json "$RUNNER_TEMP/SentiPocketApp-Release-settings.json" \
+            --source-privacy apps/SentiPocketApp/Resources/PrivacyInfo.xcprivacy \
+            --configuration Release \
+            --aps-environment production \
+            --bundle-id "$IOS_BUNDLE_ID" \
+            --marketing-version "$IOS_MARKETING_VERSION" \
+            --build-number "$IOS_BUILD_NUMBER" \
+            --api-url "$IOS_API_URL" \
+            --gateway-url "$IOS_GATEWAY_URL" \
+            --products-root "$RUNNER_TEMP/ReleaseDeviceDerivedData/Build/Products"
       - name: Build simulator closure
         run: >-
           xcodebuild
