@@ -112,7 +112,8 @@ public final class SentiCallManager: NSObject {
         pushRegistry.desiredPushTypes = [.voIP]
     }
 
-    /// Hermetic lifecycle-test initializer: no PushKit registration and no real CallKit report side effects.
+    /// Hermetic lifecycle-test initializer: no PushKit registration, provider delegate callbacks, or real CallKit
+    /// report side effects. Tests invoke delegate methods directly when exercising provider lifecycle behavior.
     init(
         provider: CXProvider,
         currentVoipToken: @escaping () -> String? = { nil },
@@ -131,7 +132,6 @@ public final class SentiCallManager: NSObject {
         self.reportEndedCall = reportEndedCall
         self.audioActivationTimeoutNanoseconds = audioActivationTimeoutNanoseconds
         super.init()
-        provider.setDelegate(self, queue: nil)
     }
 
     /// PushKit retains the current token. Replaying it closes the killed-launch ordering where the delegate callback
