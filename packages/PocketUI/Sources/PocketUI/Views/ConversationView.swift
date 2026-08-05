@@ -47,9 +47,9 @@ public struct ConversationView: View {
                         .font(.title2.weight(.bold))
                         .accessibilityAddTraits(.isHeader)
 
-                    ForEach(state.bundle.summary.perAgent, id: \.agentId) { agent in
+                    ForEach(state.bundle.summary.perAgent, id: \.pocketOpaqueIdentity) { agent in
                         Section {
-                            ForEach(agent.claims) { claim in
+                            ForEach(agent.claims, id: \.pocketOpaqueIdentity) { claim in
                                 GroundedClaimRow(
                                     claim: claim,
                                     evidenceIndex: evidenceIndex,
@@ -404,5 +404,13 @@ private struct GroundedClaimRow: View {
         }
         .padding(.vertical, 4)
     }
+}
+
+private extension AgentSummary {
+    var pocketOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(agentId) }
+}
+
+private extension Claim {
+    var pocketOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(id) }
 }
 #endif

@@ -5,6 +5,7 @@ import PocketCall
 import PocketContracts
 import PocketReasoning
 import PocketDialVoice
+import PocketSyncClient
 
 // DialHost — the app-lifetime composition wiring for DIALS (Forge, onAnswered hookup part-b). With a trusted gateway
 // configured, it owns SentiCallManager (its PKPushRegistry delegate must live the whole app) + DialCoordinator and
@@ -282,7 +283,7 @@ final class DialHost: ObservableObject {
     /// Bind PushKit registration and dial hydration to the exact session selected from SessionListCoordinator's
     /// current authorized row allowlist. Nil or a selection change cancels the old in-flight flow and registrar.
     func selectSession(_ sessionId: String?) {
-        guard selectedSessionId != sessionId else { return }
+        guard !UTF8ExactIdentity.matches(selectedSessionId, sessionId) else { return }
 
         closeLocalAuthority()
         selectedSessionId = nil
@@ -319,7 +320,7 @@ final class DialHost: ObservableObject {
     }
 
     private func sessionAuthorizationRevoked(_ sessionId: String) {
-        guard selectedSessionId == sessionId else { return }
+        guard UTF8ExactIdentity.matches(selectedSessionId, sessionId) else { return }
         closeLocalAuthority()
         selectedSessionId = nil
     }
@@ -528,11 +529,23 @@ final class DialHost: ObservableObject {
         onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in },
         isWriteAuthorized: @escaping @MainActor () -> Bool = { true }
     ) async -> DialOutcome {
-        let reasoner = ProviderDialReasoner(
-            provider: GatewayReasoningProvider(client: GatewayReasoningHTTPClient(
+        let tokenProvider: @Sendable () -> String? = { SessionTokenStore.load() }
+        let verifiedReasoning = VerifiedGatewayReasoningProvider(
+            expectedSessionId: ring.core.sessionId,
+            gateway: UnboundGatewayReasoningProvider(client: GatewayReasoningHTTPClient(
                 apiBaseURL: gatewayURL,
+                tokenProvider: tokenProvider,
                 onReauthenticationRequired: onReauthenticationRequired
-            )))
+            )),
+            checkpointTransport: HTTPCheckpointTransport(
+                gatewayBaseURL: gatewayURL,
+                urlSession: SentiHTTPTransportPolicy.checkpointSession,
+                tokenProvider: tokenProvider
+            ),
+            tokenProvider: tokenProvider,
+            onReauthenticationRequired: onReauthenticationRequired
+        )
+        let reasoner = ProviderDialReasoner(provider: verifiedReasoning)
         let voice = LiveDialVoice(reasoner: reasoner,
                                   sessionId: ring.core.sessionId,
                                   checkpointId: ring.core.checkpointId,
@@ -615,7 +628,7 @@ final class SelectedSessionDialHydrator {
         }
 
         let ring = try await hydrateState(state)
-        guard ring.core.sessionId == incomingCore.sessionId,
+        guard UTF8ExactIdentity.matches(ring.core.sessionId, incomingCore.sessionId),
               ring.core.binding == incomingFence,
               selectionGate.permits(ring.core.sessionId),
               isBindingAuthorized(ring.core.sessionId, incomingFence) else {
@@ -638,7 +651,7 @@ final class DialSessionSelectionGate: @unchecked Sendable {
 
     func permits(_ sessionId: String) -> Bool {
         lock.lock()
-        let permitted = self.sessionId == sessionId
+        let permitted = UTF8ExactIdentity.matches(self.sessionId, sessionId)
         lock.unlock()
         return permitted
     }
@@ -674,7 +687,7 @@ struct DialCallLifecycle {
     }
 
     mutating func answered(callUUID: UUID, dialId: String, revision: UInt64) -> AnswerResult {
-        guard reported[callUUID] == dialId,
+        guard UTF8ExactIdentity.matches(reported[callUUID], dialId),
               startedCallUUID == nil,
               pendingAnswer == nil else { return .rejected }
         let ready = Ready(callUUID: callUUID, dialId: dialId, revision: revision)

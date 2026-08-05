@@ -16,7 +16,8 @@ public struct ReceiptTrustStore: Equatable, Sendable {
     init(signingKeys: [TrustedReceiptSigningKey]) {
         let ids = signingKeys.map(\.signingKeyId)
         self.signingKeys = signingKeys
-        self.isStructurallyValid = !ids.contains(where: \.isEmpty) && Set(ids).count == ids.count
+        self.isStructurallyValid = !ids.contains(where: \.isEmpty)
+            && Set(ids.map(OpaqueUTF8Identity.init)).count == ids.count
     }
 }
 
@@ -55,13 +56,13 @@ public struct ReceiptPresentation: Equatable, Sendable {
         guard receipt.isStructurallyValid() else {
             return Self(status: .invalid(detail: "Receipt fields do not match its declared status."))
         }
-        guard receipt.proposalId == proposal.id else {
+        guard OpaqueUTF8Identity.matches(receipt.proposalId, proposal.id) else {
             return Self(status: .invalid(detail: "Receipt proposal identity does not match the reviewed proposal."))
         }
-        guard receipt.targetSessionId == proposal.targetSessionId else {
+        guard OpaqueUTF8Identity.matches(receipt.targetSessionId, proposal.targetSessionId) else {
             return Self(status: .invalid(detail: "Receipt target session does not match the reviewed proposal."))
         }
-        guard receipt.confirmedProposalHash == proposal.proposalHash else {
+        guard OpaqueUTF8Identity.matches(receipt.confirmedProposalHash, proposal.proposalHash) else {
             return Self(status: .invalid(detail: "Receipt hash does not match the proposal you confirmed."))
         }
         guard receipt.confirmedByHumanAt >= proposal.createdAt else {
@@ -94,7 +95,9 @@ public struct ReceiptPresentation: Equatable, Sendable {
             guard trustStore.isStructurallyValid else {
                 return Self(status: .invalid(detail: "Receipt trust store contains duplicate or invalid key identities."))
             }
-            guard let trustedKey = trustStore.signingKeys.first(where: { $0.signingKeyId == signingKeyId }) else {
+            guard let trustedKey = trustStore.signingKeys.first(where: {
+                OpaqueUTF8Identity.matches($0.signingKeyId, signingKeyId)
+            }) else {
                 return Self(status: .invalid(detail: "Receipt signing key is not trusted."))
             }
 

@@ -94,7 +94,7 @@ public struct SessionListPresentationState: Equatable, Sendable {
         let reportedCount = resultCount ?? sessions.count
         let ids = sessions.map(\.sessionId)
         let identitiesAreValid = ids.allSatisfy { $0.pocketNonblank != nil }
-            && Set(ids).count == ids.count
+            && Set(ids.map(OpaqueUTF8Identity.init)).count == ids.count
         let countIsValid = reportedCount >= 0 && reportedCount == sessions.count
         let sourceAllowsContent: Bool
         if case .unavailable = provenance {
@@ -116,7 +116,8 @@ public struct SessionListPresentationState: Equatable, Sendable {
 }
 
 public struct SessionRowPresentation: Equatable, Identifiable, Sendable {
-    public let id: String
+    public let id: OpaqueUTF8Identity
+    public let sessionId: String
     public let title: String
     public let summary: String?
     public let status: String
@@ -127,7 +128,8 @@ public struct SessionRowPresentation: Equatable, Identifiable, Sendable {
     public let lastActivity: ParsedSessionTimestamp?
 
     fileprivate init(_ session: SessionSummary) {
-        self.id = session.sessionId
+        self.id = OpaqueUTF8Identity(session.sessionId)
+        self.sessionId = session.sessionId
         self.title = session.title.pocketNonblank ?? "Untitled session"
         self.summary = session.summaryText.pocketNonblank
         self.status = session.status
@@ -159,18 +161,22 @@ public struct SessionActivityPresentationState: Equatable, Sendable {
         isRefreshing: Bool = false,
         failure: SessionLoadFailure? = nil
     ) {
-        let eventSessionsMatch = eventPage.events.allSatisfy { $0.sessionId == sessionId }
-        let actionSessionsMatch = actionPage.sessionId == sessionId
-            && actionPage.actions.allSatisfy { $0.sessionId == sessionId }
+        let eventSessionsMatch = eventPage.events.allSatisfy {
+            OpaqueUTF8Identity.matches($0.sessionId, sessionId)
+        }
+        let actionSessionsMatch = OpaqueUTF8Identity.matches(actionPage.sessionId, sessionId)
+            && actionPage.actions.allSatisfy {
+                OpaqueUTF8Identity.matches($0.sessionId, sessionId)
+            }
         let eventIDs = eventPage.events.map(\.id)
         let eventSequences = eventPage.events.map(\.sequenceId)
         let actionIDs = actionPage.actions.map(\.id)
         let identitiesAreValid = sessionId.pocketNonblank != nil
             && eventIDs.allSatisfy { $0.pocketNonblank != nil }
             && actionIDs.allSatisfy { $0.pocketNonblank != nil }
-            && Set(eventIDs).count == eventIDs.count
+            && Set(eventIDs.map(OpaqueUTF8Identity.init)).count == eventIDs.count
             && Set(eventSequences).count == eventSequences.count
-            && Set(actionIDs).count == actionIDs.count
+            && Set(actionIDs.map(OpaqueUTF8Identity.init)).count == actionIDs.count
         let sourceAllowsContent: Bool
         if case .unavailable = provenance {
             sourceAllowsContent = false
@@ -203,6 +209,16 @@ public struct SessionEventRowPresentation: Equatable, Identifiable, Sendable {
     public struct ID: Hashable, Sendable {
         public let sessionId: String
         public let eventId: String
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            OpaqueUTF8Identity.matches(lhs.sessionId, rhs.sessionId)
+                && OpaqueUTF8Identity.matches(lhs.eventId, rhs.eventId)
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(OpaqueUTF8Identity(sessionId))
+            hasher.combine(OpaqueUTF8Identity(eventId))
+        }
     }
 
     public let id: ID
@@ -232,6 +248,16 @@ public struct SessionActionRowPresentation: Equatable, Identifiable, Sendable {
     public struct ID: Hashable, Sendable {
         public let sessionId: String
         public let actionId: String
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            OpaqueUTF8Identity.matches(lhs.sessionId, rhs.sessionId)
+                && OpaqueUTF8Identity.matches(lhs.actionId, rhs.actionId)
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(OpaqueUTF8Identity(sessionId))
+            hasher.combine(OpaqueUTF8Identity(actionId))
+        }
     }
 
     public let id: ID

@@ -34,6 +34,16 @@ public struct ProposalAuthorizationContext: Equatable, Sendable {
         self.evaluatedAt = evaluatedAt
         self.validUntil = validUntil
     }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        OpaqueUTF8Identity.matches(lhs.id, rhs.id)
+            && OpaqueUTF8Identity.matches(lhs.confirmationChallenge, rhs.confirmationChallenge)
+            && OpaqueUTF8Identity.matches(lhs.expectedTargetSessionId, rhs.expectedTargetSessionId)
+            && lhs.expectedTargetSequence == rhs.expectedTargetSequence
+            && lhs.oldestAllowedProposalDate == rhs.oldestAllowedProposalDate
+            && lhs.evaluatedAt == rhs.evaluatedAt
+            && lhs.validUntil == rhs.validUntil
+    }
 }
 
 public struct ProposalValidationState: Equatable, Sendable {
@@ -41,6 +51,12 @@ public struct ProposalValidationState: Equatable, Sendable {
         let context: ProposalAuthorizationContext
         let proposalId: String
         let proposalHash: String
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.context == rhs.context
+                && OpaqueUTF8Identity.matches(lhs.proposalId, rhs.proposalId)
+                && OpaqueUTF8Identity.matches(lhs.proposalHash, rhs.proposalHash)
+        }
     }
 
     private enum Status: Equatable, Sendable {
@@ -78,7 +94,7 @@ public struct ProposalValidationState: Equatable, Sendable {
               proposal.createdAt <= context.evaluatedAt else {
             return .invalid(reason: "Proposal is outside the authorized freshness window.")
         }
-        guard proposal.targetSessionId == context.expectedTargetSessionId else {
+        guard OpaqueUTF8Identity.matches(proposal.targetSessionId, context.expectedTargetSessionId) else {
             return .invalid(reason: "Proposal target session is not authorized for this checkpoint.")
         }
         guard proposal.targetSequence == context.expectedTargetSequence else {
@@ -103,9 +119,12 @@ public struct ProposalValidationState: Equatable, Sendable {
         guard case .authorized(let authorization) = status else { return false }
         return currentDate >= authorization.context.evaluatedAt
             && currentDate < authorization.context.validUntil
-            && authorization.proposalId == proposal.id
-            && authorization.proposalHash == proposal.proposalHash
-            && authorization.context.expectedTargetSessionId == proposal.targetSessionId
+            && OpaqueUTF8Identity.matches(authorization.proposalId, proposal.id)
+            && OpaqueUTF8Identity.matches(authorization.proposalHash, proposal.proposalHash)
+            && OpaqueUTF8Identity.matches(
+                authorization.context.expectedTargetSessionId,
+                proposal.targetSessionId
+            )
             && authorization.context.expectedTargetSequence == proposal.targetSequence
     }
 
@@ -134,7 +153,8 @@ public enum ProposalReadBackState: Equatable, Sendable {
 
     public func completedExactly(_ proposal: ActionProposal) -> Bool {
         guard case .completed(_, let proposalId, let proposalHash) = self else { return false }
-        return proposalId == proposal.id && proposalHash == proposal.proposalHash
+        return OpaqueUTF8Identity.matches(proposalId, proposal.id)
+            && OpaqueUTF8Identity.matches(proposalHash, proposal.proposalHash)
     }
 }
 
@@ -220,17 +240,19 @@ public final class ProposalConfirmationLedger: @unchecked Sendable, Equatable {
     }
 
     private let lock = NSLock()
-    private var entries: [String: Entry] = [:]
+    private var entries: [OpaqueUTF8Identity: Entry] = [:]
 
     public init(consumedConfirmations: [ConsumedProposalConfirmation] = []) {
         for confirmation in consumedConfirmations {
-            switch entries[confirmation.proposalId] {
+            let identity = OpaqueUTF8Identity(confirmation.proposalId)
+            switch entries[identity] {
             case nil:
-                entries[confirmation.proposalId] = .consumed(proposalHash: confirmation.proposalHash)
-            case .consumed(let registeredHash) where registeredHash == confirmation.proposalHash:
+                entries[identity] = .consumed(proposalHash: confirmation.proposalHash)
+            case .consumed(let registeredHash)
+                where OpaqueUTF8Identity.matches(registeredHash, confirmation.proposalHash):
                 break
             case .available, .reading, .ready, .consumed, .submitting, .revoked:
-                entries[confirmation.proposalId] = .revoked
+                entries[identity] = .revoked
             }
         }
     }
@@ -241,15 +263,16 @@ public final class ProposalConfirmationLedger: @unchecked Sendable, Equatable {
 
     fileprivate func register(proposalId: String, proposalHash: String) -> Bool {
         withLock {
-            switch entries[proposalId] {
+            let identity = OpaqueUTF8Identity(proposalId)
+            switch entries[identity] {
             case nil:
-                entries[proposalId] = .available(proposalHash: proposalHash)
+                entries[identity] = .available(proposalHash: proposalHash)
                 return true
             case .available(let registeredHash),
                  .reading(let registeredHash, _),
                  .ready(let registeredHash, _):
-                guard registeredHash == proposalHash else {
-                    entries[proposalId] = .revoked
+                guard OpaqueUTF8Identity.matches(registeredHash, proposalHash) else {
+                    entries[identity] = .revoked
                     return false
                 }
                 return true
@@ -261,10 +284,11 @@ public final class ProposalConfirmationLedger: @unchecked Sendable, Equatable {
 
     fileprivate func beginReadBack(proposalId: String, proposalHash: String, attemptId: UUID) -> Bool {
         withLock {
-            switch entries[proposalId] {
+            let identity = OpaqueUTF8Identity(proposalId)
+            switch entries[identity] {
             case .available(let registeredHash), .ready(let registeredHash, _):
-                guard registeredHash == proposalHash else { return false }
-                entries[proposalId] = .reading(proposalHash: proposalHash, attemptId: attemptId)
+                guard OpaqueUTF8Identity.matches(registeredHash, proposalHash) else { return false }
+                entries[identity] = .reading(proposalHash: proposalHash, attemptId: attemptId)
                 return true
             case .reading, .consumed, .submitting, .revoked, nil:
                 return false
@@ -274,53 +298,60 @@ public final class ProposalConfirmationLedger: @unchecked Sendable, Equatable {
 
     fileprivate func completeReadBack(proposalId: String, proposalHash: String, attemptId: UUID) -> Bool {
         withLock {
-            guard case .reading(let registeredHash, let activeAttemptId) = entries[proposalId],
-                  registeredHash == proposalHash,
+            let identity = OpaqueUTF8Identity(proposalId)
+            guard case .reading(let registeredHash, let activeAttemptId) = entries[identity],
+                  OpaqueUTF8Identity.matches(registeredHash, proposalHash),
                   activeAttemptId == attemptId else { return false }
-            entries[proposalId] = .ready(proposalHash: proposalHash, attemptId: attemptId)
+            entries[identity] = .ready(proposalHash: proposalHash, attemptId: attemptId)
             return true
         }
     }
 
     fileprivate func failReadBack(proposalId: String, proposalHash: String, attemptId: UUID) -> Bool {
         withLock {
-            guard case .reading(let registeredHash, let activeAttemptId) = entries[proposalId],
-                  registeredHash == proposalHash,
+            let identity = OpaqueUTF8Identity(proposalId)
+            guard case .reading(let registeredHash, let activeAttemptId) = entries[identity],
+                  OpaqueUTF8Identity.matches(registeredHash, proposalHash),
                   activeAttemptId == attemptId else { return false }
-            entries[proposalId] = .available(proposalHash: proposalHash)
+            entries[identity] = .available(proposalHash: proposalHash)
             return true
         }
     }
 
     fileprivate func consumeReady(proposalId: String, proposalHash: String, attemptId: UUID) -> Bool {
         withLock {
-            guard case .ready(let registeredHash, let completedAttemptId) = entries[proposalId],
-                  registeredHash == proposalHash,
+            let identity = OpaqueUTF8Identity(proposalId)
+            guard case .ready(let registeredHash, let completedAttemptId) = entries[identity],
+                  OpaqueUTF8Identity.matches(registeredHash, proposalHash),
                   completedAttemptId == attemptId else { return false }
-            entries[proposalId] = .consumed(proposalHash: proposalHash)
+            entries[identity] = .consumed(proposalHash: proposalHash)
             return true
         }
     }
 
     fileprivate func beginSubmission(proposalId: String, proposalHash: String) -> Bool {
         withLock {
-            guard case .consumed(let registeredHash) = entries[proposalId],
-                  registeredHash == proposalHash else { return false }
-            entries[proposalId] = .submitting(proposalHash: proposalHash)
+            let identity = OpaqueUTF8Identity(proposalId)
+            guard case .consumed(let registeredHash) = entries[identity],
+                  OpaqueUTF8Identity.matches(registeredHash, proposalHash) else { return false }
+            entries[identity] = .submitting(proposalHash: proposalHash)
             return true
         }
     }
 
     fileprivate func revoke(proposalId: String) {
         withLock {
-            entries[proposalId] = .revoked
+            entries[OpaqueUTF8Identity(proposalId)] = .revoked
         }
     }
 
     fileprivate func isReady(proposalId: String, proposalHash: String, attemptId: UUID) -> Bool {
         withLock {
-            guard case .ready(let registeredHash, let completedAttemptId) = entries[proposalId] else { return false }
-            return registeredHash == proposalHash && completedAttemptId == attemptId
+            guard case .ready(let registeredHash, let completedAttemptId) = entries[OpaqueUTF8Identity(proposalId)] else {
+                return false
+            }
+            return OpaqueUTF8Identity.matches(registeredHash, proposalHash)
+                && completedAttemptId == attemptId
         }
     }
 
@@ -416,8 +447,8 @@ public struct ProposalConfirmationGate: Equatable, Sendable {
         }
         guard case .speaking(let activeAttemptId, let proposalId, let proposalHash) = readBack,
               activeAttemptId == attempt.id,
-              proposalId == currentProposal.id,
-              proposalHash == currentProposal.proposalHash,
+              OpaqueUTF8Identity.matches(proposalId, currentProposal.id),
+              OpaqueUTF8Identity.matches(proposalHash, currentProposal.proposalHash),
               ledger.completeReadBack(
                 proposalId: proposalId,
                 proposalHash: proposalHash,
@@ -491,8 +522,11 @@ public struct ProposalConfirmationGate: Equatable, Sendable {
     public mutating func markSubmitting(_ intent: ActionConfirmationIntent, at currentDate: Date) -> Bool {
         guard phase == .ready,
               intent.proposal == proposal,
-              intent.authorizationId == validation.authorizationId,
-              intent.confirmationChallenge == validation.authorizationContext?.confirmationChallenge,
+              OpaqueUTF8Identity.matches(intent.authorizationId, validation.authorizationId),
+              OpaqueUTF8Identity.matches(
+                  intent.confirmationChallenge,
+                  validation.authorizationContext?.confirmationChallenge
+              ),
               validation.matches(proposal, at: currentDate),
               ledger.beginSubmission(proposalId: proposal.id, proposalHash: proposal.proposalHash) else { return false }
         phase = .submitting

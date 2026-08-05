@@ -84,6 +84,49 @@ import Foundation
 import CryptoKit
 #endif
 
+/// Hashable identity for opaque protocol strings whose authority is defined by their original UTF-8 bytes.
+///
+/// Swift `String` equality intentionally treats canonically equivalent Unicode spellings as equal. That behavior is
+/// correct for human language but unsafe for session, checkpoint, event, action, dial, and credential identifiers.
+/// Construct this value only after the caller has applied the identifier's protocol-specific shape and size budget.
+public struct OpaqueUTF8Identity: Hashable, Sendable {
+    public let rawValue: String
+    private let bytes: [UInt8]
+
+    public init(_ rawValue: String) {
+        self.rawValue = rawValue
+        self.bytes = Array(rawValue.utf8)
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.bytes == rhs.bytes
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(bytes)
+    }
+
+    public static func matches(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.utf8.elementsEqual(rhs.utf8)
+    }
+
+    public static func matches(_ lhs: String?, _ rhs: String) -> Bool {
+        guard let lhs else { return false }
+        return matches(lhs, rhs)
+    }
+
+    public static func matches(_ lhs: String?, _ rhs: String?) -> Bool {
+        switch (lhs, rhs) {
+        case (.none, .none):
+            return true
+        case (.some(let lhs), .some(let rhs)):
+            return matches(lhs, rhs)
+        default:
+            return false
+        }
+    }
+}
+
 public enum PocketContracts {
     public static let version = "0.1.8"
 }
@@ -322,6 +365,14 @@ public extension PocketBundle {
         func tooLong(_ s: String, _ cap: Int) -> Bool { s.utf8.count > cap }   // caps measured in UTF-8 BYTES
         // An id must be non-blank AND already-trimmed — whitespace-only or untrimmed ids are invalid identities.
         func malformed(_ id: String) -> Bool { let t = id.trimmingCharacters(in: .whitespacesAndNewlines); return t.isEmpty || t != id }
+        func exactEvidence(_ lhs: EvidenceRef, _ rhs: EvidenceRef) -> Bool {
+            OpaqueUTF8Identity.matches(lhs.id, rhs.id)
+                && OpaqueUTF8Identity.matches(lhs.sessionId, rhs.sessionId)
+                && lhs.sequence == rhs.sequence
+                && OpaqueUTF8Identity.matches(lhs.agentId, rhs.agentId)
+                && OpaqueUTF8Identity.matches(lhs.snippet, rhs.snippet)
+                && lhs.ts == rhs.ts
+        }
 
         // Round-5 DoS: total element + total byte budget across the WHOLE graph, FAIL-FAST before the field scan and
         // before signature canonicalization. (Per-array caps alone don't bound the product agents × claims × bytes.)
@@ -345,7 +396,9 @@ public extension PocketBundle {
 
         if contractsVersion != PocketContracts.version { issues.append(.wrongContractsVersion) }
         if summary.summaryBaselineSchema != PocketBundle.expectedSummarySchema { issues.append(.wrongSummarySchema) }
-        if summary.checkpointId != checkpointId { issues.append(.checkpointIdMismatch) }
+        if !OpaqueUTF8Identity.matches(summary.checkpointId, checkpointId) {
+            issues.append(.checkpointIdMismatch)
+        }
 
         // Sequence range: strictly positive + non-inverted. Top-level evidence must be non-empty.
         if sequenceStart > sequenceEnd { issues.append(.invertedSequenceRange) }
@@ -367,48 +420,65 @@ public extension PocketBundle {
 
         // Top-level evidence — the authoritative UI resolution set: non-blank+trimmed ids, per-field caps, in-session,
         // positive+in-range sequence, sane millisecond-exact dates, GLOBALLY-unique ids.
-        var topSeen = Set<String>()
-        var topById: [String: EvidenceRef] = [:]
+        var topSeen = Set<OpaqueUTF8Identity>()
+        var topById: [OpaqueUTF8Identity: EvidenceRef] = [:]
         for e in evidence {
             if e.id.isEmpty || e.agentId.isEmpty || e.snippet.isEmpty { issues.append(.emptyRequiredField) }
             if malformed(e.id) || malformed(e.agentId) { issues.append(.malformedId) }
             if tooLong(e.id, PocketBundle.capEvId) || tooLong(e.agentId, PocketBundle.capEvId) || tooLong(e.snippet, PocketBundle.capSnippet) { issues.append(.oversizedField) }
-            if e.sessionId != sessionId { issues.append(.evidenceSessionMismatch) }
+            if !OpaqueUTF8Identity.matches(e.sessionId, sessionId) {
+                issues.append(.evidenceSessionMismatch)
+            }
             if e.sequence <= 0 { issues.append(.negativeSequence) }
             if e.sequence < sequenceStart || e.sequence > sequenceEnd { issues.append(.evidenceSequenceOutOfRange) }
             if !PocketBundle.dateIsSaneAndMillisExact(e.ts) { issues.append(ActionReceipt.safeEpochMillis(e.ts) == nil ? .unsaneDate : .subMillisecondDate) }
-            if !topSeen.insert(e.id).inserted { issues.append(.duplicateEvidenceId) }
-            topById[e.id] = e
+            let evidenceIdentity = OpaqueUTF8Identity(e.id)
+            if !topSeen.insert(evidenceIdentity).inserted { issues.append(.duplicateEvidenceId) }
+            topById[evidenceIdentity] = e
         }
 
         // Per-agent: agentIds unique ACROSS agents. Per-agent evidence must be byte-identical to top-level, BOUND to
         // its container (evidence.agentId == the agent), and unique WITHIN the agent's list. Claim ids unique WITHIN
         // the agent; citation ids unique within a claim; fact/inference cited; citations resolve to top-level. (Dedup
         // is per-agent — matching the gateway — so a gateway bundle is never rejected.)
-        var agentIdSeen = Set<String>()
+        var agentIdSeen = Set<OpaqueUTF8Identity>()
         for agent in summary.perAgent {
             if agent.agentId.isEmpty { issues.append(.emptyRequiredField) }
             if malformed(agent.agentId) { issues.append(.malformedId) }
-            if !agentIdSeen.insert(agent.agentId).inserted { issues.append(.duplicateAgentId) }
-            if tooLong(agent.agentId, PocketBundle.capEvId) || tooLong(agent.summary, PocketBundle.capSummary) { issues.append(.oversizedField) }
-            var nestedSeen = Set<String>()
-            for pe in agent.evidence {
-                if topById[pe.id] != pe { issues.append(.perAgentEvidenceMismatch) }
-                if pe.agentId != agent.agentId { issues.append(.perAgentEvidenceForeignAgent) }
-                if !nestedSeen.insert(pe.id).inserted { issues.append(.duplicateEvidenceId) }
+            if !agentIdSeen.insert(OpaqueUTF8Identity(agent.agentId)).inserted {
+                issues.append(.duplicateAgentId)
             }
-            var claimSeen = Set<String>()
+            if tooLong(agent.agentId, PocketBundle.capEvId) || tooLong(agent.summary, PocketBundle.capSummary) { issues.append(.oversizedField) }
+            var nestedSeen = Set<OpaqueUTF8Identity>()
+            for pe in agent.evidence {
+                let evidenceIdentity = OpaqueUTF8Identity(pe.id)
+                if topById[evidenceIdentity].map({ exactEvidence($0, pe) }) != true {
+                    issues.append(.perAgentEvidenceMismatch)
+                }
+                if !OpaqueUTF8Identity.matches(pe.agentId, agent.agentId) {
+                    issues.append(.perAgentEvidenceForeignAgent)
+                }
+                if !nestedSeen.insert(evidenceIdentity).inserted { issues.append(.duplicateEvidenceId) }
+            }
+            var claimSeen = Set<OpaqueUTF8Identity>()
             for claim in agent.claims {
                 if claim.id.isEmpty || claim.text.isEmpty { issues.append(.emptyRequiredField) }
                 if malformed(claim.id) { issues.append(.malformedId) }
                 if tooLong(claim.id, PocketBundle.capStr) || tooLong(claim.text, PocketBundle.capSummary)
                     || claim.evidenceIds.count > PocketBundle.capEvidence
                     || claim.evidenceIds.contains(where: { tooLong($0, PocketBundle.capEvId) }) { issues.append(.oversizedField) }
-                if !claimSeen.insert(claim.id).inserted { issues.append(.duplicateClaimId) }
-                var citeSeen = Set<String>()
-                for cid in claim.evidenceIds where !citeSeen.insert(cid).inserted { issues.append(.duplicateCitationId) }
+                if !claimSeen.insert(OpaqueUTF8Identity(claim.id)).inserted {
+                    issues.append(.duplicateClaimId)
+                }
+                var citeSeen = Set<OpaqueUTF8Identity>()
+                for cid in claim.evidenceIds
+                    where !citeSeen.insert(OpaqueUTF8Identity(cid)).inserted {
+                    issues.append(.duplicateCitationId)
+                }
                 if (claim.kind == .fact || claim.kind == .inference) && claim.evidenceIds.isEmpty { issues.append(.uncitedFactOrInference) }
-                if !claim.evidenceIds.allSatisfy({ topSeen.contains($0) }) { issues.append(.foreignClaimCitation) }
+                if !claim.evidenceIds.allSatisfy({ topSeen.contains(OpaqueUTF8Identity($0)) }) {
+                    issues.append(.foreignClaimCitation)
+                }
             }
         }
 

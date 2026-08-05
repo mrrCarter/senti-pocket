@@ -45,8 +45,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: PocketContracts
+            path: packages/PocketContracts
           - name: PocketCall
             path: packages/PocketCall
+          - name: PocketReasoning
+            path: packages/PocketReasoning
+          - name: PocketUI
+            path: packages/PocketUI
           - name: PocketVoice
             path: packages/PocketVoice
           - name: PocketDialVoice

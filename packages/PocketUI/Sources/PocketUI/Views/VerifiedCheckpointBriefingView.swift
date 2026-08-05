@@ -49,7 +49,7 @@ public struct VerifiedCheckpointBriefingView: View {
                 verificationCard
                 headlineCard
 
-                ForEach(presentation.summary.perAgent, id: \.agentId) { agent in
+                ForEach(presentation.summary.perAgent, id: \.verifiedOpaqueIdentity) { agent in
                     agentCard(agent)
                 }
 
@@ -142,7 +142,7 @@ public struct VerifiedCheckpointBriefingView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            ForEach(agent.claims) { claim in
+            ForEach(agent.claims, id: \.verifiedOpaqueIdentity) { claim in
                 claimRow(claim, agentId: agent.agentId)
             }
         }
@@ -224,5 +224,13 @@ public struct VerifiedCheckpointBriefingView: View {
         let identity = values.map { "\($0.utf8.count):\($0)" }.joined(separator: ".")
         return "pocket.verified-checkpoint.\(kind).\(identity)"
     }
+}
+
+private extension AgentSummary {
+    var verifiedOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(agentId) }
+}
+
+private extension Claim {
+    var verifiedOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(id) }
 }
 #endif

@@ -26,7 +26,7 @@ public actor SessionRepository {
     private var includeArchived = false
     private var nextCursor: String?
     private var hasMore = false
-    private var seenCursors: Set<String> = []
+    private var seenCursors: Set<OpaqueUTF8Identity> = []
     private var loadedAt: Date?
     private var revision: UInt64 = 0
     private var loadingCursor: String?
@@ -65,7 +65,7 @@ public actor SessionRepository {
         self.includeArchived = includeArchived
         nextCursor = validated.nextCursor
         hasMore = validated.hasMore
-        seenCursors = Set(validated.nextCursor.map { [$0] } ?? [])
+        seenCursors = Set(validated.nextCursor.map { [OpaqueUTF8Identity($0)] } ?? [])
         loadedAt = clock()
         return snapshot()
     }
@@ -74,7 +74,7 @@ public actor SessionRepository {
     public func loadMoreSessions() async throws -> SessionListSnapshot {
         guard loadedAt != nil else { throw SessionTransportError.invalidRequest }
         guard hasMore, let cursor = nextCursor else { return snapshot() }
-        guard seenCursors.contains(cursor) else {
+        guard seenCursors.contains(OpaqueUTF8Identity(cursor)) else {
             throw SessionTransportError.invalidData
         }
         guard loadingCursor == nil, loadingRevision == nil else { return snapshot() }
@@ -82,7 +82,7 @@ public actor SessionRepository {
         loadingCursor = cursor
         loadingRevision = operationRevision
         defer {
-            if loadingCursor == cursor, loadingRevision == operationRevision {
+            if OpaqueUTF8Identity.matches(loadingCursor, cursor), loadingRevision == operationRevision {
                 loadingCursor = nil
                 loadingRevision = nil
             }
@@ -93,7 +93,8 @@ public actor SessionRepository {
             limit: pageSize,
             cursor: cursor
         )
-        guard revision == operationRevision, nextCursor == cursor else {
+        guard revision == operationRevision,
+              OpaqueUTF8Identity.matches(nextCursor, cursor) else {
             throw SessionTransportError.cancelled
         }
         let validated = try Self.validate(page: page, expectedArchived: includeArchived)
@@ -103,7 +104,8 @@ public actor SessionRepository {
             throw SessionTransportError.invalidData
         }
         if let newCursor = validated.nextCursor {
-            guard newCursor != cursor, !seenCursors.contains(newCursor) else {
+            guard !OpaqueUTF8Identity.matches(newCursor, cursor),
+                  !seenCursors.contains(OpaqueUTF8Identity(newCursor)) else {
                 throw SessionTransportError.invalidData
             }
         }
@@ -111,7 +113,7 @@ public actor SessionRepository {
         sessions.append(contentsOf: validated.sessions)
         nextCursor = validated.nextCursor
         hasMore = validated.hasMore
-        if let nextCursor { seenCursors.insert(nextCursor) }
+        if let nextCursor { seenCursors.insert(OpaqueUTF8Identity(nextCursor)) }
         loadedAt = clock()
         return snapshot()
     }

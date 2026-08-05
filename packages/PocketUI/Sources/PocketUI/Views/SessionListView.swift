@@ -40,11 +40,11 @@ public struct SessionListView: View {
 
             Section("Your sessions") {
                 ForEach(state.rows) { row in
-                    Button { send(.selectSession(sessionId: row.id)) } label: {
+                    Button { send(.selectSession(sessionId: row.sessionId)) } label: {
                         SessionRow(row: row)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityIdentifier("pocket.sessions.row.\(row.id)")
+                    .accessibilityIdentifier("pocket.sessions.row.\(row.sessionId)")
                     .accessibilityHint("Opens this session")
                     .listRowBackground(PocketPalette.raised)
                 }
@@ -184,7 +184,7 @@ private struct SessionRow: View {
             .font(.caption)
             .foregroundStyle(PocketPalette.textSecondary)
 
-            Text(verbatim: row.id)
+            Text(verbatim: row.sessionId)
                 .font(.caption2.monospaced())
                 .foregroundStyle(PocketPalette.textSecondary)
                 .lineLimit(1)

@@ -2,7 +2,7 @@
 // renders/speaks ReasoningPhase outcomes produced from a real ReasoningProvider, instead of PocketAppModel's
 // #if-DEBUG fixture (L446 static PocketFixtures.briefingPlan / L646 "no cache evidence" refuse).
 //
-// It selects the provider by connectivity (online → GatewayReasoningProvider over relay's gated /brief+/answer;
+// It selects the provider by connectivity (online → the verified checkpoint-bound gateway provider;
 // offline/reconnecting → the honest CachedReasoningProvider), drives the package-tested ReasoningDriver, and
 // publishes a ReasoningPhase the view renders + LABELS by provenance (warden bar #1: a .cachedSample brief is
 // never shown as live). Provider CONSTRUCTION is injected (`selectProvider`) so this compiles + wires today, before
@@ -20,7 +20,7 @@ final class RealReasoningCoordinator: ObservableObject {
 
     private let sessionId: String
     private let checkpointId: String?
-    /// Composition root injects this: `isOnline ? GatewayReasoningProvider(client:) : CachedReasoningProvider(...)`.
+    /// Composition root injects only a checkpoint-bound live provider or an honest unavailable/cached fallback.
     /// A closure (not a stored provider) so connectivity is re-evaluated per request and the concrete clients stay
     /// out of this type — it is complete before relay's PocketSyncClient exists.
     private let selectProvider: @Sendable (_ isOnline: Bool) -> ReasoningProvider

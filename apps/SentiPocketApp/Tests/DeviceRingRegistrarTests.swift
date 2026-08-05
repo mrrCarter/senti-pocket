@@ -915,6 +915,61 @@ final class DeviceRingRegistrarTests: XCTestCase {
         XCTAssertEqual(try state.load().binding?.sessionId, "session-b")
     }
 
+    func test_unicode_canonical_but_byte_distinct_session_rotates_registration() async throws {
+        let composed = "session-caf\u{00E9}"
+        let decomposed = "session-cafe\u{0301}"
+        let client = ScriptedRegistryClient(registerSteps: [
+            .success(receipt(
+                session: composed,
+                bindingId: bindingA,
+                bindingRevision: 1,
+                claimId: claimA,
+                claimRevision: 1
+            )),
+            .success(receipt(
+                session: decomposed,
+                bindingId: bindingB,
+                bindingRevision: 2,
+                claimId: claimB,
+                claimRevision: 2
+            )),
+        ])
+        let (registrar, _, state, _) = makeRegistrar(client: client)
+        await registrar.tokenUpdated("aabbcc")?.value
+        await registrar.selectSession(composed)?.value
+        await registrar.loginCompleted()?.value
+        await registrar.selectSession(decomposed)?.value
+
+        XCTAssertEqual(client.registers.count, 2)
+        XCTAssertTrue(client.registers[0].0.sessionId.utf8.elementsEqual(composed.utf8))
+        XCTAssertTrue(client.registers[1].0.sessionId.utf8.elementsEqual(decomposed.utf8))
+        XCTAssertFalse(client.registers[0].0.sessionId.utf8.elementsEqual(client.registers[1].0.sessionId.utf8))
+        XCTAssertTrue(try XCTUnwrap(state.load().binding).sessionId.utf8.elementsEqual(decomposed.utf8))
+    }
+
+    func test_unicode_canonical_but_byte_distinct_receipt_cannot_commit_pending_intent() async throws {
+        let composed = "session-caf\u{00E9}"
+        let decomposed = "session-cafe\u{0301}"
+        let client = ScriptedRegistryClient(registerSteps: [
+            .success(receipt(
+                session: decomposed,
+                bindingId: bindingA,
+                bindingRevision: 1,
+                claimId: claimA,
+                claimRevision: 1
+            )),
+        ])
+        let (registrar, _, state, _) = makeRegistrar(client: client)
+        await registrar.tokenUpdated("aabbcc")?.value
+        await registrar.selectSession(composed)?.value
+        await registrar.loginCompleted()?.value
+
+        XCTAssertNil(try state.load().binding)
+        let pendingSession = try XCTUnwrap(state.load().pendingRegistration).sessionId
+        XCTAssertTrue(pendingSession.utf8.elementsEqual(composed.utf8))
+        XCTAssertFalse(pendingSession.utf8.elementsEqual(decomposed.utf8))
+    }
+
     func test_fresh_token_after_invalidation_atomically_transfers_old_binding() async throws {
         let client = ScriptedRegistryClient(registerSteps: [
             .success(receipt(

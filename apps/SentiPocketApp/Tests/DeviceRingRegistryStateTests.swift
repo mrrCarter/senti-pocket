@@ -131,6 +131,7 @@ final class DeviceRingRegistryStateTests: XCTestCase {
     private let claimId = "claim_0123456789abcdef0123456789abcdef"
 
     private func binding(
+        sessionId: String = "session-a",
         credential: String = "bearer-a",
         token: String = "aabbcc",
         expiresAt: Date = Date(timeIntervalSince1970: 2_000_000_000),
@@ -139,7 +140,7 @@ final class DeviceRingRegistryStateTests: XCTestCase {
         authorizedLifetime: TimeInterval? = 7 * 24 * 60 * 60
     ) -> DeviceRingBindingRecord {
         DeviceRingBindingRecord(
-            sessionId: "session-a",
+            sessionId: sessionId,
             platform: "apns",
             tokenDigest: DeviceRingFingerprint.digest(token),
             credentialFingerprint: DeviceRingFingerprint.digest(credential),
@@ -159,6 +160,30 @@ final class DeviceRingRegistryStateTests: XCTestCase {
                 )
             }
         )
+    }
+
+    private func pending(sessionId: String) -> DeviceRingPendingRegistration {
+        DeviceRingPendingRegistration(
+            sessionId: sessionId,
+            platform: "apns",
+            tokenDigest: DeviceRingFingerprint.digest("aabbcc"),
+            credentialFingerprint: DeviceRingFingerprint.digest("bearer-a"),
+            ownerVersion: DeviceRingRegistryOwnerContext.version,
+            ownerHandle: DeviceRingFingerprint.digest("owner-a"),
+            idempotencyKey: "01234567-89ab-4def-8123-456789abcdef",
+            expectedBindingId: bindingId,
+            expectedBindingRevision: 7,
+            expectedTokenClaimId: claimId,
+            expectedTokenClaimRevision: 9
+        )
+    }
+
+    func test_binding_and_pending_record_equality_uses_exact_session_bytes() {
+        let composed = "session-caf\u{00E9}"
+        let decomposed = "session-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: Swift String equality is Unicode-canonical")
+        XCTAssertNotEqual(binding(sessionId: composed), binding(sessionId: decomposed))
+        XCTAssertNotEqual(pending(sessionId: composed), pending(sessionId: decomposed))
     }
 
     func test_installation_identity_is_exactly_32_bytes_stable_and_unpadded() throws {
@@ -442,6 +467,30 @@ final class DeviceRingRegistryStateTests: XCTestCase {
         token = "aabbcc"
         selected = "session-b"
         XCTAssertFalse(gate.permits(sessionId: "session-a", fence: record.fence))
+    }
+
+    @MainActor
+    func test_binding_gate_rejects_unicode_canonical_but_byte_distinct_session() throws {
+        let composed = "session-caf\u{00E9}"
+        let decomposed = "session-cafe\u{0301}"
+        let storage = TestDeviceRingSecureStorage()
+        let store = DeviceRingRegistryStateStore(
+            storage: storage,
+            authorityDenyStore: TestDeviceRingAuthorityDenyStore()
+        )
+        let record = binding(sessionId: composed)
+        try store.save(DeviceRingRegistryState(binding: record))
+        let gate = DeviceRingBindingGate(
+            stateStore: store,
+            credentialProvider: { "bearer-a" },
+            voipTokenProvider: { "aabbcc" },
+            isSessionSelected: { _ in true },
+            now: { Date(timeIntervalSince1970: 1_900_000_000) },
+            continuousNow: { 10_000 }
+        )
+
+        XCTAssertTrue(gate.permits(sessionId: composed, fence: record.fence))
+        XCTAssertFalse(gate.permits(sessionId: decomposed, fence: record.fence))
     }
 
     @MainActor

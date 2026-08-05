@@ -32,7 +32,9 @@ struct PocketPhoneView: View {
                 HStack(spacing: 8) { ProgressView(); Text("Reasoning over your checkpoint…").foregroundStyle(.secondary) }
             case .briefingReady(let plan, let provenance):
                 provenanceLabel(provenance)
-                ForEach(plan.segments) { seg in Text(seg.text).font(.subheadline) }
+                ForEach(plan.segments, id: \.sentiOpaqueIdentity) { seg in
+                    Text(seg.text).font(.subheadline)
+                }
             case .answerLoading(let question):
                 HStack(spacing: 8) { ProgressView(); Text("Answering “\(question)”…").foregroundStyle(.secondary) }
             case .answered(let answer, let provenance):
@@ -123,5 +125,9 @@ struct PocketPhoneView: View {
         }
         .padding(.vertical, 4)
     }
+}
+
+private extension BriefingSegment {
+    var sentiOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(id) }
 }
 #endif

@@ -409,6 +409,43 @@ final class PhoneWriteOutboxDurabilityTests: XCTestCase {
         XCTAssertEqual(OutboxStore.load(), persisted, "session B must not mutate session A's confirmed outbox")
     }
 
+    func test_canonically_equal_but_byte_distinct_session_cannot_claim_persisted_intent() {
+        let composedSessionId = "session-caf\u{00E9}"
+        let decomposedSessionId = "session-cafe\u{0301}"
+        XCTAssertEqual(composedSessionId, decomposedSessionId, "precondition: Swift String equality is canonical")
+        XCTAssertFalse(UTF8ExactIdentity.matches(composedSessionId, decomposedSessionId))
+
+        let persisted = makeIntent(
+            sessionId: composedSessionId,
+            message: "Only the byte-exact selected session may retry this"
+        )
+        OutboxStore.save(persisted)
+
+        guard case .foreignSession(let boundSessionId) = persisted.binding(to: decomposedSessionId) else {
+            return XCTFail("a canonical Unicode variant must remain a foreign session")
+        }
+        XCTAssertTrue(UTF8ExactIdentity.matches(boundSessionId, composedSessionId))
+        XCTAssertFalse(UTF8ExactIdentity.matches(boundSessionId, decomposedSessionId))
+
+        let variantSelection = PhoneWriteViewModel(sessionId: decomposedSessionId, client: makeClient())
+        guard case .blockedByPendingSession(let blockedSessionId) = variantSelection.state else {
+            return XCTFail("the byte-distinct selection must be blocked by the persisted owner")
+        }
+        XCTAssertTrue(UTF8ExactIdentity.matches(blockedSessionId, composedSessionId))
+        XCTAssertFalse(UTF8ExactIdentity.matches(blockedSessionId, decomposedSessionId))
+
+        variantSelection.retryPending()
+        variantSelection.draft("Attempt to overwrite the exact owner")
+        variantSelection.cancel()
+
+        guard let restored = OutboxStore.load() else {
+            return XCTFail("retry, draft, and cancel from a byte-distinct session must preserve the outbox")
+        }
+        XCTAssertTrue(UTF8ExactIdentity.matches(restored.proposal.targetSessionId, composedSessionId))
+        XCTAssertFalse(UTF8ExactIdentity.matches(restored.proposal.targetSessionId, decomposedSessionId))
+        XCTAssertTrue(UTF8ExactIdentity.matches(restored.proposal.id, persisted.proposal.id))
+    }
+
     func test_confirm_compare_and_set_cannot_overwrite_an_intent_claimed_after_view_model_init() {
         let sessionB = PhoneWriteViewModel(sessionId: "session-B", client: makeClient())
         let proposalA = PocketWriteClient.makeHumanMessageProposal(
@@ -510,6 +547,42 @@ final class PhoneWriteOutboxDurabilityTests: XCTestCase {
         }
         XCTAssertTrue(message.contains("integrity"))
         XCTAssertNil(OutboxStore.load(), "a structurally invalid local intent must never remain retryable")
+    }
+
+    func test_canonically_equal_but_byte_distinct_confirmation_proposal_id_is_invalidated() {
+        let composedProposalId = "proposal-caf\u{00E9}"
+        let decomposedProposalId = "proposal-cafe\u{0301}"
+        XCTAssertEqual(composedProposalId, decomposedProposalId, "precondition: Swift String equality is canonical")
+        XCTAssertFalse(UTF8ExactIdentity.matches(composedProposalId, decomposedProposalId))
+
+        let createdAt = Date(timeIntervalSince1970: 1_784_000_000)
+        let proposal = ActionProposal(
+            id: composedProposalId,
+            kind: .humanMessage,
+            targetSessionId: "session-A",
+            targetSequence: 0,
+            renderedPreview: "The confirmation must bind the original proposal-id bytes",
+            createdAt: createdAt,
+            sourceQuestionId: nil
+        )
+        let persisted = PersistedWriteIntent(
+            proposal: proposal,
+            confirmation: GovernedWriteConfirmation(
+                proposalId: decomposedProposalId,
+                confirmedProposalHash: proposal.proposalHash,
+                confirmedAt: Date(timeIntervalSince1970: 1_784_000_001)
+            )
+        )
+
+        XCTAssertEqual(persisted.binding(to: "session-A"), .invalid)
+        OutboxStore.save(persisted)
+
+        let restored = PhoneWriteViewModel(sessionId: "session-A", client: makeClient())
+        guard case .refused(let message) = restored.state else {
+            return XCTFail("a byte-distinct confirmation proposal id must be refused")
+        }
+        XCTAssertTrue(message.contains("integrity"))
+        XCTAssertNil(OutboxStore.load(), "the invalid confirmation must be cleared and never become retryable")
     }
 
     /// Regression for the moved persist: a cancelled decision must still leave NOTHING queued. cancel() after the

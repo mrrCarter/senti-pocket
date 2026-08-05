@@ -69,8 +69,12 @@ public struct ReasonedQuestionAnswer: Sendable, Equatable, Identifiable {
 
 /// Relay's `unavailable.nearestTopics[]` = {label, evidenceId}. "Nothing exact, but here's the closest real thing."
 public struct NearestTopic: Sendable, Equatable, Identifiable {
-    public var id: String { evidenceId }
+    public var id: OpaqueUTF8Identity { OpaqueUTF8Identity(evidenceId) }
     public let label: String
     public let evidenceId: String
     public init(label: String, evidenceId: String) { self.label = label; self.evidenceId = evidenceId }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.label == rhs.label && OpaqueUTF8Identity.matches(lhs.evidenceId, rhs.evidenceId)
+    }
 }

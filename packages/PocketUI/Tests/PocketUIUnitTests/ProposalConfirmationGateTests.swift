@@ -306,6 +306,43 @@ final class ProposalConfirmationGateTests: XCTestCase {
         }
     }
 
+    func testCanonicalButByteDistinctTargetSessionIsNotAuthorized() {
+        let composed = "session-caf\u{00E9}"
+        let decomposed = "session-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: ordinary String comparison is canonical")
+        let proposal = PocketUITestFactory.proposal(sessionId: composed)
+        let validation = ProposalValidationState.authorize(
+            proposal,
+            context: context(for: proposal, expectedSessionId: decomposed)
+        )
+
+        XCTAssertNotNil(validation.failureReason)
+        let gate = ProposalConfirmationGate(
+            proposal: proposal,
+            validation: validation,
+            ledger: ProposalConfirmationLedger(),
+            currentDate: now
+        )
+        guard case .invalidated = gate.phase else {
+            return XCTFail("a byte-distinct target must never enter read-back")
+        }
+    }
+
+    func testLedgerKeepsCanonicalButByteDistinctProposalIdsIndependent() {
+        let composed = "proposal-caf\u{00E9}"
+        let decomposed = "proposal-cafe\u{0301}"
+        let first = PocketUITestFactory.proposal(id: composed)
+        let second = PocketUITestFactory.proposal(id: decomposed)
+        let ledger = ProposalConfirmationLedger()
+
+        let firstGate = makeGate(proposal: first, ledger: ledger)
+        let secondGate = makeGate(proposal: second, ledger: ledger)
+
+        XCTAssertEqual(firstGate.phase, .awaitingReadBack)
+        XCTAssertEqual(secondGate.phase, .awaitingReadBack)
+        XCTAssertFalse(first.id.utf8.elementsEqual(second.id.utf8))
+    }
+
     func testAuthorizationExpiryAfterReadBackPreventsConfirmation() throws {
         let proposal = PocketUITestFactory.proposal()
         let expiresAt = now.addingTimeInterval(10)

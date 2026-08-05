@@ -9,8 +9,9 @@ import PocketContracts
 ///                          signature). No EVENT can introduce an unverified bundle into a live call. (Direct
 ///                          `PocketCallState` construction stays a UI-preview affordance — the production
 ///                          coordinator only ever feeds states produced by `reduce` from verified events.)
-///   • `.answered(plan)`  → plan.checkpointId == bundle.checkpointId.
-///   • `.questionAnswered`→ qa.checkpointId == bundle.checkpointId AND citations ⊆ this bundle's evidence.
+///   • `.answered(plan)`  → plan is bounded, non-empty, checkpoint-bound, and every citation resolves in the exact
+///                          `VerifiedBundle` already held by the incoming call.
+///   • `.questionAnswered`→ checkpoint identity is UTF-8 exact and bounded citations resolve in this bundle.
 ///   • `.proposalDrafted` → proposal.targetSessionId == bundle.sessionId (no wrong-session write) AND a non-empty
 ///                          per-episode `challenge` nonce the coordinator minted for THIS confirm screen.
 ///   • `.confirmed(cap)`  → an opaque single-use `ConfirmationCapability` echoing the awaiting proposal's FULL
@@ -28,7 +29,7 @@ public enum PocketCallState: Equatable, Sendable {
     // UNCONSTRUCTABLE from an unverified bundle even by a misbehaving caller. This closes the "public raw state is
     // an authority transition" bypass at the TYPE level (was: `.conversing(rawBundle,[])` could reach `.executing`).
     case incoming(VerifiedBundle)                                            // "Senti is calling"
-    case briefing(VerifiedBundle, BriefingPlan)                             // narrating (Echo speaks; barge-in interrupts)
+    case briefing(VerifiedBriefingPlan)                                     // narrating (Echo speaks; barge-in interrupts)
     case conversing(VerifiedBundle, answers: [QuestionAnswer])              // barge-in Q&A over cached evidence
     case awaitingConfirmation(VerifiedBundle, ActionProposal, challenge: String)  // preview + read-back; awaiting confirm
     case executing(VerifiedBundle, ActionProposal)                         // governed writeback in flight
@@ -55,6 +56,14 @@ public struct ConfirmationCapability: Equatable, Sendable {
         ConfirmationCapability(proposalId: proposal.id, proposalHash: proposal.proposalHash,
                                targetSessionId: proposal.targetSessionId, targetSequence: proposal.targetSequence,
                                challenge: challenge)
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        OpaqueUTF8Identity.matches(lhs.proposalId, rhs.proposalId)
+            && OpaqueUTF8Identity.matches(lhs.proposalHash, rhs.proposalHash)
+            && OpaqueUTF8Identity.matches(lhs.targetSessionId, rhs.targetSessionId)
+            && lhs.targetSequence == rhs.targetSequence
+            && OpaqueUTF8Identity.matches(lhs.challenge, rhs.challenge)
     }
 }
 
@@ -87,22 +96,23 @@ public enum PocketCall {
             return .incoming(verified)   // carry the VerifiedBundle through every live state
 
         case let (.incoming(vb), .answered(plan)):
-            return plan.checkpointId == vb.bundle.checkpointId
-                ? .briefing(vb, plan)
-                : .incoming(vb)   // provenance mismatch: refuse
+            guard let verifiedPlan = VerifiedBriefingPlan.verify(plan, against: vb) else {
+                return .incoming(vb)   // ungrounded/malformed/cross-checkpoint plan: refuse
+            }
+            return .briefing(verifiedPlan)
 
-        case let (.briefing(vb, _), .interrupted),
-             let (.briefing(vb, _), .briefingCompleted):
-            return .conversing(vb, answers: [])
+        case let (.briefing(verifiedPlan), .interrupted),
+             let (.briefing(verifiedPlan), .briefingCompleted):
+            return .conversing(verifiedPlan.bundle, answers: [])
 
         case let (.conversing(vb, answers), .questionAnswered(qa)):
-            guard qa.checkpointId == vb.bundle.checkpointId,
+            guard Self.byteExact(qa.checkpointId, vb.bundle.checkpointId),
                   Self.citationsWithinBundle(qa.citations, vb.bundle) else { return state }
             return .conversing(vb, answers: answers + [qa])
 
         // Arm confirmation ONLY for a proposal that targets THIS bundle's session AND with a real episode nonce.
         case let (.conversing(vb, _), .proposalDrafted(proposal, challenge)):
-            return (proposal.targetSessionId == vb.bundle.sessionId && !challenge.isEmpty)
+            return (Self.byteExact(proposal.targetSessionId, vb.bundle.sessionId) && !challenge.isEmpty)
                 ? .awaitingConfirmation(vb, proposal, challenge: challenge)
                 : .conversing(vb, answers: [])
 
@@ -110,14 +120,14 @@ public enum PocketCall {
         // identity + this episode's challenge, the proposal is valid-for-confirmation, and target == bundle.session.
         case let (.awaitingConfirmation(vb, proposal, challenge), .confirmed(cap)):
             let boundToReadback =
-                cap.proposalId == proposal.id
-                && cap.proposalHash == proposal.proposalHash
-                && cap.targetSessionId == proposal.targetSessionId
+                Self.byteExact(cap.proposalId, proposal.id)
+                && Self.byteExact(cap.proposalHash, proposal.proposalHash)
+                && Self.byteExact(cap.targetSessionId, proposal.targetSessionId)
                 && cap.targetSequence == proposal.targetSequence
-                && cap.challenge == challenge
+                && Self.byteExact(cap.challenge, challenge)
             let ok = boundToReadback
                 && proposal.isValidForConfirmation()
-                && proposal.targetSessionId == vb.bundle.sessionId
+                && Self.byteExact(proposal.targetSessionId, vb.bundle.sessionId)
             return ok ? .executing(vb, proposal)
                       : .awaitingConfirmation(vb, proposal, challenge: challenge)   // refuse (fail-safe)
 
@@ -145,8 +155,27 @@ public enum PocketCall {
 
     static func citationsWithinBundle(_ citations: [String], _ bundle: PocketBundle) -> Bool {
         guard !citations.isEmpty else { return true }   // an honest "no evidence" answer is allowed
-        let known = Set(bundle.evidence.map { $0.id })
-        return citations.allSatisfy { known.contains($0) }
+        guard citations.count <= PocketBundle.capEvidence else { return false }
+        let known = Set(bundle.evidence.map { Array($0.id.utf8) })
+        var seen = Set<[UInt8]>()
+        var totalBytes = 0
+        return citations.allSatisfy { citation in
+            guard isWellFormedIdentity(citation, maxBytes: PocketBundle.capEvId),
+                  citation.utf8.count <= PocketBundle.maxTotalBytes - totalBytes else { return false }
+            totalBytes += citation.utf8.count
+            let key = Array(citation.utf8)
+            return seen.insert(key).inserted && known.contains(key)
+        }
+    }
+
+    private static func byteExact(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.utf8.elementsEqual(rhs.utf8)
+    }
+
+    private static func isWellFormedIdentity(_ value: String, maxBytes: Int) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= maxBytes else { return false }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && byteExact(trimmed, value)
     }
 
     static func receiptBinds(_ receipt: ActionReceipt,
@@ -154,10 +183,10 @@ public enum PocketCall {
                              bundle: PocketBundle,
                              gatewayKey: String) -> Bool {
         guard receipt.isStructurallyValid(),
-              receipt.proposalId == proposal.id,
-              receipt.confirmedProposalHash == proposal.proposalHash,
-              receipt.targetSessionId == proposal.targetSessionId,
-              proposal.targetSessionId == bundle.sessionId else { return false }
+              byteExact(receipt.proposalId, proposal.id),
+              byteExact(receipt.confirmedProposalHash, proposal.proposalHash),
+              byteExact(receipt.targetSessionId, proposal.targetSessionId),
+              byteExact(proposal.targetSessionId, bundle.sessionId) else { return false }
         if receipt.status == .posted {
             #if canImport(CryptoKit)
             return receipt.signatureState(gatewayPublicKeyBase64url: gatewayKey) == .verified
@@ -180,6 +209,30 @@ public enum PocketCall {
 public struct VerifiedBundle: Equatable, Sendable {
     public let bundle: PocketBundle
     private init(bundle: PocketBundle) { self.bundle = bundle }
+
+    /// Compares the bytes covered by the gateway signature plus the signature bytes themselves. Swift `String ==`
+    /// performs Unicode canonical equivalence, so synthesized `PocketBundle` equality is not an authority boundary:
+    /// composed and decomposed spellings can compare equal even though they produce different signed UTF-8 payloads.
+    public func exactlyMatches(_ candidate: PocketBundle) -> Bool {
+        // Raw public callers do not receive the minting guarantee carried by `self`. Validate first both to reject
+        // semantically invalid aliases (notably sub-millisecond Dates that round to the same signed epoch millis) and
+        // to bound the canonicalization work before materializing the candidate payload.
+        guard candidate.isSemanticallyValid() else { return false }
+        return hasSameSignedBytes(as: candidate)
+    }
+
+    private func hasSameSignedBytes(as candidate: PocketBundle) -> Bool {
+        OpaqueUTF8Identity.matches(
+            bundle.canonicalBundlePayload(),
+            candidate.canonicalBundlePayload()
+        ) && OpaqueUTF8Identity.matches(bundle.signature, candidate.signature)
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        // Equality must remain reflexive even for DEBUG-only invalid test wrappers. Authority admission goes through
+        // `exactlyMatches(_:)`, which additionally requires raw-candidate semantic validity.
+        lhs.hasSameSignedBytes(as: rhs.bundle)
+    }
 
     /// The ONLY ingress mint — no caller-supplied key/anchor (closes the caller-key-injection bypass).
     public static func verify(_ bundle: PocketBundle) -> VerifiedBundle? {

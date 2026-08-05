@@ -16,6 +16,18 @@ public struct PresentedEvidenceSelection: Equatable, Identifiable, Sendable {
             self.checkpointId = checkpointId
             self.evidenceId = evidenceId
         }
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            OpaqueUTF8Identity.matches(lhs.sessionId, rhs.sessionId)
+                && OpaqueUTF8Identity.matches(lhs.checkpointId, rhs.checkpointId)
+                && OpaqueUTF8Identity.matches(lhs.evidenceId, rhs.evidenceId)
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(OpaqueUTF8Identity(sessionId))
+            hasher.combine(OpaqueUTF8Identity(checkpointId))
+            hasher.combine(OpaqueUTF8Identity(evidenceId))
+        }
     }
 
     public var id: ID {
@@ -28,10 +40,19 @@ public struct PresentedEvidenceSelection: Equatable, Identifiable, Sendable {
     private let sourceBundle: VerifiedBundle
     private let evidence: EvidenceRef
 
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id
+            && lhs.sourceBundle == rhs.sourceBundle
+            && lhs.evidence.pocketExactlyMatches(rhs.evidence)
+    }
+
     public init?(evidence: EvidenceRef, verifiedBundle: VerifiedBundle) {
         let bundle = verifiedBundle.bundle
-        guard bundle.evidence.contains(evidence),
-              bundle.evidence.filter({ $0.id == evidence.id }).count == 1 else { return nil }
+        let exactIdentityMatches = bundle.evidence.filter {
+            OpaqueUTF8Identity.matches($0.id, evidence.id)
+        }
+        guard exactIdentityMatches.count == 1,
+              exactIdentityMatches[0].pocketExactlyMatches(evidence) else { return nil }
         self.checkpointId = bundle.checkpointId
         self.sessionId = bundle.sessionId
         self.evidenceId = evidence.id
@@ -41,10 +62,13 @@ public struct PresentedEvidenceSelection: Equatable, Identifiable, Sendable {
 
     fileprivate func resolve(in verifiedBundle: VerifiedBundle) -> EvidenceRef? {
         let bundle = verifiedBundle.bundle
+        let exactIdentityMatches = bundle.evidence.filter {
+            OpaqueUTF8Identity.matches($0.id, evidenceId)
+        }
         guard verifiedBundle == sourceBundle,
-              bundle.evidence.filter({ $0.id == evidenceId }).count == 1,
-              bundle.evidence.contains(evidence) else { return nil }
-        return evidence
+              exactIdentityMatches.count == 1,
+              exactIdentityMatches[0].pocketExactlyMatches(evidence) else { return nil }
+        return exactIdentityMatches[0]
     }
 }
 
@@ -126,6 +150,13 @@ public struct CheckpointContext: Equatable, Sendable {
             sequenceEnd: bundle.sequenceEnd
         )
     }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        OpaqueUTF8Identity.matches(lhs.checkpointId, rhs.checkpointId)
+            && OpaqueUTF8Identity.matches(lhs.sessionId, rhs.sessionId)
+            && lhs.sequenceStart == rhs.sequenceStart
+            && lhs.sequenceEnd == rhs.sequenceEnd
+    }
 }
 
 public enum CheckpointAttention: Equatable, Sendable {
@@ -197,7 +228,7 @@ public struct BundleIntegrityState: Equatable, Sendable {
 
     fileprivate func bound(to bundle: PocketBundle) -> Self {
         guard case .verified(let verifiedBundle) = status else { return self }
-        guard verifiedBundle.bundle == bundle else {
+        guard verifiedBundle.exactlyMatches(bundle) else {
             return .invalid(reason: "Verified bundle identity does not match the presented checkpoint.")
         }
         return self
@@ -205,7 +236,7 @@ public struct BundleIntegrityState: Equatable, Sendable {
 
     fileprivate func verifiedBundle(boundTo bundle: PocketBundle) -> VerifiedBundle? {
         guard case .verified(let verifiedBundle) = status,
-              verifiedBundle.bundle == bundle else { return nil }
+              verifiedBundle.exactlyMatches(bundle) else { return nil }
         return verifiedBundle
     }
 }
@@ -218,6 +249,16 @@ public struct CheckpointInboxItem: Equatable, Identifiable, Sendable {
         public init(sessionId: String, checkpointId: String) {
             self.sessionId = sessionId
             self.checkpointId = checkpointId
+        }
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            OpaqueUTF8Identity.matches(lhs.sessionId, rhs.sessionId)
+                && OpaqueUTF8Identity.matches(lhs.checkpointId, rhs.checkpointId)
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(OpaqueUTF8Identity(sessionId))
+            hasher.combine(OpaqueUTF8Identity(checkpointId))
         }
     }
 
@@ -345,11 +386,11 @@ public enum ConversationEntry: Equatable, Identifiable, Sendable {
     case questionAnswer(QuestionAnswer)
     case notice(ConversationNotice)
 
-    public var id: String {
+    public var id: OpaqueUTF8Identity {
         switch self {
-        case .briefing(let segment): return "briefing.\(segment.id)"
-        case .questionAnswer(let answer): return "qa.\(answer.id)"
-        case .notice(let notice): return "notice.\(notice.id)"
+        case .briefing(let segment): return OpaqueUTF8Identity("briefing.\(segment.id)")
+        case .questionAnswer(let answer): return OpaqueUTF8Identity("qa.\(answer.id)")
+        case .notice(let notice): return OpaqueUTF8Identity("notice.\(notice.id)")
         }
     }
 }

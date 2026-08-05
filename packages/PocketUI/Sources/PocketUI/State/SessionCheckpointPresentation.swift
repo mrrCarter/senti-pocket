@@ -25,8 +25,10 @@ public struct SessionCheckpointListPresentationState: Equatable, Sendable {
         let checkpointIDs = checkpoints.map(\.id)
         let identitiesAreValid = sessionId.pocketCheckpointNonblank != nil
             && checkpointIDs.allSatisfy { $0.pocketCheckpointNonblank != nil }
-            && Set(checkpointIDs).count == checkpointIDs.count
-        let sessionsMatch = checkpoints.allSatisfy { $0.checkpoint.sessionId == sessionId }
+            && Set(checkpointIDs.map(OpaqueUTF8Identity.init)).count == checkpointIDs.count
+        let sessionsMatch = checkpoints.allSatisfy {
+            OpaqueUTF8Identity.matches($0.checkpoint.sessionId, sessionId)
+        }
         let countsAreValid = page.count >= 0 && page.count == checkpoints.count
         let sequencesAreValid = checkpoints.allSatisfy { checkpoint in
             let value = checkpoint.checkpoint
@@ -64,6 +66,16 @@ public struct SessionCheckpointRowPresentation: Equatable, Identifiable, Sendabl
     public struct ID: Hashable, Sendable {
         public let sessionId: String
         public let checkpointId: String
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            OpaqueUTF8Identity.matches(lhs.sessionId, rhs.sessionId)
+                && OpaqueUTF8Identity.matches(lhs.checkpointId, rhs.checkpointId)
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(OpaqueUTF8Identity(sessionId))
+            hasher.combine(OpaqueUTF8Identity(checkpointId))
+        }
     }
 
     public let id: ID

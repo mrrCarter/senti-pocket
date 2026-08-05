@@ -1,7 +1,7 @@
 // GemmaReasoningProvider — the ON-DEVICE Gemma provider (.liveReasoned, OFFLINE). Bridges echo's PocketInference
 // (LiteRT-LM running Gemma E4B on the phone) into the ReasoningProvider abstraction, so the app reasons over the
 // VERIFIED checkpoint with Gemma ON-DEVICE — no cloud, no OpenAI key. This is the concrete "Gemma is actually used"
-// path for reasoning: the coordinator injects it as the OFFLINE provider (online → GatewayReasoningProvider).
+// path for reasoning: the coordinator injects it as the OFFLINE provider (online → verified gateway boundary).
 //
 // The engine must already have prepareModel'd a verified Gemma artifact (ModelArtifactStore) before this runs;
 // otherwise engine.answer throws and the driver surfaces `.failed` honestly (never a fabricated brief).
