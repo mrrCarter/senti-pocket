@@ -51,9 +51,9 @@ public final class SentiCallManager: NSObject {
     /// NEVER carried here — this only surfaces the ring shape + the dialId. Decoded via the KAV-locked DialReceive.receive.
     /// (internal, not public: DialReceiveState is app-internal; the DialHost consumer is in-module.)
     var onDialReceived: ((DialReceiveState, String, UUID) -> Void)?
-    /// Receive-time privacy gate installed by DialHost. Durable server registrations can outlive a local selection or
-    /// principal, so metadata is exposed only for the exact selected session AND current Registry V2 binding proof.
-    var isIncomingDialAuthorized: ((RingCore) -> Bool)?
+    /// Receive-time Registry V2 gate installed by DialHost. Parse only the raw session/binding fence before touching
+    /// display or governed fields, then recheck the same fence after CallKit accepts the report.
+    var isIncomingBindingAuthorized: ((String, DeviceRingBindingFence) -> Bool)?
     /// The call ended / was declined → tear down (stop audio, drop the episode).
     public var onEnded: ((UUID) -> Void)?
     /// CallKit ACTIVATED the audio session → safe to start capture/playback (hand to PocketVoice's DuplexAudioSessionLease).
@@ -63,6 +63,7 @@ public final class SentiCallManager: NSObject {
 
     private let provider: CXProvider
     private let pushRegistry: PKPushRegistry?
+    private let currentVoipTokenProvider: () -> String?
     private let reportIncomingCall: @MainActor (
         UUID,
         CXCallUpdate,
@@ -92,6 +93,10 @@ public final class SentiCallManager: NSObject {
         let pushRegistry = PKPushRegistry(queue: .main)
         self.provider = provider
         self.pushRegistry = pushRegistry
+        self.currentVoipTokenProvider = { [weak pushRegistry] in
+            guard let data = pushRegistry?.pushToken(for: .voIP), !data.isEmpty else { return nil }
+            return Self.hexToken(data)
+        }
         self.reportIncomingCall = { id, update, completion in
             provider.reportNewIncomingCall(with: id, update: update) { error in
                 Task { @MainActor in completion(error == nil) }
@@ -110,6 +115,7 @@ public final class SentiCallManager: NSObject {
     /// Hermetic lifecycle-test initializer: no PushKit registration and no real CallKit report side effects.
     init(
         provider: CXProvider,
+        currentVoipToken: @escaping () -> String? = { nil },
         reportIncomingCall: @escaping @MainActor (
             UUID,
             CXCallUpdate,
@@ -120,11 +126,27 @@ public final class SentiCallManager: NSObject {
     ) {
         self.provider = provider
         self.pushRegistry = nil
+        self.currentVoipTokenProvider = currentVoipToken
         self.reportIncomingCall = reportIncomingCall
         self.reportEndedCall = reportEndedCall
         self.audioActivationTimeoutNanoseconds = audioActivationTimeoutNanoseconds
         super.init()
         provider.setDelegate(self, queue: nil)
+    }
+
+    /// PushKit retains the current token. Replaying it closes the killed-launch ordering where the delegate callback
+    /// occurred in an earlier process but a push or authenticated selection arrives before another rotation callback.
+    var currentVoipToken: String? {
+        currentVoipTokenProvider()
+    }
+
+    func replayCurrentVoipToken() {
+        guard let token = currentVoipToken else { return }
+        onVoipToken?(token)
+    }
+
+    private static func hexToken(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Present the native incoming-call UI for a decision ring. Foreground-capable (demoable without a VoIP cert) and
@@ -324,7 +346,7 @@ extension SentiCallManager: @preconcurrency CXProviderDelegate {
 extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
     public func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
         guard type == .voIP else { return }
-        let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
+        let token = Self.hexToken(pushCredentials.token)
         onVoipToken?(token)
     }
 
@@ -351,16 +373,26 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
         _ dict: [AnyHashable: Any],
         completion: @escaping () -> Void
     ) {
+        replayCurrentVoipToken()
+        let authorize = isIncomingBindingAuthorized ?? { _, _ in false }
         let prepared = Self.prepareIncomingPush(
             dict,
-            isDialAuthorized: isIncomingDialAuthorized ?? { _ in false }
+            isBindingAuthorized: authorize
         )
         ring(prepared.call) { [weak self] accepted in
             // Surface hydration state only after CallKit accepted the exact report. A failed or concurrently revoked
             // report retains no protected caller/session state and can never later be answered into a governed flow.
-            if accepted,
-               let state = prepared.state,
-               let dialId = prepared.dialId {
+            if accepted {
+                guard let state = prepared.state,
+                      let dialId = prepared.dialId,
+                      let rawFence = DeviceRingPushFenceParser.parse(dict),
+                      authorize(rawFence.sessionId, rawFence.fence) else {
+                    // CallKit accepted the mandatory report, but authority disappeared (or never existed) before the
+                    // report completed. End that exact UUID immediately; it must not linger as an answerable episode.
+                    self?.end(prepared.call.id)
+                    completion()
+                    return
+                }
                 self?.onDialReceived?(state, dialId, prepared.call.id)
             }
             completion()
@@ -390,34 +422,39 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
     /// call: no caller/message/context/priority metadata is exposed and no hydration state is retained.
     static func prepareIncomingPush(
         _ payload: [AnyHashable: Any],
-        isDialAuthorized: (RingCore) -> Bool
+        isBindingAuthorized: (String, DeviceRingBindingFence) -> Bool
     ) -> (call: IncomingDecisionCall, state: DialReceiveState?, dialId: String?) {
-        let decoded = decode(payload)
-        guard let received = receiveState(from: payload),
-              let core = core(from: received.state),
-              isDialAuthorized(core) else {
-            return (
-                IncomingDecisionCall(
-                    id: decoded.id,
-                    dialId: decoded.dialId,
-                    callerDisplayName: "Senti",
-                    message: "",
-                    context: nil,
-                    priority: "medium"
-                ),
-                nil,
-                nil
-            )
+        let generic = IncomingDecisionCall(
+            id: UUID(),
+            dialId: "",
+            callerDisplayName: "Senti",
+            message: "",
+            context: nil,
+            priority: "medium"
+        )
+        // Parse only v/session/binding, authorize, then permit the full DTO decoder to touch display/governed fields.
+        guard let rawFence = DeviceRingPushFenceParser.parse(payload),
+              isBindingAuthorized(rawFence.sessionId, rawFence.fence),
+              let received = receiveState(from: payload),
+              let stateFence = sessionAndFence(from: received.state),
+              stateFence.sessionId == rawFence.sessionId,
+              stateFence.fence == rawFence.fence else {
+            return (generic, nil, nil)
         }
+        let decoded = decode(payload)
         return (decoded, received.state, received.dialId)
     }
 
-    private static func core(from state: DialReceiveState) -> RingCore? {
+    private static func sessionAndFence(
+        from state: DialReceiveState
+    ) -> (sessionId: String, fence: DeviceRingBindingFence)? {
         switch state {
         case .renderable(let ring):
-            return ring.core
+            guard let binding = ring.core.binding else { return nil }
+            return (ring.core.sessionId, binding)
         case .needsHydration(_, let core):
-            return core
+            guard let binding = core.binding else { return nil }
+            return (core.sessionId, binding)
         case .rejected:
             return nil
         }

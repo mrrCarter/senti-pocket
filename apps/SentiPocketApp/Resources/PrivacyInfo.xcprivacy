@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- PrivacyInfo.xcprivacy — Apple privacy manifest (Atlas, per Forge PR #81 / the PocketVoice-cut re-add trigger).
-     Required for App Store submission once on-device Whisper STT (PocketDialVoice) accesses the microphone.
-     HONEST posture: Senti Pocket does NOT collect or track. Speech is transcribed ON-DEVICE (whisper.cpp), never
-     sent off-device for the STT itself. No tracking, no data linked to identity, no third-party SDKs collecting data. -->
+<!-- PrivacyInfo.xcprivacy — required-reason API declarations for the current native target. On-device Whisper audio is
+     not uploaded for transcription. Data-collection declarations and App Store privacy answers still require a release
+     inventory of every retained backend field; this file must not be treated as proof that account-linked app traffic
+     is outside Apple's collection definitions. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -11,8 +11,8 @@
     <false/>
     <key>NSPrivacyTrackingDomains</key>
     <array/>
-    <!-- No data types collected: the mic audio is transcribed on-device and never leaves for STT; the governed write
-         posts only the user's explicitly-confirmed message (functional, not "collection" in Apple's sense). -->
+    <!-- Provisional until the backend-retention inventory is approved; never infer App Store privacy answers from this
+         empty array. The release gate must update this declaration if retained account/device/content fields qualify. -->
     <key>NSPrivacyCollectedDataTypes</key>
     <array/>
     <!-- Required-reason APIs actually used. -->
@@ -25,6 +25,16 @@
             <key>NSPrivacyAccessedAPITypeReasons</key>
             <array>
                 <string>CA92.1</string>
+            </array>
+        </dict>
+        <dict>
+            <!-- Sleep-inclusive monotonic time counts down a server-issued Registry V2 lease and detects clock/reboot
+                 discontinuity. It remains on-device and is never used for fingerprinting (35F9.1 = elapsed timers). -->
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>35F9.1</string>
             </array>
         </dict>
     </array>

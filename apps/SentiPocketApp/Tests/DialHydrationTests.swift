@@ -17,10 +17,11 @@ final class DialHydrationTests: XCTestCase {
                       priority: String = "high",
                       callerName: String = "Senti · claude-warden needs your decision",
                       sessionId: String = "6cf7e861",
-                      checkpointId: String? = "cp_9") -> RingCore {
+                      checkpointId: String? = "cp_9",
+                      binding: DeviceRingBindingFence? = nil) -> RingCore {
         RingCore(id: id, kind: kind, priority: priority,
                  callerName: callerName,
-                 sessionId: sessionId, checkpointId: checkpointId)
+                 sessionId: sessionId, checkpointId: checkpointId, binding: binding)
     }
 
     private func signal(id: String = "need_1",
@@ -74,31 +75,23 @@ final class DialHydrationTests: XCTestCase {
         XCTAssertEqual(ring.core.callerName, "Senti · update from claude-warden")
     }
 
+    func test_registry_v2_binding_fence_survives_authenticated_merge_exactly() throws {
+        let fence = DeviceRingBindingFence(
+            id: "bind_0123456789abcdef0123456789abcdef",
+            revision: 7
+        )
+
+        let ring = try DialHydration.merge(
+            core: core(binding: fence),
+            fetched: signal()
+        )
+
+        XCTAssertEqual(ring.core.binding, fence)
+    }
+
     func test_non_pickOption_kind_has_no_options() throws {
         let r = try DialHydration.merge(core: core(kind: "go"), fetched: signal(kind: .go))
         XCTAssertEqual(r.options, [])                              // only pickOption carries options
-    }
-
-    func test_hydration_preserves_the_already_authorized_binding_proof() throws {
-        let authorized = RingCore(
-            id: "need_1",
-            kind: "decisionYours",
-            priority: "high",
-            callerName: "Senti",
-            sessionId: "6cf7e861",
-            checkpointId: "cp_9",
-            bindingVersion: 2,
-            bindingId: String(repeating: "i", count: 24),
-            bindingRevision: String(repeating: "r", count: 32),
-            installationGeneration: "7"
-        )
-
-        let ring = try DialHydration.merge(core: authorized, fetched: signal())
-
-        XCTAssertEqual(ring.core.bindingVersion, 2)
-        XCTAssertEqual(ring.core.bindingId, authorized.bindingId)
-        XCTAssertEqual(ring.core.bindingRevision, authorized.bindingRevision)
-        XCTAssertEqual(ring.core.installationGeneration, "7")
     }
 
     // MARK: - 2. substitution refusal (the security invariant)

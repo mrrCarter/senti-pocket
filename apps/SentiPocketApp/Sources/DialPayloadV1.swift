@@ -18,7 +18,7 @@
 
 import Foundation
 
-/// The APNs push DTO (relay's buildDialPayload v1 output). Optionals are the governed fields the LEAN path sheds.
+/// The shared APNs DTO. Registry V2 requires the nested server binding; the legacy fixture decoder requires it absent.
 struct DialPayloadV1: Decodable, Equatable, Sendable {
     let v: Int
     let id: String
@@ -27,13 +27,8 @@ struct DialPayloadV1: Decodable, Equatable, Sendable {
     let callerName: String
     let who: String             // always "senti-pocket" (the ring source; NOT the requesting agent — that's requestedBy, hydrated)
     let sessionId: String
-    // Registry V2 installation proof. All four are absent on the explicit V1 migration lane; once any is present the
-    // complete tuple is required. The real PushKit composition rejects absent/mismatched proofs for this app version.
-    let bindingVersion: Int?
-    let bindingId: String?
-    let bindingRevision: String?
-    let installationGeneration: String?
     let checkpointId: String?
+    let binding: DeviceRingBindingFence?
     let fetch: Bool             // true ⇒ LEAN/core-only ⇒ MUST hydrate before rendering governed content
     let ts: String              // ISO-8601 with millis + Z
     // governed content — present ONLY on the RICH (fetch == false) path:
@@ -63,10 +58,7 @@ struct RingCore: Equatable, Sendable {
     let callerName: String
     let sessionId: String
     let checkpointId: String?
-    let bindingVersion: Int?
-    let bindingId: String?
-    let bindingRevision: String?
-    let installationGeneration: String?
+    let binding: DeviceRingBindingFence?
 
     init(
         id: String,
@@ -75,10 +67,7 @@ struct RingCore: Equatable, Sendable {
         callerName: String,
         sessionId: String,
         checkpointId: String?,
-        bindingVersion: Int? = nil,
-        bindingId: String? = nil,
-        bindingRevision: String? = nil,
-        installationGeneration: String? = nil
+        binding: DeviceRingBindingFence? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -86,10 +75,7 @@ struct RingCore: Equatable, Sendable {
         self.callerName = callerName
         self.sessionId = sessionId
         self.checkpointId = checkpointId
-        self.bindingVersion = bindingVersion
-        self.bindingId = bindingId
-        self.bindingRevision = bindingRevision
-        self.installationGeneration = installationGeneration
+        self.binding = binding
     }
 }
 
@@ -103,19 +89,39 @@ struct RenderableRing: Equatable, Sendable {
 }
 
 enum DialReceive {
-    static let currentVersion = 1
+    static let currentVersion = 2
     private static let knownKinds: Set<String> = ["go", "decisionYours", "pickOption", "info", "checkpointReady"]
     private static let writeKinds: Set<String> = ["go", "decisionYours", "pickOption"]
 
-    /// Decode + apply the fetch invariant. Never renders governed content that arrived on a LEAN push (returns
-    /// `.needsHydration` instead), and never treats a malformed push as a valid ring.
+    /// Production ingress is Registry V2 only. The raw preflight in SentiCallKit authorizes the exact nested fence
+    /// before this full decode; this second check prevents any direct caller from accidentally accepting V1.
     static func receive(_ data: Data) -> DialReceiveState {
+        receive(data, expectedVersion: currentVersion, bindingRequired: true)
+    }
+
+    /// Cross-language V1 KAV compatibility only. Production PushKit ingress never calls this path.
+    static func receiveLegacyV1(_ data: Data) -> DialReceiveState {
+        receive(data, expectedVersion: 1, bindingRequired: false)
+    }
+
+    private static func receive(
+        _ data: Data,
+        expectedVersion: Int,
+        bindingRequired: Bool
+    ) -> DialReceiveState {
         let payload: DialPayloadV1
         do { payload = try JSONDecoder().decode(DialPayloadV1.self, from: data) }
         catch { return .rejected(reason: "undecodable dial payload: \(error)") }
 
-        guard payload.v == currentVersion else {
-            return .rejected(reason: "unsupported dial payload version \(payload.v) (expected \(currentVersion))")
+        guard payload.v == expectedVersion else {
+            return .rejected(reason: "unsupported dial payload version \(payload.v) (expected \(expectedVersion))")
+        }
+        if bindingRequired {
+            guard let binding = payload.binding, binding.isValid else {
+                return .rejected(reason: "Registry V2 dial payload missing a valid binding fence")
+            }
+        } else if payload.binding != nil {
+            return .rejected(reason: "legacy V1 dial payload unexpectedly carried a binding fence")
         }
         guard !payload.id.isEmpty, !payload.kind.isEmpty, !payload.sessionId.isEmpty else {
             return .rejected(reason: "dial payload missing required core (id/kind/sessionId)")
@@ -123,33 +129,10 @@ enum DialReceive {
         guard knownKinds.contains(payload.kind) else {
             return .rejected(reason: "dial payload has unknown kind")
         }
-        let proof = [
-            payload.bindingVersion != nil,
-            payload.bindingId != nil,
-            payload.bindingRevision != nil,
-            payload.installationGeneration != nil
-        ]
-        if proof.contains(true) {
-            guard proof.allSatisfy({ $0 }),
-                  payload.bindingVersion == DeviceRingBinding.registryVersion,
-                  let bindingId = payload.bindingId, !bindingId.isEmpty,
-                  let bindingRevision = payload.bindingRevision, !bindingRevision.isEmpty,
-                  let generation = payload.installationGeneration,
-                  !generation.isEmpty,
-                  generation.first != "0",
-                  generation.allSatisfy(\.isNumber),
-                  UInt64(generation) != nil else {
-                return .rejected(reason: "dial payload has an incomplete or invalid Registry V2 binding proof")
-            }
-        }
 
         let core = RingCore(id: payload.id, kind: payload.kind, priority: payload.priority,
                             callerName: payload.callerName, sessionId: payload.sessionId,
-                            checkpointId: payload.checkpointId,
-                            bindingVersion: payload.bindingVersion,
-                            bindingId: payload.bindingId,
-                            bindingRevision: payload.bindingRevision,
-                            installationGeneration: payload.installationGeneration)
+                            checkpointId: payload.checkpointId, binding: payload.binding)
 
         // A write-kind is always an authenticated doorbell. Reject a contradictory RICH shape instead of coercing it:
         // there is no legitimate producer for that shape, and rejection prevents raw push metadata from surviving into
