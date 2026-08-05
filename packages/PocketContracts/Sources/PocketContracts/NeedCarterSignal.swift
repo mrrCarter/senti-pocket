@@ -40,6 +40,17 @@ public enum NeedCarterKind: Codable, Equatable, Sendable {
         }
     }
 
+    /// Frozen DialPayloadV1/V2 wire vocabulary. This intentionally differs from `slug` for Swift Codable case names.
+    public var dialWireKind: String {
+        switch self {
+        case .go: return "go"
+        case .decisionYours: return "decisionYours"
+        case .pickOption: return "pickOption"
+        case .info: return "info"
+        case .checkpointReady: return "checkpointReady"
+        }
+    }
+
     /// The concrete choice labels a `pickOption` ring carries (empty for every other kind). Drives both the spoken
     /// options folded into the pickup message AND the rendered chips, so the two presentations never diverge.
     public var spokenOptions: [String] {

@@ -6,8 +6,8 @@
 // fetch, never from the unauthenticated push.
 //
 // SECURITY INVARIANT (load-bearing): the fetched signal's id MUST equal the push core's id, and its session/checkpoint
-// must match the core — else we refuse the merge (a mismatched/substituted signal must never paint onto this ring).
-// This closes the "authenticated fetch returns a DIFFERENT signal than the push announced" substitution edge.
+// must match the core — else we refuse the merge. All semantic presentation fields are then derived from that fetched
+// signal, so untrusted push kind/caller/priority values cannot be mixed with authenticated governed content.
 
 import Foundation
 import PocketContracts
@@ -26,7 +26,7 @@ enum DialHydrationError: LocalizedError, Equatable {
 enum DialHydration {
     /// Merge the LEAN push core with the authed-fetched full NeedCarterSignal → a RenderableRing.
     /// Throws if the fetched signal doesn't match the ring the push announced (id/session/checkpoint) — never merges a
-    /// substituted signal. The governed content (message, options, evidenceSeqs) comes ONLY from the authed fetch.
+    /// substituted signal. Governed content and semantic presentation come ONLY from the authenticated fetch.
     static func merge(core: RingCore, fetched signal: NeedCarterSignal) throws -> RenderableRing {
         guard signal.id == core.id else {
             throw DialHydrationError.idMismatch(pushId: core.id, fetchedId: signal.id)
@@ -45,13 +45,14 @@ enum DialHydration {
         // pickOption labels come from the signal's kind; every other kind has no options.
         let options: [String]
         if case .pickOption(let labels) = signal.kind { options = labels } else { options = [] }
+        let authenticatedDialFields = signal.dialFields()
 
         return RenderableRing(
             core: RingCore(
                 id: core.id,
-                kind: core.kind,                       // the push core's kind slug (already the display kind)
-                priority: core.priority,
-                callerName: core.callerName,
+                kind: signal.kind.dialWireKind,
+                priority: authenticatedDialFields.priority,
+                callerName: authenticatedDialFields.callerName,
                 sessionId: core.sessionId,
                 checkpointId: signal.context.checkpointId,  // AUTHED-ONLY: the push's checkpoint is never trusted as the value
                 bindingVersion: core.bindingVersion,
