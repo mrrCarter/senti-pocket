@@ -1,5 +1,63 @@
 # Xcode Build & Test Manifest — Senti Pocket
 
+## Superseding execution block — 2026-08-04
+
+Everything below this block is retained as historical lane evidence; where it conflicts, this block is authoritative.
+
+- Gateway Registry V2 source of truth: draft PR #124, exact head
+  `9774a4554b8be18d1a0886f03bf881cfd7912310`, direct from `master`. Windows gateway suite: 695/695; hosted Omar Gate:
+  green; Relay security review: +1. Keep V2 dark until the distributed body-reading operation-admission proxy is built
+  and its boot acknowledgement is proved. Constant-time owner-handle comparison and an explicit expired-signal 410
+  vector are tracked low-priority follow-ups.
+- Held PR #123 (`efdb431c7b7ce4b543fa3451e9c62df7c6e5eb71`) is phone/demo evidence only. Do not merge it: it contains obsolete
+  gateway paths. Publish and build the clean iOS-only foundation from `master`, then the Registry V2 authority PR stacked
+  on that foundation. Record `git rev-parse HEAD` and `git status --short` with every result.
+- Preserve `com.plexaura.sentipocket.app`, Swift 5.9, automatic signing, tracked entitlements, Debug development/Release
+  production APNs environments, `audio` + `voip`, the UI-test target, and `scripts/ios/archive_ipa.sh`. Change the bundle
+  ID only to an explicitly registered Push-enabled App ID, with the APNs topic/provider/profile changed in the same atom.
+
+Mac build/test gate:
+
+```bash
+cd apps/SentiPocketApp
+xcodegen generate
+xcodebuild -project SentiPocketApp.xcodeproj -scheme SentiPocketApp \
+  -destination 'generic/platform=iOS Simulator' build
+DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c '
+import json, sys
+for devices in json.load(sys.stdin).get("devices", {}).values():
+    for device in devices:
+        if device.get("isAvailable") and device.get("name", "").startswith("iPhone"):
+            print(device["udid"]); raise SystemExit(0)
+raise SystemExit("no available iPhone simulator")
+')"
+xcodebuild -project SentiPocketApp.xcodeproj -scheme SentiPocketApp \
+  -destination "id=$DEVICE_ID" test
+```
+
+The complete app target must include `DeviceRingRegistryStateTests`, `DeviceRingRegistrationClientTests`,
+`DeviceRingRegistrarTests`, `DialCoordinatorTests`, `DialHostTests`, `DialHostLifecycleTests`, `SentiCallDecodeTests`,
+`GatewayEndpointTests`, `SignInCoordinatorTests`, and `PhoneWriteOutboxDurabilityTests`. Require zero failures. In
+particular, prove nested V2 fence preflight and post-report recheck, owner/bearer continuity, idempotent cleanup, stale
+revision denial, monotonic lease expiry, UUID-scoped CallKit reporting/audio quarantine, cancellation before irreversible
+confirmation, durable post-confirm outcomes, and sign-out ordering (local authority + durable marker before credential).
+
+Phone gate after simulator green:
+
+1. Run `scripts/ios/archive_ipa.sh` from a clean exact commit and retain `IPA_MANIFEST.txt`, provisioning receipt, Team ID,
+   bundle-qualified App ID, APNs environment, `audio`/`voip`, signature, and IPA hash evidence.
+2. Install on a registered physical iPhone and prove a real PushKit token plus genuine provider-sent VoIP push. A signed
+   IPA or DEBUG-local ring does not prove APNs delivery.
+3. Run at least five answer → audio activation → speak/listen → hangup cycles, plus revoke-during-report, delayed/missing
+   activation, provider reset/background, token rotation, session/auth revocation, and cold-launch restoration.
+4. Keep Registry V2 disabled until the admission proxy, gateway, iOS adoption, APNs provider, migration/purge evidence,
+   fleet acknowledgements, and rollback drill are all complete.
+5. Before App Store submission, reconcile `PrivacyInfo.xcprivacy` and App Store privacy answers against the actual
+   backend-retention inventory for installation/APNs identifiers, account identifiers, and confirmed user content. The
+   current empty collected-data array is provisional, not release evidence.
+
+---
+
 pocket-forge (Mac agent) is NOT available yet (Carter's 2015 MacBook Pro is being set up with Node + the sentinelayer CLI; ready ~tomorrow). **forge is NOT a blocker** — all lanes keep building. forge will build + test EVERYTHING here in one pass when the Mac is ready.
 
 **RULE: every agent APPENDS to this file whenever they add anything new. This list only gets LONGER. Never shrink it.** Each item = something forge must build or test on the Mac. Include the exact command / target / expected result.

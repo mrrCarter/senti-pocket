@@ -56,7 +56,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
 
     func test_writekind_decision_lean_needs_hydration() throws {
         let cases = try loadCases()
-        let s = DialReceive.receive(try payloadData("writekind_decision_lean", in: cases))
+        let s = DialReceive.receiveLegacyV1(try payloadData("writekind_decision_lean", in: cases))
         guard case .needsHydration(let id, let core) = s else { return XCTFail("expected needsHydration, got \(s)") }
         XCTAssertEqual(id, "need_1")
         XCTAssertEqual(core.kind, "decisionYours")          // plain-string kind → RingCore.kind:String
@@ -66,7 +66,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
 
     func test_writekind_pickOption_lean_needs_hydration_options_never_on_push() throws {
         let cases = try loadCases()
-        let s = DialReceive.receive(try payloadData("writekind_pickOption_lean", in: cases))
+        let s = DialReceive.receiveLegacyV1(try payloadData("writekind_pickOption_lean", in: cases))
         guard case .needsHydration(let id, let core) = s else { return XCTFail("expected needsHydration, got \(s)") }
         XCTAssertEqual(id, "need_2")
         XCTAssertEqual(core.kind, "pickOption")
@@ -84,7 +84,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
             payload["message"] = "UNTRUSTED PUSH CONTENT"
             payload["options"] = ["Approve attacker content"]
 
-            let state = DialReceive.receive(try JSONSerialization.data(withJSONObject: payload))
+            let state = DialReceive.receiveLegacyV1(try JSONSerialization.data(withJSONObject: payload))
             guard case .rejected(let reason) = state else {
                 return XCTFail("rich write-kind \(kind) must be rejected, got \(state)")
             }
@@ -100,7 +100,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
             var payload = seed
             payload["kind"] = "futureWriteKind"
             payload["fetch"] = fetch
-            let state = DialReceive.receive(try JSONSerialization.data(withJSONObject: payload))
+            let state = DialReceive.receiveLegacyV1(try JSONSerialization.data(withJSONObject: payload))
             guard case .rejected(let reason) = state else {
                 return XCTFail("unknown kind with fetch=\(fetch) must be rejected, got \(state)")
             }
@@ -112,7 +112,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
 
     func test_rich_info_is_renderable_with_governed_content() throws {
         let cases = try loadCases()
-        let s = DialReceive.receive(try payloadData("rich_info", in: cases))
+        let s = DialReceive.receiveLegacyV1(try payloadData("rich_info", in: cases))
         guard case .renderable(let r) = s else { return XCTFail("expected renderable, got \(s)") }
         XCTAssertEqual(r.core.id, "need_4")
         XCTAssertEqual(r.core.kind, "info")
@@ -128,7 +128,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
         guard var payload = payloadObject("rich_info", in: cases) else { return }
         payload["options"] = ["UNTRUSTED OPTION"]
 
-        let state = DialReceive.receive(try JSONSerialization.data(withJSONObject: payload))
+        let state = DialReceive.receiveLegacyV1(try JSONSerialization.data(withJSONObject: payload))
         guard case .rejected(let reason) = state else {
             return XCTFail("display-only RICH payload with options must be rejected, got \(state)")
         }
@@ -139,20 +139,20 @@ final class DialPayloadV1KAVTests: XCTestCase {
 
     func test_lean_overflow_forces_hydration() throws {
         let cases = try loadCases()
-        let s = DialReceive.receive(try payloadData("lean_overflow", in: cases))
+        let s = DialReceive.receiveLegacyV1(try payloadData("lean_overflow", in: cases))
         guard case .needsHydration(let id, _) = s else { return XCTFail("expected needsHydration, got \(s)") }
         XCTAssertEqual(id, "need_3")                        // an info that overflowed the budget → forced LEAN
     }
 
     func test_worst_byte_unicode_needs_hydration() throws {
         let cases = try loadCases()
-        let s = DialReceive.receive(try payloadData("worst_byte", in: cases))
+        let s = DialReceive.receiveLegacyV1(try payloadData("worst_byte", in: cases))
         guard case .needsHydration = s else { return XCTFail("expected needsHydration, got \(s)") }  // 中… decodes as Swift String
     }
 
     func test_max_core_needs_hydration() throws {
         let cases = try loadCases()
-        let s = DialReceive.receive(try payloadData("max_core", in: cases))
+        let s = DialReceive.receiveLegacyV1(try payloadData("max_core", in: cases))
         guard case .needsHydration = s else { return XCTFail("expected needsHydration, got \(s)") }  // 😀 + escaped-quote strings
     }
 
@@ -162,7 +162,7 @@ final class DialPayloadV1KAVTests: XCTestCase {
         let cases = try loadCases()
         XCTAssertGreaterThanOrEqual(cases.count, 6, "expected at least the 6 seeded dial-payload cases")
         for name in cases.keys {
-            let s = DialReceive.receive(try payloadData(name, in: cases))
+            let s = DialReceive.receiveLegacyV1(try payloadData(name, in: cases))
             if case .rejected(let reason) = s { XCTFail("KAV case \(name) was rejected by the decoder: \(reason)") }
         }
     }

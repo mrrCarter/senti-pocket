@@ -216,6 +216,7 @@ final class GatewayEndpointTests: XCTestCase {
         var hydrationCalls = 0
         let hydrator = SelectedSessionDialHydrator(
             selectionGate: gate,
+            isBindingAuthorized: { _, _ in true },
             hydrate: { state in
                 hydrationCalls += 1
                 guard case .needsHydration(_, let core) = state else {
@@ -236,7 +237,11 @@ final class GatewayEndpointTests: XCTestCase {
             priority: "high",
             callerName: "Senti",
             sessionId: "session-A",
-            checkpointId: nil
+            checkpointId: nil,
+            binding: DeviceRingBindingFence(
+                id: "bind_0123456789abcdef0123456789abcdef",
+                revision: 1
+            )
         )
 
         do {
@@ -256,6 +261,10 @@ final class GatewayEndpointTests: XCTestCase {
         let gate = DialSessionSelectionGate()
         gate.select("session-A")
         var bindingIsCurrent = true
+        let fence = DeviceRingBindingFence(
+            id: "bind_0123456789abcdef0123456789abcdef",
+            revision: 7
+        )
         let core = RingCore(
             id: "dial-A",
             kind: "go",
@@ -263,14 +272,13 @@ final class GatewayEndpointTests: XCTestCase {
             callerName: "Senti",
             sessionId: "session-A",
             checkpointId: nil,
-            bindingVersion: 2,
-            bindingId: String(repeating: "i", count: 24),
-            bindingRevision: String(repeating: "r", count: 32),
-            installationGeneration: "1"
+            binding: fence
         )
         let hydrator = SelectedSessionDialHydrator(
             selectionGate: gate,
-            isBindingAuthorized: { _ in bindingIsCurrent },
+            isBindingAuthorized: { sessionId, candidate in
+                bindingIsCurrent && sessionId == core.sessionId && candidate == fence
+            },
             hydrate: { _ in
                 bindingIsCurrent = false
                 return RenderableRing(
@@ -526,23 +534,13 @@ final class GatewayEndpointTests: XCTestCase {
             GatewayEndpointStubURLProtocol.reset()
         }
         let sessionId = "session-A"
-        let bindingA = DeviceRingBinding(
-            registryVersion: 2,
-            sessionId: sessionId,
-            tokenFingerprint: DeviceRingTokenFingerprint.make("token-A"),
-            installationGeneration: "1",
-            bindingId: String(repeating: "a", count: 24),
-            bindingRevision: String(repeating: "r", count: 32),
-            leaseExpiresAtSec: Int64.max
+        let bindingA = DeviceRingBindingFence(
+            id: "bind_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            revision: 1
         )
-        let bindingB = DeviceRingBinding(
-            registryVersion: 2,
-            sessionId: sessionId,
-            tokenFingerprint: DeviceRingTokenFingerprint.make("token-B"),
-            installationGeneration: "2",
-            bindingId: String(repeating: "b", count: 24),
-            bindingRevision: String(repeating: "s", count: 32),
-            leaseExpiresAtSec: Int64.max
+        let bindingB = DeviceRingBindingFence(
+            id: "bind_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            revision: 2
         )
         let hydratedCoreA = RingCore(
             id: "dial-A",
@@ -551,20 +549,14 @@ final class GatewayEndpointTests: XCTestCase {
             callerName: "Senti",
             sessionId: sessionId,
             checkpointId: nil,
-            bindingVersion: 2,
-            bindingId: bindingA.bindingId,
-            bindingRevision: bindingA.bindingRevision,
-            installationGeneration: bindingA.installationGeneration
+            binding: bindingA
         )
         let selectionGate = DialSessionSelectionGate()
         selectionGate.select(sessionId)
-        let bindingGate = DeviceRingBindingGate(initialBinding: bindingA)
+        var currentBinding: DeviceRingBindingFence? = bindingA
         let isWriteAuthorized: @MainActor () -> Bool = {
-            DialDeviceAuthorization.permits(
-                hydratedCoreA,
-                selectionGate: selectionGate,
-                bindingGate: bindingGate
-            )
+            selectionGate.permits(hydratedCoreA.sessionId)
+                && hydratedCoreA.binding == currentBinding
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
@@ -584,9 +576,9 @@ final class GatewayEndpointTests: XCTestCase {
         }
 
         selectionGate.select(nil)
-        bindingGate.replace(with: nil)
+        currentBinding = nil
         selectionGate.select(sessionId)
-        bindingGate.replace(with: bindingB)
+        currentBinding = bindingB
         let result = await adapter.confirmAndPost()
 
         guard case .refused(let reason) = result else {

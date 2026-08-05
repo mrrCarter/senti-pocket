@@ -10,6 +10,7 @@ import PocketSyncClient
 /// canvas renders live on `git pull` + open — no simulator run required to see progress.
 @main
 struct SentiPocketApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     #if DEBUG
     @StateObject private var model = PocketAppModel()
     #endif
@@ -34,7 +35,14 @@ struct SentiPocketApp: App {
                 .environmentObject(dialHost)
                 .onAppear { wireRegistrarToLogin() }
                 .onChange(of: releaseAuthenticationIsActive) { isActive in
-                    if !isActive { dialHost.onAuthenticationInvalidated() }
+                    if !isActive && shouldImmediatelyInvalidateDialHost {
+                        dialHost.onAuthenticationInvalidated()
+                    }
+                }
+                .onChange(of: scenePhase) { phase in
+                    if phase == .active {
+                        dialHost.applicationBecameActive()
+                    }
                 }
             #endif
         }
@@ -49,19 +57,36 @@ struct SentiPocketApp: App {
         #endif
     }
 
+    private var shouldImmediatelyInvalidateDialHost: Bool {
+        #if DEBUG
+        true
+        #else
+        // User sign-out owns a durable old-bearer revoke. Its pending bit survives marker, DELETE, and Keychain
+        // failures, so the generic false transition must not disarm that explicit retry path.
+        !signIn.isSignOutPending
+        #endif
+    }
+
     /// Wire login → the device VoIP-register: on a fresh login (SignInCoordinator.onAuthenticated) register the cached
     /// token so a ring can be ADDRESSED to this device. With DialHost's onVoipToken adapter this covers both orderings
     /// (token-before-login and token-after-login). Release only — DEBUG runs the fixture flow with no real auth/register.
     @MainActor
     private func wireRegistrarToLogin() {
         #if !DEBUG
-        signIn.onAuthenticated = { [weak dialHost] in dialHost?.onLoginCompleted() }
-        signIn.onAuthenticationRevoked = { [weak dialHost] in dialHost?.onAuthenticationInvalidated() }
-        dialHost.installAuthenticationExpiryHandler { [weak signIn] in
+        let host = dialHost
+        signIn.onAuthenticated = { host.onLoginCompleted() }
+        signIn.onAuthenticationRevoked = { host.onAuthenticationInvalidated() }
+        signIn.onSignOutStarted = {
+            try host.beginSignOut()
+        }
+        signIn.onWillSignOut = {
+            try await host.prepareForSignOut()
+        }
+        host.installAuthenticationExpiryHandler { [weak signIn] in
             signIn?.invalidateAuthentication()
         }
         if signIn.isAuthenticated {
-            dialHost.onLoginCompleted()
+            host.onLoginCompleted()
         }
         #endif
     }

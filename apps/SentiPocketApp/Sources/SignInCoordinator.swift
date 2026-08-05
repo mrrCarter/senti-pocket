@@ -30,25 +30,34 @@ final class SignInCoordinator: ObservableObject {
     private let login: () async throws -> Void
     /// Truth source for "is a real token in the store" — defaults to the Keychain-backed SentiNativeAuth.isLoggedIn.
     private let isLoggedIn: () -> Bool
-    /// Sign-out side effect — defaults to clearing the Keychain token.
-    private let signOutAction: () -> Void
+    /// Sign-out side effect — defaults to clearing the Keychain token and reports secure-storage failure.
+    private let signOutAction: () throws -> Void
     /// Confirmed write authority belongs to the authenticated principal and must not cross sign-out/account changes.
     private let clearProtectedLocalState: () -> Void
 
     /// Fired AFTER a login that leaves a real token in the store (and once at launch if already signed in is handled
     /// by the caller). The device VoIP-register hooks here — it needs the fresh Bearer to POST /dial/register.
     var onAuthenticated: (() -> Void)?
-    /// App-lifetime protected services must revoke selected-session authority on every accepted 401 or sign-out.
+    /// App-lifetime protected services close selected-session/call authority before a rejected credential or protected
+    /// state is removed. The sign-out path uses the stronger two-phase hooks below instead.
     var onAuthenticationRevoked: (() -> Void)?
+    /// Runs synchronously before `handle(.signOut)` returns. DialHost closes local call/selection authority and persists
+    /// the registry revocation marker here, eliminating an app-kill/scheduling gap.
+    var onSignOutStarted: (() throws -> Void)?
+    /// Completes the exact registry revoke while the old bearer still exists. Failure keeps that bearer for retry.
+    var onWillSignOut: (() async throws -> Void)?
 
     private var loginTask: Task<Void, Never>?
+    private var signOutTask: Task<Void, Never>?
+    private var signOutPending = false
+    private var pendingSignOutRequiresReauthentication = false
 
     init(login: @escaping () async throws -> Void,
          // NB: default is the nonisolated `SessionTokenStore.load() != nil` (exactly what SentiNativeAuth.isLoggedIn
          // computes) — referencing the @MainActor `SentiNativeAuth.isLoggedIn` from this nonisolated default-arg
          // context is a concurrency error (caught on the Mac build).
          isLoggedIn: @escaping () -> Bool = { SessionTokenStore.load() != nil },
-         signOut: @escaping () -> Void = { SessionTokenStore.delete() },
+         signOut: @escaping () throws -> Void = { try SessionTokenStore.delete() },
          clearProtectedLocalState: @escaping () -> Void = { OutboxStore.clear() }) {
         self.login = login
         self.isLoggedIn = isLoggedIn
@@ -66,6 +75,10 @@ final class SignInCoordinator: ObservableObject {
     /// The gate SentiPocketApp reads: the authed surfaces are reachable ONLY when this is true.
     var isAuthenticated: Bool { phase == .signedIn }
 
+    /// Remains true across registry-revoke and Keychain-delete failures. The app shell uses this instead of the
+    /// presentation phase to distinguish an intentional sign-out retry from an unrelated authentication loss.
+    var isSignOutPending: Bool { signOutPending }
+
     /// Composition roots capture this generation. A callback retained by principal A cannot invalidate a later
     /// principal B root after sign-out/re-login, even if the old request completes after the new token is installed.
     func isCurrentAuthentication(_ expectedEpoch: UInt64) -> Bool {
@@ -78,15 +91,41 @@ final class SignInCoordinator: ObservableObject {
     /// A protected API returned 401 after the launch gate had admitted the user. Clear the stale bearer before
     /// exposing sign-in again; protected feature coordinators clear their own snapshots before invoking this.
     func invalidateAuthentication(expectedEpoch: UInt64? = nil) {
+        if signOutPending {
+            // A 401 can arrive while the exact registry revoke is using the old bearer. That bearer can no longer
+            // finish DELETE, so retain the durable revoke intent, discard the rejected credential, and require a fresh
+            // login whose token is used only to finish sign-out. Never disarm the pending revoke or route Retry to the
+            // ordinary signed-in flow.
+            pendingSignOutRequiresReauthentication = true
+            authenticationEpoch &+= 1
+            loginTask?.cancel()
+            loginTask = nil
+            signOutTask?.cancel()
+            signOutTask = nil
+            clearProtectedLocalState()
+            do {
+                try signOutAction()
+                phase = .reauthenticationRequired
+            } catch {
+                phase = .unavailable(.secureStorage)
+            }
+            return
+        }
         guard phase == .signedIn else { return }
         if let expectedEpoch, authenticationEpoch != expectedEpoch { return }
         authenticationEpoch &+= 1
         loginTask?.cancel()
         loginTask = nil
+        signOutTask?.cancel()
+        signOutTask = nil
         onAuthenticationRevoked?()
         clearProtectedLocalState()
-        signOutAction()
-        phase = .reauthenticationRequired
+        do {
+            try signOutAction()
+            phase = .reauthenticationRequired
+        } catch {
+            phase = .unavailable(.secureStorage)
+        }
     }
 
     /// Map a presentation intent to the real auth flow. Returns the in-flight login Task (if any) so tests can await
@@ -95,27 +134,33 @@ final class SignInCoordinator: ObservableObject {
     func handle(_ intent: PocketProductIntent) -> Task<Void, Never>? {
         switch intent {
         case .beginSignIn, .retryAuthentication:
-            guard phase != .authorizing else { return nil }   // one login at a time; don't stack device flows
+            if signOutPending {
+                guard phase != .signingOut else { return nil }
+                if pendingSignOutRequiresReauthentication {
+                    return startLogin(resumingPendingSignOut: true)
+                }
+                return startSignOut()
+            }
+            guard phase != .authorizing, phase != .signingOut else { return nil }
             return startLogin()
         case .cancelSignIn:
+            guard phase == .authorizing else { return nil }
             loginTask?.cancel(); loginTask = nil
             phase = .signedOut
             return nil
         case .signOut:
-            loginTask?.cancel(); loginTask = nil
-            authenticationEpoch &+= 1
-            onAuthenticationRevoked?()
-            phase = .signingOut
-            clearProtectedLocalState()
-            signOutAction()
-            phase = .signedOut
-            return nil
+            guard phase == .signedIn || phase == .authorizing || signOutPending else { return nil }
+            return startSignOut()
         default:
             return nil   // Sessions/activity intents belong to another surface
         }
     }
 
-    private func startLogin() -> Task<Void, Never> {
+    private func startLogin(resumingPendingSignOut: Bool = false) -> Task<Void, Never> {
+        if !resumingPendingSignOut {
+            signOutPending = false
+            pendingSignOutRequiresReauthentication = false
+        }
         phase = .authorizing
         let task = Task { [weak self] in
             guard let self else { return }
@@ -125,8 +170,16 @@ final class SignInCoordinator: ObservableObject {
                 // GATE #2: only a REAL stored token counts as signed-in — never fake success.
                 if self.isLoggedIn() {
                     self.authenticationEpoch &+= 1
-                    self.phase = .signedIn
-                    self.onAuthenticated?()
+                    if resumingPendingSignOut && self.signOutPending {
+                        self.pendingSignOutRequiresReauthentication = false
+                        // Re-arm the registrar with the fresh bearer, then immediately resume the still-pending exact
+                        // revoke. The authenticated product root is never exposed during this cleanup-only login.
+                        self.onAuthenticated?()
+                        await self.startSignOut().value
+                    } else {
+                        self.phase = .signedIn
+                        self.onAuthenticated?()
+                    }
                 } else {
                     self.phase = .unavailable(.secureStorage)   // login returned but no token persisted
                 }
@@ -137,6 +190,66 @@ final class SignInCoordinator: ObservableObject {
         }
         loginTask = task
         return task
+    }
+
+    private func startSignOut() -> Task<Void, Never> {
+        if !signOutPending {
+            loginTask?.cancel()
+            loginTask = nil
+            authenticationEpoch &+= 1
+            signOutPending = true
+        }
+        signOutTask?.cancel()
+        signOutTask = nil
+        let signOutEpoch = authenticationEpoch
+        phase = .signingOut
+
+        do {
+            try onSignOutStarted?()
+        } catch {
+            phase = Self.mappedSignOutPhase(for: error)
+            return Task {}
+        }
+
+        // Durable route denial/local authority closure must win the race with confirmed-state removal. Repeating this
+        // idempotent clear on a retry is intentional: a failed synchronous marker attempt leaves protected state intact.
+        clearProtectedLocalState()
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.onWillSignOut?()
+            } catch {
+                guard !Task.isCancelled,
+                      self.authenticationEpoch == signOutEpoch,
+                      self.phase == .signingOut else { return }
+                self.phase = Self.mappedSignOutPhase(for: error)
+                self.signOutTask = nil
+                return
+            }
+            guard !Task.isCancelled,
+                  self.authenticationEpoch == signOutEpoch,
+                  self.phase == .signingOut else { return }
+            do {
+                try self.signOutAction()
+                self.signOutPending = false
+                self.pendingSignOutRequiresReauthentication = false
+                self.phase = .signedOut
+            } catch {
+                // Do not claim a clean sign-out while a load-bearing credential may still exist.
+                self.phase = .unavailable(.secureStorage)
+            }
+            self.signOutTask = nil
+        }
+        signOutTask = task
+        return task
+    }
+
+    private static func mappedSignOutPhase(for error: Error) -> PocketSignInPhase {
+        if let error = error as? DeviceRingSignOutError, error == .secureState {
+            return .unavailable(.secureStorage)
+        }
+        return .unavailable(.service)
     }
 
     /// NativeAuthError → the credential-free PocketSignInPhase the UI renders. User-driven backouts return to the clean

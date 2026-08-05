@@ -55,10 +55,9 @@ enum DialHydration {
                 callerName: authenticatedDialFields.callerName,
                 sessionId: core.sessionId,
                 checkpointId: signal.context.checkpointId,  // AUTHED-ONLY: the push's checkpoint is never trusted as the value
-                bindingVersion: core.bindingVersion,
-                bindingId: core.bindingId,
-                bindingRevision: core.bindingRevision,
-                installationGeneration: core.installationGeneration
+                // Registry V2 already authorized this exact server fence before the fetch. Preserve it verbatim so
+                // the post-await gate can prove the same binding is still current; hydration never invents a fence.
+                binding: core.binding
             ),
             message: signal.question,                  // the governed content, from the AUTHED fetch only
             options: options,

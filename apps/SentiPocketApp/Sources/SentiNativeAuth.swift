@@ -83,11 +83,28 @@ enum SessionTokenStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        SecItemDelete(query as CFDictionary) // idempotent replace
+        let update = SecItemUpdate(
+            query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary
+        )
+        if update == errSecSuccess { return }
+        guard update == errSecItemNotFound else {
+            throw NativeAuthError.network("keychain store failed (\(update))")
+        }
         var add = query
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly // survives relaunch, never leaves device
         let status = SecItemAdd(add as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            let retry = SecItemUpdate(
+                query as CFDictionary,
+                [kSecValueData as String: data] as CFDictionary
+            )
+            guard retry == errSecSuccess else {
+                throw NativeAuthError.network("keychain store failed (\(retry))")
+            }
+            return
+        }
         guard status == errSecSuccess else { throw NativeAuthError.network("keychain store failed (\(status))") }
     }
 
@@ -105,12 +122,15 @@ enum SessionTokenStore {
         return token
     }
 
-    static func delete() {
-        SecItemDelete([
+    static func delete() throws {
+        let status = SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ] as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw NativeAuthError.network("keychain delete failed (\(status))")
+        }
     }
 }
 
@@ -153,6 +173,7 @@ final class SentiNativeAuth: NSObject {
         presentApproval(urlString: start.authorize_url)
         defer { cancelWeb() }
         let token = try await pollUntilApproved(sessionId: start.session_id, challenge: verifier)
+        try Task.checkCancellation()
         try SessionTokenStore.save(token)
     }
 
