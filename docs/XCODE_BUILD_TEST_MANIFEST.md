@@ -12,9 +12,11 @@ Everything below this block is retained as historical lane evidence; where it co
 - Held PR #123 (`efdb431c7b7ce4b543fa3451e9c62df7c6e5eb71`) is phone/demo evidence only. Do not merge it: it contains obsolete
   gateway paths. Publish and build the clean iOS-only foundation from `master`, then the Registry V2 authority PR stacked
   on that foundation. Record `git rev-parse HEAD` and `git status --short` with every result.
-- Preserve `com.plexaura.sentipocket.app`, Swift 5.9, automatic signing, tracked entitlements, Debug development/Release
-  production APNs environments, `audio` + `voip`, the UI-test target, and `scripts/ios/archive_ipa.sh`. Change the bundle
-  ID only to an explicitly registered Push-enabled App ID, with the APNs topic/provider/profile changed in the same atom.
+- Preserve `com.plexaura.sentipocket.app`, Swift 5.9, automatic signing, tracked entitlements, `audio` + `voip`, the
+  UI-test target, and `scripts/ios/archive_ipa.sh`. Debug defaults to development and Release defaults to production in
+  unsigned build settings, but the signed export method/profile is authoritative for the final APNs environment. Change
+  the bundle ID only to an explicitly registered Push-enabled App ID, with the APNs topic/provider/profile changed in
+  the same atom.
 
 Mac build/test gate:
 
@@ -44,7 +46,7 @@ confirmation, durable post-confirm outcomes, and sign-out ordering (local author
 
 Phone gate after simulator green:
 
-1. Run `scripts/ios/archive_ipa.sh` from a clean exact commit and retain `IPA_MANIFEST.txt`, provisioning receipt, Team ID,
+1. Run `scripts/ios/archive_ipa.sh` from a clean exact commit and retain `IPA_MANIFEST.json`, provisioning receipt, Team ID,
    bundle-qualified App ID, APNs environment, `audio`/`voip`, signature, and IPA hash evidence.
 2. Install on a registered physical iPhone and prove a real PushKit token plus genuine provider-sent VoIP push. A signed
    IPA or DEBUG-local ring does not prove APNs delivery.

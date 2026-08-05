@@ -38,5 +38,9 @@ node_modules/
 # secrets
 *.pem
 *.key
+*.p8
+*.p12
+*.mobileprovision
+*.provisionprofile
 secrets/
 ElevenLabs*.txt
