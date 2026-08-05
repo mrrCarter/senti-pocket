@@ -67,12 +67,13 @@ final class PhoneWriteOutboxDurabilityTests: XCTestCase {
     private func setBackupExcluded(_ excluded: Bool, at url: URL) throws {
         var values = URLResourceValues()
         values.isExcludedFromBackup = excluded
-        var mutableURL = url
-        try mutableURL.setResourceValues(values)
+        var uncachedURL = URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath)
+        try uncachedURL.setResourceValues(values)
     }
 
     private func isBackupExcluded(at url: URL) throws -> Bool {
-        try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true
+        let uncachedURL = URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath)
+        return try uncachedURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true
     }
 
     private func prepareExcludedStagingDirectory(_ fileSystem: OutboxStore.FileSystem) throws -> URL {

@@ -107,11 +107,18 @@ enum OutboxStore {
                 excludeFromBackup: { url in
                     var values = URLResourceValues()
                     values.isExcludedFromBackup = true
-                    var mutableURL = url
-                    try mutableURL.setResourceValues(values)
+                    // URL caches resource values on the value instance. Data.write(.atomic) and rename replace
+                    // inodes at the same path, so consulting a reused URL can otherwise report the prior inode's
+                    // exclusion bit and skip protecting the replacement. Rebuild from the path for every mutation
+                    // and every verification.
+                    var uncachedURL = URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath)
+                    try uncachedURL.setResourceValues(values)
                 },
                 isExcludedFromBackup: { url in
-                    try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true
+                    let uncachedURL = URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath)
+                    return try uncachedURL.resourceValues(
+                        forKeys: [.isExcludedFromBackupKey]
+                    ).isExcludedFromBackup == true
                 },
                 install: { source, destination in
                     let status = source.path.withCString { sourcePath in
