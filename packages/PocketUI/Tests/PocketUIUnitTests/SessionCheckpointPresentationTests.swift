@@ -52,6 +52,39 @@ final class SessionCheckpointPresentationTests: XCTestCase {
         XCTAssertEqual(state.resultCount, 0)
     }
 
+    func testCanonicalButByteDistinctCheckpointSessionFailsClosed() throws {
+        let composed = "room-caf\u{00E9}"
+        let decomposed = "room-cafe\u{0301}"
+        let checkpoint = checkpointJSON(sessionId: decomposed)
+        let state = SessionCheckpointListPresentationState(
+            sessionId: composed,
+            page: try decode(SessionCheckpointListPage.self, """
+            {"checkpoints":[\(checkpoint)],"count":1}
+            """),
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertEqual(state.failure, .invalidData)
+        XCTAssertTrue(state.rows.isEmpty)
+    }
+
+    func testCanonicalButByteDistinctCheckpointIDsRemainDistinct() throws {
+        let composed = "cp-caf\u{00E9}"
+        let decomposed = "cp-cafe\u{0301}"
+        let state = SessionCheckpointListPresentationState(
+            sessionId: "room-1",
+            page: try decode(SessionCheckpointListPage.self, """
+            {"checkpoints":[\(checkpointJSON(checkpointId: composed)),
+            \(checkpointJSON(checkpointId: decomposed))],"count":2}
+            """),
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertNil(state.failure)
+        XCTAssertEqual(state.rows.count, 2)
+        XCTAssertNotEqual(state.rows[0].id, state.rows[1].id)
+    }
+
     func testInvalidSequenceOrCountFailsClosed() throws {
         let inverted = checkpointJSON(startSequence: 30, endSequence: 20)
         let invalidSequenceState = SessionCheckpointListPresentationState(
@@ -108,9 +141,14 @@ final class SessionCheckpointPresentationTests: XCTestCase {
         """)
     }
 
-    private func checkpointJSON(startSequence: Int64 = 10, endSequence: Int64 = 20) -> String {
+    private func checkpointJSON(
+        checkpointId: String = "cp-1",
+        sessionId: String = "room-1",
+        startSequence: Int64 = 10,
+        endSequence: Int64 = 20
+    ) -> String {
         """
-        {"checkpointId":"cp-1","sessionId":"room-1","kind":"manual_checkpoint",
+        {"checkpointId":"\(checkpointId)","sessionId":"\(sessionId)","kind":"manual_checkpoint",
         "title":"Sunday checkpoint","summary":"Bounded room summary","startSequence":\(startSequence),
         "endSequence":\(endSequence),"tokenRange":null,"createdBy":"carter",
         "createdByAgentId":"human-mrrcarter","eventSequence":21,"cursor":"c21",

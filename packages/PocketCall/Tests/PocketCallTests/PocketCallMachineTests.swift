@@ -10,14 +10,21 @@ final class PocketCallMachineTests: XCTestCase {
     private let key = "AA"                     // placeholder gateway key; only consulted for a `.posted` receipt
     private let challenge = "nonce-episode-1"  // per-episode confirmation nonce
 
-    private func bundle(session: String = "s1", checkpoint: String = "cp1", evidence: [EvidenceRef] = []) -> PocketBundle {
-        let summary = CheckpointSummary(checkpointId: checkpoint, headline: "h", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: nil, perAgent: [], risks: [], blockers: [])
-        return PocketBundle(contractsVersion: PocketContracts.version, checkpointId: checkpoint, sessionId: session, sequenceStart: 1, sequenceEnd: 2, summary: summary, evidence: evidence, createdAt: ts, signature: "sig", signingKeyId: "k")
+    private func evidence(session: String = "s1") -> EvidenceRef {
+        EvidenceRef(id: "ev_1", sessionId: session, sequence: 1, agentId: "a", snippet: "x", ts: ts)
     }
-    private func vb(session: String = "s1", checkpoint: String = "cp1", evidence: [EvidenceRef] = []) -> VerifiedBundle {
+    private func bundle(session: String = "s1", checkpoint: String = "cp1", evidence: [EvidenceRef]? = nil) -> PocketBundle {
+        let summary = CheckpointSummary(checkpointId: checkpoint, headline: "h", summaryBaselineSchema: "checkpoint_summary_sections_v1", grade: nil, perAgent: [], risks: [], blockers: [])
+        return PocketBundle(contractsVersion: PocketContracts.version, checkpointId: checkpoint, sessionId: session, sequenceStart: 1, sequenceEnd: 2, summary: summary, evidence: evidence ?? [self.evidence(session: session)], createdAt: ts, signature: "sig", signingKeyId: "k")
+    }
+    private func vb(session: String = "s1", checkpoint: String = "cp1", evidence: [EvidenceRef]? = nil) -> VerifiedBundle {
         VerifiedBundle.makeUnverifiedForTesting(bundle(session: session, checkpoint: checkpoint, evidence: evidence))
     }
-    private func plan(checkpoint: String = "cp1") -> BriefingPlan { BriefingPlan(checkpointId: checkpoint, segments: []) }
+    private func plan(checkpoint: String = "cp1", evidenceIds: [String] = ["ev_1"]) -> BriefingPlan {
+        BriefingPlan(checkpointId: checkpoint, segments: [
+            BriefingSegment(id: "seg-0", text: "grounded briefing", evidenceIds: evidenceIds)
+        ])
+    }
     private func invalidProposal() -> ActionProposal {
         // explicit bad hash -> isValidForConfirmation() is false (and false on non-CryptoKit hosts too)
         ActionProposal(id: "p1", kind: .threadedReply, targetSessionId: "s1", targetSequence: 10, renderedPreview: "x", requiresConfirmation: true, createdAt: ts, sourceQuestionId: nil, proposalHash: "WRONG")
@@ -96,6 +103,129 @@ final class PocketCallMachineTests: XCTestCase {
         let capB = ConfirmationCapability.forReadBack(of: displayedB, challenge: challenge)
         guard case .executing = PocketCall.reduce(awaiting, .confirmed(capB), gatewayKey: key) else { return XCTFail("B's exact cap should execute") }
     }
+
+    func testCanonicalButByteDistinctProposalAndCapabilityBindingsAreRefused() {
+        let composed = "id-caf\u{00E9}"
+        let decomposed = "id-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: ordinary String equality is canonical")
+        let conversing = PocketCallState.conversing(vb(session: composed), answers: [])
+        let foreignTarget = ActionProposal(
+            id: "proposal-foreign",
+            kind: .threadedReply,
+            targetSessionId: decomposed,
+            targetSequence: 10,
+            renderedPreview: "review",
+            createdAt: ts,
+            sourceQuestionId: nil
+        )
+        guard case .conversing = PocketCall.reduce(
+            conversing,
+            .proposalDrafted(foreignTarget, challenge: challenge),
+            gatewayKey: key
+        ) else {
+            return XCTFail("a byte-distinct target must not arm confirmation")
+        }
+
+        let displayed = ActionProposal(
+            id: composed,
+            kind: .threadedReply,
+            targetSessionId: composed,
+            targetSequence: 10,
+            renderedPreview: "review",
+            createdAt: ts,
+            sourceQuestionId: nil
+        )
+        let awaiting = PocketCallState.awaitingConfirmation(vb(session: composed), displayed, challenge: composed)
+        let variantCapabilities = [
+            ConfirmationCapability(
+                proposalId: decomposed,
+                proposalHash: displayed.proposalHash,
+                targetSessionId: displayed.targetSessionId,
+                targetSequence: displayed.targetSequence,
+                challenge: composed
+            ),
+            ConfirmationCapability(
+                proposalId: displayed.id,
+                proposalHash: displayed.proposalHash,
+                targetSessionId: decomposed,
+                targetSequence: displayed.targetSequence,
+                challenge: composed
+            ),
+            ConfirmationCapability(
+                proposalId: displayed.id,
+                proposalHash: displayed.proposalHash,
+                targetSessionId: displayed.targetSessionId,
+                targetSequence: displayed.targetSequence,
+                challenge: decomposed
+            ),
+        ]
+        for capability in variantCapabilities {
+            XCTAssertNotEqual(
+                capability,
+                ConfirmationCapability.forReadBack(of: displayed, challenge: composed),
+                "capability equality must preserve every authority field's original UTF-8 bytes"
+            )
+            guard case .awaitingConfirmation = PocketCall.reduce(
+                awaiting,
+                .confirmed(capability),
+                gatewayKey: key
+            ) else {
+                return XCTFail("a byte-distinct capability field must not execute")
+            }
+        }
+    }
+
+    func testCanonicalButByteDistinctReceiptBindingsCannotComplete() {
+        let composed = "id-caf\u{00E9}"
+        let decomposed = "id-cafe\u{0301}"
+        let proposal = ActionProposal(
+            id: composed,
+            kind: .threadedReply,
+            targetSessionId: composed,
+            targetSequence: 10,
+            renderedPreview: "review",
+            createdAt: ts,
+            sourceQuestionId: nil
+        )
+        let executing = PocketCallState.executing(vb(session: composed), proposal)
+        let variants = [
+            ActionReceipt(
+                id: "receipt-1",
+                proposalId: decomposed,
+                status: .pendingConnectivity,
+                result: nil,
+                targetSessionId: composed,
+                confirmedByHumanAt: ts,
+                confirmedProposalHash: proposal.proposalHash,
+                executedAt: nil,
+                failureReason: nil,
+                signature: nil,
+                signingKeyId: nil
+            ),
+            ActionReceipt(
+                id: "receipt-2",
+                proposalId: composed,
+                status: .pendingConnectivity,
+                result: nil,
+                targetSessionId: decomposed,
+                confirmedByHumanAt: ts,
+                confirmedProposalHash: proposal.proposalHash,
+                executedAt: nil,
+                failureReason: nil,
+                signature: nil,
+                signingKeyId: nil
+            ),
+        ]
+        for receipt in variants {
+            guard case .executing = PocketCall.reduce(
+                executing,
+                .executed(receipt),
+                gatewayKey: key
+            ) else {
+                return XCTFail("a byte-distinct receipt binding must not complete")
+            }
+        }
+    }
     #endif
 
     /// SAFETY (Echo #2): a briefing plan for a different checkpoint must not start the briefing.
@@ -105,12 +235,94 @@ final class PocketCallMachineTests: XCTestCase {
         guard case .incoming = after else { return XCTFail("cross-checkpoint plan must be refused") }
     }
 
+    /// SAFETY: matching a checkpoint id is insufficient; the plan must contain visible, uniquely cited evidence
+    /// belonging to the exact verified bundle already held by the call.
+    func testPlanGroundingAndShapeEnforced() {
+        let incoming = PocketCallState.incoming(vb())
+        let invalidPlans = [
+            BriefingPlan(checkpointId: "cp1", segments: []),
+            plan(evidenceIds: []),
+            plan(evidenceIds: ["ev_UNKNOWN"]),
+            plan(evidenceIds: ["ev_1", "ev_1"]),
+            BriefingPlan(checkpointId: "cp1", segments: [
+                BriefingSegment(id: "seg-0", text: "  ", evidenceIds: ["ev_1"])
+            ])
+        ]
+        for candidate in invalidPlans {
+            guard case .incoming = PocketCall.reduce(incoming, .answered(candidate), gatewayKey: key) else {
+                return XCTFail("invalid briefing plan must be refused: \(candidate)")
+            }
+        }
+        let candidate = plan()
+        guard case .briefing(let verified) = PocketCall.reduce(incoming, .answered(candidate), gatewayKey: key) else {
+            return XCTFail("exact bundle-grounded plan should be admitted")
+        }
+        XCTAssertEqual(verified.plan, candidate)
+        XCTAssertEqual(verified.bundle.bundle.checkpointId, "cp1")
+    }
+
     /// SAFETY (Echo #3): Q&A for a wrong checkpoint, or citing evidence absent from the bundle, is dropped.
     func testQAProvenanceAndCitationsEnforced() {
         let ev = EvidenceRef(id: "ev_1", sessionId: "s1", sequence: 1, agentId: "a", snippet: "x", ts: ts)
         let conversing = PocketCallState.conversing(vb(evidence: [ev]), answers: [])
         XCTAssertEqual(PocketCall.reduce(conversing, .questionAnswered(qa(checkpoint: "OTHER-CP")), gatewayKey: key), conversing)
         XCTAssertEqual(PocketCall.reduce(conversing, .questionAnswered(qa(citations: ["ev_UNKNOWN"])), gatewayKey: key), conversing)
+        XCTAssertEqual(PocketCall.reduce(conversing, .questionAnswered(qa(citations: ["ev_1", "ev_1"])), gatewayKey: key), conversing)
+        XCTAssertEqual(
+            PocketCall.reduce(
+                conversing,
+                .questionAnswered(qa(citations: [String(repeating: "x", count: PocketBundle.capEvId + 1)])),
+                gatewayKey: key
+            ),
+            conversing
+        )
+        XCTAssertEqual(
+            PocketCall.reduce(
+                conversing,
+                .questionAnswered(qa(citations: (0...PocketBundle.capEvidence).map { "ev_\($0)" })),
+                gatewayKey: key
+            ),
+            conversing
+        )
+
+        let composedCheckpoint = "cp_caf\u{00E9}"
+        let decomposedCheckpoint = "cp_cafe\u{0301}"
+        let canonicallyEqualCheckpointState = PocketCallState.conversing(
+            vb(checkpoint: composedCheckpoint),
+            answers: []
+        )
+        XCTAssertEqual(composedCheckpoint, decomposedCheckpoint)
+        XCTAssertEqual(
+            PocketCall.reduce(
+                canonicallyEqualCheckpointState,
+                .questionAnswered(qa(checkpoint: decomposedCheckpoint)),
+                gatewayKey: key
+            ),
+            canonicallyEqualCheckpointState
+        )
+
+        let composedEvidence = "ev_caf\u{00E9}"
+        let decomposedEvidence = "ev_cafe\u{0301}"
+        let canonicallyEqualCitationState = PocketCallState.conversing(
+            vb(evidence: [EvidenceRef(
+                id: composedEvidence,
+                sessionId: "s1",
+                sequence: 1,
+                agentId: "a",
+                snippet: "x",
+                ts: ts
+            )]),
+            answers: []
+        )
+        XCTAssertEqual(composedEvidence, decomposedEvidence)
+        XCTAssertEqual(
+            PocketCall.reduce(
+                canonicallyEqualCitationState,
+                .questionAnswered(qa(citations: [decomposedEvidence])),
+                gatewayKey: key
+            ),
+            canonicallyEqualCitationState
+        )
         guard case let .conversing(_, answers) = PocketCall.reduce(conversing, .questionAnswered(qa(citations: ["ev_1"])), gatewayKey: key), answers.count == 1 else {
             return XCTFail("valid cited Q&A should append")
         }

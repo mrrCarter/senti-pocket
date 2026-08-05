@@ -11,6 +11,16 @@ final class ContractsCrossModuleTests: XCTestCase {
 
     private let ts = Date(timeIntervalSince1970: 1_752_835_200)
 
+    func testOpaqueUTF8IdentityUsesOriginalBytesInsteadOfUnicodeCanonicalEquality() {
+        let composed = "caf\u{00E9}"
+        let decomposed = "cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: ordinary Swift strings are canonically equal")
+        XCTAssertFalse(OpaqueUTF8Identity.matches(composed, decomposed))
+        XCTAssertNotEqual(OpaqueUTF8Identity(composed), OpaqueUTF8Identity(decomposed))
+        XCTAssertEqual(Set([OpaqueUTF8Identity(composed), OpaqueUTF8Identity(decomposed)]).count, 2)
+        XCTAssertEqual(OpaqueUTF8Identity(composed).rawValue, composed)
+    }
+
     func testEveryContractConstructsCrossModule() throws {
         let ev = EvidenceRef(id: "ev_1", sessionId: "s1", sequence: 230141, agentId: "a", snippet: "x", ts: ts)
         let rawEvent = RawEvent(sequenceId: 230141, event: "session_message", agentId: "a1", payload: "hello", idempotencyToken: "tok1", ts: ts)
@@ -245,6 +255,37 @@ final class ContractsCrossModuleTests: XCTestCase {
         XCTAssertTrue(semBundle(agentId: "agent-b", perAgentEvidence: [evA]).semanticIssues().contains(.perAgentEvidenceForeignAgent))  // nested ev bound to its container agent
         XCTAssertTrue(semBundle(evId: " ev1 ").semanticIssues().contains(.malformedId))                          // untrimmed evidence id
         XCTAssertTrue(semBundle(signingKeyId: "   ").semanticIssues().contains(.malformedId))                    // whitespace-only id
+
+        // Opaque authority is ORIGINAL UTF-8, never Swift's Unicode-canonical String equality.
+        let composed = "id-caf\u{00E9}"
+        let decomposed = "id-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: the spellings are canonically equal")
+        XCTAssertTrue(
+            semBundle(cpBundle: composed, cpSummary: decomposed)
+                .semanticIssues().contains(.checkpointIdMismatch)
+        )
+        XCTAssertTrue(
+            semBundle(sessionId: composed, evSession: decomposed)
+                .semanticIssues().contains(.evidenceSessionMismatch)
+        )
+        XCTAssertTrue(
+            semBundle(
+                evId: composed,
+                claims: [Claim(id: "c1", text: "x", kind: .fact, evidenceIds: [decomposed])]
+            ).semanticIssues().contains(.foreignClaimCitation)
+        )
+        let byteDistinctEvidence = EvidenceRef(
+            id: decomposed,
+            sessionId: "sess_demo_1",
+            sequence: 151,
+            agentId: "agent-a",
+            snippet: "other",
+            ts: ts
+        )
+        XCTAssertFalse(
+            semBundle(evId: composed, secondEvidence: byteDistinctEvidence)
+                .semanticIssues().contains(.duplicateEvidenceId)
+        )
 
         // Round-5 total-work DoS budget (fail-fast; per-array caps don't bound the product): over-element (>20000) + over-byte (>1_048_576).
         // NOTE: values track PocketBundle.maxTotalElements/maxTotalBytes — bump BOTH here whenever those caps change (this test IS an enforcing surface).

@@ -1,6 +1,6 @@
 // CachedReasoningProvider — the OFFLINE fallback (.cachedSample). Serves the LAST-SYNCED briefing and, for Q&A,
 // honestly surfaces the nearest cached topics — it NEVER reasons and NEVER fabricates an answer offline. This is
-// the honest floor beneath the online GatewayReasoningProvider; Echo's on-device E4B is the future .liveReasoned
+// the honest floor beneath the verified online provider; Echo's on-device E4B is the future .liveReasoned
 // OFFLINE provider that will replace this for real offline reasoning.
 //
 // Warden bar #1 (honest labeling): `provenance == .cachedSample`. The coordinator/UI renders that unmistakably as a

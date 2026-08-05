@@ -28,17 +28,19 @@ enum DialHydration {
     /// Throws if the fetched signal doesn't match the ring the push announced (id/session/checkpoint) — never merges a
     /// substituted signal. Governed content and semantic presentation come ONLY from the authenticated fetch.
     static func merge(core: RingCore, fetched signal: NeedCarterSignal) throws -> RenderableRing {
-        guard signal.id == core.id else {
+        guard UTF8ExactIdentity.matches(signal.id, core.id) else {
             throw DialHydrationError.idMismatch(pushId: core.id, fetchedId: signal.id)
         }
-        guard signal.context.sessionId == core.sessionId else {
+        guard UTF8ExactIdentity.matches(signal.context.sessionId, core.sessionId) else {
             throw DialHydrationError.contextMismatch("session \(signal.context.sessionId) != push \(core.sessionId)")
         }
         // checkpointId: refuse a substitution (both present + differ). The merged VALUE is taken AUTHED-ONLY from the
         // signal below — NEVER the push — so a push that announces a checkpoint the authed signal doesn't carry can't
         // scope a follow-up's grounding with an unauthenticated value (forge finding on #91: checkpointId flows
         // push→RingCore→LiveDialVoice→reasoner.answerFollowUp, so the push must never source it).
-        if let pushCp = core.checkpointId, let sigCp = signal.context.checkpointId, pushCp != sigCp {
+        if let pushCp = core.checkpointId,
+           let sigCp = signal.context.checkpointId,
+           !UTF8ExactIdentity.matches(pushCp, sigCp) {
             throw DialHydrationError.contextMismatch("checkpoint \(sigCp) != push \(pushCp)")
         }
 

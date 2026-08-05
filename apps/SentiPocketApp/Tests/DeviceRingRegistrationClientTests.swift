@@ -237,6 +237,7 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
     }
 
     private func request(
+        sessionId: String = "session-a",
         expectedBindingId: String? = nil,
         expectedBindingRevision: Int? = nil,
         expectedTokenClaimId: String? = nil,
@@ -247,7 +248,7 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
             installationId: installationId,
             idempotencyKey: idempotencyKey,
             voipToken: "aabbcc",
-            sessionId: "session-a",
+            sessionId: sessionId,
             expectedBindingId: expectedBindingId,
             expectedBindingRevision: expectedBindingRevision,
             expectedTokenClaimId: expectedTokenClaimId,
@@ -443,6 +444,70 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
         body["future"] = true
         RegisterStubURLProtocol.reset(body: json(body))
         await expect(.malformedResponse, client: makeClient())
+    }
+
+    func test_registry_response_session_echoes_are_utf8_byte_exact() async {
+        let composed = "session-caf\u{00E9}"
+        let decomposed = "session-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: Swift String equality is Unicode-canonical")
+
+        RegisterStubURLProtocol.reset(body: successBody(sessionId: decomposed))
+        await expect(
+            .malformedResponse,
+            client: makeClient(),
+            request: request(sessionId: composed)
+        )
+
+        RegisterStubURLProtocol.reset(body: cleanupSuccessBody(sessionId: decomposed))
+        await expectCleanup(
+            .malformedResponse,
+            client: makeClient(),
+            request: cleanupRequest(sessionId: composed)
+        )
+
+        RegisterStubURLProtocol.reset(status: 409, body: deniedBeforeCommitBody(sessionId: decomposed))
+        await expect(
+            .malformedResponse,
+            client: makeClient(),
+            request: request(sessionId: composed)
+        )
+
+        RegisterStubURLProtocol.reset(
+            status: 409,
+            body: recoveryBody(
+                reason: "registration-committed-but-unauthorized",
+                expiresAt: "2027-01-22T08:00:00.000Z",
+                sessionId: decomposed
+            )
+        )
+        await expect(
+            .malformedResponse,
+            client: makeClient(),
+            request: request(sessionId: composed)
+        )
+
+        RegisterStubURLProtocol.reset(body: json([
+            "unregistered": true,
+            "registrationVersion": 2,
+            "ownerVersion": 1,
+            "ownerHandle": ownerHandle,
+            "sessionId": decomposed,
+        ]))
+        let unregister = DeviceRingUnregistrationRequest(
+            ownerHandle: ownerHandle,
+            installationId: installationId,
+            sessionId: composed,
+            bindingId: bindingId,
+            bindingRevision: 7
+        )
+        do {
+            try await makeClient().unregister(unregister, bearerToken: "old-bearer")
+            XCTFail("byte-distinct unregister echo must fail closed")
+        } catch let error as DeviceRingRegistrationError {
+            XCTAssertEqual(error, .malformedResponse)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 
     func test_receipt_subtracts_round_trip_and_unavailable_or_regressing_clock_fails_closed() async throws {

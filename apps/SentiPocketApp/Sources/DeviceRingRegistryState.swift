@@ -304,6 +304,21 @@ struct DeviceRingBindingRecord: Codable, Equatable, Sendable {
     let expiresAt: Date
     let leaseAuthority: DeviceRingLeaseAuthority?
 
+    static func == (lhs: DeviceRingBindingRecord, rhs: DeviceRingBindingRecord) -> Bool {
+        UTF8ExactIdentity.matches(lhs.sessionId, rhs.sessionId) &&
+        lhs.platform == rhs.platform &&
+        lhs.tokenDigest == rhs.tokenDigest &&
+        lhs.credentialFingerprint == rhs.credentialFingerprint &&
+        lhs.ownerVersion == rhs.ownerVersion &&
+        lhs.ownerHandle == rhs.ownerHandle &&
+        lhs.bindingId == rhs.bindingId &&
+        lhs.bindingRevision == rhs.bindingRevision &&
+        lhs.tokenClaimId == rhs.tokenClaimId &&
+        lhs.tokenClaimRevision == rhs.tokenClaimRevision &&
+        lhs.expiresAt == rhs.expiresAt &&
+        lhs.leaseAuthority == rhs.leaseAuthority
+    }
+
     var fence: DeviceRingBindingFence {
         DeviceRingBindingFence(id: bindingId, revision: bindingRevision)
     }
@@ -347,6 +362,20 @@ struct DeviceRingPendingRegistration: Codable, Equatable, Sendable {
     let expectedTokenClaimId: String?
     let expectedTokenClaimRevision: Int?
 
+    static func == (lhs: DeviceRingPendingRegistration, rhs: DeviceRingPendingRegistration) -> Bool {
+        UTF8ExactIdentity.matches(lhs.sessionId, rhs.sessionId) &&
+        lhs.platform == rhs.platform &&
+        lhs.tokenDigest == rhs.tokenDigest &&
+        lhs.credentialFingerprint == rhs.credentialFingerprint &&
+        lhs.ownerVersion == rhs.ownerVersion &&
+        lhs.ownerHandle == rhs.ownerHandle &&
+        lhs.idempotencyKey == rhs.idempotencyKey &&
+        lhs.expectedBindingId == rhs.expectedBindingId &&
+        lhs.expectedBindingRevision == rhs.expectedBindingRevision &&
+        lhs.expectedTokenClaimId == rhs.expectedTokenClaimId &&
+        lhs.expectedTokenClaimRevision == rhs.expectedTokenClaimRevision
+    }
+
     func matches(
         sessionId: String,
         platform: String,
@@ -355,7 +384,7 @@ struct DeviceRingPendingRegistration: Codable, Equatable, Sendable {
         ownerVersion: Int,
         ownerHandle: String
     ) -> Bool {
-        self.sessionId == sessionId &&
+        UTF8ExactIdentity.matches(self.sessionId, sessionId) &&
         self.platform == platform &&
         self.tokenDigest == tokenDigest &&
         self.credentialFingerprint == credentialFingerprint &&
@@ -680,7 +709,7 @@ final class DeviceRingBindingGate {
               !state.revocationRequested,
               state.pendingRegistration == nil,
               let binding = state.binding,
-              binding.sessionId == sessionId,
+              UTF8ExactIdentity.matches(binding.sessionId, sessionId),
               binding.bindingId == fence.id,
               binding.bindingRevision == fence.revision,
               binding.credentialFingerprint == DeviceRingFingerprint.digest(credential),

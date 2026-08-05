@@ -7,20 +7,60 @@ import PocketReasoning
 
 private final class GatewayEndpointStubURLProtocol: URLProtocol {
     private static let lock = NSLock()
-    private(set) static var requestCount = 0
-    private(set) static var lastHost: String?
-    private(set) static var lastTimeoutInterval: TimeInterval?
+    private static var requestCountStorage = 0
+    private static var lastHostStorage: String?
+    private static var lastTimeoutIntervalStorage: TimeInterval?
+    private static var stopLoadingCountStorage = 0
+    private static var responseHeadersDeliveredCountStorage = 0
     private static var responseStatus: Int?
     private static var responseBody = Data()
+    private static var responseHeaders = ["Content-Type": "application/json"]
+    private static var responseURL: URL?
+    private static var finishLoading = true
     private static var requestHook: (@Sendable () -> Void)?
+
+    static var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestCountStorage
+    }
+
+    static var lastHost: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastHostStorage
+    }
+
+    static var lastTimeoutInterval: TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastTimeoutIntervalStorage
+    }
+
+    static var stopLoadingCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopLoadingCountStorage
+    }
+
+    static var responseHeadersDeliveredCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return responseHeadersDeliveredCountStorage
+    }
 
     static func reset() {
         lock.lock()
-        requestCount = 0
-        lastHost = nil
-        lastTimeoutInterval = nil
+        requestCountStorage = 0
+        lastHostStorage = nil
+        lastTimeoutIntervalStorage = nil
+        stopLoadingCountStorage = 0
+        responseHeadersDeliveredCountStorage = 0
         responseStatus = nil
         responseBody = Data()
+        responseHeaders = ["Content-Type": "application/json"]
+        responseURL = nil
+        finishLoading = true
         requestHook = nil
         lock.unlock()
     }
@@ -28,11 +68,17 @@ private final class GatewayEndpointStubURLProtocol: URLProtocol {
     static func respond(
         status: Int,
         body: Data = Data("{}".utf8),
+        headers: [String: String] = ["Content-Type": "application/json"],
+        responseURL: URL? = nil,
+        finishLoading: Bool = true,
         requestHook: (@Sendable () -> Void)? = nil
     ) {
         lock.lock()
         responseStatus = status
         responseBody = body
+        responseHeaders = headers
+        self.responseURL = responseURL
+        self.finishLoading = finishLoading
         self.requestHook = requestHook
         lock.unlock()
     }
@@ -42,34 +88,59 @@ private final class GatewayEndpointStubURLProtocol: URLProtocol {
 
     override func startLoading() {
         Self.lock.lock()
-        Self.requestCount += 1
-        Self.lastHost = request.url?.host
-        Self.lastTimeoutInterval = request.timeoutInterval
+        Self.requestCountStorage += 1
+        Self.lastHostStorage = request.url?.host
+        Self.lastTimeoutIntervalStorage = request.timeoutInterval
         let status = Self.responseStatus
         let body = Self.responseBody
+        let headers = Self.responseHeaders
+        let responseURL = Self.responseURL
+        let finishLoading = Self.finishLoading
         let requestHook = Self.requestHook
         Self.lock.unlock()
         requestHook?()
         if let status,
-           let url = request.url,
+           let url = responseURL ?? request.url,
            let response = HTTPURLResponse(
                url: url,
                statusCode: status,
                httpVersion: "HTTP/1.1",
-               headerFields: ["Content-Type": "application/json"]
-           ) {
+               headerFields: headers
+            ) {
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: body)
-            client?.urlProtocolDidFinishLoading(self)
+            Self.lock.lock()
+            Self.responseHeadersDeliveredCountStorage += 1
+            Self.lock.unlock()
+            if finishLoading {
+                client?.urlProtocol(self, didLoad: body)
+                client?.urlProtocolDidFinishLoading(self)
+            }
             return
         }
         client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        Self.lock.lock()
+        Self.stopLoadingCountStorage += 1
+        Self.lock.unlock()
+    }
 }
 
 final class GatewayEndpointTests: XCTestCase {
+    func test_phone_and_dial_session_identity_is_utf8_byte_exact() {
+        let composed = "session-caf\u{00E9}"
+        let decomposed = "session-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: Swift String equality is Unicode-canonical")
+        XCTAssertNotEqual(UTF8ExactIdentity(composed), UTF8ExactIdentity(decomposed))
+        XCTAssertFalse(UTF8ExactIdentity.matches(Optional(composed), decomposed))
+
+        let selection = DialSessionSelectionGate()
+        selection.select(composed)
+        XCTAssertTrue(selection.permits(composed))
+        XCTAssertFalse(selection.permits(decomposed))
+    }
+
     func test_accepts_only_an_explicit_https_origin() {
         let url = GatewayEndpoint.resolve("  HTTPS://gateway.example.com:8443/  ")
 
@@ -424,6 +495,220 @@ final class GatewayEndpointTests: XCTestCase {
         XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 1)
     }
 
+    func test_reasoning_redirect_delegate_refuses_the_redirect_request() throws {
+        let originalURL = try XCTUnwrap(URL(string: "https://trusted-gateway.example/brief"))
+        let redirectedURL = try XCTUnwrap(URL(string: "https://attacker.example/brief"))
+        let response = try XCTUnwrap(
+            HTTPURLResponse(
+                url: originalURL,
+                statusCode: 307,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Location": redirectedURL.absoluteString]
+            )
+        )
+        let completion = expectation(description: "redirect decision")
+        var acceptedRedirect: URLRequest?
+
+        GatewayReasoningNoRedirectDelegate.shared.urlSession(
+            .shared,
+            task: URLSession.shared.dataTask(with: originalURL),
+            willPerformHTTPRedirection: response,
+            newRequest: URLRequest(url: redirectedURL)
+        ) { request in
+            acceptedRedirect = request
+            completion.fulfill()
+        }
+
+        wait(for: [completion], timeout: 1)
+        XCTAssertNil(acceptedRedirect, "the bearer-scoped request must never follow a redirect")
+    }
+
+    func test_reasoning_rejects_wrong_response_url_and_missing_or_wrong_json_mime() async {
+        let validBody = Data(
+            #"{"segments":[],"grounded":false,"checkpointId":"cp-1","contractsVersion":"0.1.8"}"#.utf8
+        )
+        let cases: [(URL?, [String: String])] = [
+            (URL(string: "https://attacker.example/brief"), ["Content-Type": "application/json"]),
+            (nil, [:]),
+            (nil, ["Content-Type": "text/plain"]),
+        ]
+
+        for (responseURL, headers) in cases {
+            GatewayEndpointStubURLProtocol.reset()
+            GatewayEndpointStubURLProtocol.respond(
+                status: 200,
+                body: validBody,
+                headers: headers,
+                responseURL: responseURL
+            )
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+            let client = GatewayReasoningHTTPClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { "valid-token" }
+            )
+
+            do {
+                _ = try await client.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+                XCTFail("response URL and MIME must be admitted exactly")
+            } catch GatewayReasoningError.malformedResponse {
+                // expected
+            } catch {
+                XCTFail("unexpected error: \(error)")
+            }
+        }
+        GatewayEndpointStubURLProtocol.reset()
+    }
+
+    func test_already_cancelled_reasoning_reads_no_credential_and_starts_no_request() async {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let tokenReads = LockedCounter()
+        let client = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: {
+                tokenReads.increment()
+                return "valid-token"
+            }
+        )
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await client.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+        }
+
+        do {
+            _ = try await task.value
+            XCTFail("an already-cancelled operation must stop before reading authority")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertEqual(tokenReads.value, 0)
+        XCTAssertEqual(GatewayEndpointStubURLProtocol.requestCount, 0)
+    }
+
+    func test_reasoning_cancellation_after_headers_cancels_the_underlying_stream() async {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        GatewayEndpointStubURLProtocol.respond(status: 200, finishLoading: false)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let tokenReads = LockedCounter()
+        let client = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: {
+                tokenReads.increment()
+                return "valid-token"
+            }
+        )
+        let task = Task {
+            try await client.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+        }
+        for _ in 0..<100 {
+            if GatewayEndpointStubURLProtocol.responseHeadersDeliveredCount == 1,
+               tokenReads.value >= 2 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(
+            GatewayEndpointStubURLProtocol.responseHeadersDeliveredCount,
+            1,
+            "the test must cancel only after the response headers were delivered"
+        )
+        XCTAssertGreaterThanOrEqual(
+            tokenReads.value,
+            2,
+            "the client must resume from bytes(for:) and revalidate authority before cancellation"
+        )
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("a cancelled response stream must not decode or publish")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        for _ in 0..<100 {
+            if GatewayEndpointStubURLProtocol.stopLoadingCount > 0 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThan(GatewayEndpointStubURLProtocol.stopLoadingCount, 0)
+    }
+
+    func test_reasoning_response_enforces_the_exact_wire_cap() async throws {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        let body = Data(
+            #"{"segments":[],"grounded":false,"checkpointId":"cp-1","contractsVersion":"0.1.8"}"#.utf8
+        )
+        GatewayEndpointStubURLProtocol.respond(
+            status: 200,
+            body: body
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let exactClient = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: { "valid-token" },
+            responseByteLimit: body.count
+        )
+        _ = try await exactClient.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+
+        GatewayEndpointStubURLProtocol.respond(status: 200, body: body)
+        let undersizedClient = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: { "valid-token" },
+            responseByteLimit: body.count - 1
+        )
+        do {
+            _ = try await undersizedClient.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+            XCTFail("an oversized reasoning response must fail before decode")
+        } catch GatewayReasoningError.malformedResponse {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func test_reasoning_rejects_declared_content_length_before_body_accumulation() async {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        GatewayEndpointStubURLProtocol.respond(
+            status: 200,
+            body: Data("{}".utf8),
+            headers: [
+                "Content-Type": "application/json",
+                "Content-Length": "65",
+            ]
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let client = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: { "valid-token" },
+            responseByteLimit: 64
+        )
+
+        do {
+            _ = try await client.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+            XCTFail("declared body beyond the cap must fail before decode")
+        } catch GatewayReasoningError.malformedResponse {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     @MainActor
     func test_late_write_401_from_old_principal_does_not_invalidate_or_clear_new_principal() async {
         OutboxStore.clear()
@@ -510,6 +795,66 @@ final class GatewayEndpointTests: XCTestCase {
             XCTFail("unexpected error: \(error)")
         }
         XCTAssertEqual(signal.value, 0)
+    }
+
+    func test_late_reasoning_success_or_service_error_from_old_principal_is_superseded() async {
+        let validBody = Data(
+            #"{"segments":[],"grounded":false,"checkpointId":"cp-1","contractsVersion":"0.1.8"}"#.utf8
+        )
+        for (status, body) in [(200, validBody), (503, Data("{}".utf8))] {
+            GatewayEndpointStubURLProtocol.reset()
+            let token = LockedTokenBox("principal-A")
+            GatewayEndpointStubURLProtocol.respond(
+                status: status,
+                body: body,
+                requestHook: { token.value = "principal-B" }
+            )
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+            let client = GatewayReasoningHTTPClient(
+                apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+                urlSession: URLSession(configuration: configuration),
+                tokenProvider: { token.value }
+            )
+
+            do {
+                _ = try await client.postBrief(sessionId: "session-A", checkpointId: nil)
+                XCTFail("status \(status) from an old principal must not escape")
+            } catch GatewayReasoningError.supersededAuthentication {
+                // expected
+            } catch {
+                XCTFail("unexpected error for status \(status): \(error)")
+            }
+        }
+        GatewayEndpointStubURLProtocol.reset()
+    }
+
+    func test_malformed_reasoning_from_a_rotated_principal_is_superseded() async {
+        GatewayEndpointStubURLProtocol.reset()
+        defer { GatewayEndpointStubURLProtocol.reset() }
+        GatewayEndpointStubURLProtocol.respond(status: 200, body: Data("{".utf8))
+        let tokenSequence = LockedTokenSequence(
+            initialValue: "principal-A",
+            replacementValue: "principal-B",
+            initialReadCount: 3
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayEndpointStubURLProtocol.self]
+        let client = GatewayReasoningHTTPClient(
+            apiBaseURL: URL(string: "https://trusted-gateway.example")!,
+            urlSession: URLSession(configuration: configuration),
+            tokenProvider: { tokenSequence.next() }
+        )
+
+        do {
+            _ = try await client.postBrief(sessionId: "session-A", checkpointId: "cp-1")
+            XCTFail("a stale malformed response must not publish principal A's error into principal B")
+        } catch GatewayReasoningError.supersededAuthentication {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertEqual(tokenSequence.readCount, 4)
     }
 
     @MainActor
@@ -737,6 +1082,34 @@ private final class LockedTokenBox: @unchecked Sendable {
             storedValue = newValue
             lock.unlock()
         }
+    }
+}
+
+private final class LockedTokenSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let initialValue: String
+    private let replacementValue: String
+    private let initialReadCount: Int
+    private var storedReadCount = 0
+
+    init(initialValue: String, replacementValue: String, initialReadCount: Int) {
+        self.initialValue = initialValue
+        self.replacementValue = replacementValue
+        self.initialReadCount = initialReadCount
+    }
+
+    var readCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReadCount
+    }
+
+    func next() -> String {
+        lock.lock()
+        storedReadCount += 1
+        let value = storedReadCount <= initialReadCount ? initialValue : replacementValue
+        lock.unlock()
+        return value
     }
 }
 

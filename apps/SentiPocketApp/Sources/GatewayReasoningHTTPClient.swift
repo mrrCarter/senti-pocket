@@ -1,6 +1,6 @@
 // GatewayReasoningHTTPClient — the app's concrete HTTP client to relay's GATED reasoning gateway (POST /brief,
-// POST /answer). Conforms to PocketReasoning's GatewayReasoningClient seam, so GatewayReasoningProvider gets a real
-// online client (unblocks .liveReasoned reasoning on-screen — the online half of the bad-build fix). App-shell lane:
+// POST /answer). Conforms to PocketReasoning's GatewayReasoningClient seam, so the unbound wire adapter gets a real
+// unbound wire client; only VerifiedGatewayReasoningProvider may publish its output as .liveReasoned. App-shell lane:
 // this is the app's network client; relay owns the SERVER endpoints it calls (bf79a6fa /answer, 4b1feaa /brief).
 //
 // Request shapes are SOURCE-BOUND to handlers.mjs: /brief {sessionId, checkpointId?}, /answer {sessionId, question,
@@ -63,11 +63,29 @@ enum GatewayReasoningError: LocalizedError {
     }
 }
 
+/// A bearer scoped to the configured reasoning origin must never follow an HTTP redirect.
+final class GatewayReasoningNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    static let shared = GatewayReasoningNoRedirectDelegate()
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 struct GatewayReasoningHTTPClient: GatewayReasoningClient {
     /// `/brief` and `/answer` are non-streaming: the gateway can spend up to 5s authenticating and 30s waiting for
     /// Gemma before the first response byte. Keep that healthy path inside the shared session's 60s resource wall
     /// without weakening the 15s default used by the app's ordinary interactive requests.
     private static let reasoningRequestTimeout: TimeInterval = 45
+    /// The semantic plan/answer budget is 1 MiB. JSON escaping and field names can expand that representation, so
+    /// use the same bounded 8 MiB wire ceiling as the exact-checkpoint transport and stream into it incrementally.
+    static let maximumResponseBytes = 8 * 1_024 * 1_024
 
     private let apiBaseURL: URL
     private let urlSession: URLSession
@@ -76,15 +94,19 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
     /// The reasoning driver intentionally turns provider errors into an honest `.failed` phase. This side-channel
     /// also closes the authenticated app root when the gateway explicitly reports an expired bearer.
     private let onReauthenticationRequired: @Sendable (String?) -> Void
+    private let responseByteLimit: Int
 
     init(apiBaseURL: URL,
          urlSession: URLSession = SentiHTTPTransportPolicy.liveSession,
          tokenProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() },
-         onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in }) {
+         onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in },
+         responseByteLimit: Int = Self.maximumResponseBytes) {
+        precondition((1...Self.maximumResponseBytes).contains(responseByteLimit))
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
         self.tokenProvider = tokenProvider
         self.onReauthenticationRequired = onReauthenticationRequired
+        self.responseByteLimit = responseByteLimit
     }
 
     private struct BriefRequest: Encodable { let sessionId: String; let checkpointId: String? }
@@ -99,6 +121,7 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
     }
 
     private func post<Req: Encodable, Res: Decodable>(path: String, body: Req) async throws -> Res {
+        try Task.checkCancellation()
         guard let token = tokenProvider(), !token.isEmpty else {
             onReauthenticationRequired(nil)
             throw GatewayReasoningError.notLoggedIn
@@ -110,20 +133,96 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")  // membership-gated (scope sync)
         req.httpBody = try JSONEncoder().encode(body)
-        let (data, response): (Data, URLResponse)
-        do { (data, response) = try await urlSession.data(for: req) }
-        catch { throw GatewayReasoningError.network(error.localizedDescription) }
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+        do {
+            (bytes, response) = try await urlSession.bytes(
+                for: req,
+                delegate: GatewayReasoningNoRedirectDelegate.shared
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        } catch {
+            try requireCurrentToken(token)
+            throw GatewayReasoningError.network(error.localizedDescription)
+        }
+        defer { bytes.task.cancel() }
+        try Task.checkCancellation()
+        try requireCurrentToken(token)
+        guard let http = response as? HTTPURLResponse,
+              response.url == req.url else {
+            throw GatewayReasoningError.malformedResponse
+        }
+        if !(200..<300).contains(http.statusCode) {
             if http.statusCode == 401 {
-                guard tokenProvider() == token else {
-                    throw GatewayReasoningError.supersededAuthentication
-                }
+                try requireCurrentToken(token)
                 onReauthenticationRequired(token)
                 throw GatewayReasoningError.reauthenticationRequired
             }
             throw GatewayReasoningError.http(http.statusCode)   // 401/403 auth, 501 backend-unconfigured, 503 no-checkpoint…
         }
-        do { return try JSONDecoder().decode(Res.self, from: data) }
-        catch { throw GatewayReasoningError.malformedResponse }
+        guard http.mimeType?.lowercased() == "application/json" else {
+            throw GatewayReasoningError.malformedResponse
+        }
+        let data: Data
+        do {
+            data = try await Self.collect(bytes, response: response, maximumBytes: responseByteLimit)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        } catch let error as URLError {
+            try requireCurrentToken(token)
+            throw GatewayReasoningError.network(error.localizedDescription)
+        } catch let error as GatewayReasoningError {
+            try requireCurrentToken(token)
+            throw error
+        } catch {
+            try requireCurrentToken(token)
+            throw GatewayReasoningError.malformedResponse
+        }
+        try Task.checkCancellation()
+        try requireCurrentToken(token)
+        let decoded: Res
+        do {
+            decoded = try JSONDecoder().decode(Res.self, from: data)
+        } catch {
+            try requireCurrentToken(token)
+            throw GatewayReasoningError.malformedResponse
+        }
+        try Task.checkCancellation()
+        try requireCurrentToken(token)
+        return decoded
+    }
+
+    private func requireCurrentToken(_ expectedToken: String) throws {
+        guard UTF8ExactIdentity.matches(tokenProvider(), expectedToken) else {
+            throw GatewayReasoningError.supersededAuthentication
+        }
+    }
+
+    private static func collect(
+        _ bytes: URLSession.AsyncBytes,
+        response: URLResponse,
+        maximumBytes: Int
+    ) async throws -> Data {
+        if response.expectedContentLength > Int64(maximumBytes) {
+            throw GatewayReasoningError.malformedResponse
+        }
+        var data = Data()
+        if response.expectedContentLength > 0 {
+            data.reserveCapacity(Int(response.expectedContentLength))
+        }
+        for try await byte in bytes {
+            guard data.count < maximumBytes else {
+                throw GatewayReasoningError.malformedResponse
+            }
+            data.append(byte)
+            if data.count % 4_096 == 0 {
+                try Task.checkCancellation()
+            }
+        }
+        return data
     }
 }

@@ -437,7 +437,7 @@ extension SentiCallManager: @preconcurrency PKPushRegistryDelegate {
               isBindingAuthorized(rawFence.sessionId, rawFence.fence),
               let received = receiveState(from: payload),
               let stateFence = sessionAndFence(from: received.state),
-              stateFence.sessionId == rawFence.sessionId,
+              UTF8ExactIdentity.matches(stateFence.sessionId, rawFence.sessionId),
               stateFence.fence == rawFence.fence else {
             return (generic, nil, nil)
         }

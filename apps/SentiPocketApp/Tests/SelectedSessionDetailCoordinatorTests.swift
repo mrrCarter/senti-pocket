@@ -134,6 +134,105 @@ final class SelectedSessionDetailCoordinatorTests: XCTestCase {
         }
     }
 
+    func test_canonical_variant_selection_starts_new_requests_and_old_completion_cannot_publish() async throws {
+        let composed = "room-caf\u{00E9}"
+        let decomposed = "room-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: ordinary String equality is canonical")
+        let transport = ControlledSessionDetailTransport()
+        let coordinator = SelectedSessionDetailCoordinator(transport: transport)
+
+        let first = try XCTUnwrap(coordinator.setSelectedSession(
+            composed,
+            authenticationRevision: 1
+        ))
+        try await waitForRequests(transport, events: 1, actions: 1, checkpoints: 1)
+        let second = try XCTUnwrap(coordinator.setSelectedSession(
+            decomposed,
+            authenticationRevision: 1
+        ))
+        try await waitForRequests(transport, events: 2, actions: 2, checkpoints: 2)
+        let requested = await transport.requestedSessions()
+        XCTAssertTrue(requested.events[0].utf8.elementsEqual(composed.utf8))
+        XCTAssertTrue(requested.events[1].utf8.elementsEqual(decomposed.utf8))
+
+        await transport.resumeNextEvent(.success(try eventPage(sessionId: composed, marker: "old")))
+        await transport.resumeNextAction(.success(try actionPage(sessionId: composed, marker: "old")))
+        await transport.resumeNextCheckpoint(.success(try checkpointPage(
+            sessionId: composed,
+            marker: "old"
+        )))
+        await first.value
+
+        XCTAssertTrue(coordinator.selectedSessionId?.utf8.elementsEqual(decomposed.utf8) == true)
+        XCTAssertNil(coordinator.activityState)
+        XCTAssertNil(coordinator.checkpointState)
+        XCTAssertEqual(coordinator.activityLoadState, .loading)
+        XCTAssertEqual(coordinator.checkpointLoadState, .loading)
+
+        await transport.resumeNextEvent(.success(try eventPage(sessionId: decomposed, marker: "new")))
+        await transport.resumeNextAction(.success(try actionPage(sessionId: decomposed, marker: "new")))
+        await transport.resumeNextCheckpoint(.success(try checkpointPage(
+            sessionId: decomposed,
+            marker: "new"
+        )))
+        await second.value
+
+        XCTAssertEqual(coordinator.activityState?.events.map(\.id.eventId), ["event-new"])
+        XCTAssertEqual(coordinator.checkpointState?.rows.map(\.checkpointId), ["checkpoint-new"])
+    }
+
+    func test_canonical_variant_intents_and_visible_row_ids_are_rejected() async throws {
+        let composedSession = "room-caf\u{00E9}"
+        let decomposedSession = "room-cafe\u{0301}"
+        let composedMarker = "caf\u{00E9}"
+        let decomposedMarker = "cafe\u{0301}"
+        let opened = ExactCheckpointTargetProbe()
+        let transport = ControlledSessionDetailTransport()
+        let coordinator = SelectedSessionDetailCoordinator(
+            transport: transport,
+            onOpenCheckpoint: { opened.values.append($0) }
+        )
+        let operation = try XCTUnwrap(coordinator.setSelectedSession(
+            composedSession,
+            authenticationRevision: 9
+        ))
+        try await waitForRequests(transport, events: 1, actions: 1, checkpoints: 1)
+        await transport.resumeNextEvent(.success(try eventPage(
+            sessionId: composedSession,
+            marker: composedMarker
+        )))
+        await transport.resumeNextAction(.success(try actionPage(
+            sessionId: composedSession,
+            marker: composedMarker
+        )))
+        await transport.resumeNextCheckpoint(.success(try checkpointPage(
+            sessionId: composedSession,
+            marker: composedMarker
+        )))
+        await operation.value
+
+        coordinator.send(.refreshActivity(sessionId: decomposedSession))
+        coordinator.send(.refreshCheckpoints(sessionId: decomposedSession))
+        coordinator.send(.openEvent(sessionId: decomposedSession, sequenceId: 1))
+        coordinator.send(.openAction(
+            sessionId: composedSession,
+            actionId: "action-\(decomposedMarker)"
+        ))
+        coordinator.send(.openCheckpoint(
+            sessionId: composedSession,
+            checkpointId: "checkpoint-\(decomposedMarker)"
+        ))
+
+        let counts = await transport.requestCounts()
+        XCTAssertEqual(counts.events, 1)
+        XCTAssertEqual(counts.actions, 1)
+        XCTAssertEqual(counts.checkpoints, 1)
+        XCTAssertNil(coordinator.destination)
+        XCTAssertTrue(opened.values.isEmpty)
+        XCTAssertNil(coordinator.event(sequenceId: 1, eventId: "event-\(decomposedMarker)"))
+        XCTAssertNil(coordinator.action(actionId: "action-\(decomposedMarker)"))
+    }
+
     func test_activity_navigation_accepts_only_exact_visible_rows_and_clears_with_selection() async throws {
         let transport = ControlledSessionDetailTransport()
         let coordinator = SelectedSessionDetailCoordinator(transport: transport)

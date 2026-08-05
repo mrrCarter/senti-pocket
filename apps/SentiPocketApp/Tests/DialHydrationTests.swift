@@ -126,6 +126,38 @@ final class DialHydrationTests: XCTestCase {
         }
     }
 
+    func test_unicode_canonical_but_byte_distinct_identity_is_refused() {
+        let composed = "caf\u{00E9}"
+        let decomposed = "cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: Swift String equality is Unicode-canonical")
+        XCTAssertFalse(composed.utf8.elementsEqual(decomposed.utf8))
+
+        XCTAssertThrowsError(try DialHydration.merge(
+            core: core(id: "need_\(composed)"),
+            fetched: signal(id: "need_\(decomposed)")
+        )) { error in
+            guard case DialHydrationError.idMismatch = error else {
+                return XCTFail("expected byte-exact idMismatch, got \(error)")
+            }
+        }
+        XCTAssertThrowsError(try DialHydration.merge(
+            core: core(sessionId: "session_\(composed)"),
+            fetched: signal(sessionId: "session_\(decomposed)")
+        )) { error in
+            guard case DialHydrationError.contextMismatch = error else {
+                return XCTFail("expected byte-exact session mismatch, got \(error)")
+            }
+        }
+        XCTAssertThrowsError(try DialHydration.merge(
+            core: core(checkpointId: "cp_\(composed)"),
+            fetched: signal(checkpointId: "cp_\(decomposed)")
+        )) { error in
+            guard case DialHydrationError.contextMismatch = error else {
+                return XCTFail("expected byte-exact checkpoint mismatch, got \(error)")
+            }
+        }
+    }
+
     // MARK: - checkpoint fallback (lean push shed the checkpoint; the authed fetch is authoritative)
 
     func test_checkpoint_from_fetch_when_lean_push_omitted_it() throws {

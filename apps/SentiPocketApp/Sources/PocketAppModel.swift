@@ -220,8 +220,14 @@ final class PocketAppModel: NSObject, ObservableObject {
         case .confirmProposal(let confirmation):
             guard case .proposal(let proposalState) = state.destination,
                   confirmation.proposal == proposalState.confirmationGate.proposal,
-                  confirmation.proposalId == proposalState.confirmationGate.proposal.id,
-                  confirmation.proposalHash == proposalState.confirmationGate.proposal.proposalHash,
+                  OpaqueUTF8Identity.matches(
+                      confirmation.proposalId,
+                      proposalState.confirmationGate.proposal.id
+                  ),
+                  OpaqueUTF8Identity.matches(
+                      confirmation.proposalHash,
+                      proposalState.confirmationGate.proposal.proposalHash
+                  ),
                   let receiptState = PocketUIDemoFixtures.pendingReceiptState(
                     for: confirmation,
                     confirmedAt: Date()
@@ -234,7 +240,10 @@ final class PocketAppModel: NSObject, ObservableObject {
 
         case .cancelProposal(let proposalID):
             guard case .proposal(let proposalState) = state.destination,
-                  proposalState.confirmationGate.proposal.id == proposalID else { return }
+                  OpaqueUTF8Identity.matches(
+                      proposalState.confirmationGate.proposal.id,
+                      proposalID
+                  ) else { return }
             var gate = proposalState.confirmationGate
             if case .proposal(let attempt)? = activeSpeech?.purpose {
                 gate.failReadBack(attempt, message: "Read-back cancelled before completion.")
@@ -289,7 +298,7 @@ final class PocketAppModel: NSObject, ObservableObject {
               case .inbox(let inbox) = state.destination else { return false }
         let expectedIntegrity = BundleIntegrityState(verifiedBundle: verifiedBundle)
         return inbox.items.contains {
-            $0.bundle == verifiedBundle.bundle && $0.integrity == expectedIntegrity
+            verifiedBundle.exactlyMatches($0.bundle) && $0.integrity == expectedIntegrity
         }
     }
 
@@ -299,7 +308,7 @@ final class PocketAppModel: NSObject, ObservableObject {
     ) -> Bool {
         guard matches(context, verifiedBundle: verifiedBundle),
               case .incoming(let incoming) = state.destination else { return false }
-        return incoming.bundle == verifiedBundle.bundle
+        return verifiedBundle.exactlyMatches(incoming.bundle)
             && incoming.integrity == BundleIntegrityState(verifiedBundle: verifiedBundle)
     }
 
@@ -309,7 +318,8 @@ final class PocketAppModel: NSObject, ObservableObject {
     ) -> Bool {
         guard matches(context, verifiedBundle: verifiedBundle),
               case .conversation(let conversation) = state.destination else { return false }
-        return conversation.bundle == verifiedBundle.bundle && conversation.integrity.kind == .verified
+        return verifiedBundle.exactlyMatches(conversation.bundle)
+            && conversation.integrity.kind == .verified
     }
 
     private func matchesCurrentEvidenceSelection(
@@ -317,19 +327,19 @@ final class PocketAppModel: NSObject, ObservableObject {
         verifiedBundle: VerifiedBundle
     ) -> Bool {
         guard case .conversation(let conversation) = state.destination,
-              conversation.bundle == verifiedBundle.bundle,
+              verifiedBundle.exactlyMatches(conversation.bundle),
               conversation.integrity == BundleIntegrityState(verifiedBundle: verifiedBundle) else {
             return false
         }
 
         let citedEvidenceIDs = Set(
-            conversation.briefingPlan.segments.flatMap(\.evidenceIds)
+            (conversation.briefingPlan.segments.flatMap(\.evidenceIds)
                 + conversation.transcript.flatMap { entry in
                     if case .questionAnswer(let answer) = entry { return answer.citations }
                     return []
-                }
+                }).map(OpaqueUTF8Identity.init)
         )
-        guard citedEvidenceIDs.contains(selection.evidenceId) else { return false }
+        guard citedEvidenceIDs.contains(OpaqueUTF8Identity(selection.evidenceId)) else { return false }
         return verifiedBundle.bundle.evidence.contains { evidence in
             PresentedEvidenceSelection(evidence: evidence, verifiedBundle: verifiedBundle) == selection
         }

@@ -112,6 +112,30 @@ final class DialCoordinatorTests: XCTestCase {
     }
 
     @MainActor
+    func test_unicode_canonical_but_byte_distinct_dial_id_is_rejected() async {
+        let composed = "need-caf\u{00E9}"
+        let decomposed = "need-cafe\u{0301}"
+        let rec = Recorder()
+        let uuid = UUID()
+        let coordinator = make(rec, hydrate: { _ in
+            XCTFail("byte-distinct dial id must not hydrate")
+            return self.ring()
+        })
+        coordinator.received(state(composed), dialId: composed, callUUID: uuid)
+
+        let outcome = await coordinator.answered(dialId: decomposed, callUUID: uuid)
+        if case .declined = outcome {} else { return XCTFail("byte-distinct dial id must decline") }
+        XCTAssertTrue(rec.ranRings.isEmpty)
+
+        var lifecycle = DialCallLifecycle()
+        XCTAssertTrue(lifecycle.reported(callUUID: uuid, dialId: composed))
+        XCTAssertEqual(
+            lifecycle.answered(callUUID: uuid, dialId: decomposed, revision: 1),
+            .rejected
+        )
+    }
+
+    @MainActor
     func test_discarded_episode_cannot_hydrate_or_run() async {
         let rec = Recorder()
         let uuid = UUID()

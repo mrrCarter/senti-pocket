@@ -251,7 +251,7 @@ private struct AuthenticatedRootView: View {
                     SessionListView(state: sessions.state) { intent in
                         sessions.send(intent)
                         if case .selectSession(let sessionId) = intent,
-                           sessions.selectedSessionId == sessionId {
+                           UTF8ExactIdentity.matches(sessions.selectedSessionId, sessionId) {
                             selectedTab = .pocket
                         }
                     }
@@ -408,10 +408,10 @@ private struct SelectedSessionPocketView: View {
                 sessionId: sessionId,
                 onReauthenticationRequired: onReauthenticationRequired,
                 isWriteAuthorized: {
-                    sessions.selectedSessionId == sessionId
+                    UTF8ExactIdentity.matches(sessions.selectedSessionId, sessionId)
                 }
             )
-                .id(sessionId)
+                .id(UTF8ExactIdentity(sessionId))
         } else {
             NavigationStack {
                 StatusView(
@@ -489,7 +489,7 @@ private struct SelectedSessionActivityBoundary: View {
                 }
             }
         }
-        .id(sessions.selectedSessionId)
+        .id(sessions.selectedSessionId.map(UTF8ExactIdentity.init))
     }
 
     /// Item-based navigation destinations require iOS 17; Pocket's floor remains iOS 16.
@@ -612,15 +612,27 @@ struct PhoneRootView: View {
         let gatewayURL = GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_GATEWAY_URL"])
         let authenticationExpiry = AuthenticationExpiryRelay()
         authenticationExpiry.install(onReauthenticationRequired)
-        // ONLINE → real gateway reasoning (GatewayReasoningHTTPClient → relay's gated /brief+/answer, bearer session
-        // token). It reasons the moment relay's backend + a key/Gemma are live; until then /brief 501/503 → the driver
-        // surfaces .failed honestly (never a fabricated brief). A build with no trusted gateway has no selected-session
-        // cache yet and returns an explicit unavailable error; it never borrows the DEBUG fixture's session content.
-        let online = gatewayURL.map {
-            GatewayReasoningProvider(client: GatewayReasoningHTTPClient(
-                apiBaseURL: $0,
+        // ONLINE → gateway reasoning admitted against an independently fetched, signature-verified exact checkpoint.
+        // The actor keeps auth/session/checkpoint context and refuses foreign citations before the UI can label output
+        // live/grounded. Until the backend + signing key/Gemma are live, failures surface honestly. A build with no
+        // trusted gateway has no selected-session cache and never borrows DEBUG fixture content.
+        let tokenProvider: @Sendable () -> String? = { SessionTokenStore.load() }
+        let online = gatewayURL.map { gatewayURL in
+            VerifiedGatewayReasoningProvider(
+                expectedSessionId: sessionId,
+                gateway: UnboundGatewayReasoningProvider(client: GatewayReasoningHTTPClient(
+                    apiBaseURL: gatewayURL,
+                    tokenProvider: tokenProvider,
+                    onReauthenticationRequired: { authenticationExpiry.signal(expectedToken: $0) }
+                )),
+                checkpointTransport: HTTPCheckpointTransport(
+                    gatewayBaseURL: gatewayURL,
+                    urlSession: SentiHTTPTransportPolicy.checkpointSession,
+                    tokenProvider: tokenProvider
+                ),
+                tokenProvider: tokenProvider,
                 onReauthenticationRequired: { authenticationExpiry.signal(expectedToken: $0) }
-            ))
+            )
         }
         _reasoning = StateObject(wrappedValue: RealReasoningCoordinator(
             sessionId: sessionId, checkpointId: nil,
@@ -736,9 +748,9 @@ struct RootView: View {
                 Label("verified · \(b.signingKeyId)", systemImage: "checkmark.seal.fill")
                     .font(.caption2).foregroundStyle(.green)
             }
-            ForEach(b.summary.perAgent, id: \.agentId) { agent in
+            ForEach(b.summary.perAgent, id: \.sentiOpaqueIdentity) { agent in
                 Section(agent.agentId) {
-                    ForEach(agent.claims) { claim in
+                    ForEach(agent.claims, id: \.sentiOpaqueIdentity) { claim in
                         HStack(alignment: .top) {
                             Text(badge(claim.kind)).font(.caption2)
                             Text(claim.text).font(.subheadline)
@@ -763,6 +775,14 @@ struct RootView: View {
     }
 }
 #endif
+
+private extension AgentSummary {
+    var sentiOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(agentId) }
+}
+
+private extension Claim {
+    var sentiOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(id) }
+}
 
 /// iOS 16-compatible empty/error state (ContentUnavailableView is iOS 17+, but the app target is pinned to iOS 16
 /// per the baseline — forge #238084 caught the mismatch on the real Mac). Pure VStack/Image/Text = iOS 16-safe.

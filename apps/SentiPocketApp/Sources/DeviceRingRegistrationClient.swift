@@ -368,7 +368,7 @@ struct DeviceRingRegistrationClient: DeviceRingRegistryClient, @unchecked Sendab
               decoded.registrationVersion == 2,
               decoded.ownerVersion == request.ownerVersion,
               decoded.ownerHandle == request.ownerHandle,
-              decoded.sessionId == request.sessionId,
+              UTF8ExactIdentity.matches(decoded.sessionId, request.sessionId),
               decoded.platform == request.platform,
               DeviceRingBindingFence(
                 id: decoded.bindingId,
@@ -454,7 +454,7 @@ struct DeviceRingRegistrationClient: DeviceRingRegistryClient, @unchecked Sendab
               decoded.ownerVersion == request.ownerVersion,
               decoded.ownerHandle == request.ownerHandle,
               decoded.idempotencyKey == request.idempotencyKey,
-              decoded.sessionId == request.sessionId,
+              UTF8ExactIdentity.matches(decoded.sessionId, request.sessionId),
               decoded.platform == request.platform,
               decoded.registered == false,
               decoded.authorized == false,
@@ -502,7 +502,7 @@ struct DeviceRingRegistrationClient: DeviceRingRegistryClient, @unchecked Sendab
               decoded.registrationVersion == 2,
               decoded.ownerVersion == request.ownerVersion,
               decoded.ownerHandle == request.ownerHandle,
-              decoded.sessionId == request.sessionId else {
+              UTF8ExactIdentity.matches(decoded.sessionId, request.sessionId) else {
             throw DeviceRingRegistrationError.malformedResponse
         }
     }
@@ -655,7 +655,7 @@ struct DeviceRingRegistrationClient: DeviceRingRegistryClient, @unchecked Sendab
               strictPositiveInteger(object["registrationVersion"]) == 2,
               strictPositiveInteger(object["ownerVersion"]) == request.ownerVersion,
               object["ownerHandle"] as? String == request.ownerHandle,
-              object["sessionId"] as? String == request.sessionId,
+              UTF8ExactIdentity.matches(object["sessionId"] as? String, request.sessionId),
               object["platform"] as? String == request.platform,
               let bindingId = object["bindingId"] as? String,
               let bindingRevision = strictPositiveInteger(object["bindingRevision"]),
@@ -714,7 +714,7 @@ struct DeviceRingRegistrationClient: DeviceRingRegistryClient, @unchecked Sendab
                   strictPositiveInteger(object["registrationVersion"]) == 2,
                   strictPositiveInteger(object["ownerVersion"]) == request.ownerVersion,
                   object["ownerHandle"] as? String == request.ownerHandle,
-                  object["sessionId"] as? String == request.sessionId,
+                  UTF8ExactIdentity.matches(object["sessionId"] as? String, request.sessionId),
                   object["platform"] as? String == request.platform,
                   strictBool(object["idempotent"]) == true else {
                 throw DeviceRingRegistrationError.malformedResponse

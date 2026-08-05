@@ -20,6 +20,46 @@ final class ReceiptPresentationTests: XCTestCase {
         XCTAssertTrue(presentation.detail.localizedCaseInsensitiveContains("does not prove durable"))
     }
 
+    func testCanonicalButByteDistinctReceiptBindingsAreInvalid() {
+        let composed = "id-caf\u{00E9}"
+        let decomposed = "id-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: ordinary String comparison is canonical")
+        let proposal = PocketUITestFactory.proposal(id: composed, sessionId: composed)
+        let base = PocketUITestFactory.receipt(proposal: proposal, status: .pendingConnectivity)
+        let wrongProposal = ActionReceipt(
+            id: base.id,
+            proposalId: decomposed,
+            status: base.status,
+            result: base.result,
+            targetSessionId: base.targetSessionId,
+            confirmedByHumanAt: base.confirmedByHumanAt,
+            confirmedProposalHash: base.confirmedProposalHash,
+            executedAt: base.executedAt,
+            failureReason: base.failureReason,
+            signature: base.signature,
+            signingKeyId: base.signingKeyId
+        )
+        let wrongSession = ActionReceipt(
+            id: base.id,
+            proposalId: base.proposalId,
+            status: base.status,
+            result: base.result,
+            targetSessionId: decomposed,
+            confirmedByHumanAt: base.confirmedByHumanAt,
+            confirmedProposalHash: base.confirmedProposalHash,
+            executedAt: base.executedAt,
+            failureReason: base.failureReason,
+            signature: base.signature,
+            signingKeyId: base.signingKeyId
+        )
+
+        for receipt in [wrongProposal, wrongSession] {
+            let presentation = evaluate(receipt, proposal: proposal)
+            XCTAssertFalse(presentation.isPosted)
+            XCTAssertEqual(presentation.title, "Receipt verification error")
+        }
+    }
+
     func testPendingReceiptWithExecutionFieldsIsInvalid() {
         let proposal = PocketUITestFactory.proposal()
         let receipt = PocketUITestFactory.receipt(

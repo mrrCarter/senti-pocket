@@ -76,7 +76,7 @@ final class SessionListCoordinator: ObservableObject {
     }
 
     private func selectSession(_ sessionId: String) {
-        guard state.rows.contains(where: { $0.id == sessionId }) else { return }
+        guard state.rows.contains(where: { UTF8ExactIdentity.matches($0.sessionId, sessionId) }) else { return }
         setSelectedSession(sessionId)
     }
 
@@ -128,7 +128,9 @@ final class SessionListCoordinator: ObservableObject {
                 self.snapshot = next
                 self.provenance = .network(lastUpdated: next.loadedAt)
                 if let selectedSessionId = self.selectedSessionId,
-                   !next.sessions.contains(where: { $0.sessionId == selectedSessionId }) {
+                   !next.sessions.contains(where: {
+                       UTF8ExactIdentity.matches($0.sessionId, selectedSessionId)
+                   }) {
                     self.setSelectedSession(nil)
                 }
                 self.state = self.render(
@@ -233,7 +235,7 @@ final class SessionListCoordinator: ObservableObject {
     }
 
     private func setSelectedSession(_ sessionId: String?) {
-        guard selectedSessionId != sessionId else { return }
+        guard !UTF8ExactIdentity.matches(selectedSessionId, sessionId) else { return }
         selectedSessionId = sessionId
         onSelectionChanged(sessionId)
     }

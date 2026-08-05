@@ -77,10 +77,11 @@ struct EvidenceLinksView: View {
                     .foregroundStyle(PocketPalette.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            ForEach(resolution.resolved) { reference in
+            ForEach(resolution.resolved, id: \.pocketOpaqueIdentity) { reference in
                 EvidenceCard(evidence: reference, onOpen: onOpen)
             }
-            ForEach(resolution.missingIds, id: \.self) { missingId in
+            ForEach(resolution.missingIds.map(OpaqueUTF8Identity.init), id: \.self) { identity in
+                let missingId = identity.rawValue
                 Label("Evidence unavailable: \(missingId)", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(PocketPalette.warning)

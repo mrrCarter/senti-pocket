@@ -129,7 +129,7 @@ final class DeviceRingRegistrar {
         let canonical = sessionId.flatMap {
             DeviceRingRegistryValidation.isCanonicalOpaque($0, maximumUTF8Bytes: 128) ? $0 : nil
         }
-        guard selectedSessionId != canonical else {
+        guard !UTF8ExactIdentity.matches(selectedSessionId, canonical) else {
             return scheduleReconciliation()
         }
         selectedSessionId = canonical
@@ -343,7 +343,7 @@ final class DeviceRingRegistrar {
            !state.revocationRequested,
            !authorityIsDenied,
            let binding = state.binding,
-           binding.sessionId == sessionId,
+           UTF8ExactIdentity.matches(binding.sessionId, sessionId),
            binding.platform == "apns",
            binding.tokenDigest == tokenDigest,
            binding.credentialFingerprint == credentialFingerprint,
@@ -605,7 +605,7 @@ final class DeviceRingRegistrar {
                   pending.credentialFingerprint == DeviceRingFingerprint.digest(bearer),
                   receipt.ownerVersion == pending.ownerVersion,
                   receipt.ownerHandle == pending.ownerHandle,
-                  receipt.sessionId == pending.sessionId,
+                  UTF8ExactIdentity.matches(receipt.sessionId, pending.sessionId),
                   receipt.platform == pending.platform,
                   var current = try? stateStore.load(),
                   current.pendingRegistration == pending else {
@@ -757,7 +757,7 @@ final class DeviceRingRegistrar {
     ) -> Bool {
         authenticated &&
         !revokeBeforeNextRegistration &&
-        selectedSessionId == pending.sessionId &&
+        UTF8ExactIdentity.matches(selectedSessionId, pending.sessionId) &&
         latestToken == voipToken &&
         bearerProvider() == bearer &&
         pending.tokenDigest == DeviceRingFingerprint.digest(voipToken) &&
@@ -776,11 +776,11 @@ final class DeviceRingRegistrar {
               pending.credentialFingerprint == DeviceRingFingerprint.digest(bearer) else {
             return false
         }
-        return revokeBeforeNextRegistration || selectedSessionId == pending.sessionId
+        return revokeBeforeNextRegistration || UTF8ExactIdentity.matches(selectedSessionId, pending.sessionId)
     }
 
     private func revokeSelectedSessionIfCurrent(_ sessionId: String) {
-        guard selectedSessionId == sessionId else { return }
+        guard UTF8ExactIdentity.matches(selectedSessionId, sessionId) else { return }
         selectedSessionId = nil
         generation &+= 1
         onSessionAuthorizationRevoked?(sessionId)
@@ -811,7 +811,7 @@ final class DeviceRingRegistrar {
     ) -> Bool {
         guard receipt.ownerVersion == expected.ownerVersion,
               receipt.ownerHandle == expected.ownerHandle,
-              receipt.sessionId == expected.sessionId,
+              UTF8ExactIdentity.matches(receipt.sessionId, expected.sessionId),
               receipt.platform == expected.platform else { return false }
         do {
             try stateStore.denyAuthority()

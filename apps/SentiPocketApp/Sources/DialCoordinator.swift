@@ -70,7 +70,7 @@ final class DialCoordinator: ObservableObject {
             return .declined("call ended before hydration")
         }
         guard let episode = pending.removeValue(forKey: callUUID),
-              episode.dialId == dialId else {
+              UTF8ExactIdentity.matches(episode.dialId, dialId) else {
             return .declined("no ring state for dial \(dialId)")
         }
         let ring: RenderableRing

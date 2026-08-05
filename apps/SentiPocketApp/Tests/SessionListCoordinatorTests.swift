@@ -68,7 +68,7 @@ final class SessionListCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.selectedSessionId)
         coordinator.send(.selectSession(sessionId: "room-1"))
 
-        XCTAssertEqual(coordinator.state.rows.map(\.id), ["room-2", "room-1"])
+        XCTAssertEqual(coordinator.state.rows.map(\.sessionId), ["room-2", "room-1"])
         XCTAssertEqual(coordinator.selectedSessionId, "room-1")
         XCTAssertNil(coordinator.state.failure)
         guard case .network = coordinator.state.provenance else {
@@ -85,7 +85,7 @@ final class SessionListCoordinatorTests: XCTestCase {
         await coordinator.start()?.value
         await coordinator.loadMoreSessions().value
 
-        XCTAssertEqual(coordinator.state.rows.map(\.id), ["room-2", "room-1"])
+        XCTAssertEqual(coordinator.state.rows.map(\.sessionId), ["room-2", "room-1"])
         XCTAssertFalse(coordinator.state.hasMore)
     }
 
@@ -98,7 +98,7 @@ final class SessionListCoordinatorTests: XCTestCase {
         await coordinator.start()?.value
         await coordinator.refreshSessions().value
 
-        XCTAssertEqual(coordinator.state.rows.map(\.id), ["room-1"])
+        XCTAssertEqual(coordinator.state.rows.map(\.sessionId), ["room-1"])
         XCTAssertEqual(coordinator.state.failure, .network)
         guard case .cache(_, let authenticationExpired) = coordinator.state.provenance else {
             return XCTFail("stale rows after a network failure must be labeled cache")
@@ -133,9 +133,47 @@ final class SessionListCoordinatorTests: XCTestCase {
         await coordinator.refreshSessions().value
 
         XCTAssertNil(coordinator.selectedSessionId)
-        XCTAssertEqual(coordinator.state.rows.map(\.id), ["room-2"])
+        XCTAssertEqual(coordinator.state.rows.map(\.sessionId), ["room-2"])
         XCTAssertEqual(selection.values, ["room-1", nil],
                        "dial registration must be revoked when the authorized row disappears")
+    }
+
+    func test_non_ascii_session_identity_is_rejected_before_selection() async throws {
+        let composed = "room-caf\u{00E9}"
+        let decomposed = "room-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: ordinary String comparison is canonical")
+        let coordinator = makeCoordinator([
+            .page(try page(ids: [composed], nextCursor: nil, hasMore: false))
+        ])
+
+        await coordinator.start()?.value
+        coordinator.send(.selectSession(sessionId: decomposed))
+
+        XCTAssertNil(coordinator.selectedSessionId)
+        XCTAssertTrue(coordinator.state.rows.isEmpty)
+        XCTAssertEqual(coordinator.state.failure, .invalidData)
+        guard case .unavailable = coordinator.state.provenance else {
+            return XCTFail("a non-ASCII wire session identity must fail closed before presentation")
+        }
+    }
+
+    func test_refresh_replacing_selection_with_distinct_valid_identifier_revokes_authority() async throws {
+        let original = "room-Case"
+        let replacement = "room-case"
+        XCTAssertNotEqual(original, replacement)
+        let selection = SessionSelectionProbe()
+        let coordinator = makeCoordinator([
+            .page(try page(ids: [original], nextCursor: nil, hasMore: false)),
+            .page(try page(ids: [replacement], nextCursor: nil, hasMore: false)),
+        ], onSelectionChanged: { selection.values.append($0) })
+
+        await coordinator.start()?.value
+        coordinator.send(.selectSession(sessionId: original))
+        await coordinator.refreshSessions().value
+
+        XCTAssertNil(coordinator.selectedSessionId)
+        XCTAssertEqual(selection.values, [original, nil])
+        XCTAssertEqual(coordinator.state.rows.map(\.sessionId), [replacement])
     }
 
     func test_service_failure_after_success_keeps_rows_but_revokes_live_provenance() async throws {
@@ -147,7 +185,7 @@ final class SessionListCoordinatorTests: XCTestCase {
         await coordinator.start()?.value
         await coordinator.refreshSessions().value
 
-        XCTAssertEqual(coordinator.state.rows.map(\.id), ["room-1"])
+        XCTAssertEqual(coordinator.state.rows.map(\.sessionId), ["room-1"])
         XCTAssertEqual(coordinator.state.failure, .service)
         guard case .cache = coordinator.state.provenance else {
             return XCTFail("a failed refresh must never leave stale rows labeled as live network data")

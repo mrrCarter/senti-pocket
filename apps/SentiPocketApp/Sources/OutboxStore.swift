@@ -27,12 +27,12 @@ struct PersistedWriteIntent: Codable, Sendable, Equatable {
     func binding(to selectedSessionId: String) -> SelectionBinding {
         guard proposal.kind == .humanMessage,
               proposal.isValidForConfirmation(),
-              confirmation.proposalId == proposal.id,
-              confirmation.confirmedProposalHash == proposal.proposalHash,
+              UTF8ExactIdentity.matches(confirmation.proposalId, proposal.id),
+              UTF8ExactIdentity.matches(confirmation.confirmedProposalHash, proposal.proposalHash),
               ActionReceipt.safeEpochMillis(confirmation.confirmedAt) != nil else {
             return .invalid
         }
-        guard proposal.targetSessionId == selectedSessionId else {
+        guard UTF8ExactIdentity.matches(proposal.targetSessionId, selectedSessionId) else {
             return .foreignSession(proposal.targetSessionId)
         }
         return .matching

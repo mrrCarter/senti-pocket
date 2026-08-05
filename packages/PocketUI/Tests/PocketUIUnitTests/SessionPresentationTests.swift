@@ -20,7 +20,7 @@ final class SessionPresentationTests: XCTestCase {
             provenance: .network(lastUpdated: Date(timeIntervalSince1970: 9))
         )
 
-        XCTAssertEqual(state.rows.map(\.id), ["room-1"])
+        XCTAssertEqual(state.rows.map(\.sessionId), ["room-1"])
         XCTAssertEqual(state.resultCount, 1)
         XCTAssertNil(state.failure)
     }
@@ -60,7 +60,8 @@ final class SessionPresentationTests: XCTestCase {
         )
 
         XCTAssertEqual(state.rows.count, 1)
-        XCTAssertEqual(state.rows[0].id, "room-1")
+        XCTAssertEqual(state.rows[0].sessionId, "room-1")
+        XCTAssertEqual(state.rows[0].id.rawValue, "room-1")
         XCTAssertEqual(state.rows[0].title, "Untitled session")
         XCTAssertEqual(state.rows[0].summary, "Current work")
         XCTAssertEqual(state.rows[0].statusLabel, "Active")
@@ -188,6 +189,110 @@ final class SessionPresentationTests: XCTestCase {
 
         XCTAssertTrue(state.rows.isEmpty)
         XCTAssertEqual(state.failure, .invalidData)
+    }
+
+    func testCanonicalButByteDistinctSessionRowsRemainDistinctSwiftUIIdentities() throws {
+        let composed = "room-caf\u{00E9}"
+        let decomposed = "room-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: ordinary String identity would collide")
+        func session(_ id: String) -> String {
+            """
+            {"sessionId":"\(id)","status":"active","archiveStatus":"active","visibility":"private",
+            "membershipRole":"owner","title":"Room","summaryText":null,"summaryGeneratedAt":null,
+            "summaryModel":null,"agentCount":1,"eventCount":1,"totalCostUsd":0,"createdAt":null,
+            "lastActivityAt":null,"expiresAt":null,"killedAt":null,"templateName":null,"codebasePath":null,
+            "s3ArchivePath":null}
+            """
+        }
+        let page = try decode(SessionListPage.self, """
+        {"sessions":[\(session(composed)),\(session(decomposed))],"count":2,
+        "include_archived":false,"next_cursor":null,"has_more":false}
+        """)
+
+        let state = SessionListPresentationState(
+            page: page,
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertNil(state.failure)
+        XCTAssertEqual(state.rows.count, 2)
+        XCTAssertNotEqual(state.rows[0].id, state.rows[1].id)
+        XCTAssertFalse(state.rows[0].sessionId.utf8.elementsEqual(state.rows[1].sessionId.utf8))
+    }
+
+    func testCanonicalButByteDistinctActivitySessionFailsClosed() throws {
+        let composed = "room-caf\u{00E9}"
+        let decomposed = "room-cafe\u{0301}"
+        let events = try decode(SessionEventForwardPage.self, """
+        {"events":[{"id":"ev-1","event":"session_message","agent":{},"agentId":"relay",
+        "agentModel":"","payload":{"text":"private"},"ts":"2026-07-18T10:35:00Z",
+        "timestamp":"2026-07-18T10:35:00Z","cursor":"c1","sequenceId":7,
+        "sessionId":"\(decomposed)","source":null}]}
+        """)
+        let actions = try decode(SessionActionPage.self, """
+        {"sessionId":"\(composed)","count":0,"projection":{},"actions":[]}
+        """)
+
+        let state = SessionActivityPresentationState(
+            sessionId: composed,
+            eventPage: events,
+            actionPage: actions,
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertEqual(state.failure, .invalidData)
+        XCTAssertTrue(state.events.isEmpty)
+    }
+
+    func testCanonicalButByteDistinctActionSessionFailsClosed() throws {
+        let composed = "room-caf\u{00E9}"
+        let decomposed = "room-cafe\u{0301}"
+        let events = try decode(SessionEventForwardPage.self, #"{"events":[]}"#)
+        let envelopeVariant = try decode(SessionActionPage.self, """
+        {"sessionId":"\(decomposed)","count":0,"projection":{},"actions":[]}
+        """)
+        let rowVariant = try decode(SessionActionPage.self, """
+        {"sessionId":"\(composed)","count":1,"projection":{},"actions":[{"id":"act-1",
+        "sessionId":"\(decomposed)","targetSequenceId":0,"targetCursor":null,"targetActionId":null,
+        "actionType":"working_on","actorKind":"agent","actorId":"relay","actorUserId":null,
+        "actorRole":null,"note":null,"metadata":{},"idempotencyKey":"idem-1",
+        "createdAt":"2026-07-18T10:36:00Z"}]}
+        """)
+
+        for actions in [envelopeVariant, rowVariant] {
+            let state = SessionActivityPresentationState(
+                sessionId: composed,
+                eventPage: events,
+                actionPage: actions,
+                provenance: .network(lastUpdated: Date())
+            )
+            XCTAssertEqual(state.failure, .invalidData)
+            XCTAssertTrue(state.actions.isEmpty)
+        }
+    }
+
+    func testCanonicalButByteDistinctEventIDsDoNotCollapse() throws {
+        let composed = "event-caf\u{00E9}"
+        let decomposed = "event-cafe\u{0301}"
+        let events = try decode(SessionEventForwardPage.self, """
+        {"events":[{"id":"\(composed)","event":"session_message","agent":{},"agentId":"relay",
+        "agentModel":"","payload":{},"ts":"2026-07-18T10:35:00Z","timestamp":"2026-07-18T10:35:00Z",
+        "cursor":"c1","sequenceId":7,"sessionId":"room-1","source":null},
+        {"id":"\(decomposed)","event":"session_message","agent":{},"agentId":"relay",
+        "agentModel":"","payload":{},"ts":"2026-07-18T10:36:00Z","timestamp":"2026-07-18T10:36:00Z",
+        "cursor":"c2","sequenceId":8,"sessionId":"room-1","source":null}]}
+        """)
+        let actions = try decode(SessionActionPage.self, #"{"sessionId":"room-1","count":0,"projection":{},"actions":[]}"#)
+        let state = SessionActivityPresentationState(
+            sessionId: "room-1",
+            eventPage: events,
+            actionPage: actions,
+            provenance: .network(lastUpdated: Date())
+        )
+
+        XCTAssertNil(state.failure)
+        XCTAssertEqual(state.events.count, 2)
+        XCTAssertNotEqual(state.events[0].id, state.events[1].id)
     }
 
     func testAuthorizationFailureSuppressesOtherwiseValidProtectedRows() throws {

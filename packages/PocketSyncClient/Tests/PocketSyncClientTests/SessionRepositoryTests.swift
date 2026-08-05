@@ -5,14 +5,20 @@ import PocketContracts
 
 private actor MockSessionTransport: SessionTransport {
     private var pages: [SessionListPage]
+    private var cursors: [String?] = []
 
     init(pages: [SessionListPage]) {
         self.pages = pages
     }
 
     func listSessions(includeArchived: Bool, limit: Int, cursor: String?) async throws -> SessionListPage {
+        cursors.append(cursor)
         guard !pages.isEmpty else { throw SessionTransportError.service(statusCode: 599) }
         return pages.removeFirst()
+    }
+
+    func requestedCursors() -> [String?] {
+        cursors
     }
 
     func listEvents(
@@ -144,6 +150,36 @@ final class SessionRepositoryTests: XCTestCase {
 
         let retained = await repository.currentSnapshot()
         XCTAssertEqual(retained?.sessions.map(\.sessionId), ["room_2"])
+    }
+
+    func test_unicode_canonical_but_byte_distinct_cursors_advance_independently() async throws {
+        let composed = "cursor-caf\u{00E9}"
+        let decomposed = "cursor-cafe\u{0301}"
+        XCTAssertEqual(composed, decomposed, "precondition: Swift String equality is Unicode-canonical")
+        XCTAssertFalse(OpaqueUTF8Identity.matches(composed, decomposed))
+
+        let transport = MockSessionTransport(pages: [
+            try page(ids: ["room_3"], nextCursor: composed, hasMore: true),
+            try page(ids: ["room_2"], nextCursor: decomposed, hasMore: true),
+            try page(ids: ["room_1"], nextCursor: nil, hasMore: false),
+        ])
+        let repository = SessionRepository(transport: transport)
+
+        _ = try await repository.refreshSessions()
+        let advanced = try await repository.loadMoreSessions()
+        XCTAssertTrue(OpaqueUTF8Identity.matches(advanced.nextCursor, decomposed))
+        XCTAssertFalse(OpaqueUTF8Identity.matches(advanced.nextCursor, composed))
+
+        let complete = try await repository.loadMoreSessions()
+        XCTAssertEqual(complete.sessions.map(\.sessionId), ["room_3", "room_2", "room_1"])
+        XCTAssertNil(complete.nextCursor)
+        XCTAssertFalse(complete.hasMore)
+
+        let requested = await transport.requestedCursors()
+        XCTAssertEqual(requested.count, 3)
+        XCTAssertNil(requested[0])
+        XCTAssertTrue(OpaqueUTF8Identity.matches(requested[1], composed))
+        XCTAssertTrue(OpaqueUTF8Identity.matches(requested[2], decomposed))
     }
 
     func test_invalid_server_count_or_archive_mode_cannot_replace_valid_snapshot() async throws {
