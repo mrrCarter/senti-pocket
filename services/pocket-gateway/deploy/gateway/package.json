@@ -9,7 +9,10 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "package": "npm run build",
-    "test": "node --test ../../test/gateway-entrypoint.test.mjs"
+    "registry:apply": "node ./scripts/registry-cutover.mjs apply",
+    "registry:plan": "node ./scripts/registry-cutover.mjs plan",
+    "registry:test": "node --test ../../test/registry-cutover.test.mjs ../../test/registry-cutover-cli.test.mjs",
+    "test": "node --test ../../test/gateway-entrypoint.test.mjs ../../test/registry-cutover.test.mjs ../../test/registry-cutover-cli.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "3.1103.0",

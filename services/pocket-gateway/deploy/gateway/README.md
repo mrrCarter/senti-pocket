@@ -32,3 +32,18 @@ Signer, an immutable signed S3 `VersionId`, and the matching canonical base64 SH
 The sibling `infra/terraform/gateway` module can publish one numeric Lambda version. It intentionally creates no API
 Gateway route, Lambda URL, alias, DNS record, or permission for public invocation. Rollback remains a later mapping back
 to an earlier reviewed numeric version, or leaving APNs disabled.
+
+## Registry cutover operator utility
+
+`scripts/registry-cutover.mjs` is an operator-side plan/apply command; the Lambda build does not import or package it.
+The read-only plan performs a sequential, fully paginated `ConsistentRead=true` base-table scan and emits sanitized
+counts/checksums only. Apply requires the exact plan checksum within five minutes, explicit V1-purge and quiescence
+flags, and lowercase SHA-256 digests for separately retained writer-fence and invocation-drain evidence. It targets one
+verified table ARN/incarnation, rejects global tables and any V2 row, independently refuses non-V1 deletes, and emits a
+zero proof only after two new all-six-prefix scans are empty.
+
+The command cannot quiesce writers: strongly consistent scans are not a cross-page snapshot. Disable registration/ring
+ingress, remove old numeric/weighted targets and stale permissions, fence the V1 writer, wait the maximum Lambda timeout
+plus propagation, and prove no old invocation remains before planning. Use a short-lived role with only exact-table
+`DescribeTable`, `Scan`, and `DeleteItem`; the gateway runtime role intentionally keeps no scan permission. See
+`../../DEPLOY.md` for the full evidence contract and exact commands.
