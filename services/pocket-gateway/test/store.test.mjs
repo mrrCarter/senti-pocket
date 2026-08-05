@@ -95,6 +95,60 @@ test('compareAndSwap is exact-version atomic in memory and rejects stale index w
   assert.deepEqual((await store.get('index')).installationHashes, ['a', 'b']);
 });
 
+test('compareAndSwap shares the strict TTL option contract on both adapters', async () => {
+  const mem = createInMemoryStore();
+  await assert.rejects(
+    mem.compareAndSwap('index', null, { recordVersion: '1' }, { ttlEpochSec: 0 }),
+    /positive safe integer/,
+  );
+  assert.equal(mem._records.size, 0, 'invalid in-memory TTL fails before the CAS write');
+
+  let ttlReads = 0;
+  const opts = { get ttlEpochSec() { ttlReads += 1; return VALID; } };
+  const c = fakeClient();
+  await createDynamoStore({ client: c, table: 'T' }).compareAndSwap(
+    'index',
+    null,
+    { recordVersion: '1' },
+    opts,
+  );
+  assert.equal(ttlReads, 1, 'CAS TTL getter is read exactly once');
+  assert.equal(c.puts[0].Item.ttl, VALID, 'CAS TTL is top-level for Dynamo cleanup');
+  assert.equal(c.puts[0].Item.value.ttl, undefined, 'CAS TTL never contaminates the logical record');
+
+  const bad = fakeClient();
+  await assert.rejects(
+    createDynamoStore({ client: bad, table: 'T' }).compareAndSwap(
+      'index',
+      null,
+      { recordVersion: '1' },
+      { ttlEpochSec: 'forever' },
+    ),
+    /positive safe integer/,
+  );
+  assert.equal(bad.puts.length, 0, 'invalid Dynamo TTL fails before the conditional write');
+});
+
+test('Dynamo supports an explicit strongly-consistent record read and uses one after CAS contention', async () => {
+  const condition = Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
+  const gets = [];
+  const client = {
+    async get(params) {
+      gets.push(structuredClone(params));
+      return { Item: { value: { recordVersion: '7' } } };
+    },
+    async put() { throw condition; },
+    async delete() {},
+  };
+  const store = createDynamoStore({ client, table: 'T' });
+  assert.deepEqual(await store.get('index', { consistent: true }), { recordVersion: '7' });
+  const refused = await store.compareAndSwap('index', '6', { recordVersion: '7' });
+  assert.equal(refused.swapped, false);
+  assert.equal(gets.length, 2);
+  assert.equal(gets[0].ConsistentRead, true);
+  assert.equal(gets[1].ConsistentRead, true, 'conditional loser re-reads the winning state strongly');
+});
+
 test('Dynamo generation/index CAS emit conditional puts and return the current value after a failed condition', async () => {
   const condition = Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
   const current = { generationOrder: '00000000000000000003', generation: '3' };

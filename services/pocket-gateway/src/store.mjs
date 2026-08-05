@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 //   - get(key)/put(key,value): durable record of the terminal receipt OR the emitted marker (so a later request on a
 //     DIFFERENT instance loads the emitted actionId and RE-VERIFIES instead of re-posting).
 //   - advanceGeneration(key,value): monotonic durable-head CAS; only a strictly larger fixed-width generationOrder wins.
-//   - compareAndSwap(key,expectedVersion,value): exact-version CAS for bounded secondary indexes.
+//   - compareAndSwap(key,expectedVersion,value,opts?): exact-version CAS for bounded secondary indexes; optional TTL.
 //
 // PROD adapter (DynamoDB) — documented contract, not deployed here (no AWS creds in this env):
 //   acquireLock  -> PutItem {pk:key, sk:'lock', ttl:now+30s} with ConditionExpression attribute_not_exists(pk)
@@ -54,7 +54,7 @@ export function createInMemoryStore() {
   const records = new Map();
   const locks = new Map(); // key -> owner token
   return {
-    async get(key) { return records.get(key); },
+    async get(key, _opts) { return records.get(key); },
     async put(key, value, opts) { resolveTtlOption(opts); records.set(key, value); return value; }, // validates the ttl-option for adapter parity (rejects present-invalid); in-memory uses LOGICAL expiry, no physical TTL
     async delete(key) { records.delete(key); },
     /** returns a fresh owner token if acquired; null if already held. */
@@ -77,7 +77,8 @@ export function createInMemoryStore() {
       return { advanced: true, current: value };
     },
     /** Exact-version CAS used by bounded candidate indexes; null means the record must still be absent. */
-    async compareAndSwap(key, expectedVersion, value) {
+    async compareAndSwap(key, expectedVersion, value, opts) {
+      resolveTtlOption(opts); // adapter parity; in-memory uses logical expiry and needs no physical cleanup
       const nextVersion = canonicalRecordVersion(value && value.recordVersion);
       const current = records.get(key);
       if (expectedVersion === null) {
@@ -109,8 +110,10 @@ export function createDynamoStore(cfg = {}) {
   const lk = (key) => ({ pk: key, sk: 'lock' });
   const isCond = (e) => e && (e.name === 'ConditionalCheckFailedException' || e.code === 'ConditionalCheckFailedException');
   const nowSec = () => Math.floor(now() / 1000);
-  const getRecord = async (key) => {
-    const r = await client.get({ TableName: table, Key: rk(key) });
+  const getRecord = async (key, opts = {}) => {
+    const params = { TableName: table, Key: rk(key) };
+    if (opts.consistent === true) params.ConsistentRead = true;
+    const r = await client.get(params);
     return r && r.Item ? r.Item.value : undefined;
   };
   return {
@@ -146,7 +149,7 @@ export function createDynamoStore(cfg = {}) {
       catch (e) { if (isCond(e)) return; throw e; }
     },
     async putIfAbsent(key, value, opts = {}) {
-      // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can expire the item — e.g. DPoP jti replay
+      // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can expire the item — e.g. proof jti replay
       // records, which must NOT be nested under `value` where TTL can't see them (Echo P1).
       const item = { ...rk(key), value };
       const ttl = resolveTtlOption(opts); if (ttl !== undefined) item.ttl = ttl; // R7: present-invalid ttl throws (shared parser with put)
@@ -168,12 +171,14 @@ export function createDynamoStore(cfg = {}) {
         return { advanced: true, current: value };
       } catch (e) {
         if (!isCond(e)) throw e;
-        return { advanced: false, current: await getRecord(key) };
+        return { advanced: false, current: await getRecord(key, { consistent: true }) };
       }
     },
-    async compareAndSwap(key, expectedVersion, value) {
+    async compareAndSwap(key, expectedVersion, value, opts = {}) {
       const nextVersion = canonicalRecordVersion(value && value.recordVersion);
       const Item = { ...rk(key), value: { ...value, recordVersion: nextVersion }, recordVersion: nextVersion };
+      const ttl = resolveTtlOption(opts);
+      if (ttl !== undefined) Item.ttl = ttl;
       const params = expectedVersion === null
         ? { TableName: table, Item, ConditionExpression: 'attribute_not_exists(pk)' }
         : {
@@ -188,7 +193,7 @@ export function createDynamoStore(cfg = {}) {
         return { swapped: true, current: value };
       } catch (e) {
         if (!isCond(e)) throw e;
-        return { swapped: false, current: await getRecord(key) };
+        return { swapped: false, current: await getRecord(key, { consistent: true }) };
       }
     },
   };
@@ -236,7 +241,7 @@ export function createDynamoClientAdapter(docClient, commands = {}) {
 }
 
 /**
- * Store-backed DPoP jti replay guard (prod): single-use jti across instances via an atomic putIfAbsent. `seen`
+ * Store-backed proof-jti replay guard (prod): single-use jti across instances via an atomic putIfAbsent. `seen`
  * returns true iff the jti was already recorded (a replay). Shape mirrors createInMemoryReplayGuard (auth.mjs).
  */
 export function createStoreReplayGuard(store, { prefix = 'dpop-jti:' } = {}) {
