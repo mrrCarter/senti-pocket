@@ -34,23 +34,39 @@ const lp = (s) => String(s).length + ':' + String(s);
 /** cache/dedupe by a HASH of the credential — the raw token is never used as a map key. */
 const tokenKey = (authz) => createHash('sha256').update(authz).digest('base64url');
 
+export class SentiSessionVerifierUnavailableError extends Error {
+  constructor(message, { cause } = {}) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = 'SentiSessionVerifierUnavailableError';
+    this.code = 'senti-session-verifier-unavailable';
+  }
+}
+
 /**
  * @param {object}   cfg
  * @param {Function} cfg.fetch        injected fetch (deploy-owned transport)
  * @param {string}   cfg.apiBaseUrl   api ORIGIN (GET /api/v1/auth/me is appended)
- * @param {string[]} [cfg.scopes]     scopes granted to a validated user session (default read+write+voice)
+ * @param {string[]} [cfg.scopes]     scopes granted to a validated user session (default read+write+voice+dial)
  * @param {number}   [cfg.cacheTtlMs] validated-identity cache TTL — caps per-execute round-trips + the auth_me rate
  *                                    burn (30/window); also caps revocation latency. Default 20s.
  * @param {number}   [cfg.timeoutMs]
  * @param {Function} [cfg.now]
+ * @param {boolean}  [cfg.throwOnUnavailable] distinguish invalid credentials (null) from transport/contract outage
  * @returns {(headers: object) => Promise<null | {humanId,principal,scopes,site,tokenClaims}>}
  */
-export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT_SCOPES, cacheTtlMs = DEFAULT_CACHE_TTL_MS, timeoutMs = DEFAULT_TIMEOUT_MS, maxCacheEntries = DEFAULT_MAX_CACHE_ENTRIES, now = () => Date.now() } = {}) {
+export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT_SCOPES, cacheTtlMs = DEFAULT_CACHE_TTL_MS, timeoutMs = DEFAULT_TIMEOUT_MS, maxCacheEntries = DEFAULT_MAX_CACHE_ENTRIES, now = () => Date.now(), throwOnUnavailable = false } = {}) {
   if (typeof fetch !== 'function') throw new Error('createSentiSessionVerifier: fetch is required');
   const base = String(apiBaseUrl || '').replace(/\/+$/, '');
   if (!base) throw new Error('createSentiSessionVerifier: apiBaseUrl is required');
   const grantedScopes = Object.freeze([...scopes]);
   const cache = new Map(); // sha256(token) -> { result, exp }
+  if (typeof throwOnUnavailable !== 'boolean') {
+    throw new Error('createSentiSessionVerifier: throwOnUnavailable must be boolean');
+  }
+  const unavailable = (message, cause) => {
+    if (throwOnUnavailable) throw new SentiSessionVerifierUnavailableError(message, { cause });
+    return null;
+  };
 
   return async function verifyToken(headers) {
     const authz = headers && (headers.authorization || headers.Authorization);
@@ -68,18 +84,33 @@ export function createSentiSessionVerifier({ fetch, apiBaseUrl, scopes = DEFAULT
     try {
       // Delegate validation to the api under the caller's OWN token — the gateway holds no secret, mints nothing.
       res = await fetch(`${base}/api/v1/auth/me`, { method: 'GET', headers: { authorization: authz }, ...(signal ? { signal } : {}) });
-    } catch {
-      return null;                                                    // network/timeout -> fail-closed (never authorize an unvalidated token)
+    } catch (cause) {
+      return unavailable('Senti session validation transport is unavailable', cause);
     }
-    if (!res || !res.ok) { cache.delete(key); return null; }          // 401/403 (invalid/blocked/banned) / 5xx -> fail-closed, never cache a failure
+    let ok;
+    let status;
+    try {
+      ok = res?.ok;
+      status = res?.status;
+    } catch (cause) {
+      return unavailable('Senti session validation response is unavailable', cause);
+    }
+    if (!res || typeof ok !== 'boolean') return unavailable('Senti session validation response is invalid');
+    if (!ok) {
+      cache.delete(key);
+      if (status === 401 || status === 403) return null;
+      return unavailable('Senti session validation service rejected the request unexpectedly');
+    }
 
     let me;
-    try { me = await res.json(); } catch { return null; }
+    try { me = await res.json(); } catch (cause) {
+      return unavailable('Senti session validation response is invalid', cause);
+    }
     // Contract: GET /api/v1/auth/me returns the user with a TOP-LEVEL `id` (api auth route get_current_user -> UserResponse;
     // corroborated by the shipped CLI create-sentinelayer/src/auth/service.js fetchCurrentUser -> normalizeUser, which
     // reads user.id top-level). Pinned here so an api response reshape can't silently break B3 unnoticed.
     const humanId = me && (typeof me.id === 'string' && me.id ? me.id : null);
-    if (!humanId) return null;                                        // no identity -> fail-closed
+    if (!humanId) return unavailable('Senti session validation identity is invalid');
 
     // FROZEN (Warden hardening note 1): this result is cached and returned BY REFERENCE on every cache hit, so a
     // downstream in-place mutation (.push/.sort/.splice on ctx.scopes) would poison the entry for ALL later hits of this

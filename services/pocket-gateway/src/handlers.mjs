@@ -2,9 +2,10 @@
 // Framework-agnostic: createGateway(deps).handle({method,path,query,headers,body}) -> {status,headers,body,isBase64Encoded?}.
 // Drop into Lambda/API Gateway or a local http server via a thin adapter. All I/O is injected (hermetic tests, no live calls).
 //
-// AUTH BOUNDARY (fail-closed): every non-health route REQUIRES a valid AIdenID-issued token. The human identity comes
-// from the token (ConsumerAccount.id), NEVER from the request body. Authorization to write is server-derived
-// (knownSessionIdsFor(humanId)) — a client can never name an arbitrary target session.
+// AUTH BOUNDARY (fail-closed): direct/V1 non-health routes use the configured token verifier. The two protected V2
+// writes instead require a privately branded, request-bound admission context that the Lambda adapter verifies before
+// normalization; they never revalidate the public bearer. Human identity is verifier/assertion-owned, NEVER read from
+// the request body. Authorization to write remains server-derived, so a client cannot name an arbitrary target session.
 // Token model (per Echo's AIdenID research): atk_ = workload/project token; the phone uses a human-bound,
 // audience/resource-scoped token minted via /v1/sessions/exchange (DPoP-bound). deps.verifyToken owns that check.
 import { randomUUID, createHash } from 'node:crypto';
@@ -22,6 +23,8 @@ import { buildStoryboard, assembleDeckVideo } from './deck/video.mjs';
 import { createDialRegistry } from './dial-registry.mjs';
 import { mapSignalToPushInput } from './need-carter-dial.mjs';
 import { groundingIdsFromBundle, keepGrounded, isGrounded } from './grounding-gate.mjs';
+import { isOperationAdmissionAssertionContext } from './operation-admission-assertion.mjs';
+import { isRegistryOperationAdmissionRoute } from './operation-admission.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 const REGISTRATION_CONTEXT_CACHE_HEADERS = Object.freeze({
@@ -30,6 +33,10 @@ const REGISTRATION_CONTEXT_CACHE_HEADERS = Object.freeze({
 });
 const registrationContextJson = (status, body, headers = {}) =>
   json(status, body, { ...headers, ...REGISTRATION_CONTEXT_CACHE_HEADERS });
+const OPERATION_ADMISSION_UNAVAILABLE = Object.freeze({
+  error: 'registration operation admission unavailable',
+  reason: 'operation-admission-unavailable',
+});
 
 /**
  * Map an ActionReceipt to a response (warden contract ruling): a receipt whose confirmation binding was NEVER
@@ -80,6 +87,7 @@ export function ringIdempotencyKey(body = {}) {
 /**
  * @param {{
  *   verifyToken: (headers:object)=>Promise<{humanId:string,scopes?:string[]}|null>,
+ *   requireOperationAdmissionAssertion?: boolean,
  *   store: object,                       // async store (store.mjs)
  *   run: (args:string[])=>string,        // sl runner (actions execute + read-back)
  *   signingKey: any, signingKeyId: string,
@@ -91,6 +99,12 @@ export function ringIdempotencyKey(body = {}) {
  * }} deps
  */
 export function createGateway(deps) {
+  if (
+    deps.requireOperationAdmissionAssertion !== undefined &&
+    typeof deps.requireOperationAdmissionAssertion !== 'boolean'
+  ) {
+    throw new Error('requireOperationAdmissionAssertion must be boolean');
+  }
   // Route scope requirements, aligned to AIdenID's granted scopes. write => execute; read => sync. TTS requires a
   // DISTINCT least-privilege `pocket:voice` (Echo): it triggers third-party voice processing/egress, not a passive
   // read, so a read+write token must NOT authorize it. Override via deps.scopes if the contract changes.
@@ -730,16 +744,29 @@ export function createGateway(deps) {
   }
 
   return {
-    async handle(req) {
+    async handle(req, operationAdmissionContext) {
       // handle() is the gateway's contract boundary — it must NEVER throw to an adapter (a throw becomes a runtime crash
       // / adapter-specific 5xx that can leak a stack). Any unexpected error from a handler collapses to a clean 500 here.
       try {
         const method = (req.method || 'GET').toUpperCase();
         const path = req.path || '/';
         const isDialRegistrationContext = method === 'GET' && path === '/dial/register/context';
+        const isOperationAdmissionRoute = isRegistryOperationAdmissionRoute(method, path);
+        if (operationAdmissionContext !== undefined && !isOperationAdmissionRoute) {
+          return json(503, OPERATION_ADMISSION_UNAVAILABLE);
+        }
         if (method === 'GET' && path === '/health') return json(200, { ok: true });
 
-        const ctx = await authenticate(req);
+        let ctx;
+        if (isOperationAdmissionRoute && deps.requireOperationAdmissionAssertion === true) {
+          if (!isOperationAdmissionAssertionContext(operationAdmissionContext)) {
+            return json(503, OPERATION_ADMISSION_UNAVAILABLE);
+          }
+          ctx = operationAdmissionContext;
+        } else {
+          if (operationAdmissionContext !== undefined) return json(503, OPERATION_ADMISSION_UNAVAILABLE);
+          ctx = await authenticate(req);
+        }
         if (!ctx || typeof ctx.humanId !== 'string' || !ctx.humanId) {
           const response = isDialRegistrationContext ? registrationContextJson : json;
           return response(401, { error: 'authentication required' }, { 'www-authenticate': 'Bearer' });
