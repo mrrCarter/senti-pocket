@@ -243,11 +243,8 @@ extension WhisperModelStore {
                 _ = Darwin.close(directory.parent)
             }
             try applyDirectoryPolicy(to: rootDirectory, directory: directory)
-            let transactionLock = try acquireTransactionLock(in: directory.root)
-            defer {
-                _ = Darwin.flock(transactionLock, LOCK_UN)
-                _ = Darwin.close(transactionLock)
-            }
+            let transactionLease = try acquireTransactionLock(in: directory.root)
+            defer { releaseTransactionLock(transactionLease) }
 
             let canonicalURL = rootDirectory.appendingPathComponent(
                 descriptor.fileName,
@@ -353,11 +350,8 @@ extension WhisperModelStore {
                 _ = Darwin.close(directory.parent)
             }
             try requireDirectoryPolicy(at: rootDirectory, directory: directory)
-            let transactionLock = try acquireTransactionLock(in: directory.root)
-            defer {
-                _ = Darwin.flock(transactionLock, LOCK_UN)
-                _ = Darwin.close(transactionLock)
-            }
+            let transactionLease = try acquireTransactionLock(in: directory.root)
+            defer { releaseTransactionLock(transactionLease) }
             let canonicalURL = rootDirectory.appendingPathComponent(
                 descriptor.fileName,
                 isDirectory: false
@@ -577,9 +571,32 @@ extension WhisperModelStore {
             return descriptor
         }
 
-        private static func acquireTransactionLock(in root: Int32) throws -> Int32 {
+        /// POSIX record locks are process-associated, so the in-memory registry serializes actors
+        /// in this process while F_SETLK serializes other processes and is released after a crash.
+        private static func acquireTransactionLock(in root: Int32) throws -> TransactionLease {
+            let rootIdentity = try descriptorIdentity(root, failure: .storageUnavailable)
+            let key = DirectoryIdentityKey(
+                deviceNumber: rootIdentity.deviceNumber,
+                fileNumber: rootIdentity.fileNumber
+            )
+            guard ProcessTransactionRegistry.shared.acquire(key) else {
+                throw WhisperModelStoreError.installationInProgress
+            }
+            var descriptor: Int32 = -1
+            var hasAdvisoryLock = false
+            var shouldCleanUp = true
+            defer {
+                if shouldCleanUp {
+                    if hasAdvisoryLock {
+                        _ = configureAdvisoryLock(descriptor, type: Int16(F_UNLCK))
+                    }
+                    if descriptor >= 0 { _ = Darwin.close(descriptor) }
+                    ProcessTransactionRegistry.shared.release(key)
+                }
+            }
+
             let lockLeaf = ".whisper-model-store.lock"
-            let descriptor = lockLeaf.withCString { name in
+            descriptor = lockLeaf.withCString { name in
                 Darwin.openat(
                     root,
                     name,
@@ -591,31 +608,48 @@ extension WhisperModelStore {
                 throw WhisperModelStoreError.storageUnavailable
             }
             guard try requireOwnedRegularFile(descriptor, in: root, named: lockLeaf) else {
-                _ = Darwin.close(descriptor)
                 throw WhisperModelStoreError.storageUnavailable
             }
             guard Darwin.fchmod(descriptor, stagingMode) == 0 else {
-                _ = Darwin.close(descriptor)
                 throw WhisperModelStoreError.storagePolicyFailed
             }
             guard try requireOwnedRegularFile(descriptor, in: root, named: lockLeaf) else {
-                _ = Darwin.close(descriptor)
                 throw WhisperModelStoreError.storageUnavailable
             }
-            guard Darwin.flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            guard configureAdvisoryLock(descriptor, type: Int16(F_WRLCK)) == 0 else {
                 let lockError = errno
-                _ = Darwin.close(descriptor)
-                if lockError == EWOULDBLOCK {
+                if lockError == EACCES || lockError == EAGAIN {
                     throw WhisperModelStoreError.installationInProgress
                 }
                 throw WhisperModelStoreError.storageUnavailable
             }
+            hasAdvisoryLock = true
             guard try requireOwnedRegularFile(descriptor, in: root, named: lockLeaf) else {
-                _ = Darwin.flock(descriptor, LOCK_UN)
-                _ = Darwin.close(descriptor)
                 throw WhisperModelStoreError.storageUnavailable
             }
-            return descriptor
+            shouldCleanUp = false
+            return TransactionLease(descriptor: descriptor, key: key)
+        }
+
+        private static func releaseTransactionLock(_ lease: TransactionLease) {
+            _ = configureAdvisoryLock(lease.descriptor, type: Int16(F_UNLCK))
+            _ = Darwin.close(lease.descriptor)
+            ProcessTransactionRegistry.shared.release(lease.key)
+        }
+
+        private static func configureAdvisoryLock(_ descriptor: Int32, type: Int16) -> Int32 {
+            var request = flock()
+            request.l_start = 0
+            request.l_len = 0
+            request.l_pid = 0
+            request.l_type = type
+            request.l_whence = Int16(SEEK_SET)
+            while true {
+                let result = withUnsafeMutablePointer(to: &request) { pointer in
+                    Darwin.fcntl(descriptor, F_SETLK, pointer)
+                }
+                if result == 0 || errno != EINTR { return result }
+            }
         }
 
         private static func coordinatedCopy(
@@ -1048,6 +1082,35 @@ extension WhisperModelStore {
     private struct DirectoryDescriptors: Sendable {
         let parent: Int32
         let root: Int32
+    }
+
+    private struct DirectoryIdentityKey: Hashable, Sendable {
+        let deviceNumber: UInt64
+        let fileNumber: UInt64
+    }
+
+    private struct TransactionLease: Sendable {
+        let descriptor: Int32
+        let key: DirectoryIdentityKey
+    }
+
+    private final class ProcessTransactionRegistry: @unchecked Sendable {
+        static let shared = ProcessTransactionRegistry()
+
+        private let lock = NSLock()
+        private var activeDirectories: Set<DirectoryIdentityKey> = []
+
+        func acquire(_ key: DirectoryIdentityKey) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return activeDirectories.insert(key).inserted
+        }
+
+        func release(_ key: DirectoryIdentityKey) {
+            lock.lock()
+            activeDirectories.remove(key)
+            lock.unlock()
+        }
     }
 
     private final class CoordinationState: @unchecked Sendable {
