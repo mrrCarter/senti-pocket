@@ -252,7 +252,7 @@ struct DeviceRingRegistrationClient: DeviceRingRegistryClient, @unchecked Sendab
 
     init(
         apiBaseURL: URL,
-        urlSession: URLSession = .shared,
+        urlSession: URLSession = SentiHTTPTransportPolicy.liveSession,
         currentBearerProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() },
         onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in },
         wallNow: @escaping @Sendable () -> Date = Date.init,

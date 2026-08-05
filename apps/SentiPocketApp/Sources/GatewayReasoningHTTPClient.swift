@@ -73,7 +73,7 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
     private let onReauthenticationRequired: @Sendable (String?) -> Void
 
     init(apiBaseURL: URL,
-         urlSession: URLSession = .shared,
+         urlSession: URLSession = SentiHTTPTransportPolicy.liveSession,
          tokenProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() },
          onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in }) {
         self.apiBaseURL = apiBaseURL
