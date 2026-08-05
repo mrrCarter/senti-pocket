@@ -6,6 +6,8 @@ import { randomUUID } from 'node:crypto';
 //   - acquireLock(key)/releaseLock(key): a short-TTL mutex so only one instance runs the post for a proposal.id.
 //   - get(key)/put(key,value): durable record of the terminal receipt OR the emitted marker (so a later request on a
 //     DIFFERENT instance loads the emitted actionId and RE-VERIFIES instead of re-posting).
+//   - advanceGeneration(key,value): monotonic durable-head CAS; only a strictly larger fixed-width generationOrder wins.
+//   - compareAndSwap(key,expectedVersion,value): exact-version CAS for bounded secondary indexes.
 //
 // PROD adapter (DynamoDB) — documented contract, not deployed here (no AWS creds in this env):
 //   acquireLock  -> PutItem {pk:key, sk:'lock', ttl:now+30s} with ConditionExpression attribute_not_exists(pk)
@@ -29,6 +31,20 @@ function resolveTtlOption(opts) {
   return v;
 }
 
+function canonicalRecordVersion(value, name = 'recordVersion') {
+  if (typeof value !== 'string' || !/^[1-9][0-9]{0,19}$/.test(value)) {
+    throw new Error(`store: ${name} must be a canonical positive uint64 decimal string`);
+  }
+  return value;
+}
+
+function fixedGenerationOrder(value) {
+  if (typeof value !== 'string' || !/^[0-9]{20}$/.test(value) || value === '00000000000000000000') {
+    throw new Error('store: generationOrder must be a fixed-width positive uint64 decimal string');
+  }
+  return value;
+}
+
 /**
  * In-memory store — single process, so the primitives are trivially atomic. Used for dev + hermetic tests.
  * acquireLock returns an OWNER TOKEN (or null if held); releaseLock only releases if the caller still owns it
@@ -47,6 +63,32 @@ export function createInMemoryStore() {
     async releaseLock(key, token) { if (locks.get(key) === token) locks.delete(key); },
     /** atomic reserve: true if stored, false if the key already existed. */
     async putIfAbsent(key, value, opts) { resolveTtlOption(opts); if (records.has(key)) return false; records.set(key, value); return true; },
+    /**
+     * Monotonic durable-head update. A stalled lower-generation writer can never replace a newer installation head.
+     * Returns the current value on refusal so callers can distinguish an idempotent retry from a stale/conflicting one.
+     */
+    async advanceGeneration(key, value) {
+      const next = fixedGenerationOrder(value && value.generationOrder);
+      const current = records.get(key);
+      if (current && fixedGenerationOrder(current.generationOrder) >= next) {
+        return { advanced: false, current };
+      }
+      records.set(key, value);
+      return { advanced: true, current: value };
+    },
+    /** Exact-version CAS used by bounded candidate indexes; null means the record must still be absent. */
+    async compareAndSwap(key, expectedVersion, value) {
+      const nextVersion = canonicalRecordVersion(value && value.recordVersion);
+      const current = records.get(key);
+      if (expectedVersion === null) {
+        if (current !== undefined) return { swapped: false, current };
+      } else {
+        canonicalRecordVersion(expectedVersion, 'expectedVersion');
+        if (!current || current.recordVersion !== expectedVersion) return { swapped: false, current };
+      }
+      records.set(key, { ...value, recordVersion: nextVersion });
+      return { swapped: true, current: value };
+    },
     // test/debug introspection only
     _records: records,
     _locks: locks,
@@ -67,8 +109,12 @@ export function createDynamoStore(cfg = {}) {
   const lk = (key) => ({ pk: key, sk: 'lock' });
   const isCond = (e) => e && (e.name === 'ConditionalCheckFailedException' || e.code === 'ConditionalCheckFailedException');
   const nowSec = () => Math.floor(now() / 1000);
+  const getRecord = async (key) => {
+    const r = await client.get({ TableName: table, Key: rk(key) });
+    return r && r.Item ? r.Item.value : undefined;
+  };
   return {
-    async get(key) { const r = await client.get({ TableName: table, Key: rk(key) }); return r && r.Item ? r.Item.value : undefined; },
+    get: getRecord,
     async put(key, value, opts = {}) {
       // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can auto-delete the record (e.g. dial-signal-store's
       // 900s signals). Records without ttlEpochSec are durable (idempotency/emitted markers), unchanged.
@@ -108,6 +154,42 @@ export function createDynamoStore(cfg = {}) {
         await client.put({ TableName: table, Item: item, ConditionExpression: 'attribute_not_exists(pk)' });
         return true;
       } catch (e) { if (isCond(e)) return false; throw e; }
+    },
+    async advanceGeneration(key, value) {
+      const next = fixedGenerationOrder(value && value.generationOrder);
+      try {
+        await client.put({
+          TableName: table,
+          Item: { ...rk(key), value, generationOrder: next },
+          ConditionExpression: 'attribute_not_exists(pk) OR #go < :next',
+          ExpressionAttributeNames: { '#go': 'generationOrder' },
+          ExpressionAttributeValues: { ':next': next },
+        });
+        return { advanced: true, current: value };
+      } catch (e) {
+        if (!isCond(e)) throw e;
+        return { advanced: false, current: await getRecord(key) };
+      }
+    },
+    async compareAndSwap(key, expectedVersion, value) {
+      const nextVersion = canonicalRecordVersion(value && value.recordVersion);
+      const Item = { ...rk(key), value: { ...value, recordVersion: nextVersion }, recordVersion: nextVersion };
+      const params = expectedVersion === null
+        ? { TableName: table, Item, ConditionExpression: 'attribute_not_exists(pk)' }
+        : {
+            TableName: table,
+            Item,
+            ConditionExpression: '#rv = :expected',
+            ExpressionAttributeNames: { '#rv': 'recordVersion' },
+            ExpressionAttributeValues: { ':expected': canonicalRecordVersion(expectedVersion, 'expectedVersion') },
+          };
+      try {
+        await client.put(params);
+        return { swapped: true, current: value };
+      } catch (e) {
+        if (!isCond(e)) throw e;
+        return { swapped: false, current: await getRecord(key) };
+      }
     },
   };
 }

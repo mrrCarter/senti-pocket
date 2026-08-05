@@ -97,3 +97,62 @@ test('e2e: /dial/register fail-closed when no deviceRegistry is wired -> 501', a
   assert.equal(res.status, 501);
   assert.equal(parse(res).reason, 'dial-not-configured');
 });
+
+test('e2e V2: register is membership-gated; exact unregister remains available after membership loss', async () => {
+  let isMember = true;
+  const calls = [];
+  const deviceRegistry = {
+    async registerV2(input) {
+      calls.push(['register', input]);
+      return {
+        deviceCount: 1,
+        installationGeneration: input.installationGeneration,
+        bindingId: 'i'.repeat(24),
+        bindingRevision: 'r'.repeat(32),
+        leaseExpiresAtSec: Math.floor(Date.now() / 1000) + 60,
+      };
+    },
+    async unregisterV2(input) { calls.push(['unregister', input]); return { unregistered: true }; },
+    async lookup() { return []; },
+  };
+  const gw = createGateway({
+    verifyToken: async (headers) => headers.authorization
+      ? { humanId: 'verified-owner', principal: 'verified-owner', scopes: FULL }
+      : null,
+    knownSessionIdsFor: async () => isMember ? ['sess-1'] : [],
+    deviceRegistry,
+    run: () => '{}',
+    signingKey: {},
+  });
+  const registerBody = {
+    registryVersion: 2,
+    installationId: 'A'.repeat(43),
+    installationGeneration: '1',
+    voipToken: 'apns-token',
+    sessionId: 'sess-1',
+    platform: 'apns',
+  };
+  const registered = await call(gw, '/dial/register', registerBody);
+  assert.equal(registered.status, 200);
+  assert.equal(parse(registered).bindingRevision, 'r'.repeat(32));
+
+  isMember = false;
+  assert.equal((await call(gw, '/dial/register', { ...registerBody, installationGeneration: '2' })).status, 403,
+    'a new target binding still requires current membership');
+  const unregistered = await call(gw, '/dial/unregister', {
+    registryVersion: 2,
+    installationId: registerBody.installationId,
+    installationGeneration: '2',
+    previousInstallationGeneration: '1',
+    bindingId: 'i'.repeat(24),
+    bindingRevision: 'r'.repeat(32),
+    sessionId: 'sess-1',
+  });
+  assert.deepEqual(unregistered, {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+    body: { unregistered: true },
+  });
+  assert.equal(calls[1][0], 'unregister');
+  assert.equal(calls[1][1].humanId, 'verified-owner', 'unregister owner comes only from verified auth');
+});
