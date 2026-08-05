@@ -24,6 +24,12 @@ import { mapSignalToPushInput } from './need-carter-dial.mjs';
 import { groundingIdsFromBundle, keepGrounded, isGrounded } from './grounding-gate.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
+const REGISTRATION_CONTEXT_CACHE_HEADERS = Object.freeze({
+  'cache-control': 'no-store',
+  pragma: 'no-cache',
+});
+const registrationContextJson = (status, body, headers = {}) =>
+  json(status, body, { ...headers, ...REGISTRATION_CONTEXT_CACHE_HEADERS });
 
 /**
  * Map an ActionReceipt to a response (warden contract ruling): a receipt whose confirmation binding was NEVER
@@ -90,9 +96,17 @@ export function createGateway(deps) {
   // read, so a read+write token must NOT authorize it. Override via deps.scopes if the contract changes.
   const SCOPES = { execute: 'sessions:write', sync: 'sessions:read', tts: 'pocket:voice', dial: 'pocket:dial', ...(deps.scopes || {}) };
   // /dial/register substrate: binds a device VoIP token to a session (deploy wires deps.deviceRegistry to Dynamo; the
-  // registry defers a missing backend to a register-time 501, so constructing it unconditionally is safe). now defaults
-  // to Date.now (ms) — the registeredAt stamp only.
-  const dialReg = createDialRegistry({ deviceRegistry: deps.deviceRegistry });
+  // registry defers a missing backend to a register-time 501, so constructing it unconditionally is safe). Normalize
+  // the gateway's injectable ISO clock to milliseconds so receipt expiry and the registry share one time source.
+  const dialNow = () => {
+    if (typeof deps.now !== 'function') return Date.now();
+    const value = deps.now();
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) throw new Error('gateway clock returned an invalid value');
+    return parsed;
+  };
+  const dialReg = createDialRegistry({ deviceRegistry: deps.deviceRegistry, now: dialNow });
 
   async function authenticate(req) {
     if (typeof deps.verifyToken !== 'function') return null; // no verifier wired => deny everything (fail-closed)
@@ -441,11 +455,27 @@ export function createGateway(deps) {
     // context may echo session text -> best-effort scrub + bound before it leaves via the push payload.
     const context = typeof body.context === 'string' ? scrubText(body.context).text.slice(0, 2048) : undefined;
     let out;
-    try { out = await deps.pushBackend({ message, context, priority, sessionId, humanId: ctx.humanId }); }
+    try {
+      out = await deps.pushBackend({
+        message,
+        context,
+        priority,
+        sessionId,
+        principal: ctx.principal || ctx.humanId,
+        humanId: ctx.humanId,
+      });
+    }
     catch { return json(502, { error: 'dial backend error', reason: 'dispatch-failed' }); }
     const dispatched = !!(out && out.dispatched);
     const dialId = out && typeof out.dialId === 'string' ? out.dialId : null;
-    return json(dispatched ? 200 : 502, dispatched ? { dialId, dispatched: true } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' });
+    return json(dispatched ? 200 : 502, dispatched
+      ? { dialId, dispatched: true }
+      : {
+        error: 'dial dispatch failed',
+        dialId,
+        dispatched: false,
+        reason: (out && out.reason) || 'not-dispatched',
+      });
   }
 
   // POST /dial/ring-owner — the EXPLICIT ring path (sl ring-owner / an agent's MCP tool). The caller DESCRIBES a need
@@ -503,11 +533,27 @@ export function createGateway(deps) {
       const mapped = mapSignalToPushInput(signal, { humanId: ctx.humanId });
       if (!mapped.ring) return { status: 422, body: { error: 'signal not rung', reason: mapped.reason, ...(mapped.error ? { detail: mapped.error } : {}) } };
       let out;
-      try { out = await deps.pushBackend({ ...mapped.input, storedSignal: mapped.storedSignal }); }
+      try {
+        out = await deps.pushBackend({
+          ...mapped.input,
+          principal: ctx.principal || ctx.humanId,
+          storedSignal: mapped.storedSignal,
+        });
+      }
       catch { return { status: 502, body: { error: 'dial backend error', reason: 'dispatch-failed' } }; }
       const dispatched = !!(out && out.dispatched);
       const dialId = (out && typeof out.dialId === 'string' ? out.dialId : null) || mapped.input.id;
-      return { status: dispatched ? 200 : 502, body: dispatched ? { dialId, dispatched: true, kind: mapped.kind.slug } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' } };
+      return {
+        status: dispatched ? 200 : 502,
+        body: dispatched
+          ? { dialId, dispatched: true, kind: mapped.kind.slug }
+          : {
+            error: 'dial dispatch failed',
+            dialId,
+            dispatched: false,
+            reason: (out && out.reason) || 'not-dispatched',
+          },
+      };
     };
 
     // ROBUSTNESS (Warden #86 follow-up): idempotency + a soft per-human ring rate-limit, BEST-EFFORT over deps.store.
@@ -572,15 +618,81 @@ export function createGateway(deps) {
   // forge PR #40). The registry is dispatch-substrate for /dial: it AUTHORS NOTHING and holds no key. humanId comes from
   // the VERIFIED token (ctx.humanId), NEVER the body — a caller can only register a device under their OWN identity,
   // which is what makes /dial's ctx.humanId dispatch secure (register + dial + pushBackend lookup share the one key).
-  // Same least-privilege pocket:dial scope. Fail-closed: no registry -> 501, bad token -> 400/413, non-member -> 403.
+  // Same least-privilege pocket:dial scope for new writes. A revoked caller first persists a denial outcome for the
+  // exact V2 operation. That barrier and the original registration transaction contend on one Dynamo item, so a 403
+  // cannot be followed by a late route commit. A commit that linearized first returns revocation-only fences instead.
   async function handleDialRegister(req, ctx) {
-    if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
+    if (!hasScope(ctx, SCOPES.dial)) {
+      const replayBody = readBody(req.body);
+      if (replayBody) {
+        dialNow(); // fail before a durable denial write if the shared receipt clock is invalid
+        try {
+          const replay = await dialReg.denyRegistration({
+            principal: ctx.principal || ctx.humanId,
+            humanId: ctx.humanId,
+            body: replayBody,
+            deniedError: 'missing scope ' + SCOPES.dial,
+          });
+          if (replay) return json(replay.status, replay.body);
+        } catch {
+          // A non-definitive storage/corruption failure is retryable: the client must retain its pending request. Collapse
+          // all causes to one response so the failure itself does not become a registry-record existence oracle.
+          return json(502, {
+            error: 'registry denial failed',
+            reason: 'registry-denial-failed',
+          });
+        }
+      }
+      return json(403, { error: 'missing scope ' + SCOPES.dial });
+    }
     const body = readBody(req.body);
     if (!body) return json(400, { error: 'invalid JSON body' });
+    dialNow(); // validate the response clock before any registry mutation
     const r = await dialReg.register({
+      principal: ctx.principal || ctx.humanId,
       humanId: ctx.humanId,
       body,
       isMember: async (sid) => { const known = await deps.knownSessionIdsFor(ctx.humanId); return Array.isArray(known) && known.includes(sid); },
+    });
+    return json(r.status, r.body);
+  }
+
+  // DELETE /dial/register — authenticated, existence-oblivious V2 compare-delete. Scope and membership are deliberately
+  // not required: a device must be able to revoke a binding after either grant disappears. The registry derives the
+  // target from ctx.humanId + sessionId and deletes only the exact server bindingId/revision, so late A cannot erase B.
+  async function handleDialUnregister(req, ctx) {
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    const r = await dialReg.unregister({
+      principal: ctx.principal || ctx.humanId,
+      humanId: ctx.humanId,
+      body,
+    });
+    return json(r.status, r.body);
+  }
+
+  // GET /dial/register/context — authenticated, auth-only owner continuity bootstrap. It derives a stable opaque
+  // handle from the verifier-owned principal and returns no registration/binding authority. Keeping this as its own
+  // read-only route makes it independently rate-limitable at the edge without coupling rate state to registry writes.
+  async function handleDialRegistrationContext(_req, ctx) {
+    const r = await dialReg.registrationContext({
+      principal: ctx.principal || ctx.humanId,
+      humanId: ctx.humanId,
+    });
+    return registrationContextJson(r.status, r.body);
+  }
+
+  // POST /dial/register/reconcile — authenticated and strictly subtractive. It needs neither pocket:dial scope nor
+  // membership: a phone that lost its raw PushKit token can use its durable SHA-256 digest to barrier an unknown commit
+  // and remove only that exact operation's server-issued binding. The response never grants lease authority.
+  async function handleDialRegistrationCleanup(req, ctx) {
+    const body = readBody(req.body);
+    if (!body) return json(400, { error: 'invalid JSON body' });
+    dialNow(); // cleanup returns serverTime; never mutate if it cannot issue a valid receipt
+    const r = await dialReg.cleanupRegistration({
+      principal: ctx.principal || ctx.humanId,
+      humanId: ctx.humanId,
+      body,
     });
     return json(r.status, r.body);
   }
@@ -624,11 +736,13 @@ export function createGateway(deps) {
       try {
         const method = (req.method || 'GET').toUpperCase();
         const path = req.path || '/';
+        const isDialRegistrationContext = method === 'GET' && path === '/dial/register/context';
         if (method === 'GET' && path === '/health') return json(200, { ok: true });
 
         const ctx = await authenticate(req);
         if (!ctx || typeof ctx.humanId !== 'string' || !ctx.humanId) {
-          return json(401, { error: 'authentication required' }, { 'www-authenticate': 'Bearer' });
+          const response = isDialRegistrationContext ? registrationContextJson : json;
+          return response(401, { error: 'authentication required' }, { 'www-authenticate': 'Bearer' });
         }
         // `return await` (not bare `return`): the handlers are async, so awaiting HERE keeps a rejection inside this
         // try/catch — a bare `return handleX()` would settle in the caller's await, escaping the boundary.
@@ -642,10 +756,18 @@ export function createGateway(deps) {
         if (method === 'POST' && path === '/dial') return await handleDial(req, ctx);
         if (method === 'POST' && path === '/dial/ring-owner') return await handleRingOwner(req, ctx);
         if (method === 'GET' && path === '/dial') return await handleDialFetch(req, ctx);
+        if (isDialRegistrationContext) {
+          return await handleDialRegistrationContext(req, ctx);
+        }
         if (method === 'POST' && path === '/dial/register') return await handleDialRegister(req, ctx);
+        if (method === 'POST' && path === '/dial/register/reconcile') return await handleDialRegistrationCleanup(req, ctx);
+        if (method === 'DELETE' && path === '/dial/register') return await handleDialUnregister(req, ctx);
         return json(404, { error: 'not found' });
       } catch {
-        return json(500, { error: 'internal error' }); // no stack/detail leaked to the client
+        const isDialRegistrationContext =
+          (req?.method || 'GET').toUpperCase() === 'GET' && (req?.path || '/') === '/dial/register/context';
+        const response = isDialRegistrationContext ? registrationContextJson : json;
+        return response(500, { error: 'internal error' }); // no stack/detail leaked to the client
       }
     },
   };
