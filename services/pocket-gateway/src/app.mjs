@@ -5,7 +5,11 @@
 import { createGateway } from './handlers.mjs';
 import { createHumanMessageClient } from './human-message-client.mjs';
 import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
-import { createDynamoStore } from './store.mjs';
+import { createDynamoStore, createStoreReplayGuard } from './store.mjs';
+import {
+  createOperationAdmissionAssertionVerifier,
+  OPERATION_ADMISSION_ASSERTION_SCHEMA,
+} from './operation-admission-assertion.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
 import {
@@ -16,7 +20,14 @@ import {
 import { createDynamoDeviceRegistryV2 } from './device-registry-v2.mjs';
 import { createDialSignalStore } from './dial-signal-store.mjs';
 import { createDeckVideoBackend } from './deck/deck-video-backend.mjs';
-import { lambdaHandler } from './lambda.mjs';
+import {
+  lambdaHandler,
+  OPERATION_ADMISSION_ATTESTATION_RESPONSE_SCHEMA,
+} from './lambda.mjs';
+
+const OPERATION_ADMISSION_CAPABILITY = 'registry-v2-operation-admission-capable';
+const NUMERIC_LAMBDA_VERSION_ARN_RE =
+  /^arn:(?:aws|aws-cn|aws-us-gov):lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]{1,64}:([1-9][0-9]*)$/;
 
 /**
  * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID,
@@ -29,7 +40,8 @@ import { lambdaHandler } from './lambda.mjs';
  *     (createDynamoClientAdapter in store.mjs) over a v3 @aws-sdk/lib-dynamodb DocumentClient — v3 exposes
  *     .send(new GetCommand(...)), not bare get/put/delete, so the deploy wraps it before injecting here.
  *   - signingKey: Ed25519 private key (KMS/Secrets Manager) for receipts
- *   - fetch: validates SENTI sessions (GET /auth/me) + posts the human write — the gateway holds NO signing secret
+ *   - fetch: validates SENTI sessions (GET /auth/me) on direct/V1 routes + posts the human write. Protected V2 writes
+ *     arrive with the single-use admission assertion instead of performing a second external validation.
  *   - run: a senti writeback runner (bundled sl or a senti API client) — `POST /actions/execute` uses it
  *   - knownSessionIdsFor(humanId): the sessions the human may write to (server-derived authorization)
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
@@ -42,17 +54,16 @@ import { lambdaHandler } from './lambda.mjs';
  *   - deviceRegistry / pushBackend: OPTIONAL overrides for the store-backed defaults (a dedicated device table, etc.)
  *     Registry V2 requires explicit DEVICE_REGISTRY_MODE=v2, DEVICE_REGISTRY_V1_PURGED=1,
  *     DEVICE_REGISTRY_CLIENT_V2_READY=1, DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1,
- *     DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1, DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1, and an HMAC key. The
+ *     DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1, and an HMAC key. The
  *     acknowledgements prevent a deployment from
  *     claiming closure while durable V1 rows can still ring, the installed iOS client still speaks V1, a pre-outcome
- *     V2 worker can still write, the auth-only operation journal lacks distributed unique-operation admission, or
- *     rotated bearer credentials cannot prove a stable registry owner before reaching admission.
- *     The injected dynamoClient must then expose get/transactWrite (plus the legacy store methods). Partial config
- *     fails boot.
+ *     V2 worker can still write, or rotated bearer credentials cannot prove a stable registry owner before reaching
+ *     admission. Registry V2 protected writes themselves always require operation-admission assertions.
+ *     The injected dynamoClient must then expose get/transactWrite (plus the legacy store methods).
  */
 export function createProdGateway(env = {}, deps = {}) {
   // FAIL BOOT if any production binding is absent (Echo P0). SENTI_API_BASE_URL is load-bearing twice: it's where the
-  // gateway VALIDATES the caller's SENTI session (verifyToken -> GET /auth/me) AND where the human write posts.
+  // gateway validates direct/V1 caller sessions (verifyToken -> GET /auth/me) AND where the human write posts.
   const missingEnv = ['DDB_TABLE', 'SIGNING_KEY_ID', 'GATEWAY_PUBLIC_URL', 'SENTI_API_BASE_URL']
     .filter((k) => !env[k]);
   if (missingEnv.length) throw new Error('pocket-gateway prod config missing: ' + missingEnv.join(', '));
@@ -62,9 +73,10 @@ export function createProdGateway(env = {}, deps = {}) {
   const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
   // Pocket-native auth (B3): pocket-gateway is Pocket-PRIVATE — all routes are Pocket-app routes, NO external-MCP/DPoP
   // resource-server surface — so it authenticates the caller's ONE SENTI user-session token by CALLING the api
-  // (GET /auth/me). It holds NO signing secret and can never mint a session (the api's HS256 secret never leaves the
-  // api). Membership stays the server-derived knownSessionIdsFor(humanId); the SAME token is forwarded to the human write.
-  const verifyToken = createSentiSessionVerifier({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
+  // (GET /auth/me). Protected V2 writes instead consume the narrow assertion minted after admission's one validation.
+  // The gateway cannot mint a Senti session (the API's session secret never leaves the API). Membership stays the
+  // server-derived knownSessionIdsFor(humanId); the same token is forwarded only where a human write requires it.
+  const verifySentiSession = createSentiSessionVerifier({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
   const ttsBackend = env.ELEVENLABS_API_KEY
     ? createElevenLabsBackend({ apiKey: env.ELEVENLABS_API_KEY, fetch: deps.fetch, defaultVoiceId: env.TTS_VOICE_ID })
     : undefined;
@@ -85,7 +97,7 @@ export function createProdGateway(env = {}, deps = {}) {
   // DIAL-ME: V2 owns exactly one binding item per installation plus one bounded, strongly-read directory per
   // authenticated human+session. Binding, global token ownership, and directory membership move atomically; no
   // eventually-consistent GSI participates in routing correctness. Existing deployments remain on the legacy V1
-  // default. A V2 phone receives an honest 501 from V1, while partial/mixed migration configuration fails boot.
+  // default. A V2 phone receives an honest 501 from V1.
   const registryMode = env.DEVICE_REGISTRY_MODE || 'v1';
   const v2HmacKey = env.DEVICE_REGISTRY_HMAC_KEY_B64;
   if (env.DEVICE_REGISTRY_TARGET_INDEX) {
@@ -95,9 +107,9 @@ export function createProdGateway(env = {}, deps = {}) {
     throw new Error('pocket-gateway DEVICE_REGISTRY_MODE must be v1 or v2');
   }
   if (registryMode === 'v1' && (
-    v2HmacKey || env.DEVICE_REGISTRY_V1_PURGED || env.DEVICE_REGISTRY_CLIENT_V2_READY ||
-    env.DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY || env.DEVICE_REGISTRY_OPERATION_ADMISSION_READY ||
-    env.DEVICE_REGISTRY_OWNER_CONTINUITY_READY
+    v2HmacKey || env.DEVICE_REGISTRY_HMAC_SECRET_ARN || env.DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID ||
+    env.DEVICE_REGISTRY_V1_PURGED || env.DEVICE_REGISTRY_CLIENT_V2_READY ||
+    env.DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY || env.DEVICE_REGISTRY_OWNER_CONTINUITY_READY
   )) {
     throw new Error('pocket-gateway Registry V2 settings require DEVICE_REGISTRY_MODE=v2');
   }
@@ -112,15 +124,22 @@ export function createProdGateway(env = {}, deps = {}) {
       'pocket-gateway Registry V2 requires DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1 after a quiesced homogeneous outcome-protocol cutover',
     );
   }
-  if (registryMode === 'v2' && env.DEVICE_REGISTRY_OPERATION_ADMISSION_READY !== '1') {
-    throw new Error(
-      'pocket-gateway Registry V2 requires DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1 after distributed unique-operation admission is verified',
-    );
-  }
   if (registryMode === 'v2' && env.DEVICE_REGISTRY_OWNER_CONTINUITY_READY !== '1') {
     throw new Error(
       'pocket-gateway Registry V2 requires DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1 after stable owner continuity is verified',
     );
+  }
+  if (registryMode === 'v2' && !env.DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID) {
+    throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID');
+  }
+  if (registryMode === 'v2' && !env.DEVICE_REGISTRY_HMAC_SECRET_ARN) {
+    throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_HMAC_SECRET_ARN');
+  }
+  if (registryMode === 'v2' && !v2HmacKey) {
+    throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_HMAC_KEY_B64');
+  }
+  if (registryMode === 'v2' && !/^[1-9][0-9]*$/.test(env.AWS_LAMBDA_FUNCTION_VERSION || '')) {
+    throw new Error('pocket-gateway Registry V2 requires an immutable numeric AWS_LAMBDA_FUNCTION_VERSION');
   }
 
   let deviceRegistry = deps.deviceRegistry;
@@ -135,9 +154,6 @@ export function createProdGateway(env = {}, deps = {}) {
       assertDeviceRegistryV2Capabilities(deviceRegistry, 'pocket-gateway Registry V2 implementation');
     }
   } else {
-    if (registryMode === 'v2' && !v2HmacKey) {
-      throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_HMAC_KEY_B64');
-    }
     deviceRegistry = registryMode === 'v2'
       ? createDynamoDeviceRegistryV2({
         client: deps.dynamoClient,
@@ -168,7 +184,8 @@ export function createProdGateway(env = {}, deps = {}) {
     : undefined;
 
   return createGateway({
-    verifyToken,
+    verifyToken: verifySentiSession,
+    requireOperationAdmissionAssertion: registryMode === 'v2',
     store,
     ttsBackend,
     // /deck?format=video assembles an mp4 via these INJECTED native backends. A deploy-injected (pre-sandboxed)
@@ -194,6 +211,89 @@ export function createProdGateway(env = {}, deps = {}) {
 
 /** The deployed Lambda handler: `export const handler = createLambda(process.env, injectedDeps)`. */
 export function createLambda(env, deps) {
+  // Snapshot every scalar this Lambda version may attest or use for assertion verification. The response below is an
+  // explicit allowlist: notably it cannot expose the HMAC value, bearer/body data, or unrelated environment entries.
+  const runtime = Object.freeze({
+    functionVersion: env.AWS_LAMBDA_FUNCTION_VERSION,
+    registryMode: env.DEVICE_REGISTRY_MODE || 'v1',
+    v1Purged: env.DEVICE_REGISTRY_V1_PURGED,
+    clientReady: env.DEVICE_REGISTRY_CLIENT_V2_READY,
+    outcomeReady: env.DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY,
+    ownerReady: env.DEVICE_REGISTRY_OWNER_CONTINUITY_READY,
+    hmacSecretArn: env.DEVICE_REGISTRY_HMAC_SECRET_ARN,
+    hmacSecretVersionId: env.DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID,
+    hmacKey: env.DEVICE_REGISTRY_HMAC_KEY_B64,
+  });
   // canonicalBaseUrl pins the DPoP htu to the deploy origin, not an attacker-spoofable Host header (Echo P0).
-  return lambdaHandler(createProdGateway(env, deps), { canonicalBaseUrl: env.GATEWAY_PUBLIC_URL });
+  const gateway = createProdGateway(env, deps);
+  const requireOperationAdmissionAssertion = runtime.registryMode === 'v2';
+  const assertionReplayGuard = requireOperationAdmissionAssertion
+    ? createStoreReplayGuard(
+      createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE }),
+      { prefix: 'operation-admission-assertion-jti:v1:' },
+    )
+    : undefined;
+  let verifier;
+  let immutableInvokedFunctionArn;
+  let attestation;
+  const exactInvokedFunctionArn = (lambdaContext) => {
+    const candidate = lambdaContext?.invokedFunctionArn;
+    const match = typeof candidate === 'string' ? NUMERIC_LAMBDA_VERSION_ARN_RE.exec(candidate) : null;
+    if (!match || match[1] !== runtime.functionVersion) {
+      throw new Error('operation admission requires the exact invoked ARN of its immutable numeric Lambda version');
+    }
+    if (immutableInvokedFunctionArn !== undefined && immutableInvokedFunctionArn !== candidate) {
+      throw new Error('operation admission invoked-function ARN changed within one Lambda environment');
+    }
+    immutableInvokedFunctionArn = candidate;
+    return candidate;
+  };
+  const verifyOperationAdmissionAssertion = requireOperationAdmissionAssertion
+    ? (event, lambdaContext) => {
+      const audience = exactInvokedFunctionArn(lambdaContext);
+      if (!verifier) {
+        verifier = createOperationAdmissionAssertionVerifier({
+          hmacKey: runtime.hmacKey,
+          kid: runtime.hmacSecretVersionId,
+          secretArn: runtime.hmacSecretArn,
+          audience,
+          replayGuard: assertionReplayGuard,
+          now: typeof deps?.now === 'function'
+            ? () => {
+              const value = deps.now();
+              if (typeof value === 'number') return value;
+              return Date.parse(value);
+            }
+            : undefined,
+        });
+      }
+      return verifier.verify(event);
+    }
+    : undefined;
+  const operationAdmissionAttestation = (lambdaContext) => {
+    const invokedFunctionArn = exactInvokedFunctionArn(lambdaContext);
+    if (!attestation) {
+      attestation = Object.freeze({
+        schema: OPERATION_ADMISSION_ATTESTATION_RESPONSE_SCHEMA,
+        capability: OPERATION_ADMISSION_CAPABILITY,
+        invoked_function_arn: invokedFunctionArn,
+        function_version: runtime.functionVersion,
+        registry_mode: runtime.registryMode,
+        v1_purged: runtime.v1Purged,
+        client_ready: runtime.clientReady,
+        outcome_ready: runtime.outcomeReady,
+        owner_ready: runtime.ownerReady,
+        hmac_secret_arn: runtime.hmacSecretArn,
+        hmac_secret_version_id: runtime.hmacSecretVersionId,
+        assertion_schema: OPERATION_ADMISSION_ASSERTION_SCHEMA,
+      });
+    }
+    return attestation;
+  };
+  return lambdaHandler(gateway, {
+    canonicalBaseUrl: env.GATEWAY_PUBLIC_URL,
+    requireOperationAdmissionAssertion,
+    verifyOperationAdmissionAssertion,
+    operationAdmissionAttestation,
+  });
 }

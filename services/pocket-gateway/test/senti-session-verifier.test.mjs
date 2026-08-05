@@ -3,7 +3,10 @@
 // forwarded verbatim + never leaked.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createSentiSessionVerifier } from '../src/senti-session-verifier.mjs';
+import {
+  SentiSessionVerifierUnavailableError,
+  createSentiSessionVerifier,
+} from '../src/senti-session-verifier.mjs';
 
 function fakeFetch(handler) {
   const calls = [];
@@ -40,6 +43,29 @@ test('fail-closed: 403 / 5xx / network error / non-JSON / missing id -> null', a
   assert.equal(await mk(async () => { throw new Error('ECONNREFUSED'); })({ authorization: 'Bearer x' }), null);
   assert.equal(await mk(async () => ({ ok: true, status: 200, json: async () => { throw new Error('bad'); } }))({ authorization: 'Bearer x' }), null);
   assert.equal(await mk(async () => ({ ok: true, status: 200, json: async () => ({ email: 'no-id' }) }))({ authorization: 'Bearer x' }), null);
+});
+
+test('strict admission mode separates invalid credentials from verifier transport/contract outages', async () => {
+  const mk = (fetch) => createSentiSessionVerifier({
+    fetch,
+    apiBaseUrl: 'https://a',
+    throwOnUnavailable: true,
+  });
+  assert.equal(await mk(fakeFetch(() => httpStatus(401)).fetch)({ authorization: 'Bearer x' }), null);
+  assert.equal(await mk(fakeFetch(() => httpStatus(403)).fetch)({ authorization: 'Bearer x' }), null);
+  assert.equal(await mk(fakeFetch(() => meOk('u')).fetch)({}), null);
+  for (const verify of [
+    mk(fakeFetch(() => httpStatus(500)).fetch),
+    mk(async () => { throw new Error('ECONNREFUSED secret detail'); }),
+    mk(async () => ({ ok: true, status: 200, json: async () => { throw new Error('bad JSON'); } })),
+    mk(async () => ({ ok: true, status: 200, json: async () => ({ email: 'no-id' }) })),
+  ]) {
+    await assert.rejects(
+      verify({ authorization: 'Bearer x' }),
+      (error) => error instanceof SentiSessionVerifierUnavailableError &&
+        error.code === 'senti-session-verifier-unavailable',
+    );
+  }
 });
 
 test('no bearer -> null (fail-closed), never calls the api', async () => {
@@ -99,4 +125,8 @@ test('the returned identity is deeply FROZEN (cached by-ref; no downstream mutat
 test('factory requires fetch + apiBaseUrl', () => {
   assert.throws(() => createSentiSessionVerifier({ apiBaseUrl: 'https://a' }), /fetch is required/);
   assert.throws(() => createSentiSessionVerifier({ fetch: async () => {} }), /apiBaseUrl is required/);
+  assert.throws(
+    () => createSentiSessionVerifier({ fetch: async () => {}, apiBaseUrl: 'https://a', throwOnUnavailable: 'yes' }),
+    /throwOnUnavailable must be boolean/,
+  );
 });

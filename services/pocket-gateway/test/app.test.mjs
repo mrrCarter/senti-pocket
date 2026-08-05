@@ -18,9 +18,11 @@ const V2_ENV = {
   DEVICE_REGISTRY_V1_PURGED: '1',
   DEVICE_REGISTRY_CLIENT_V2_READY: '1',
   DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY: '1',
-  DEVICE_REGISTRY_OPERATION_ADMISSION_READY: '1',
   DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '1',
   DEVICE_REGISTRY_HMAC_KEY_B64: Buffer.alloc(32, 0x51).toString('base64'),
+  DEVICE_REGISTRY_HMAC_SECRET_ARN: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:senti-pocket-registry-hmac-AbCdEf',
+  DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID: '0123456789abcdef0123456789abcdef',
+  AWS_LAMBDA_FUNCTION_VERSION: '42',
 };
 const V2_DYNAMO = {
   async get() { return {}; },
@@ -78,6 +80,18 @@ test('createProdGateway Registry V2 requires mode, migration gates, secret, and 
     /requires DEVICE_REGISTRY_HMAC_KEY_B64/,
   );
   assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_HMAC_SECRET_ARN: undefined }, {
+      ...FULL_DEPS, dynamoClient: V2_DYNAMO,
+    }),
+    /requires DEVICE_REGISTRY_HMAC_SECRET_ARN/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID: undefined }, {
+      ...FULL_DEPS, dynamoClient: V2_DYNAMO,
+    }),
+    /requires DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID/,
+  );
+  assert.throws(
     () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_V1_PURGED: '0' }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
     /DEVICE_REGISTRY_V1_PURGED=1/,
   );
@@ -95,12 +109,21 @@ test('createProdGateway Registry V2 requires mode, migration gates, secret, and 
     }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
     /DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1/,
   );
-  assert.throws(
-    () => createProdGateway({
+  assert.equal(
+    typeof createProdGateway({
       ...V2_ENV,
-      DEVICE_REGISTRY_OPERATION_ADMISSION_READY: '0',
-    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
-    /DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1/,
+      DEVICE_REGISTRY_OPERATION_ADMISSION_READY: 'not-a-runtime-gate',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }).handle,
+    'function',
+    'the removed admission-readiness environment variable is not recognized by Registry V2 boot',
+  );
+  assert.equal(
+    typeof createProdGateway({
+      ...FULL_ENV,
+      DEVICE_REGISTRY_OPERATION_ADMISSION_READY: '1',
+    }, FULL_DEPS).handle,
+    'function',
+    'the removed variable is not mistaken for partial Registry V2 configuration in V1 mode',
   );
   assert.throws(
     () => createProdGateway({
