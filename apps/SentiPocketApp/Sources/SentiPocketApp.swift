@@ -689,7 +689,6 @@ private struct RootAppView: View {
                     .labelStyle(.iconOnly)
             }
             .buttonStyle(.borderedProminent)
-            .buttonBorderShape(.circle)
             .padding()
             .accessibilityLabel("Settings")
             .accessibilityIdentifier("debug.settings")
