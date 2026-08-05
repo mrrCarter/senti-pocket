@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public struct WhisperModelDescriptor: Codable, Equatable, Sendable {
@@ -15,11 +16,15 @@ public struct WhisperModelDescriptor: Codable, Equatable, Sendable {
     public let byteCount: Int64
 
     public init(identifier: String, fileName: String, sha256: String, byteCount: Int64) throws {
-        let allowedIdentifier = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
+        let safeNameCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._")
         guard !identifier.isEmpty,
               identifier.count <= 128,
-              identifier.unicodeScalars.allSatisfy(allowedIdentifier.contains),
-              fileName == URL(fileURLWithPath: fileName).lastPathComponent,
+              identifier.unicodeScalars.allSatisfy(safeNameCharacters.contains),
+              !fileName.isEmpty,
+              fileName.count <= 128,
+              fileName != ".",
+              fileName != "..",
+              fileName.unicodeScalars.allSatisfy(safeNameCharacters.contains),
               fileName.hasSuffix(".bin"),
               sha256.count == 64,
               sha256.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789abcdef").contains($0) }),
@@ -32,11 +37,45 @@ public struct WhisperModelDescriptor: Codable, Equatable, Sendable {
         self.byteCount = byteCount
     }
 
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        do {
+            try self.init(
+                identifier: container.decode(String.self, forKey: .identifier),
+                fileName: container.decode(String.self, forKey: .fileName),
+                sha256: container.decode(String.self, forKey: .sha256),
+                byteCount: container.decode(Int64.self, forKey: .byteCount)
+            )
+        } catch {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Invalid Whisper model descriptor"
+                )
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(identifier, forKey: .identifier)
+        try container.encode(fileName, forKey: .fileName)
+        try container.encode(sha256, forKey: .sha256)
+        try container.encode(byteCount, forKey: .byteCount)
+    }
+
     private init(knownIdentifier: String, fileName: String, sha256: String, byteCount: Int64) {
         identifier = knownIdentifier
         self.fileName = fileName
         self.sha256 = sha256
         self.byteCount = byteCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case identifier
+        case fileName
+        case sha256
+        case byteCount
     }
 }
 
@@ -44,6 +83,12 @@ struct WhisperFileIdentity: Equatable, Sendable {
     let deviceNumber: UInt64
     let fileNumber: UInt64
     let byteCount: Int64
+
+    init(_ status: stat) {
+        deviceNumber = UInt64(status.st_dev)
+        fileNumber = UInt64(status.st_ino)
+        byteCount = Int64(status.st_size)
+    }
 }
 
 public struct VerifiedWhisperModel: Equatable, Sendable {
@@ -78,7 +123,9 @@ public struct WhisperModelVerifier: Sendable {
               modelURL.lastPathComponent == descriptor.fileName else {
             throw VoiceError.modelVerificationFailed
         }
-        let verifiedFile = try Self.readVerifiedFile(modelURL, against: descriptor, retainBytes: true)
+        let verifiedFile = try Self.mapVerificationError {
+            try Self.readVerifiedFile(modelURL, against: descriptor, retainBytes: true)
+        }
         return VerifiedWhisperModel(
             url: modelURL,
             descriptor: descriptor,
@@ -88,7 +135,22 @@ public struct WhisperModelVerifier: Sendable {
     }
 
     static func verifyFile(_ modelURL: URL, against descriptor: WhisperModelDescriptor) throws -> WhisperFileIdentity {
-        try readVerifiedFile(modelURL, against: descriptor, retainBytes: false).identity
+        try mapVerificationError {
+            try readVerifiedFile(modelURL, against: descriptor, retainBytes: false).identity
+        }
+    }
+
+    static func verifyFileDescriptor(
+        _ fileDescriptor: Int32,
+        against descriptor: WhisperModelDescriptor
+    ) throws -> WhisperFileIdentity {
+        try mapVerificationError {
+            try readVerifiedFileDescriptor(
+                fileDescriptor,
+                against: descriptor,
+                retainBytes: false
+            ).identity
+        }
     }
 
     private static func readVerifiedFile(
@@ -96,28 +158,65 @@ public struct WhisperModelVerifier: Sendable {
         against descriptor: WhisperModelDescriptor,
         retainBytes: Bool
     ) throws -> (identity: WhisperFileIdentity, bytes: Data) {
-        let before = try fileIdentity(at: modelURL)
-        guard before.byteCount == descriptor.byteCount else { throw VoiceError.modelVerificationFailed }
+        guard modelURL.isFileURL else { throw VoiceError.modelVerificationFailed }
+        let fileDescriptor = modelURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard fileDescriptor >= 0 else { throw VoiceError.modelVerificationFailed }
+        defer { _ = Darwin.close(fileDescriptor) }
+        return try readVerifiedFileDescriptor(
+            fileDescriptor,
+            against: descriptor,
+            retainBytes: retainBytes
+        )
+    }
 
-        let handle = try FileHandle(forReadingFrom: modelURL)
-        defer { try? handle.close() }
+    private static func readVerifiedFileDescriptor(
+        _ fileDescriptor: Int32,
+        against descriptor: WhisperModelDescriptor,
+        retainBytes: Bool
+    ) throws -> (identity: WhisperFileIdentity, bytes: Data) {
+        let before = try descriptorSnapshot(fileDescriptor)
+        guard before.identity.byteCount == descriptor.byteCount else {
+            throw VoiceError.modelVerificationFailed
+        }
+        guard Darwin.lseek(fileDescriptor, 0, SEEK_SET) == 0 else {
+            throw VoiceError.modelVerificationFailed
+        }
         var hasher = SHA256()
         var observedByteCount: Int64 = 0
         var modelBytes = Data()
         if retainBytes {
             modelBytes.reserveCapacity(Int(descriptor.byteCount))
         }
+        var buffer = [UInt8](repeating: 0, count: 1_048_576)
         while true {
-            let chunk = try handle.read(upToCount: 1_048_576) ?? Data()
-            if chunk.isEmpty { break }
-            observedByteCount += Int64(chunk.count)
+            try Task.checkCancellation()
+            let count = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(fileDescriptor, rawBuffer.baseAddress, rawBuffer.count)
+            }
+            if count < 0, errno == EINTR { continue }
+            guard count >= 0 else { throw VoiceError.modelVerificationFailed }
+            if count == 0 { break }
+            observedByteCount += Int64(count)
             guard observedByteCount <= descriptor.byteCount else {
                 throw VoiceError.modelVerificationFailed
             }
-            hasher.update(data: chunk)
-            if retainBytes { modelBytes.append(chunk) }
+            buffer.withUnsafeBytes { rawBuffer in
+                hasher.update(
+                    bufferPointer: UnsafeRawBufferPointer(
+                        start: rawBuffer.baseAddress,
+                        count: count
+                    )
+                )
+            }
+            if retainBytes {
+                modelBytes.append(contentsOf: buffer.prefix(count))
+            }
         }
-        let after = try fileIdentity(at: modelURL)
+        try Task.checkCancellation()
+        let after = try descriptorSnapshot(fileDescriptor)
         guard before == after, observedByteCount == descriptor.byteCount else {
             throw VoiceError.modelVerificationFailed
         }
@@ -125,24 +224,59 @@ public struct WhisperModelVerifier: Sendable {
         guard digest == descriptor.sha256 else {
             throw VoiceError.modelVerificationFailed
         }
-        return (after, modelBytes)
+        return (after.identity, modelBytes)
     }
 
-    private static func fileIdentity(at modelURL: URL) throws -> WhisperFileIdentity {
-        let values = try modelURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+    static func fileIdentity(at modelURL: URL) throws -> WhisperFileIdentity {
+        try mapVerificationError {
+            guard modelURL.isFileURL else { throw VoiceError.modelVerificationFailed }
+            var status = stat()
+            let result = modelURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+                guard let path else { return -1 }
+                return Darwin.lstat(path, &status)
+            }
+            guard result == 0,
+                  (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+                throw VoiceError.modelVerificationFailed
+            }
+            return WhisperFileIdentity(status)
+        }
+    }
+
+    private static func descriptorSnapshot(_ fileDescriptor: Int32) throws -> VerificationSnapshot {
+        var status = stat()
+        guard Darwin.fstat(fileDescriptor, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
             throw VoiceError.modelVerificationFailed
         }
-        let attributes = try FileManager.default.attributesOfItem(atPath: modelURL.path)
-        guard let device = attributes[.systemNumber] as? NSNumber,
-              let file = attributes[.systemFileNumber] as? NSNumber,
-              let size = attributes[.size] as? NSNumber else {
+        return VerificationSnapshot(status)
+    }
+
+    private static func mapVerificationError<T>(_ operation: () throws -> T) throws -> T {
+        do {
+            return try operation()
+        } catch is CancellationError {
+            throw VoiceError.cancelled
+        } catch let error as VoiceError {
+            throw error
+        } catch {
             throw VoiceError.modelVerificationFailed
         }
-        return WhisperFileIdentity(
-            deviceNumber: device.uint64Value,
-            fileNumber: file.uint64Value,
-            byteCount: size.int64Value
-        )
+    }
+
+    private struct VerificationSnapshot: Equatable {
+        let identity: WhisperFileIdentity
+        let modifiedSeconds: Int64
+        let modifiedNanoseconds: Int64
+        let changedSeconds: Int64
+        let changedNanoseconds: Int64
+
+        init(_ status: stat) {
+            identity = WhisperFileIdentity(status)
+            modifiedSeconds = Int64(status.st_mtimespec.tv_sec)
+            modifiedNanoseconds = Int64(status.st_mtimespec.tv_nsec)
+            changedSeconds = Int64(status.st_ctimespec.tv_sec)
+            changedNanoseconds = Int64(status.st_ctimespec.tv_nsec)
+        }
     }
 }

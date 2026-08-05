@@ -37,6 +37,18 @@
                 <string>35F9.1</string>
             </array>
         </dict>
+        <dict>
+            <!-- The pinned model store checks file type, size, identity, and mutation metadata only for app-container
+                 files (C617.1) and a document-picker file the user explicitly granted (3B52.1). This metadata remains
+                 on-device and is used only to prevent substitution, symlink escape, and partial model installation. -->
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
+                <string>3B52.1</string>
+            </array>
+        </dict>
     </array>
 </dict>
 </plist>
