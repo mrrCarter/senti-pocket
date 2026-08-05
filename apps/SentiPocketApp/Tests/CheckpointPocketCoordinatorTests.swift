@@ -161,6 +161,31 @@ final class CheckpointPocketCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .idle)
     }
 
+    func test_ready_content_revokes_synchronously_before_checkpoint_owner_mutates() async throws {
+        let verified = try loadVerifiedBundle()
+        let target = makeTarget(verified, authenticationRevision: 1)
+        let transport = ControlledCheckpointTransport()
+        var coordinator: CheckpointPocketCoordinator!
+        var observedPhases: [CheckpointPocketPhase] = []
+        coordinator = CheckpointPocketCoordinator(
+            transport: transport,
+            onProtectedContentRevoked: {
+                observedPhases.append(coordinator.phase)
+            }
+        )
+        coordinator.setSelectedSession(target.sessionId, authenticationRevision: 1)
+
+        let operation = try XCTUnwrap(coordinator.open(target))
+        try await waitForRequests(transport, count: 1)
+        await transport.resumeNext(.success(verified))
+        await operation.value
+        XCTAssertEqual(coordinator.phase, .ready(target, verified))
+
+        coordinator.clear()
+        XCTAssertEqual(observedPhases, [.ready(target, verified)])
+        XCTAssertEqual(coordinator.phase, .idle)
+    }
+
     func test_current_401_notifies_once_while_stale_401_cannot_revoke_new_login() async throws {
         let verified = try loadVerifiedBundle()
         let transport = ControlledCheckpointTransport()

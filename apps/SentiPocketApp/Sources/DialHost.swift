@@ -1,4 +1,5 @@
 #if canImport(CallKit) && canImport(PushKit)
+import Combine
 import Foundation
 import PocketCall
 import PocketContracts
@@ -21,6 +22,10 @@ import PocketDialVoice
 // → listen() degrades to "" → the orchestrator briefs but can't capture — nothing posts (the same fail-safe as before).
 @MainActor
 final class DialHost: ObservableObject {
+    /// CallKit/DialVoice is the exclusive audio owner from accepted ring through terminal teardown. Checkpoint
+    /// narration observes this gate and is synchronously preempted before governed dial speech or capture can start.
+    @Published private(set) var callAudioReservationIsActive = false
+
     let callManager: SentiCallManager?
     private let coordinator: DialCoordinator?
     private let registrar: DeviceRingRegistrar?
@@ -40,6 +45,13 @@ final class DialHost: ObservableObject {
     private let prepareCallKitAudioSession: () throws -> Void
     private let callKitDidActivateAudioSession: () -> Void
     private let callKitDidDeactivateAudioSession: () -> Void
+    private var preemptibleAudioRevoker: (
+        id: UUID,
+        revoke: @MainActor () -> Task<Void, Never>?
+    )?
+    private var preemptibleAudioStopBarrier: Task<Void, Never>?
+
+    var permitsPreemptibleAudio: Bool { !callAudioReservationIsActive }
 
     init(
         gatewayURL: URL? = DialHost.gatewayURL(),
@@ -322,6 +334,28 @@ final class DialHost: ObservableObject {
         _ = registrar?.applicationBecameActive()
     }
 
+    /// Registers the currently visible, lower-priority audio owner. There is at most one verified checkpoint surface;
+    /// replacement is intentional and exact-token removal prevents an old view from unregistering a newer one.
+    func installPreemptibleAudioRevoker(
+        _ revoke: @escaping @MainActor () -> Task<Void, Never>?
+    ) -> UUID {
+        if let previous = preemptibleAudioRevoker {
+            queuePreemptibleAudioStop(previous.revoke())
+        }
+        let id = UUID()
+        preemptibleAudioRevoker = (id: id, revoke: revoke)
+        if callAudioReservationIsActive {
+            queuePreemptibleAudioStop(revoke())
+        }
+        return id
+    }
+
+    func removePreemptibleAudioRevoker(_ id: UUID) {
+        guard let revoker = preemptibleAudioRevoker, revoker.id == id else { return }
+        queuePreemptibleAudioStop(revoker.revoke())
+        preemptibleAudioRevoker = nil
+    }
+
     private func closeLocalAuthority() {
         // Selection changes additionally close hydration and registration authority.
         selectionGate.select(nil)
@@ -338,6 +372,7 @@ final class DialHost: ObservableObject {
         activeDialTask = nil
         activeCallUUID = nil
         dialRevision &+= 1
+        releaseCallAudioReservation()
         callManager?.revokeAllCalls()
     }
 
@@ -347,6 +382,7 @@ final class DialHost: ObservableObject {
             callManager?.end(callUUID)
             return
         }
+        reserveCallAudio()
         coordinator.received(state, dialId: dialId, callUUID: callUUID)
     }
 
@@ -396,6 +432,7 @@ final class DialHost: ObservableObject {
     private func callKitAudioDeactivated(_ callUUID: UUID) {
         callKitDidDeactivateAudioSession()
         guard callLifecycle.audioDeactivated(callUUID: callUUID) != nil else { return }
+        releaseCallAudioReservation()
         coordinator?.discard(callUUID: callUUID)
         callAuthorizationGate.close(callUUID)
         if activeCallUUID == callUUID {
@@ -419,18 +456,28 @@ final class DialHost: ObservableObject {
         activeDialTask?.cancel()
         callAuthorizationGate.open(ready.callUUID)
         activeCallUUID = ready.callUUID
+        let audioStopBarrier = preemptibleAudioStopBarrier
         activeDialTask = Task { @MainActor [weak self] in
+            if let audioStopBarrier { await audioStopBarrier.value }
+            guard let self,
+                  !Task.isCancelled,
+                  self.dialRevision == ready.revision,
+                  self.callAudioReservationIsActive,
+                  self.activeCallUUID == ready.callUUID,
+                  self.callAuthorizationGate.permits(ready.callUUID),
+                  self.callLifecycle.isReported(ready.callUUID) else { return }
             _ = await coordinator.answered(
                 dialId: ready.dialId,
                 callUUID: ready.callUUID
             )
-            guard let self, self.dialRevision == ready.revision else { return }
+            guard self.dialRevision == ready.revision else { return }
             self.callAuthorizationGate.close(ready.callUUID)
             _ = self.callLifecycle.ended(callUUID: ready.callUUID)
             self.activeDialTask = nil
             if self.activeCallUUID == ready.callUUID {
                 self.activeCallUUID = nil
             }
+            self.releaseCallAudioReservation()
         }
     }
 
@@ -448,7 +495,28 @@ final class DialHost: ObservableObject {
         // the revision and invalidates work; teardown for any other UUID is inert.
         if ownedLifecycleEpisode || ownedActiveTask {
             dialRevision &+= 1
+            releaseCallAudioReservation()
         }
+    }
+
+    private func reserveCallAudio() {
+        guard !callAudioReservationIsActive else { return }
+        callAudioReservationIsActive = true
+        queuePreemptibleAudioStop(preemptibleAudioRevoker?.revoke())
+    }
+
+    private func releaseCallAudioReservation() {
+        callAudioReservationIsActive = false
+    }
+
+    private func queuePreemptibleAudioStop(_ stop: Task<Void, Never>?) {
+        guard let stop else { return }
+        let predecessor = preemptibleAudioStopBarrier
+        let barrier = Task { @MainActor in
+            if let predecessor { await predecessor.value }
+            await stop.value
+        }
+        preemptibleAudioStopBarrier = barrier
     }
 
     /// Build + run the governed flow for a HYDRATED ring. DialRequest is built from the ring's core (authed), NEVER

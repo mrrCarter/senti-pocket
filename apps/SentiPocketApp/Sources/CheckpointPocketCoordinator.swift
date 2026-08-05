@@ -91,6 +91,7 @@ final class CheckpointPocketCoordinator: ObservableObject {
     private let transport: any CheckpointTransport
     private let onReauthenticationRequired: @MainActor () -> Void
     private let onSelectionRevoked: @MainActor (String) -> Void
+    private let onProtectedContentRevoked: @MainActor () -> Void
 
     private var selectedSessionId: String?
     private var authenticationRevision: UInt64?
@@ -100,11 +101,13 @@ final class CheckpointPocketCoordinator: ObservableObject {
     init(
         transport: any CheckpointTransport,
         onReauthenticationRequired: @escaping @MainActor () -> Void = {},
-        onSelectionRevoked: @escaping @MainActor (String) -> Void = { _ in }
+        onSelectionRevoked: @escaping @MainActor (String) -> Void = { _ in },
+        onProtectedContentRevoked: @escaping @MainActor () -> Void = {}
     ) {
         self.transport = transport
         self.onReauthenticationRequired = onReauthenticationRequired
         self.onSelectionRevoked = onSelectionRevoked
+        self.onProtectedContentRevoked = onProtectedContentRevoked
     }
 
     deinit {
@@ -121,6 +124,7 @@ final class CheckpointPocketCoordinator: ObservableObject {
                 || !Self.byteExactOptional(selectedSessionId, sessionId) else {
             return
         }
+        revokeReadyProtectedContent()
         cancelAndFence()
         phase = .idle
         self.authenticationRevision = authenticationRevision
@@ -128,6 +132,7 @@ final class CheckpointPocketCoordinator: ObservableObject {
     }
 
     func clearSelection() {
+        revokeReadyProtectedContent()
         cancelAndFence()
         phase = .idle
         selectedSessionId = nil
@@ -146,6 +151,7 @@ final class CheckpointPocketCoordinator: ObservableObject {
             return nil
         }
 
+        revokeReadyProtectedContent()
         cancelAndFence()
         phase = .loading(target)
         let token = RequestToken(target: target, requestRevision: requestRevision)
@@ -193,6 +199,7 @@ final class CheckpointPocketCoordinator: ObservableObject {
     }
 
     func clear() {
+        revokeReadyProtectedContent()
         cancelAndFence()
         phase = .idle
     }
@@ -252,6 +259,13 @@ final class CheckpointPocketCoordinator: ObservableObject {
         operation?.cancel()
         operation = nil
         requestRevision &+= 1
+    }
+
+    /// Narration can exist only while a verified bundle is ready. Revoke it synchronously before any owner mutation
+    /// makes that bundle unreachable; SwiftUI disappearance remains a defense-in-depth stop, not the authority fence.
+    private func revokeReadyProtectedContent() {
+        guard case .ready = phase else { return }
+        onProtectedContentRevoked()
     }
 
     private static func byteExact(_ lhs: String, _ rhs: String) -> Bool {
