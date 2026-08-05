@@ -176,6 +176,43 @@ final class SelectedSessionDetailCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.destination)
     }
 
+    func test_checkpoint_open_emits_only_exact_visible_row_bound_to_authentication_revision() async throws {
+        let transport = ControlledSessionDetailTransport()
+        let opened = ExactCheckpointTargetProbe()
+        let coordinator = SelectedSessionDetailCoordinator(
+            transport: transport,
+            onOpenCheckpoint: { opened.values.append($0) }
+        )
+
+        let operation = try XCTUnwrap(coordinator.setSelectedSession(
+            "room-1",
+            authenticationRevision: 9
+        ))
+        try await waitForRequests(transport, events: 1, actions: 1, checkpoints: 1)
+        await transport.resumeNextEvent(.success(try eventPage(sessionId: "room-1", marker: "visible")))
+        await transport.resumeNextAction(.success(try actionPage(sessionId: "room-1", marker: "visible")))
+        await transport.resumeNextCheckpoint(.success(try checkpointPage(
+            sessionId: "room-1",
+            marker: "visible"
+        )))
+        await operation.value
+
+        coordinator.send(.openCheckpoint(sessionId: "other-room", checkpointId: "checkpoint-visible"))
+        coordinator.send(.openCheckpoint(sessionId: "room-1", checkpointId: "checkpoint-forged"))
+        XCTAssertTrue(opened.values.isEmpty)
+
+        coordinator.send(.openCheckpoint(sessionId: "room-1", checkpointId: "checkpoint-visible"))
+        XCTAssertEqual(opened.values, [ExactCheckpointTarget(
+            authenticationRevision: 9,
+            sessionId: "room-1",
+            checkpointId: "checkpoint-visible"
+        )])
+
+        coordinator.clearSelection()
+        coordinator.send(.openCheckpoint(sessionId: "room-1", checkpointId: "checkpoint-visible"))
+        XCTAssertEqual(opened.values.count, 1)
+    }
+
     func test_successful_activity_revision_clears_destination_when_exact_event_identity_changes() async throws {
         let transport = ControlledSessionDetailTransport()
         let coordinator = SelectedSessionDetailCoordinator(transport: transport)
@@ -582,4 +619,9 @@ final class SelectedSessionDetailCoordinatorTests: XCTestCase {
 @MainActor
 private final class DetailCallbackProbe {
     var values: [String] = []
+}
+
+@MainActor
+private final class ExactCheckpointTargetProbe {
+    var values: [ExactCheckpointTarget] = []
 }
