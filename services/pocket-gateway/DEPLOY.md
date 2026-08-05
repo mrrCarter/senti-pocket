@@ -458,13 +458,68 @@ deployment never starts half-wired.
 
 - **Gemma** (`/answer`,`/brief`): set `GEMMA_BASE_URL` (+`GEMMA_MODEL`). Grounding-first + fail-closed — the model may
   cite only ids in the signature-verified bundle; ungrounded ⇒ clarify/unavailable, never fabricated. Absent ⇒ `501`.
-- **DIAL** (`/dial`): inject `deps.apnsSend({voipToken,platform,payload}) -> {delivered}` — the APNs VoIP push transport
-  (needs a **VoIP credential** from the Apple Developer account). The gateway supplies the final dictionary after
-  `buildVoipPushDictionary` enforces the top-level shape and serialized 5,120-byte PushKit ceiling. The transport must
-  serialize that dictionary verbatim: do not wrap it, add fields, or rebuild `aps`. Send `apns-push-type: voip` and topic
-  `<bundle-id>.voip`. Treat the raw token as routing secret material at rest/in logs. Absent ⇒ `/dial` `501`s while
-  `/dial/register` can still record. The live APNs smoke gate must assert the exact outbound serialized byte count and
-  a device-side `PKPushPayload.dictionaryPayload` decode before enabling Registry V2.
+- **DIAL** (`/dial`): inject `deps.apnsSend({voipToken,platform,payload}) -> {delivered,...}`. The zero-dependency native
+  implementation is `createApnsVoipTransport` in `src/apns-voip-transport.mjs`. It uses Apple provider-token auth and a
+  lazy, reusable HTTP/2 session to the fixed development or production APNs host. Deployment owns credential retrieval:
+  resolve one exact immutable Secrets Manager version of the Apple `.p8`, parse it with `createPrivateKey`, and pass the
+  resulting private P-256 `KeyObject`. Never put PEM/key text in an environment variable, Terraform value/state, log,
+  error, metric, or Senti message. The transport itself does not read configuration or secrets and is never enabled
+  implicitly; absent `deps.apnsSend` preserves the honest `/dial` `501` while `/dial/register` can still record.
+
+  ```js
+  import { createPrivateKey } from 'node:crypto';
+  import { createApnsVoipTransport } from './src/apns-voip-transport.mjs';
+
+  // `pinnedP8` came from an exact SecretId + VersionId read owned by deployment bootstrap.
+  const apns = createApnsVoipTransport({
+    teamId: 'AAAAAAAAAA',
+    keyId: 'BBBBBBBBBB',
+    privateKey: createPrivateKey(pinnedP8),
+    bundleId: 'com.plexaura.sentipocket.app',
+    environment: 'development', // explicit; use production only for a production-profile device token
+    onResult: emitRedactedApnsMetric,
+  });
+
+  export const handler = createLambda(runtimeEnv, {
+    // ...baseline deployment dependencies...
+    apnsSend: apns.send,
+  });
+  ```
+
+  The gateway supplies the final dictionary after `buildVoipPushDictionary` enforces the top-level dial shape and the
+  serialized 5,120-byte PushKit ceiling. The transport serializes that dictionary once and sends those exact bytes; it
+  never wraps it, adds fields, or rebuilds `aps`. It derives topic `<bundle-id>.voip` and sends push type `voip`, priority
+  `10`, expiration `0`, and a fresh request UUID. A non-APNs route is rejected before network access.
+
+  Provider JWTs are ES256 (`R || S` IEEE-P1363), single-flight cached for 50 minutes, and rejected on clock rollback.
+  Warm workers reuse their HTTP/2 session. A new token-auth connection advertises an initial peer stream limit of one,
+  matching Apple's pre-authentication rule until APNs SETTINGS safely replace it; a real HTTP/2 cold-fanout regression
+  guards this admission boundary. GOAWAY/error/close retires the session for later calls, and controlled shutdown covers
+  both current and already-retired sessions. The request deadline is monotonic and end-to-end from APNs admission across
+  provider-token signing, local HTTP/2 queueing, and network response. Authorization and the token-bearing `:path` are
+  marked never-indexed in HPACK.
+
+  An explicit Apple `403 ExpiredProviderToken` is the sole one-time replay because that negative acknowledgement
+  proves the first request was not accepted. Failure before a stream exists is typed `not-sent`; once a stream may have
+  reached Apple, timeout,
+  stream/session failure, and connection loss are outcome-ambiguous and are never replayed because a blind replay can
+  create a duplicate CallKit ring. Explicit `429`/`5xx` responses are classified for delayed durable follow-up (5xx no
+  earlier than 15 minutes even when `Retry-After` is shorter), not retried in-call. `410 Unregistered`, `410 ExpiredToken`,
+  `BadDeviceToken`, and `DeviceTokenNotForTopic` are definitive for that request; their redacted metadata does not
+  authorize automatic row deletion. A later Registry V2 cleanup worker must compare the APNs timestamp with the
+  registration/binding fence. `UnrelatedKeyIdInToken` retires the authenticated connection before later work.
+
+  `onResult` receives only APNs acceptance status, bounded normalized reason, APNs request id, disposition, latency,
+  environment, and bounded retry/unregistered metadata. Raw device token, JWT, private key, payload, response body, and
+  causes are deliberately absent. Keep each registry namespace scoped to the same APNs environment/topic, use a
+  separate environment-scoped provider key operationally, and call `apns.close()` during controlled worker shutdown or
+  tests. The next deployment PR must add the exact-version secret bootstrap, KMS/Secrets Manager least-privilege IAM,
+  explicit enable flag defaulting off, alarms, signed dark artifact, and rollback evidence; none of those permissions
+  belong on the operation-admission role.
+
+  The legacy `delivered: true` field means APNs accepted the HTTP/2 request; it never proves handset receipt or CallKit
+  presentation. The live APNs smoke gate must assert the exact outbound serialized byte count and a device-side
+  `PKPushPayload.dictionaryPayload` decode before enabling Registry V2.
 - **Video** (`/deck?format=video`): ship `resvg` + `ffmpeg` (Lambda layer) and set `RESVG_BIN` + `FFMPEG_BIN`. **The
   gateway refuses to enable video unless `RESVG_EGRESS_SANDBOXED=1`** — an explicit deploy assertion that resvg runs
   **network-egress-disabled** (resvg has no self-disable flag, so the SSRF backstop is an OS/container control the
