@@ -521,16 +521,7 @@ extension WhisperModelStore {
                   permissions(status.mode) == directoryMode else {
                 throw WhisperModelStoreError.storagePolicyFailed
             }
-            do {
-                let values = try rootDirectory.resourceValues(forKeys: [.isExcludedFromBackupKey])
-                guard values.isExcludedFromBackup == true else {
-                    throw WhisperModelStoreError.storagePolicyFailed
-                }
-            } catch let error as WhisperModelStoreError {
-                throw error
-            } catch {
-                throw WhisperModelStoreError.storagePolicyFailed
-            }
+            try requireBackupExclusion(at: rootDirectory)
             try requireDirectoryAnchor(rootDirectory, directory: directory)
             #if os(iOS)
             do {
@@ -872,16 +863,7 @@ extension WhisperModelStore {
                   permissions(status.mode) == installedMode else {
                 throw WhisperModelStoreError.storagePolicyFailed
             }
-            do {
-                let values = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
-                guard values.isExcludedFromBackup == true else {
-                    throw WhisperModelStoreError.storagePolicyFailed
-                }
-            } catch let error as WhisperModelStoreError {
-                throw error
-            } catch {
-                throw WhisperModelStoreError.storagePolicyFailed
-            }
+            try requireBackupExclusion(at: url)
             try requireAnchoredFile(
                 fileDescriptor,
                 at: url,
@@ -917,6 +899,25 @@ extension WhisperModelStore {
             values.isExcludedFromBackup = true
             do {
                 try mutableURL.setResourceValues(values)
+            } catch {
+                throw WhisperModelStoreError.storagePolicyFailed
+            }
+        }
+
+        /// `URL` resource values are cached per value. Policy is written through a mutable copy,
+        /// so verifying through the caller's original value can intermittently observe metadata
+        /// cached before `setResourceValues` completed. Invalidate that cache before fail-closed
+        /// readback; anchored descriptor checks on both sides remain authoritative.
+        private static func requireBackupExclusion(at url: URL) throws {
+            var uncachedURL = url
+            uncachedURL.removeAllCachedResourceValues()
+            do {
+                let values = try uncachedURL.resourceValues(forKeys: [.isExcludedFromBackupKey])
+                guard values.isExcludedFromBackup == true else {
+                    throw WhisperModelStoreError.storagePolicyFailed
+                }
+            } catch let error as WhisperModelStoreError {
+                throw error
             } catch {
                 throw WhisperModelStoreError.storagePolicyFailed
             }
@@ -1055,7 +1056,10 @@ extension WhisperModelStore {
                 failure: .storageUnavailable
             )
             let entry = try relativeIdentity(in: directory, named: leaf)
-            return descriptor == entry && descriptor.isOwnedRegularFile
+            guard let entry else { return false }
+            return descriptor.refersToSameFile(as: entry)
+                && descriptor.isOwnedRegularFile
+                && entry.isOwnedRegularFile
         }
 
         private static func requireAnchoredFile(
@@ -1072,9 +1076,13 @@ extension WhisperModelStore {
             )
             let entry = try relativeIdentity(in: directory.root, named: leaf)
             let path = try pathIdentity(url)
-            guard descriptor == entry,
-                  descriptor == path,
-                  descriptor.isOwnedRegularFile else {
+            guard let entry,
+                  let path,
+                  descriptor.refersToSameFile(as: entry),
+                  descriptor.refersToSameFile(as: path),
+                  descriptor.isOwnedRegularFile,
+                  entry.isOwnedRegularFile,
+                  path.isOwnedRegularFile else {
                 throw WhisperModelStoreError.storagePolicyFailed
             }
             try requireDirectoryAnchor(rootDirectory, directory: directory)
@@ -1193,6 +1201,13 @@ extension WhisperModelStore {
             mode = status.st_mode
             owner = status.st_uid
             linkCount = UInt64(status.st_nlink)
+        }
+
+        /// Stable identity used to prove that path and descriptor observations still name the
+        /// same filesystem object. Size, timestamps, and mode are intentionally excluded here:
+        /// this store changes xattrs and permissions while retaining the same anchored inode.
+        func refersToSameFile(as other: POSIXFileIdentity) -> Bool {
+            deviceNumber == other.deviceNumber && fileNumber == other.fileNumber
         }
 
         var isRegularFile: Bool {
