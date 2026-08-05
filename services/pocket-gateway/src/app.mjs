@@ -5,6 +5,7 @@
 import { createGateway } from './handlers.mjs';
 import { createHumanMessageClient } from './human-message-client.mjs';
 import { createSentiSessionVerifier } from './senti-session-verifier.mjs';
+import { createSentiTargetMembershipResolver } from './senti-target-membership.mjs';
 import { createDynamoStore, createStoreReplayGuard } from './store.mjs';
 import {
   createOperationAdmissionAssertionVerifier,
@@ -35,7 +36,7 @@ const NUMERIC_LAMBDA_VERSION_ARN_RE =
  *                        RESVG_BIN + FFMPEG_BIN + RESVG_EGRESS_SANDBOXED=1 to enable /deck?format=video — the ack asserts
  *                        the deploy runs resvg network-egress-disabled (the SSRF backstop); without it, video 501s)
  * @param {object} deps   injected externals the deploy owns:
- *   { dynamoClient, signingKey, run, knownSessionIdsFor, bundleStore, fetch }
+ *   { dynamoClient, signingKey, run, bundleStore, fetch }
  *   - dynamoClient: the { get, put, delete } async shape createDynamoStore consumes. In prod this is a THIN ADAPTER
  *     (createDynamoClientAdapter in store.mjs) over a v3 @aws-sdk/lib-dynamodb DocumentClient — v3 exposes
  *     .send(new GetCommand(...)), not bare get/put/delete, so the deploy wraps it before injecting here.
@@ -43,7 +44,8 @@ const NUMERIC_LAMBDA_VERSION_ARN_RE =
  *   - fetch: validates SENTI sessions (GET /auth/me) on direct/V1 routes + posts the human write. Protected V2 writes
  *     arrive with the single-use admission assertion instead of performing a second external validation.
  *   - run: a senti writeback runner (bundled sl or a senti API client) — `POST /actions/execute` uses it
- *   - knownSessionIdsFor(humanId): the sessions the human may write to (server-derived authorization)
+ *   - target membership is always constructed here from fetch + the fixed SENTI_API_BASE_URL. Production cannot inject
+ *     a static allowlist: the API derives identity from the exact request bearer and returns the target's current role.
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
  *   - apnsSend({voipToken,platform,payload}): OPTIONAL VoIP push transport. The native provider-token implementation is
  *     createApnsVoipTransport(...).send; deployment must explicitly resolve its pinned .p8 secret into a P-256 KeyObject
@@ -72,16 +74,21 @@ export function createProdGateway(env = {}, deps = {}) {
   const missingEnv = ['DDB_TABLE', 'SIGNING_KEY_ID', 'GATEWAY_PUBLIC_URL', 'SENTI_API_BASE_URL']
     .filter((k) => !env[k]);
   if (missingEnv.length) throw new Error('pocket-gateway prod config missing: ' + missingEnv.join(', '));
-  if (!deps.dynamoClient || !deps.signingKey || typeof deps.knownSessionIdsFor !== 'function' || typeof deps.fetch !== 'function') {
-    throw new Error('pocket-gateway prod deps missing: dynamoClient + signingKey + knownSessionIdsFor + fetch are required');
+  if (!deps.dynamoClient || !deps.signingKey || typeof deps.fetch !== 'function') {
+    throw new Error('pocket-gateway prod deps missing: dynamoClient + signingKey + fetch are required');
   }
   const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
   // Pocket-native auth (B3): pocket-gateway is Pocket-PRIVATE — all routes are Pocket-app routes, NO external-MCP/DPoP
   // resource-server surface — so it authenticates the caller's ONE SENTI user-session token by CALLING the api
   // (GET /auth/me). Protected V2 writes instead consume the narrow assertion minted after admission's one validation.
-  // The gateway cannot mint a Senti session (the API's session secret never leaves the API). Membership stays the
-  // server-derived knownSessionIdsFor(humanId); the same token is forwarded only where a human write requires it.
+  // The gateway cannot mint a Senti session (the API's session secret never leaves the API). Target authorization uses
+  // the same bearer against the API's one-session membership probe and preserves its role so viewer cannot govern a
+  // write. The same token is forwarded only where a human write requires it.
   const verifySentiSession = createSentiSessionVerifier({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
+  const getTargetMembership = createSentiTargetMembershipResolver({
+    fetch: deps.fetch,
+    apiBaseUrl: env.SENTI_API_BASE_URL,
+  });
   const ttsBackend = env.ELEVENLABS_API_KEY
     ? createElevenLabsBackend({ apiKey: env.ELEVENLABS_API_KEY, fetch: deps.fetch, defaultVoiceId: env.TTS_VOICE_ID })
     : undefined;
@@ -205,7 +212,7 @@ export function createProdGateway(env = {}, deps = {}) {
     postHumanMessage,
     signingKey: deps.signingKey,
     signingKeyId: env.SIGNING_KEY_ID,
-    knownSessionIdsFor: deps.knownSessionIdsFor,
+    getTargetMembership,
     bundleStore: deps.bundleStore,
     deviceRegistry,   // POST /dial/register (store-backed default; deploy may override)
     pushBackend,      // POST /dial dispatch (present only when deps.apnsSend is wired)

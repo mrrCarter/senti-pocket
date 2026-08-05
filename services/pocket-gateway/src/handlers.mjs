@@ -25,6 +25,10 @@ import { mapSignalToPushInput } from './need-carter-dial.mjs';
 import { groundingIdsFromBundle, keepGrounded, isGrounded } from './grounding-gate.mjs';
 import { isOperationAdmissionAssertionContext } from './operation-admission-assertion.mjs';
 import { isRegistryOperationAdmissionRoute } from './operation-admission.mjs';
+import {
+  SENTI_TARGET_MEMBERSHIP_ERROR_CODES,
+  SentiTargetMembershipUnavailableError,
+} from './senti-target-membership.mjs';
 
 const json = (status, body, headers = {}) => ({ status, headers: { 'content-type': 'application/json', ...headers }, body });
 const REGISTRATION_CONTEXT_CACHE_HEADERS = Object.freeze({
@@ -33,6 +37,13 @@ const REGISTRATION_CONTEXT_CACHE_HEADERS = Object.freeze({
 });
 const registrationContextJson = (status, body, headers = {}) =>
   json(status, body, { ...headers, ...REGISTRATION_CONTEXT_CACHE_HEADERS });
+const DIAL_HYDRATION_CACHE_HEADERS = Object.freeze({
+  'cache-control': 'no-store',
+  pragma: 'no-cache',
+});
+const dialHydrationJson = (status, body, headers = {}) =>
+  json(status, body, { ...headers, ...DIAL_HYDRATION_CACHE_HEADERS });
+const DIAL_HYDRATION_GONE = Object.freeze({ error: 'dial signal unavailable', reason: 'gone' });
 const OPERATION_ADMISSION_UNAVAILABLE = Object.freeze({
   error: 'registration operation admission unavailable',
   reason: 'operation-admission-unavailable',
@@ -59,6 +70,7 @@ const readBody = (body) => {
   return body;
 };
 const hasScope = (ctx, scope) => Array.isArray(ctx.scopes) && ctx.scopes.includes(scope);
+const TARGET_ROLE_RANK = Object.freeze({ viewer: 0, contributor: 1, admin: 2, owner: 3 });
 
 /**
  * Durable-state key namespaced by the authenticated human. A NUL separator is injection-safe: it cannot appear in a
@@ -91,7 +103,8 @@ export function ringIdempotencyKey(body = {}) {
  *   store: object,                       // async store (store.mjs)
  *   run: (args:string[])=>string,        // sl runner (actions execute + read-back)
  *   signingKey: any, signingKeyId: string,
- *   knownSessionIdsFor: (humanId:string)=>Promise<string[]>,
+ *   getTargetMembership?: (input:{sessionId:string,authorization:string})=>Promise<null|{sessionId:string,membershipRole:'owner'|'admin'|'contributor'|'viewer'}>,
+ *   knownSessionIdsFor?: (humanId:string, context?:{sessionId:string,authorization:string,access:'member'|'write'})=>Promise<string[]>, // legacy test/demo seam only
  *   bundleStore?: { listForHuman:(humanId:string,since:number)=>Promise<object[]> },
  *   dialSignalStore?: { get:(dialId:string)=>Promise<object|undefined> },  // GET /dial?id= LEAN-ring hydration (createDialSignalStore)
  *   ttsBackend?: (text:string,opts:object)=>Promise<{audio:Buffer,format:string}>,
@@ -127,6 +140,78 @@ export function createGateway(deps) {
     try { return await deps.verifyToken(req.headers || {}); } catch { return null; }
   }
 
+  // Resolve authorization for exactly one target. Production injects the fixed-origin, bearer-bound role resolver;
+  // the legacy list seam remains solely so existing hermetic createGateway tests/demos can migrate independently.
+  // No production composition is allowed to inject or fall back to that static/list seam.
+  const requestAuthorization = (req) => {
+    const headers = req && req.headers && typeof req.headers === 'object' ? req.headers : {};
+    const hasLower = Object.hasOwn(headers, 'authorization');
+    const hasUpper = Object.hasOwn(headers, 'Authorization');
+    const lower = headers.authorization;
+    const upper = headers.Authorization;
+    if ((hasLower && typeof lower !== 'string') || (hasUpper && typeof upper !== 'string')) return null;
+    if (hasLower && hasUpper && lower !== upper) return null;
+    const value = hasLower ? lower : (hasUpper ? upper : null);
+    return typeof value === 'string' && value.length > 0 ? value : null;
+  };
+
+  const membershipFailureResponse = (error) => {
+    if (error && error.code === SENTI_TARGET_MEMBERSHIP_ERROR_CODES.invalidTarget) {
+      return json(400, { error: 'invalid target session' });
+    }
+    if (error && error.code === SENTI_TARGET_MEMBERSHIP_ERROR_CODES.credentialRejected) {
+      return json(401, { error: 'authentication required' }, { 'www-authenticate': 'Bearer' });
+    }
+    if (error && error.code === SENTI_TARGET_MEMBERSHIP_ERROR_CODES.rateLimited) {
+      const headers = Number.isSafeInteger(error.retryAfterSeconds) &&
+        error.retryAfterSeconds >= 0 && error.retryAfterSeconds <= 3_600
+        ? { 'retry-after': String(error.retryAfterSeconds) }
+        : {};
+      return json(429, { error: 'authorization lookup rate limited', retryable: true }, headers);
+    }
+    return json(503, { error: 'authorization lookup unavailable', retryable: true });
+  };
+
+  const resolveTargetAccess = async (req, ctx, sessionId, minimumRole = 'viewer') => {
+    const authorization = requestAuthorization(req);
+    if (!authorization) {
+      return { response: membershipFailureResponse({ code: SENTI_TARGET_MEMBERSHIP_ERROR_CODES.credentialRejected }) };
+    }
+    try {
+      let membership;
+      if (typeof deps.getTargetMembership === 'function') {
+        membership = await deps.getTargetMembership(Object.freeze({ sessionId, authorization }));
+      } else if (typeof deps.knownSessionIdsFor === 'function') {
+        const access = minimumRole === 'viewer' ? 'member' : 'write';
+        const known = await deps.knownSessionIdsFor(
+          ctx.humanId,
+          Object.freeze({ sessionId, authorization, access }),
+        );
+        membership = Array.isArray(known) && known.includes(sessionId)
+          ? { sessionId, membershipRole: 'owner' }
+          : null;
+      } else {
+        throw new SentiTargetMembershipUnavailableError();
+      }
+      if (membership === null) return { allowed: false, membership: null };
+      if (
+        !membership ||
+        typeof membership !== 'object' ||
+        membership.sessionId !== sessionId ||
+        !Object.hasOwn(TARGET_ROLE_RANK, membership.membershipRole) ||
+        !Object.hasOwn(TARGET_ROLE_RANK, minimumRole)
+      ) {
+        throw new SentiTargetMembershipUnavailableError();
+      }
+      return {
+        allowed: TARGET_ROLE_RANK[membership.membershipRole] >= TARGET_ROLE_RANK[minimumRole],
+        membership,
+      };
+    } catch (error) {
+      return { response: membershipFailureResponse(error) };
+    }
+  };
+
   async function handleSync(req, ctx) {
     if (!hasScope(ctx, SCOPES.sync)) return json(403, { error: 'missing scope ' + SCOPES.sync });
     if (!deps.bundleStore) return json(501, { error: 'sync backend not configured' });
@@ -148,13 +233,11 @@ export function createGateway(deps) {
     const sessionId = req.query && req.query.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
     if (!deps.signingKey) return json(501, { error: 'signing not configured' });
-    // Server-derived membership authz: knownSessionIdsFor is keyed by HUMANID (the contract + the write path
-    // handleExecute), so scope by ctx.humanId — NOT the synthetic principal string (which never matches -> 403s a valid
-    // member in prod). Durable state stays principal-namespaced (below); membership is humanId. The token's claim alone
-    // still can never name an arbitrary target session.
-    let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
-    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
+    // The API derives identity from this request's exact bearer and returns the role for this one target; viewer is
+    // sufficient for checkpoint reads. The humanId remains verifier-owned but is never trusted as probe authority.
+    const access = await resolveTargetAccess(req, ctx, sessionId, 'viewer');
+    if (access.response) return access.response;
+    if (!access.allowed) return json(403, { error: 'not a known session for this principal' });
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
     let bundle;
     try {
@@ -186,10 +269,10 @@ export function createGateway(deps) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
     if (!question) return json(400, { error: 'question required' });
     if (Buffer.byteLength(question, 'utf8') > 4096) return json(413, { error: 'question exceeds 4096 bytes' });
-    // Server-derived membership authz: reason ONLY over a session this HUMAN belongs to (humanId-keyed, matching the write).
-    let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
-    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
+    // Reason only over a target for which the exact caller bearer has at least viewer membership.
+    const access = await resolveTargetAccess(req, ctx, sessionId, 'viewer');
+    if (access.response) return access.response;
+    if (!access.allowed) return json(403, { error: 'not a known session for this principal' });
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
     // Fail-closed: reason ONLY over a signature-verified checkpoint bundle (never over an unverified/synthesized one).
     let bundle;
@@ -235,9 +318,9 @@ export function createGateway(deps) {
     if (!body) return json(400, { error: 'invalid JSON body' });
     const sessionId = body.sessionId;
     if (typeof sessionId !== 'string' || sessionId.length === 0) return json(400, { error: 'sessionId required' });
-    let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
-    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this principal' });
+    const access = await resolveTargetAccess(req, ctx, sessionId, 'viewer');
+    if (access.response) return access.response;
+    if (!access.allowed) return json(403, { error: 'not a known session for this principal' });
     const now = () => (typeof deps.now === 'function' ? deps.now() : new Date().toISOString());
     let bundle;
     try {
@@ -275,15 +358,20 @@ export function createGateway(deps) {
     const { proposal, confirmation } = body;
     if (!proposal || typeof proposal.id !== 'string' || proposal.id.length === 0) return json(400, { error: 'proposal.id required' });
 
-    // Authorization is server-derived: this human may only write to sessions they actually belong to.
-    let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
+    // A governed write requires contributor-or-higher for this exact bearer+target. Preserve executeAction's existing
+    // structural allowlist by passing the one already-authorized target; never perform a second network lookup.
+    if (typeof proposal.targetSessionId !== 'string' || proposal.targetSessionId.length === 0) {
+      return json(403, { error: 'not a member of the target session', proposalId: proposal.id });
+    }
+    const access = await resolveTargetAccess(req, ctx, proposal.targetSessionId, 'contributor');
+    if (access.response) return access.response;
+    const known = access.allowed ? [proposal.targetSessionId] : [];
 
     // MEMBERSHIP PRECHECK (Forge nit / Warden hardening): reject a non-member BEFORE the durable in-flight reservation
     // below, so an authenticated `sessions:write` principal can't amplify self-namespace storage by spamming /execute for
     // sessions they don't belong to. executeAction re-checks membership authoritatively (validateProposal, fail-closed on
     // empty `known`); this is the earlier, cheaper gate with the SAME notion of membership — no store touch on refuse.
-    if (!known.includes(proposal.targetSessionId)) {
+    if (!access.allowed) {
       return json(403, { error: 'not a member of the target session', proposalId: proposal.id });
     }
 
@@ -462,10 +550,10 @@ export function createGateway(deps) {
     const sessionId = body.sessionId;
     if (typeof sessionId !== 'string' || !sessionId) return json(400, { error: 'sessionId required' });
     const priority = ['low', 'medium', 'high', 'urgent'].includes(body.priority) ? body.priority : 'medium';
-    // Membership: only ring about a session this human belongs to (humanId-keyed, same as the read endpoints).
-    let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
-    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this user' });
+    // A viewer may ring their own registered devices about a session they can read.
+    const access = await resolveTargetAccess(req, ctx, sessionId, 'viewer');
+    if (access.response) return access.response;
+    if (!access.allowed) return json(403, { error: 'not a known session for this user' });
     // context may echo session text -> best-effort scrub + bound before it leaves via the push payload.
     const context = typeof body.context === 'string' ? scrubText(body.context).text.slice(0, 2048) : undefined;
     let out;
@@ -515,10 +603,10 @@ export function createGateway(deps) {
     if (body.kind === 'pickOption' && (!Array.isArray(body.options) || body.options.length === 0)) {
       return json(400, { error: 'pickOption requires at least one option' });
     }
-    // Membership: only ring about a session this human belongs to (humanId-keyed, same gate as /dial + the read endpoints).
-    let known = [];
-    try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
-    if (!Array.isArray(known) || !known.includes(sessionId)) return json(403, { error: 'not a known session for this user' });
+    // An explicit agent-originated owner ring is active notification authority, so require contributor-or-higher.
+    const access = await resolveTargetAccess(req, ctx, sessionId, 'contributor');
+    if (access.response) return access.response;
+    if (!access.allowed) return json(403, { error: 'not a known session for this user' });
     // Build the canonical NeedCarterSignal server-side. id = GATEWAY-generated opaque (caller must NOT choose the store
     // key). confidence defaults to 1.0 (an explicit ask clears the ring floor). createdAt = Unix-epoch SECONDS (seam (c)
     // contract: atlas's NeedCarterSignal custom-decodes Unix-seconds-or-absent -> Date). question + whatWeNeed are
@@ -662,12 +750,21 @@ export function createGateway(deps) {
     const body = readBody(req.body);
     if (!body) return json(400, { error: 'invalid JSON body' });
     dialNow(); // validate the response clock before any registry mutation
+    let membershipFailure;
     const r = await dialReg.register({
       principal: ctx.principal || ctx.humanId,
       humanId: ctx.humanId,
       body,
-      isMember: async (sid) => { const known = await deps.knownSessionIdsFor(ctx.humanId); return Array.isArray(known) && known.includes(sid); },
+      isMember: async (sid) => {
+        const access = await resolveTargetAccess(req, ctx, sid, 'viewer');
+        if (access.response) {
+          membershipFailure = access.response;
+          throw new Error('target membership lookup failed');
+        }
+        return access.allowed;
+      },
     });
+    if (membershipFailure) return membershipFailure;
     return json(r.status, r.body);
   }
 
@@ -718,29 +815,36 @@ export function createGateway(deps) {
   // authorization boundary. OPAQUE-ID: the caller supplies a high-entropy dialId, NOT a session they named — so we must
   // never leak whether an id is valid to someone who can't access it. Absent, expired, AND non-member therefore collapse
   // to ONE 410 (gone): there is honestly no signal available to this caller, and it closes the existence oracle (distinct
-  // from /checkpoint, where the client names the session so a 403 reveals nothing). No store wired -> 501; bad id -> 400.
+  // from /checkpoint, where the client names the session so a 403 reveals nothing). The high-entropy id and uniform
+  // status/body/cache policy limit disclosure; the store-first implementation does not claim constant-time behavior.
+  // No store wired -> 501; bad id -> 400. Every response is no-store because both existence and content are private.
   async function handleDialFetch(req, ctx) {
-    if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
+    if (!hasScope(ctx, SCOPES.dial)) return dialHydrationJson(403, { error: 'missing scope ' + SCOPES.dial });
     if (!deps.dialSignalStore || typeof deps.dialSignalStore.get !== 'function') {
-      return json(501, { error: 'dial hydration not configured', reason: 'dial-signal-store-not-configured' });
+      return dialHydrationJson(501, { error: 'dial hydration not configured', reason: 'dial-signal-store-not-configured' });
     }
     const id = req.query && typeof req.query.id === 'string' ? req.query.id : '';
-    if (id.trim().length === 0) return json(400, { error: 'id required' });
-    if (Buffer.byteLength(id, 'utf8') > 256) return json(400, { error: 'id too long' }); // bound before a store round-trip
+    if (id.trim().length === 0) return dialHydrationJson(400, { error: 'id required' });
+    if (Buffer.byteLength(id, 'utf8') > 256) return dialHydrationJson(400, { error: 'id too long' }); // bound before a store round-trip
     let signal;
     try { signal = await deps.dialSignalStore.get(id); }
-    catch { return json(503, { error: 'dial hydration lookup failed', retryable: true }); }
+    catch { return dialHydrationJson(503, { error: 'dial hydration lookup failed', retryable: true }); }
     // Resolve membership from the STORED signal's session (only when a signal exists). Absent signal -> skip the lookup
-    // (no session to check) -> the uniform 410 below; this also avoids a knownSessionIdsFor call per bogus-id probe.
+    // (no session to check) -> the uniform 410 below; this also avoids a membership call per bogus-id probe.
     let member = false;
     const sessionId = signal && signal.context && typeof signal.context.sessionId === 'string' ? signal.context.sessionId : null;
     if (sessionId) {
-      let known = [];
-      try { known = await deps.knownSessionIdsFor(ctx.humanId); } catch { return json(500, { error: 'authorization lookup failed' }); }
-      member = Array.isArray(known) && known.includes(sessionId);
+      const access = await resolveTargetAccess(req, ctx, sessionId, 'viewer');
+      // The dial id is caller-supplied but sessionId is stored server state. ANY target-authorization outcome here
+      // (invalid stored target, stale credential, rate limit, or outage) must remain indistinguishable from an absent
+      // id; returning its typed status only when a record exists would turn the membership service into an id oracle.
+      if (access.response) {
+        return dialHydrationJson(410, DIAL_HYDRATION_GONE);
+      }
+      member = access.allowed;
     }
-    if (!signal || !member) return json(410, { error: 'dial signal unavailable', reason: 'gone' }); // absent | expired | non-member -> uniform gone
-    return json(200, signal);
+    if (!signal || !member) return dialHydrationJson(410, DIAL_HYDRATION_GONE); // absent | expired | non-member -> uniform gone
+    return dialHydrationJson(200, signal);
   }
 
   return {
