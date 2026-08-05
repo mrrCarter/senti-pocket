@@ -23,6 +23,7 @@ import PocketUI
 @MainActor
 final class SignInCoordinator: ObservableObject {
     @Published private(set) var phase: PocketSignInPhase
+    @Published private(set) var authenticationEpoch: UInt64
 
     /// The REAL login (device flow → SessionTokenStore.save). Injected so the composition binds the auth-API config
     /// and tests stay hermetic. Throws on failure (NativeAuthError, mapped to a phase below).
@@ -31,10 +32,14 @@ final class SignInCoordinator: ObservableObject {
     private let isLoggedIn: () -> Bool
     /// Sign-out side effect — defaults to clearing the Keychain token.
     private let signOutAction: () -> Void
+    /// Confirmed write authority belongs to the authenticated principal and must not cross sign-out/account changes.
+    private let clearProtectedLocalState: () -> Void
 
     /// Fired AFTER a login that leaves a real token in the store (and once at launch if already signed in is handled
     /// by the caller). The device VoIP-register hooks here — it needs the fresh Bearer to POST /dial/register.
     var onAuthenticated: (() -> Void)?
+    /// App-lifetime protected services must revoke selected-session authority on every accepted 401 or sign-out.
+    var onAuthenticationRevoked: (() -> Void)?
 
     private var loginTask: Task<Void, Never>?
 
@@ -43,18 +48,46 @@ final class SignInCoordinator: ObservableObject {
          // computes) — referencing the @MainActor `SentiNativeAuth.isLoggedIn` from this nonisolated default-arg
          // context is a concurrency error (caught on the Mac build).
          isLoggedIn: @escaping () -> Bool = { SessionTokenStore.load() != nil },
-         signOut: @escaping () -> Void = { SessionTokenStore.delete() }) {
+         signOut: @escaping () -> Void = { SessionTokenStore.delete() },
+         clearProtectedLocalState: @escaping () -> Void = { OutboxStore.clear() }) {
         self.login = login
         self.isLoggedIn = isLoggedIn
         self.signOutAction = signOut
-        self.phase = isLoggedIn() ? .signedIn : .signedOut
+        self.clearProtectedLocalState = clearProtectedLocalState
+        let hasStoredCredential = isLoggedIn()
+        self.phase = hasStoredCredential ? .signedIn : .signedOut
+        self.authenticationEpoch = hasStoredCredential ? 1 : 0
+        if !hasStoredCredential {
+            // Migrate/fail closed if an older build left a confirmed intent behind after its credential disappeared.
+            clearProtectedLocalState()
+        }
     }
 
     /// The gate SentiPocketApp reads: the authed surfaces are reachable ONLY when this is true.
     var isAuthenticated: Bool { phase == .signedIn }
 
+    /// Composition roots capture this generation. A callback retained by principal A cannot invalidate a later
+    /// principal B root after sign-out/re-login, even if the old request completes after the new token is installed.
+    func isCurrentAuthentication(_ expectedEpoch: UInt64) -> Bool {
+        isAuthenticated && authenticationEpoch == expectedEpoch
+    }
+
     /// Void-returning adapter for PocketSignInView's `send: (PocketProductIntent) -> Void` closure (drops the Task).
     func send(_ intent: PocketProductIntent) { handle(intent) }
+
+    /// A protected API returned 401 after the launch gate had admitted the user. Clear the stale bearer before
+    /// exposing sign-in again; protected feature coordinators clear their own snapshots before invoking this.
+    func invalidateAuthentication(expectedEpoch: UInt64? = nil) {
+        guard phase == .signedIn else { return }
+        if let expectedEpoch, authenticationEpoch != expectedEpoch { return }
+        authenticationEpoch &+= 1
+        loginTask?.cancel()
+        loginTask = nil
+        onAuthenticationRevoked?()
+        clearProtectedLocalState()
+        signOutAction()
+        phase = .reauthenticationRequired
+    }
 
     /// Map a presentation intent to the real auth flow. Returns the in-flight login Task (if any) so tests can await
     /// it; `@discardableResult` so the view's `send: (PocketProductIntent) -> Void` closure can ignore it.
@@ -70,7 +103,10 @@ final class SignInCoordinator: ObservableObject {
             return nil
         case .signOut:
             loginTask?.cancel(); loginTask = nil
+            authenticationEpoch &+= 1
+            onAuthenticationRevoked?()
             phase = .signingOut
+            clearProtectedLocalState()
             signOutAction()
             phase = .signedOut
             return nil
@@ -88,6 +124,7 @@ final class SignInCoordinator: ObservableObject {
                 if Task.isCancelled { return }
                 // GATE #2: only a REAL stored token counts as signed-in — never fake success.
                 if self.isLoggedIn() {
+                    self.authenticationEpoch &+= 1
                     self.phase = .signedIn
                     self.onAuthenticated?()
                 } else {

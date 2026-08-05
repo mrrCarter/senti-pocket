@@ -11,14 +11,51 @@
 import Foundation
 import PocketReasoning
 
+/// Bridges Sendable HTTP callbacks back to the app's main-actor authentication gate without retaining a stale
+/// composition root. The handler can be installed after an app-lifetime client (DialHost) has been constructed.
+final class AuthenticationExpiryRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private let tokenProvider: @Sendable () -> String?
+    private var handler: (@MainActor @Sendable () -> Void)?
+
+    init(tokenProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() }) {
+        self.tokenProvider = tokenProvider
+    }
+
+    func install(_ handler: @escaping @MainActor @Sendable () -> Void) {
+        lock.lock()
+        self.handler = handler
+        lock.unlock()
+    }
+
+    /// Carry the bearer used by the failed request across the async actor hop. A late 401 from principal A must not
+    /// invalidate principal B after a re-login; nil is reserved for a request that found no credential at its start.
+    func signal(expectedToken: String?) {
+        lock.lock()
+        let handler = handler
+        lock.unlock()
+        guard let handler else { return }
+        Task { @MainActor [tokenProvider] in
+            guard tokenProvider() == expectedToken else { return }
+            handler()
+        }
+    }
+}
+
 enum GatewayReasoningError: LocalizedError {
     case notLoggedIn
+    case reauthenticationRequired
+    case supersededAuthentication
     case http(Int)
     case network(String)
     case malformedResponse
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:       return "Sign in to reason over your live session."
+        case .reauthenticationRequired:
+            return "Your Senti authorization expired. Sign in again to reason over this session."
+        case .supersededAuthentication:
+            return "The reasoning response belonged to an earlier sign-in and was ignored."
         case .http(let c):       return "The reasoning gateway returned HTTP \(c)."
         case .network(let m):    return "Reasoning gateway unreachable: \(m)"
         case .malformedResponse: return "The reasoning gateway returned an unexpected response."
@@ -31,13 +68,18 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
     private let urlSession: URLSession
     /// Injected so tests / offline can supply the token without a Keychain; defaults to the real session store.
     private let tokenProvider: @Sendable () -> String?
+    /// The reasoning driver intentionally turns provider errors into an honest `.failed` phase. This side-channel
+    /// also closes the authenticated app root when the gateway explicitly reports an expired bearer.
+    private let onReauthenticationRequired: @Sendable (String?) -> Void
 
     init(apiBaseURL: URL,
          urlSession: URLSession = .shared,
-         tokenProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() }) {
+         tokenProvider: @escaping @Sendable () -> String? = { SessionTokenStore.load() },
+         onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
         self.tokenProvider = tokenProvider
+        self.onReauthenticationRequired = onReauthenticationRequired
     }
 
     private struct BriefRequest: Encodable { let sessionId: String; let checkpointId: String? }
@@ -52,7 +94,10 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
     }
 
     private func post<Req: Encodable, Res: Decodable>(path: String, body: Req) async throws -> Res {
-        guard let token = tokenProvider(), !token.isEmpty else { throw GatewayReasoningError.notLoggedIn }
+        guard let token = tokenProvider(), !token.isEmpty else {
+            onReauthenticationRequired(nil)
+            throw GatewayReasoningError.notLoggedIn
+        }
         guard let url = URL(string: path, relativeTo: apiBaseURL) else { throw GatewayReasoningError.network("bad url \(path)") }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -64,6 +109,13 @@ struct GatewayReasoningHTTPClient: GatewayReasoningClient {
         do { (data, response) = try await urlSession.data(for: req) }
         catch { throw GatewayReasoningError.network(error.localizedDescription) }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            if http.statusCode == 401 {
+                guard tokenProvider() == token else {
+                    throw GatewayReasoningError.supersededAuthentication
+                }
+                onReauthenticationRequired(token)
+                throw GatewayReasoningError.reauthenticationRequired
+            }
             throw GatewayReasoningError.http(http.statusCode)   // 401/403 auth, 501 backend-unconfigured, 503 no-checkpoint…
         }
         do { return try JSONDecoder().decode(Res.self, from: data) }

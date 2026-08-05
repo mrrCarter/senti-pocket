@@ -61,6 +61,28 @@ final class DialHydrationTests: XCTestCase {
         XCTAssertEqual(r.options, [])                              // only pickOption carries options
     }
 
+    func test_hydration_preserves_the_already_authorized_binding_proof() throws {
+        let authorized = RingCore(
+            id: "need_1",
+            kind: "decision-yours",
+            priority: "high",
+            callerName: "Senti",
+            sessionId: "6cf7e861",
+            checkpointId: "cp_9",
+            bindingVersion: 2,
+            bindingId: String(repeating: "i", count: 24),
+            bindingRevision: String(repeating: "r", count: 32),
+            installationGeneration: "7"
+        )
+
+        let ring = try DialHydration.merge(core: authorized, fetched: signal())
+
+        XCTAssertEqual(ring.core.bindingVersion, 2)
+        XCTAssertEqual(ring.core.bindingId, authorized.bindingId)
+        XCTAssertEqual(ring.core.bindingRevision, authorized.bindingRevision)
+        XCTAssertEqual(ring.core.installationGeneration, "7")
+    }
+
     // MARK: - 2. substitution refusal (the security invariant)
 
     func test_id_mismatch_is_refused() {

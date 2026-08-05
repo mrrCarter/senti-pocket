@@ -53,7 +53,11 @@ enum DialHydration {
                 priority: core.priority,
                 callerName: core.callerName,
                 sessionId: core.sessionId,
-                checkpointId: signal.context.checkpointId   // AUTHED-ONLY: the push's checkpoint is never trusted as the value
+                checkpointId: signal.context.checkpointId,  // AUTHED-ONLY: the push's checkpoint is never trusted as the value
+                bindingVersion: core.bindingVersion,
+                bindingId: core.bindingId,
+                bindingRevision: core.bindingRevision,
+                installationGeneration: core.installationGeneration
             ),
             message: signal.question,                  // the governed content, from the AUTHED fetch only
             options: options,
