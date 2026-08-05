@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   RegistryCutoverCliError,
@@ -11,6 +13,9 @@ import {
 } from '../deploy/gateway/scripts/registry-cutover.mjs';
 
 const TABLE_ARN = 'arn:aws:dynamodb:us-east-1:123456789012:table/pocket-registry-prod';
+const REGISTRY_CUTOVER_CLI_PATH = fileURLToPath(
+  new URL('../deploy/gateway/scripts/registry-cutover.mjs', import.meta.url),
+);
 const BINDING = Object.freeze({
   accountId: '123456789012',
   region: 'us-east-1',
@@ -35,6 +40,23 @@ const APPLY_EVIDENCE_ARGS = [
   '--drain-evidence-digest',
   DRAIN_EVIDENCE_DIGEST,
 ];
+
+test('real CLI process fails before AWS with an exact sanitized error contract', () => {
+  const privateInput = 'private-device-token-must-not-echo';
+  const result = spawnSync(process.execPath, [REGISTRY_CUTOVER_CLI_PATH, 'invalid-command', privateInput], {
+    encoding: 'utf8',
+    env: { ...process.env, NODE_NO_WARNINGS: '1', NODE_OPTIONS: '' },
+    maxBuffer: 64 * 1024,
+    timeout: 10_000,
+  });
+
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'registry-cutover: INVALID_COMMAND\n');
+  assert.equal(`${result.stdout}${result.stderr}`.includes(privateInput), false);
+});
 
 function validTable(overrides = {}) {
   return {
