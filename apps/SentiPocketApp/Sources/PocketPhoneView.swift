@@ -8,9 +8,21 @@ import PocketContracts
 import PocketReasoning
 
 struct PocketPhoneView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var reasoning: RealReasoningCoordinator
     @ObservedObject var write: PhoneWriteViewModel
+    private let connectivityUpdates: ReasoningConnectivityUpdates
     @State private var draft: String = ""
+
+    init(
+        reasoning: RealReasoningCoordinator,
+        write: PhoneWriteViewModel,
+        connectivityUpdates: ReasoningConnectivityUpdates = ReasoningConnectivityUpdates()
+    ) {
+        _reasoning = ObservedObject(wrappedValue: reasoning)
+        _write = ObservedObject(wrappedValue: write)
+        self.connectivityUpdates = connectivityUpdates
+    }
 
     var body: some View {
         NavigationStack {
@@ -19,7 +31,19 @@ struct PocketPhoneView: View {
                 writeSection
             }
             .navigationTitle("Senti Pocket")
-            .task { reasoning.loadBriefing(connectivity: .online) }
+            .task(id: scenePhase) {
+                if scenePhase == .active {
+                    let observation = reasoning.observeConnectivity(connectivityUpdates.stream())
+                    await withTaskCancellationHandler {
+                        await observation.value
+                    } onCancel: {
+                        observation.cancel()
+                    }
+                } else {
+                    reasoning.reset()
+                }
+            }
+            .onDisappear { reasoning.reset() }
         }
     }
 
