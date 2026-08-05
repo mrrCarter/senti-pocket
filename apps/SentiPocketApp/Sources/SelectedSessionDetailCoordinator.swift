@@ -78,6 +78,7 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
     private let clock: @Sendable () -> Date
     private let onReauthenticationRequired: @MainActor () -> Void
     private let onSelectionRevoked: @MainActor (String) -> Void
+    private let onOpenCheckpoint: @MainActor (ExactCheckpointTarget) -> Void
 
     private var authenticationRevision: UInt64?
     private var requestRevision: UInt64 = 0
@@ -92,12 +93,14 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
         transport: any SessionTransport,
         clock: @escaping @Sendable () -> Date = { Date() },
         onReauthenticationRequired: @escaping @MainActor () -> Void = {},
-        onSelectionRevoked: @escaping @MainActor (String) -> Void = { _ in }
+        onSelectionRevoked: @escaping @MainActor (String) -> Void = { _ in },
+        onOpenCheckpoint: @escaping @MainActor (ExactCheckpointTarget) -> Void = { _ in }
     ) {
         self.transport = transport
         self.clock = clock
         self.onReauthenticationRequired = onReauthenticationRequired
         self.onSelectionRevoked = onSelectionRevoked
+        self.onOpenCheckpoint = onOpenCheckpoint
     }
 
     deinit {
@@ -177,11 +180,18 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
                   }) == true else { return }
             destination = .action(actionId: actionId)
         case .openCheckpoint(let sessionId, let checkpointId):
-            guard sessionId == selectedSessionId,
+            guard let authenticationRevision,
+                  let selectedSessionId,
+                  Self.byteExact(sessionId, selectedSessionId),
                   checkpointState?.rows.contains(where: {
-                      $0.sessionId == sessionId && $0.checkpointId == checkpointId
+                      Self.byteExact($0.sessionId, sessionId)
+                          && Self.byteExact($0.checkpointId, checkpointId)
                   }) == true else { return }
-            // Membership-authorized checkpoints never fall through to the signed-bundle Pocket path.
+            onOpenCheckpoint(ExactCheckpointTarget(
+                authenticationRevision: authenticationRevision,
+                sessionId: sessionId,
+                checkpointId: checkpointId
+            ))
         default:
             break
         }
@@ -584,5 +594,9 @@ final class SelectedSessionDetailCoordinator: ObservableObject {
             isRefreshing: isRefreshing,
             failure: failure
         )
+    }
+
+    private static func byteExact(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.utf8.elementsEqual(rhs.utf8)
     }
 }

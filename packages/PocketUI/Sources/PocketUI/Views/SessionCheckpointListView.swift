@@ -2,6 +2,11 @@
 import SwiftUI
 
 public struct SessionCheckpointListView: View {
+    static let exactCheckpointOpenHint =
+        "Fetches and verifies this exact signed checkpoint before any Pocket briefing content is shown."
+    static let trustBoundaryMessage =
+        "Room checkpoints are available through your membership. Opening one separately fetches and verifies the exact signed Pocket briefing before any briefing content is shown."
+
     private let state: SessionCheckpointListPresentationState
     private let send: (PocketProductIntent) -> Void
 
@@ -53,7 +58,7 @@ public struct SessionCheckpointListView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier(checkpointAccessibilityID(row))
-                    .accessibilityHint("Opens this room checkpoint. It is not a signed Pocket briefing.")
+                    .accessibilityHint(Self.exactCheckpointOpenHint)
                     .listRowBackground(PocketPalette.raised)
                 }
             }
@@ -104,7 +109,7 @@ public struct SessionCheckpointListView: View {
 
     private var trustBoundaryNotice: some View {
         Label {
-            Text("Room checkpoints are available through your membership. Only separately verified Senti briefings receive a signed-bundle badge.")
+            Text(Self.trustBoundaryMessage)
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
         } icon: {

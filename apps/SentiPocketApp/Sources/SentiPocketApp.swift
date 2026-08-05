@@ -147,6 +147,7 @@ struct SentiPocketApp: App {
 private struct AuthenticatedRootView: View {
     @StateObject private var sessions: SessionListCoordinator
     @StateObject private var details: SelectedSessionDetailCoordinator
+    @StateObject private var checkpointPocket: CheckpointPocketCoordinator
     @StateObject private var revocationRelay: AuthenticatedSessionRevocationRelay
     @State private var selectedTab: PocketTab = .sessions
     private let authenticationRevision: UInt64
@@ -165,8 +166,22 @@ private struct AuthenticatedRootView: View {
             urlSession: SentiHTTPTransportPolicy.liveSession,
             tokenProvider: { SessionTokenStore.load() }
         )
+        let checkpointTransport = HTTPCheckpointTransport(
+            gatewayBaseURL: GatewayEndpoint.resolve(infoPlistKeys: ["SENTI_GATEWAY_URL"]),
+            urlSession: SentiHTTPTransportPolicy.checkpointSession,
+            tokenProvider: { SessionTokenStore.load() }
+        )
         let revocationRelay = AuthenticatedSessionRevocationRelay(
             onReauthenticationRequired: guardedReauthentication
+        )
+        let checkpointPocket = CheckpointPocketCoordinator(
+            transport: checkpointTransport,
+            onReauthenticationRequired: {
+                revocationRelay.invalidateAuthentication()
+            },
+            onSelectionRevoked: { sessionId in
+                revocationRelay.revokeSelection(expectedSessionId: sessionId)
+            }
         )
         let details = SelectedSessionDetailCoordinator(
             transport: transport,
@@ -175,6 +190,9 @@ private struct AuthenticatedRootView: View {
             },
             onSelectionRevoked: { sessionId in
                 revocationRelay.revokeSelection(expectedSessionId: sessionId)
+            },
+            onOpenCheckpoint: { target in
+                checkpointPocket.open(target)
             }
         )
         let sessions = SessionListCoordinator(
@@ -183,6 +201,10 @@ private struct AuthenticatedRootView: View {
                 revocationRelay.invalidateAuthentication()
             },
             onSelectionChanged: { sessionId in
+                checkpointPocket.setSelectedSession(
+                    sessionId,
+                    authenticationRevision: authenticationEpoch
+                )
                 details.setSelectedSession(
                     sessionId,
                     authenticationRevision: authenticationEpoch
@@ -192,9 +214,11 @@ private struct AuthenticatedRootView: View {
         )
         revocationRelay.sessions = sessions
         revocationRelay.details = details
+        revocationRelay.checkpointPocket = checkpointPocket
 
         _sessions = StateObject(wrappedValue: sessions)
         _details = StateObject(wrappedValue: details)
+        _checkpointPocket = StateObject(wrappedValue: checkpointPocket)
         _revocationRelay = StateObject(wrappedValue: revocationRelay)
         self.authenticationRevision = authenticationEpoch
     }
@@ -216,6 +240,11 @@ private struct AuthenticatedRootView: View {
             pocket: {
                 SelectedSessionPocketView(
                     sessions: sessions,
+                    checkpointPocket: checkpointPocket,
+                    onCheckpointDone: {
+                        checkpointPocket.clear()
+                        selectedTab = .activity
+                    },
                     onReauthenticationRequired: invalidateProtectedAuthentication
                 )
             },
@@ -226,7 +255,16 @@ private struct AuthenticatedRootView: View {
                 )
             }
         )
+        .onChange(of: checkpointPocket.isActive) { isActive in
+            if isActive {
+                selectedTab = .pocket
+            }
+        }
         .onAppear {
+            checkpointPocket.setSelectedSession(
+                sessions.selectedSessionId,
+                authenticationRevision: authenticationRevision
+            )
             details.setSelectedSession(
                 sessions.selectedSessionId,
                 authenticationRevision: authenticationRevision
@@ -236,6 +274,7 @@ private struct AuthenticatedRootView: View {
         .onDisappear {
             sessions.clearSelection()
             details.clearSelection()
+            checkpointPocket.clearSelection()
         }
     }
 
@@ -251,6 +290,7 @@ private struct AuthenticatedRootView: View {
 private final class AuthenticatedSessionRevocationRelay: ObservableObject {
     weak var sessions: SessionListCoordinator?
     weak var details: SelectedSessionDetailCoordinator?
+    weak var checkpointPocket: CheckpointPocketCoordinator?
 
     private let onReauthenticationRequired: @MainActor @Sendable () -> Void
 
@@ -259,22 +299,63 @@ private final class AuthenticatedSessionRevocationRelay: ObservableObject {
     }
 
     func invalidateAuthentication() {
+        checkpointPocket?.invalidateAuthentication()
         sessions?.invalidateAuthentication()
         details?.invalidateAuthentication()
+        // Session-list invalidation emits its selection callback with the old root epoch. Clear again so that
+        // callback cannot leave even an identity-only authorization epoch behind after protected content closes.
+        checkpointPocket?.invalidateAuthentication()
         onReauthenticationRequired()
     }
 
     func revokeSelection(expectedSessionId: String) {
-        guard sessions?.selectedSessionId == expectedSessionId else { return }
+        guard let selectedSessionId = sessions?.selectedSessionId,
+              selectedSessionId.utf8.elementsEqual(expectedSessionId.utf8) else { return }
         sessions?.clearSelection()
     }
 }
 
 private struct SelectedSessionPocketView: View {
     @ObservedObject var sessions: SessionListCoordinator
+    @ObservedObject var checkpointPocket: CheckpointPocketCoordinator
+    let onCheckpointDone: @MainActor () -> Void
     let onReauthenticationRequired: @MainActor @Sendable () -> Void
 
     @ViewBuilder var body: some View {
+        switch checkpointPocket.phase {
+        case .loading:
+            checkpointStatus(
+                title: "Verifying checkpoint",
+                systemImage: "checkmark.shield",
+                message: "Fetching the exact selected checkpoint and verifying its signature before showing any content.",
+                actionTitle: nil,
+                action: nil
+            )
+
+        case .failed(_, let failure):
+            checkpointStatus(
+                title: failure.title,
+                systemImage: "exclamationmark.shield.fill",
+                message: failure.detail,
+                actionTitle: failure.allowsRetry ? "Try again" : nil,
+                action: failure.allowsRetry ? {
+                    _ = checkpointPocket.retry()
+                } : nil
+            )
+
+        case .ready(_, let verifiedBundle):
+            NavigationStack {
+                VerifiedCheckpointBriefingView(verifiedBundle: verifiedBundle)
+                    .toolbar { checkpointDoneToolbar }
+            }
+
+        case .idle:
+            idlePocket
+        }
+    }
+
+    @ViewBuilder
+    private var idlePocket: some View {
         if let sessionId = sessions.selectedSessionId {
             PhoneRootView(
                 sessionId: sessionId,
@@ -293,6 +374,34 @@ private struct SelectedSessionPocketView: View {
                 )
                 .navigationTitle("Pocket")
             }
+        }
+    }
+
+    private func checkpointStatus(
+        title: String,
+        systemImage: String,
+        message: String,
+        actionTitle: String?,
+        action: (() -> Void)?
+    ) -> some View {
+        NavigationStack {
+            StatusView(
+                title: title,
+                systemImage: systemImage,
+                message: message,
+                actionTitle: actionTitle,
+                action: action
+            )
+            .navigationTitle("Verified checkpoint")
+            .toolbar { checkpointDoneToolbar }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var checkpointDoneToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigationBarLeading) {
+            Button("Done", action: onCheckpointDone)
+                .accessibilityIdentifier("pocket.verified-checkpoint.done")
         }
     }
 }
