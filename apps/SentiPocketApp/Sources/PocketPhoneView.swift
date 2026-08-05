@@ -91,6 +91,13 @@ struct PocketPhoneView: View {
             case .pending(let message):
                 Label(message, systemImage: "wifi.slash").font(.footnote).foregroundStyle(.orange)
                 Button("Retry now") { write.retryPending() }
+            case .blockedByPendingSession(let targetSessionId):
+                Label(
+                    "A confirmed message is queued for session \(targetSessionId). Return to that session to retry it.",
+                    systemImage: "lock.shield"
+                )
+                .font(.footnote)
+                .foregroundStyle(.orange)
             case .refused(let message):
                 Label(message, systemImage: "xmark.seal.fill").font(.footnote).foregroundStyle(.red)
                 Button("Back") { write.cancel() }

@@ -26,6 +26,12 @@ struct DialPayloadV1: Decodable, Equatable, Sendable {
     let callerName: String
     let who: String             // always "senti-pocket" (the ring source; NOT the requesting agent — that's requestedBy, hydrated)
     let sessionId: String
+    // Registry V2 installation proof. All four are absent on the explicit V1 migration lane; once any is present the
+    // complete tuple is required. The real PushKit composition rejects absent/mismatched proofs for this app version.
+    let bindingVersion: Int?
+    let bindingId: String?
+    let bindingRevision: String?
+    let installationGeneration: String?
     let checkpointId: String?
     let fetch: Bool             // true ⇒ LEAN/core-only ⇒ MUST hydrate before rendering governed content
     let ts: String              // ISO-8601 with millis + Z
@@ -56,6 +62,34 @@ struct RingCore: Equatable, Sendable {
     let callerName: String
     let sessionId: String
     let checkpointId: String?
+    let bindingVersion: Int?
+    let bindingId: String?
+    let bindingRevision: String?
+    let installationGeneration: String?
+
+    init(
+        id: String,
+        kind: String,
+        priority: String,
+        callerName: String,
+        sessionId: String,
+        checkpointId: String?,
+        bindingVersion: Int? = nil,
+        bindingId: String? = nil,
+        bindingRevision: String? = nil,
+        installationGeneration: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.priority = priority
+        self.callerName = callerName
+        self.sessionId = sessionId
+        self.checkpointId = checkpointId
+        self.bindingVersion = bindingVersion
+        self.bindingId = bindingId
+        self.bindingRevision = bindingRevision
+        self.installationGeneration = installationGeneration
+    }
 }
 
 /// A fully renderable ring (RICH path, or a LEAN push after hydration merges the governed fields back in).
@@ -83,10 +117,33 @@ enum DialReceive {
         guard !payload.id.isEmpty, !payload.kind.isEmpty, !payload.sessionId.isEmpty else {
             return .rejected(reason: "dial payload missing required core (id/kind/sessionId)")
         }
+        let proof = [
+            payload.bindingVersion != nil,
+            payload.bindingId != nil,
+            payload.bindingRevision != nil,
+            payload.installationGeneration != nil
+        ]
+        if proof.contains(true) {
+            guard proof.allSatisfy({ $0 }),
+                  payload.bindingVersion == DeviceRingBinding.registryVersion,
+                  let bindingId = payload.bindingId, !bindingId.isEmpty,
+                  let bindingRevision = payload.bindingRevision, !bindingRevision.isEmpty,
+                  let generation = payload.installationGeneration,
+                  !generation.isEmpty,
+                  generation.first != "0",
+                  generation.allSatisfy(\.isNumber),
+                  UInt64(generation) != nil else {
+                return .rejected(reason: "dial payload has an incomplete or invalid Registry V2 binding proof")
+            }
+        }
 
         let core = RingCore(id: payload.id, kind: payload.kind, priority: payload.priority,
                             callerName: payload.callerName, sessionId: payload.sessionId,
-                            checkpointId: payload.checkpointId)
+                            checkpointId: payload.checkpointId,
+                            bindingVersion: payload.bindingVersion,
+                            bindingId: payload.bindingId,
+                            bindingRevision: payload.bindingRevision,
+                            installationGeneration: payload.installationGeneration)
 
         // LEAN: the governed content was shed to fit the budget → hydrate over authenticated GET before rendering it.
         // Even if a LEAN push somehow carried a stray message field, we do NOT render it pre-auth (unauthenticated transport).

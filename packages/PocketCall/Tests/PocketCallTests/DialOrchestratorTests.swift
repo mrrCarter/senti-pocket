@@ -36,6 +36,46 @@ final class DialOrchestratorTests: XCTestCase {
         func cancel() async { cancelCalls += 1 }
     }
 
+    final class CancellingVoice: DialVoice, @unchecked Sendable {
+        private let transcripts: [String]
+        private let cancelAtIndex: Int
+        private var index = 0
+
+        init(_ transcripts: [String], cancelAtIndex: Int) {
+            self.transcripts = transcripts
+            self.cancelAtIndex = cancelAtIndex
+        }
+
+        func speak(_ text: String) async {}
+
+        func listen() async -> String {
+            let current = index
+            index += 1
+            if current == cancelAtIndex {
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+            return current < transcripts.count ? transcripts[current] : ""
+        }
+
+        func answerFollowUp(_ question: String) async -> DialSpokenAnswer {
+            DialSpokenAnswer(spokenText: "grounded", grounded: true, evidenceIds: ["ev_1"])
+        }
+    }
+
+    final class CancellingConfirmedWriter: DialWriter, @unchecked Sendable {
+        private(set) var drafted: String?
+        private(set) var confirmCalls = 0
+        private(set) var cancelCalls = 0
+
+        func draft(_ message: String) async { drafted = message }
+        func confirmAndPost() async -> DialWriteResult {
+            confirmCalls += 1
+            withUnsafeCurrentTask { $0?.cancel() }
+            return .pending("confirmed intent retained for reconciliation")
+        }
+        func cancel() async { cancelCalls += 1 }
+    }
+
     private func req() -> DialRequest {
         DialRequest(dialId: "dial_x", message: "The token looks compromised.", callerName: "Senti", priority: "high")
     }
@@ -110,6 +150,51 @@ final class DialOrchestratorTests: XCTestCase {
         let w = MockWriter(result: .refused("signature not verified"))
         let out = await run(["my reply is post it", "confirm"], w)
         if case .declined = out {} else { return XCTFail("a refused write must decline, never sent") }
+    }
+
+    @MainActor
+    func testHangupDuringReplyListen_neverDraftsOrPosts() async {
+        let writer = MockWriter()
+        let voice = CancellingVoice(["my reply is ship it"], cancelAtIndex: 0)
+        let task = Task { @MainActor in
+            await DialOrchestrator(voice: voice, writer: writer).run(req())
+        }
+
+        let outcome = await task.value
+        if case .declined = outcome {} else { return XCTFail("cancelled reply listen must decline") }
+        XCTAssertNil(writer.drafted)
+        XCTAssertEqual(writer.confirmCalls, 0)
+    }
+
+    @MainActor
+    func testHangupWithConfirmTranscript_neverCallsConfirmAndPost() async {
+        let writer = MockWriter()
+        let voice = CancellingVoice(
+            ["my reply is rotate the token", "confirm"],
+            cancelAtIndex: 1
+        )
+        let task = Task { @MainActor in
+            await DialOrchestrator(voice: voice, writer: writer).run(req())
+        }
+
+        let outcome = await task.value
+        if case .declined = outcome {} else { return XCTFail("cancelled confirmation must decline") }
+        XCTAssertEqual(writer.drafted, "rotate the token")
+        XCTAssertEqual(writer.confirmCalls, 0)
+        XCTAssertEqual(writer.cancelCalls, 1)
+    }
+
+    @MainActor
+    func testHangupAfterExplicitConfirmation_keepsConfirmedOperationPending() async {
+        let writer = CancellingConfirmedWriter()
+        let voice = MockVoice(["my reply is rotate the token", "confirm"])
+
+        let outcome = await DialOrchestrator(voice: voice, writer: writer).run(req())
+
+        XCTAssertEqual(outcome, .pending("confirmed intent retained for reconciliation"))
+        XCTAssertEqual(writer.drafted, "rotate the token")
+        XCTAssertEqual(writer.confirmCalls, 1)
+        XCTAssertEqual(writer.cancelCalls, 0, "a committed operation must not be falsely retracted after hangup")
     }
 
     // MARK: - Conversing phase (grounded Q&A; reply-marker is the ONLY exit to a write)
