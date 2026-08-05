@@ -361,6 +361,105 @@ test('gateway requires the private verifier brand and never accepts a structural
   assert.equal(authCalls, 0);
 });
 
+test('production protected V2 registration probes membership once with the assertion-frozen original bearer', async () => {
+  const gatewayDynamo = memoryDynamo();
+  const admissionDynamo = memoryDynamo();
+  let authCalls = 0;
+  let membershipCalls = 0;
+  let registryCalls = 0;
+  let membershipRequest;
+  const fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/auth/me')) {
+      authCalls += 1;
+      assert.equal(options.headers.authorization, event().headers.authorization);
+      return new Response(JSON.stringify({ id: HUMAN_ID }), { status: 200 });
+    }
+    if (String(url).endsWith('/api/v1/sessions/session-v2/membership')) {
+      membershipCalls += 1;
+      membershipRequest = { url: String(url), options };
+      return new Response(JSON.stringify({ sessionId: 'session-v2', membershipRole: 'viewer' }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'cache-control': 'no-store',
+          pragma: 'no-cache',
+        },
+      });
+    }
+    throw new Error('unexpected fetch target');
+  };
+  const deviceRegistry = {
+    protocolVersion: 2,
+    operationOutcomeVersion: 1,
+    async registrationContext() {
+      return { registrationVersion: 2, ownerVersion: 1, ownerHandle: registration().ownerHandle };
+    },
+    async register() { registryCalls += 1; return undefined; }, // membership passes; malformed authority then honestly 502s
+    async reconcileRegistration() { return null; },
+    async denyRegistration() { return { state: 'denied' }; },
+    async unregister() { return { removed: false }; },
+    async lookup() { return []; },
+  };
+  const gatewayEnv = {
+    DDB_TABLE: 'pocket-gateway-test',
+    SIGNING_KEY_ID: 'test-signing-key',
+    GATEWAY_PUBLIC_URL: 'https://pocket.example.com',
+    SENTI_API_BASE_URL: 'https://api.example.com',
+    DEVICE_REGISTRY_MODE: 'v2',
+    DEVICE_REGISTRY_V1_PURGED: '1',
+    DEVICE_REGISTRY_CLIENT_V2_READY: '1',
+    DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY: '1',
+    DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '1',
+    DEVICE_REGISTRY_HMAC_KEY_B64: HMAC_KEY_B64,
+    DEVICE_REGISTRY_HMAC_SECRET_ARN: SECRET_ARN,
+    DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID: KID,
+    AWS_LAMBDA_FUNCTION_VERSION: '42',
+  };
+  const privateLambda = createLambda(gatewayEnv, {
+    dynamoClient: gatewayDynamo,
+    signingKey: generateKeyPairSync('ed25519').privateKey,
+    fetch,
+    deviceRegistry,
+    now: () => NOW_MS,
+  });
+  let privateEvent;
+  const admission = createOperationAdmissionApp({
+    REGISTRY_OPERATION_ADMISSION_AUTH_MODE,
+    SENTI_API_BASE_URL: 'https://api.example.com',
+    OPERATION_ADMISSION_DDB_TABLE: 'operation-admission-test',
+    DEVICE_REGISTRY_HMAC_SECRET_ARN: SECRET_ARN,
+    DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID: KID,
+    GATEWAY_LAMBDA_VERSION_ARN: AUDIENCE,
+  }, {
+    fetch,
+    dynamoClient: admissionDynamo,
+    hmacKey: HMAC_KEY,
+    hmacKeyVersionId: KID,
+    now: () => NOW_MS,
+    retryDelay: async () => {},
+    randomBytes: () => Buffer.alloc(32, 0x7c),
+    invokeGateway: async (received) => {
+      privateEvent = received;
+      return privateLambda(received, { invokedFunctionArn: AUDIENCE });
+    },
+  });
+
+  const response = await admission(event());
+  assert.equal(response.statusCode, 502, 'the viewer passes membership; the intentionally malformed registry authority fails later');
+  assert.equal(authCalls, 1, 'only admission performs /auth/me');
+  assert.equal(membershipCalls, 1);
+  assert.equal(registryCalls, 1, 'viewer is valid for binding their own device');
+  assert.equal(membershipRequest.options.headers.authorization, event().headers.authorization);
+  assert.equal(membershipRequest.options.method, 'GET');
+  assert.equal(membershipRequest.options.redirect, 'error');
+  assert.ok(privateEvent);
+
+  const replay = await privateLambda(privateEvent, { invokedFunctionArn: AUDIENCE });
+  assert.equal(replay.statusCode, 503);
+  assert.equal(membershipCalls, 1, 'assertion replay fails before another membership probe');
+  assert.equal(registryCalls, 1);
+});
+
 test('production admission app -> createLambda validates once, atomically consumes proof, and rejects exact replay', async () => {
   const gatewayDynamo = memoryDynamo();
   const admissionDynamo = memoryDynamo();
