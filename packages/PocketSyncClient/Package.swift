@@ -8,18 +8,23 @@ let package = Package(
         .library(name: "PocketSyncClient", targets: ["PocketSyncClient"])
     ],
     dependencies: [
-        .package(path: "../PocketContracts")
+        .package(path: "../PocketContracts"),
+        .package(path: "../PocketCall")
     ],
     targets: [
         .target(
             name: "PocketSyncClient",
-            dependencies: [.product(name: "PocketContracts", package: "PocketContracts")]
+            dependencies: [
+                .product(name: "PocketContracts", package: "PocketContracts"),
+                .product(name: "PocketCall", package: "PocketCall")
+            ]
         ),
         .testTarget(
             name: "PocketSyncClientTests",
             dependencies: [
                 "PocketSyncClient",
-                .product(name: "PocketContracts", package: "PocketContracts")
+                .product(name: "PocketContracts", package: "PocketContracts"),
+                .product(name: "PocketCall", package: "PocketCall")
             ]
         )
     ]
