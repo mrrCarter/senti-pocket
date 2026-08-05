@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGateway } from '../src/handlers.mjs';
 import { createDialPushBackend, computeDialId } from '../src/dial-registry.mjs';
+import { createInMemoryDeviceRegistryV2 } from '../src/device-registry-v2.mjs';
 
 const NOW = 1_770_000_000_000;
 const FULL = ['sessions:read', 'sessions:write', 'pocket:voice', 'pocket:dial'];
@@ -36,6 +37,44 @@ function makeGateway({ scopes = FULL } = {}) {
 }
 const call = (gw, path, body, token = 'u1') => gw.handle({ method: 'POST', path, headers: { authorization: `Bearer ${token}` }, body });
 const parse = (r) => (typeof r.body === 'string' ? JSON.parse(r.body) : r.body);
+
+function makeV2Gateway({ now = () => NOW, leaseSeconds } = {}) {
+  const deviceRegistry = createInMemoryDeviceRegistryV2({
+    hmacKey: Buffer.alloc(32, 0x61),
+    now,
+    ...(leaseSeconds === undefined ? {} : { leaseSeconds }),
+  });
+  const apnsSent = [];
+  const gw = createGateway({
+    verifyToken: async (headers) => {
+      const match = /Bearer (\w+)/.exec(headers?.authorization || '');
+      return match ? {
+        humanId: match[1],
+        principal: `pocket.principal.senti.v1\n${match[1].length}:${match[1]}`,
+        scopes: FULL,
+      } : null;
+    },
+    knownSessionIdsFor: async () => ['sess-1'],
+    deviceRegistry,
+    pushBackend: createDialPushBackend({
+      deviceRegistry,
+      apnsSend: async (input) => { apnsSent.push(input); return { delivered: true }; },
+      now,
+    }),
+    run: () => '{}',
+    signingKey: {},
+  });
+  return { gw, deviceRegistry, apnsSent };
+}
+
+const v2Body = (idempotencyKey, token = 'v2-token') => ({
+  registrationVersion: 2,
+  installationId: Buffer.alloc(32, 0x62).toString('base64url'),
+  idempotencyKey,
+  voipToken: token,
+  sessionId: 'sess-1',
+  platform: 'apns',
+});
 
 test('e2e: /dial before any device is registered -> 502 no-device-token (fail-closed, honest)', async () => {
   const { gw, apnsSent } = makeGateway();
@@ -98,61 +137,103 @@ test('e2e: /dial/register fail-closed when no deviceRegistry is wired -> 501', a
   assert.equal(parse(res).reason, 'dial-not-configured');
 });
 
-test('e2e V2: register is membership-gated; exact unregister remains available after membership loss', async () => {
-  let isMember = true;
-  const calls = [];
-  const deviceRegistry = {
-    async registerV2(input) {
-      calls.push(['register', input]);
-      return {
-        deviceCount: 1,
-        installationGeneration: input.installationGeneration,
-        bindingId: 'i'.repeat(24),
-        bindingRevision: 'r'.repeat(32),
-        leaseExpiresAtSec: Math.floor(Date.now() / 1000) + 60,
-      };
-    },
-    async unregisterV2(input) { calls.push(['unregister', input]); return { unregistered: true }; },
-    async lookup() { return []; },
-  };
-  const gw = createGateway({
-    verifyToken: async (headers) => headers.authorization
-      ? { humanId: 'verified-owner', principal: 'verified-owner', scopes: FULL }
-      : null,
-    knownSessionIdsFor: async () => isMember ? ['sess-1'] : [],
-    deviceRegistry,
-    run: () => '{}',
-    signingKey: {},
-  });
-  const registerBody = {
-    registryVersion: 2,
-    installationId: 'A'.repeat(43),
-    installationGeneration: '1',
-    voipToken: 'apns-token',
-    sessionId: 'sess-1',
-    platform: 'apns',
-  };
-  const registered = await call(gw, '/dial/register', registerBody);
-  assert.equal(registered.status, 200);
-  assert.equal(parse(registered).bindingRevision, 'r'.repeat(32));
+test('V2 e2e: one installation moves principal A -> B; stale A unregister cannot erase B', async () => {
+  const { gw, apnsSent } = makeV2Gateway();
+  const first = await call(
+    gw,
+    '/dial/register',
+    v2Body('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'token-a'),
+    'u1',
+  );
+  assert.equal(first.status, 200);
+  const bindingA = parse(first);
 
-  isMember = false;
-  assert.equal((await call(gw, '/dial/register', { ...registerBody, installationGeneration: '2' })).status, 403,
-    'a new target binding still requires current membership');
-  const unregistered = await call(gw, '/dial/unregister', {
-    registryVersion: 2,
-    installationId: registerBody.installationId,
-    installationGeneration: '2',
-    previousInstallationGeneration: '1',
-    bindingId: 'i'.repeat(24),
-    bindingRevision: 'r'.repeat(32),
-    sessionId: 'sess-1',
+  const ringA = await call(gw, '/dial', { message: 'A?', sessionId: 'sess-1' }, 'u1');
+  assert.equal(ringA.status, 200);
+  assert.equal(apnsSent.at(-1).payload.v, 2);
+  assert.deepEqual(apnsSent.at(-1).payload.binding, {
+    v: 2,
+    id: bindingA.bindingId,
+    revision: 1,
   });
-  assert.deepEqual(unregistered, {
-    status: 200,
-    headers: { 'content-type': 'application/json' },
-    body: { unregistered: true },
+
+  const second = await call(
+    gw,
+    '/dial/register',
+    {
+      ...v2Body('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'token-b'),
+      expectedBindingId: bindingA.bindingId,
+      expectedBindingRevision: bindingA.bindingRevision,
+    },
+    'u2',
+  );
+  assert.equal(second.status, 200);
+  const bindingB = parse(second);
+  assert.equal(bindingB.bindingRevision, 2);
+  assert.notEqual(bindingB.bindingId, bindingA.bindingId);
+
+  assert.equal((await call(gw, '/dial', { message: 'old?', sessionId: 'sess-1' }, 'u1')).status, 502,
+    'A is no longer addressable after the one installation item moves to B');
+
+  const staleDelete = await gw.handle({
+    method: 'DELETE',
+    path: '/dial/register',
+    headers: { authorization: 'Bearer u1' },
+    body: {
+      registrationVersion: 2,
+      installationId: v2Body('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa').installationId,
+      sessionId: 'sess-1',
+      bindingId: bindingA.bindingId,
+      bindingRevision: bindingA.bindingRevision,
+    },
   });
-  assert.equal(calls[1][0], 'unregister');
-  assert.equal(calls[1][1].humanId, 'verified-owner', 'unregister owner comes only from verified auth');
+  assert.equal(staleDelete.status, 200, 'stale/absent unregister is existence-oblivious');
+
+  const ringB = await call(gw, '/dial', { message: 'B?', sessionId: 'sess-1' }, 'u2');
+  assert.equal(ringB.status, 200);
+  assert.equal(apnsSent.at(-1).voipToken, 'token-b');
+  assert.deepEqual(apnsSent.at(-1).payload.binding, {
+    v: 2,
+    id: bindingB.bindingId,
+    revision: bindingB.bindingRevision,
+  });
+});
+
+test('V2 e2e: exact current unregister works after membership loss and leaves no addressable token', async () => {
+  const { gw } = makeV2Gateway();
+  const body = v2Body('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  const registered = parse(await call(gw, '/dial/register', body, 'u1'));
+  const response = await gw.handle({
+    method: 'DELETE',
+    path: '/dial/register',
+    headers: { authorization: 'Bearer u1' },
+    body: {
+      registrationVersion: 2,
+      installationId: body.installationId,
+      sessionId: body.sessionId,
+      bindingId: registered.bindingId,
+      bindingRevision: registered.bindingRevision,
+    },
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await call(gw, '/dial', { message: 'gone?', sessionId: 'sess-1' }, 'u1')).status, 502);
+});
+
+test('V2 e2e: logical lease expiry returns no-device-token and never reaches APNs during reclaim grace', async () => {
+  let wallMs = NOW;
+  const { gw, apnsSent } = makeV2Gateway({
+    now: () => wallMs,
+    leaseSeconds: 60,
+  });
+  const registered = parse(await call(
+    gw,
+    '/dial/register',
+    v2Body('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+    'u1',
+  ));
+  wallMs = Date.parse(registered.expiresAt);
+  const response = await call(gw, '/dial', { message: 'expired?', sessionId: 'sess-1' }, 'u1');
+  assert.equal(response.status, 502);
+  assert.equal(parse(response).reason, 'no-device-token');
+  assert.equal(apnsSent.length, 0);
 });

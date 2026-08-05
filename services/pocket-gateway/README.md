@@ -22,6 +22,16 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 - **API (done):** `src/handlers.mjs` (`GET /health`, `GET /sync`, `POST /actions/execute`, `POST /tts`). Fail-closed auth; per-human namespaced idempotency; cross-instance exactly-once writeback (durable in-flight reservation + content-based crash recovery).
 - **Auth (done):** `src/auth.mjs` — REAL AIdenID bearer verification: JWT signature against a JWKS, `iss/aud/exp/nbf`, RFC 8707 resource indicator, and DPoP proof-of-possession (RFC 9449 — thumbprint binding + `htm/htu/ath/iat` + single-use `jti` replay defense). Not a stub; JWKS/issuer/audience/resource are deploy config.
 - **Store (done):** `src/store.mjs` — async store: in-memory (dev/tests) + `createDynamoStore` (real conditional-put, OWNER-FENCED lock + `putIfAbsent` + TTL; deploy injects the `@aws-sdk/lib-dynamodb` client → package stays zero-dep) + `createStoreReplayGuard` (cross-instance DPoP jti single-use).
+- **Device Registry V2 (code-complete, deploy-unverified):** `src/device-registry-v2.mjs` — one server-HMAC-keyed
+  top-level item per installation, one HMAC-keyed global `(platform,token)` owner claim, and one strongly-read bounded
+  target directory. Every affected record moves in one DynamoDB transaction; lookup resolves at most 20 exact
+  directory/base/claim triples and has no GSI correctness dependency. Server-issued binding + token-claim CAS fences,
+  atomic displaced-owner eviction, `{directoryId,revision}` ABA fencing, hard 20-installation admission, exact
+  transactional revoke, seven-day logical lease, five-minute skew-safe physical/reclaim grace, stable-read fencing,
+  bounded 21-attempt serialization, and strict V2 wire are covered hermetically. Same intent renews without rotation;
+  principal/session/token/platform change rotates. Pushes use a fail-closed `v:2` nested binding envelope included in
+  both bare and final PushKit byte gates. V2 boot requires explicit legacy-row-purge and V2-iOS-ready acknowledgements
+  in `DEPLOY.md`; it remains unavailable to the currently shipping legacy registrar.
 - **Backends/adapters (done):** `src/lambda.mjs` (API Gateway HTTP API v2 ⇄ gateway, base64 binary, DPoP url/method), `src/tts.mjs` (ElevenLabs backend; key server-side only, `fetch` injected), `src/app.mjs` (deploy composition → `createLambda(env, deps)`).
 - **Device Registry V2 (done in source):** installation-global monotonic generation heads use Dynamo conditional
   writes; targets use the verifier's full principal namespace while membership remains human-ID based. Bounded
@@ -35,7 +45,11 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
   through V1. New V1 compatibility rows are tagged and keyed by the same full principal; historical untagged rows fail
   closed rather than becoming cross-site authority. Distinct scoped legacy devices can remain during the grace window.
 - **Writeback (done):** governed writeback (snapshot-frozen deterministic target → single-use confirm bound to proposal hash → server-time freshness → reserve-before-post exactly-once → `sl session reply` → read-back verify → signed `ActionReceipt`; offline ⇒ `pendingConnectivity`). Live-proven twice.
-- **Open (deploy/cross-lane):** DynamoDB table + IAM + AWS creds; JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled `sl` or senti API client); bind checkpoint provenance/`contentTrust` into the SIGNED bundle canonical (Atlas's contract); LLM-enriched summary prose (same grounded evidence); Swift client packages (need a Mac).
+- **Open (deploy/cross-lane):** DynamoDB table/TTL + IAM + AWS creds; Registry V1 row purge + HMAC secret; real APNs
+  VoIP transport; JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled
+  `sl` or senti API client); bind checkpoint provenance/`contentTrust` into the SIGNED bundle canonical (Atlas's
+  contract); LLM-enriched summary prose (same grounded evidence); Swift/Xcode build, simulator, device, and signing
+  validation on a Mac.
 
 ## Safety invariants (Relay-owned)
 - **Secret redaction is BEST-EFFORT, not a guarantee.** `scrub.mjs` is a known-format denylist + conservative high-entropy heuristics; it cannot prove content is secret-free (an arbitrary/natural-language secret survives). Mitigated by defense-in-depth: minimal-field projection + size bounds (`extract.mjs`), a **final egress scrub over every phone-visible string before signing** (`bundle.mjs`), and treating all residual content as untrusted. Raw room events never cross to the phone — only the summary + bounded evidence do.

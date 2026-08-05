@@ -1,20 +1,23 @@
 // dynamo-adapter.test.mjs — the PROD DEPLOY SEAM: createDynamoClientAdapter over a v3 DocumentClient's .send(Command).
 //
-// SHAPE-PROVEN, LIVE-UNVERIFIED (warden scope). These tests prove the adapter produces EXACTLY the { get, put, delete }
-// shape createDynamoStore CONSUMES — the full { Item } response for get (NOT a stripped r.Item) and an unchanged
-// ConditionalCheckFailedException passthrough — using fake Command classes + a fake .send. They deliberately do NOT
-// exercise real AWS, so they do NOT discharge the three real-AWS confirmations that remain AWS-day:
+// SHAPE-PROVEN, LIVE-UNVERIFIED (warden scope). These tests prove the adapter produces the exact
+// { get, put, delete, transactWrite? } shape consumed by the stores and Registry V2 — including the full { Item }
+// response for get (not a stripped r.Item) and unchanged AWS exceptions — using fake commands + a fake .send. They do
+// NOT exercise real AWS, so they do NOT discharge the three real-AWS confirmations that remain AWS-day:
 //   (1) the real @aws-sdk client surfaces a failed condition as e.name/e.code === 'ConditionalCheckFailedException';
 //   (2) real DynamoDB TTL deletion behavior; (3) the table's TTL attribute is configured on `ttl`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { DEVICE_REGISTRATION_VERSION, createDynamoDeviceRegistryV2 } from '../src/device-registry-v2.mjs';
 import { createDynamoClientAdapter, createDynamoStore, withLock } from '../src/store.mjs';
 
 // Fake v3 lib-dynamodb Command classes — capture the params + tag which command (the real classes carry `.input`).
 class GetCommand { constructor(input) { this.input = input; this.__kind = 'Get'; } }
 class PutCommand { constructor(input) { this.input = input; this.__kind = 'Put'; } }
 class DeleteCommand { constructor(input) { this.input = input; this.__kind = 'Delete'; } }
+class TransactWriteCommand { constructor(input) { this.input = input; this.__kind = 'TransactWrite'; } }
 const COMMANDS = { GetCommand, PutCommand, DeleteCommand };
+const V2_COMMANDS = { ...COMMANDS, TransactWriteCommand };
 
 function throwCond() { const e = new Error('The conditional request failed'); e.name = 'ConditionalCheckFailedException'; throw e; }
 
@@ -35,6 +38,16 @@ test('adapter routes get->GetCommand, put->PutCommand, delete->DeleteCommand wit
   assert.deepEqual(doc.calls[0].input, { TableName: 't', Key: { pk: 'a', sk: 'record' } });
   assert.deepEqual(doc.calls[1].input, { TableName: 't', Item: { pk: 'a', sk: 'record', value: 1 } });
   assert.deepEqual(doc.calls[2].input, { TableName: 't', Key: { pk: 'a', sk: 'lock' } });
+  assert.equal(Object.hasOwn(a, 'query'), false);
+  assert.equal(Object.hasOwn(a, 'transactWrite'), false);
+});
+
+test('adapter routes optional transactWrite through the exact injected command', async () => {
+  const doc = fakeDoc();
+  const adapter = createDynamoClientAdapter(doc, V2_COMMANDS);
+  const transaction = { TransactItems: [{ Put: { TableName: 't', Item: { pk: 'i', sk: 'binding' } } }] };
+  await adapter.transactWrite(transaction);
+  assert.deepEqual(doc.calls, [{ kind: 'TransactWrite', input: transaction }]);
 });
 
 test('adapter.get resolves the FULL { Item } response (NOT a stripped r.Item) — store.get reads r.Item.value', async () => {
@@ -59,6 +72,63 @@ test('factory validates its inputs (fail-closed)', () => {
   assert.throws(() => createDynamoClientAdapter({}, COMMANDS), /DynamoDBDocumentClient/);            // no .send
   assert.throws(() => createDynamoClientAdapter(fakeDoc(), {}), /GetCommand, PutCommand, DeleteCommand/);
   assert.throws(() => createDynamoClientAdapter(fakeDoc(), { GetCommand, PutCommand }), /must be injected/); // missing DeleteCommand
+  const transactionOnly = createDynamoClientAdapter(fakeDoc(), { ...COMMANDS, TransactWriteCommand });
+  assert.equal(typeof transactionOnly.transactWrite, 'function');
+  assert.equal(Object.hasOwn(transactionOnly, 'query'), false);
+});
+
+test('Registry V2 retries the real JavaScript message-form cancellation through the v3 adapter seam', async () => {
+  const cancellation = Object.assign(
+    new Error(
+      'Transaction cancelled, please refer cancellation reasons for specific reasons [None, ConditionalCheckFailed, None]',
+    ),
+    {
+      name: 'TransactionCanceledException',
+      $fault: 'client',
+      $metadata: {
+        httpStatusCode: 400,
+        requestId: 'test-request-id',
+        attempts: 1,
+        totalRetryDelay: 0,
+      },
+      CancellationReasons: undefined,
+    },
+  );
+  let transactionCalls = 0;
+  const doc = fakeDoc((command) => {
+    if (command.__kind === 'Get') return {};
+    if (command.__kind === 'TransactWrite') {
+      transactionCalls += 1;
+      if (transactionCalls === 1) throw cancellation;
+      return {};
+    }
+    throw new Error(`unexpected command: ${command.__kind}`);
+  });
+  const delays = [];
+  const registry = createDynamoDeviceRegistryV2({
+    client: createDynamoClientAdapter(doc, V2_COMMANDS),
+    table: 'Pocket',
+    hmacKey: Buffer.alloc(32, 0x5a),
+    now: () => Date.parse('2026-07-31T06:00:00.000Z'),
+    retryDelay: async (attempt) => {
+      delays.push(attempt);
+    },
+  });
+  const result = await registry.register({
+    principal: 'principal',
+    humanId: 'human',
+    registrationVersion: DEVICE_REGISTRATION_VERSION,
+    installationId: Buffer.alloc(32, 0x31).toString('base64url'),
+    idempotencyKey: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    voipToken: 'aabbccddeeff',
+    sessionId: 'session',
+    platform: 'apns',
+  });
+  assert.match(result.bindingId, /^bind_/);
+  assert.equal(transactionCalls, 2);
+  assert.deepEqual(delays, [1]);
+  assert.equal(Object.hasOwn(cancellation, 'CancellationReasons'), true);
+  assert.equal(cancellation.CancellationReasons, undefined);
 });
 
 // ---------- INTEGRATION: adapter shape == createDynamoStore's consumed contract (warden gate #1) ----------

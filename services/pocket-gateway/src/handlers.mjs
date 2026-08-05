@@ -447,14 +447,21 @@ export function createGateway(deps) {
         context,
         priority,
         sessionId,
-        humanId: ctx.humanId,
         principal: ctx.principal || ctx.humanId,
+        humanId: ctx.humanId,
       });
     }
     catch { return json(502, { error: 'dial backend error', reason: 'dispatch-failed' }); }
     const dispatched = !!(out && out.dispatched);
     const dialId = out && typeof out.dialId === 'string' ? out.dialId : null;
-    return json(dispatched ? 200 : 502, dispatched ? { dialId, dispatched: true } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' });
+    return json(dispatched ? 200 : 502, dispatched
+      ? { dialId, dispatched: true }
+      : {
+        error: 'dial dispatch failed',
+        dialId,
+        dispatched: false,
+        reason: (out && out.reason) || 'not-dispatched',
+      });
   }
 
   // POST /dial/ring-owner — the EXPLICIT ring path (sl ring-owner / an agent's MCP tool). The caller DESCRIBES a need
@@ -522,7 +529,17 @@ export function createGateway(deps) {
       catch { return { status: 502, body: { error: 'dial backend error', reason: 'dispatch-failed' } }; }
       const dispatched = !!(out && out.dispatched);
       const dialId = (out && typeof out.dialId === 'string' ? out.dialId : null) || mapped.input.id;
-      return { status: dispatched ? 200 : 502, body: dispatched ? { dialId, dispatched: true, kind: mapped.kind.slug } : { dialId, dispatched: false, reason: (out && out.reason) || 'not-dispatched' } };
+      return {
+        status: dispatched ? 200 : 502,
+        body: dispatched
+          ? { dialId, dispatched: true, kind: mapped.kind.slug }
+          : {
+            error: 'dial dispatch failed',
+            dialId,
+            dispatched: false,
+            reason: (out && out.reason) || 'not-dispatched',
+          },
+      };
     };
 
     // ROBUSTNESS (Warden #86 follow-up): idempotency + a soft per-human ring rate-limit, BEST-EFFORT over deps.store.
@@ -593,25 +610,24 @@ export function createGateway(deps) {
     const body = readBody(req.body);
     if (!body) return json(400, { error: 'invalid JSON body' });
     const r = await dialReg.register({
-      humanId: ctx.humanId,
       principal: ctx.principal || ctx.humanId,
+      humanId: ctx.humanId,
       body,
       isMember: async (sid) => { const known = await deps.knownSessionIdsFor(ctx.humanId); return Array.isArray(known) && known.includes(sid); },
     });
     return json(r.status, r.body);
   }
 
-  // POST /dial/unregister — advance THIS installation to a V2 tombstone and revoke only the exact prior binding.
-  // No current membership check: a user who just lost room access must still be able to revoke their own device.
-  // humanId remains token-derived, and the registry verifies installation + prior generation + binding id/revision.
-  // Every stale/missing compare-delete is an idempotent 200, so this route is not a binding-existence oracle.
+  // DELETE /dial/register — authenticated, existence-oblivious V2 compare-delete. Membership is deliberately not
+  // required: a device must be able to revoke a binding after room access disappears. The registry derives the target
+  // from ctx.humanId + sessionId and deletes only the exact server bindingId/revision, so a late A revoke cannot erase B.
   async function handleDialUnregister(req, ctx) {
     if (!hasScope(ctx, SCOPES.dial)) return json(403, { error: 'missing scope ' + SCOPES.dial });
     const body = readBody(req.body);
     if (!body) return json(400, { error: 'invalid JSON body' });
     const r = await dialReg.unregister({
-      humanId: ctx.humanId,
       principal: ctx.principal || ctx.humanId,
+      humanId: ctx.humanId,
       body,
     });
     return json(r.status, r.body);
@@ -675,7 +691,7 @@ export function createGateway(deps) {
         if (method === 'POST' && path === '/dial/ring-owner') return await handleRingOwner(req, ctx);
         if (method === 'GET' && path === '/dial') return await handleDialFetch(req, ctx);
         if (method === 'POST' && path === '/dial/register') return await handleDialRegister(req, ctx);
-        if (method === 'POST' && path === '/dial/unregister') return await handleDialUnregister(req, ctx);
+        if (method === 'DELETE' && path === '/dial/register') return await handleDialUnregister(req, ctx);
         return json(404, { error: 'not found' });
       } catch {
         return json(500, { error: 'internal error' }); // no stack/detail leaked to the client

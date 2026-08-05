@@ -68,6 +68,16 @@ test('pushBackend failure / not-dispatched -> 502 with a reason (honest, no fake
   assert.equal((await post(gw({ pushBackend: async () => { throw new Error('apns down'); } }), { message: 'x', sessionId: 'sess-1' })).status, 502);
   const res = await post(gw({ pushBackend: async () => ({ dispatched: false, reason: 'no-device-token' }) }), { message: 'x', sessionId: 'sess-1' });
   assert.equal(res.status, 502);
+  assert.equal(parse(res).error, 'dial dispatch failed');
   assert.equal(parse(res).dispatched, false);
   assert.equal(parse(res).reason, 'no-device-token');
+  const conflict = await post(gw({
+    pushBackend: async () => ({ dispatched: false, reason: 'registry-route-conflict' }),
+  }), { message: 'x', sessionId: 'sess-1' });
+  assert.deepEqual(parse(conflict), {
+    error: 'dial dispatch failed',
+    dialId: null,
+    dispatched: false,
+    reason: 'registry-route-conflict',
+  });
 });

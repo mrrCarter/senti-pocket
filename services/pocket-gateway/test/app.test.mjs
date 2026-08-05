@@ -12,6 +12,19 @@ const FULL_ENV = {
   SENTI_API_BASE_URL: 'https://api.sentinelayer.com',
 };
 const FULL_DEPS = { dynamoClient: {}, signingKey: generateKeyPairSync('ed25519').privateKey, knownSessionIdsFor: async () => [], fetch: async () => ({ ok: true, status: 200, text: async () => '{}' }) };
+const V2_ENV = {
+  ...FULL_ENV,
+  DEVICE_REGISTRY_MODE: 'v2',
+  DEVICE_REGISTRY_V1_PURGED: '1',
+  DEVICE_REGISTRY_CLIENT_V2_READY: '1',
+  DEVICE_REGISTRY_HMAC_KEY_B64: Buffer.alloc(32, 0x51).toString('base64'),
+};
+const V2_DYNAMO = {
+  async get() { return {}; },
+  async put() { return {}; },
+  async delete() { return {}; },
+  async transactWrite() { return {}; },
+};
 
 test('createProdGateway FAILS BOOT on any missing production binding', () => {
   assert.throws(() => createProdGateway({}, FULL_DEPS), /prod config missing/);
@@ -43,34 +56,62 @@ test('createProdGateway + createLambda boot with complete config', () => {
   assert.equal(typeof createLambda(FULL_ENV, FULL_DEPS), 'function');
 });
 
-test('Registry V2 production config fails closed on a missing/weak HMAC key and boots with a strong non-secret-length contract', () => {
-  assert.throws(
-    () => createProdGateway({ ...FULL_ENV, DIAL_REGISTRY_V2_REQUIRED: '1' }, FULL_DEPS),
-    /DIAL_REGISTRY_HMAC_KEY is required/,
-  );
+test('createProdGateway Registry V2 requires mode, migration gates, secret, and transactional client', () => {
+  assert.equal(typeof createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }).handle, 'function');
   assert.throws(
     () => createProdGateway({
       ...FULL_ENV,
-      DIAL_REGISTRY_V2_REQUIRED: '1',
-      DIAL_REGISTRY_HMAC_KEY: 'too-short',
-      DIAL_REGISTRY_TOKEN_SCOPE: 'com.plexaura.sentipocket.app:development',
-    }, FULL_DEPS),
-    /at least 32 bytes/,
+      DEVICE_REGISTRY_MODE: 'v2',
+      DEVICE_REGISTRY_V1_PURGED: '1',
+      DEVICE_REGISTRY_CLIENT_V2_READY: '1',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /requires DEVICE_REGISTRY_HMAC_KEY_B64/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_V1_PURGED: '0' }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_V1_PURGED=1/,
   );
   assert.throws(
     () => createProdGateway({
-      ...FULL_ENV,
-      DIAL_REGISTRY_V2_REQUIRED: '1',
-      DIAL_REGISTRY_HMAC_KEY: 'v2-registry-hmac-key-material-at-least-32-bytes',
-    }, FULL_DEPS),
-    /DIAL_REGISTRY_TOKEN_SCOPE is required/,
+      ...V2_ENV,
+      DEVICE_REGISTRY_CLIENT_V2_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_CLIENT_V2_READY=1/,
   );
-  assert.equal(typeof createProdGateway({
-    ...FULL_ENV,
-    DIAL_REGISTRY_V2_REQUIRED: '1',
-    DIAL_REGISTRY_HMAC_KEY: 'v2-registry-hmac-key-material-at-least-32-bytes',
-    DIAL_REGISTRY_TOKEN_SCOPE: 'com.plexaura.sentipocket.app:development',
-  }, FULL_DEPS).handle, 'function');
+  assert.throws(
+    () => createProdGateway({ ...FULL_ENV, DEVICE_REGISTRY_HMAC_KEY_B64: V2_ENV.DEVICE_REGISTRY_HMAC_KEY_B64 }, FULL_DEPS),
+    /require DEVICE_REGISTRY_MODE=v2/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_MODE: 'dual' }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /must be v1 or v2/,
+  );
+  assert.throws(
+    () => createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: { get() {}, put() {}, delete() {} } }),
+    /get, transactWrite/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_TARGET_INDEX: 'obsolete' }, {
+      ...FULL_DEPS, dynamoClient: V2_DYNAMO,
+    }),
+    /DEVICE_REGISTRY_TARGET_INDEX is obsolete/,
+    'an old GSI setting fails boot instead of pretending it is still load-bearing',
+  );
+  assert.throws(
+    () => createProdGateway(FULL_ENV, {
+      ...FULL_DEPS,
+      deviceRegistry: { protocolVersion: 2, register() {}, unregister() {}, lookup() {} },
+    }),
+    /requires DEVICE_REGISTRY_MODE=v2/,
+    'an injected V2 implementation cannot bypass the migration mode/purge gate',
+  );
+  assert.throws(
+    () => createProdGateway(V2_ENV, {
+      ...FULL_DEPS,
+      deviceRegistry: { protocolVersion: 1, register() {}, lookup() {} },
+    }),
+    /requires a Registry V2 implementation/,
+  );
 });
 
 // DIAL-ME prod wiring: a valid session must reach /dial* (pocket:dial in the verifier's granted set), the device binds
@@ -90,7 +131,6 @@ test('createProdGateway wires DIAL-ME: /dial/register binds under the VERIFIED h
   const reg = await gw.handle({ method: 'POST', path: '/dial/register', headers: { authorization: 'Bearer t' }, body: { voipToken: 'tok', sessionId: 'sess-1' } });
   assert.equal(reg.status, 200, 'a valid session reaches /dial/register (pocket:dial is granted)');
   assert.equal(registered[0].humanId, 'u1', 'device bound to the /auth/me identity, never the body');
-  assert.match(registered[0].principal, /^pocket\.principal\.senti\.v1\n/, 'durable target receives the full verified principal namespace');
   const dial = await gw.handle({ method: 'POST', path: '/dial', headers: { authorization: 'Bearer t' }, body: { message: 'ring', sessionId: 'sess-1' } });
   assert.equal(dial.status, 200);
   assert.equal(apnsSent[0].voipToken, 'tok', 'the registered token is resolved + rung');

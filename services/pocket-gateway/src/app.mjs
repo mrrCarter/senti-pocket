@@ -9,6 +9,7 @@ import { createDynamoStore } from './store.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
 import { createDialPushBackend, createStoreDeviceRegistry } from './dial-registry.mjs';
+import { createDynamoDeviceRegistryV2 } from './device-registry-v2.mjs';
 import { createDialSignalStore } from './dial-signal-store.mjs';
 import { createDeckVideoBackend } from './deck/deck-video-backend.mjs';
 import { lambdaHandler } from './lambda.mjs';
@@ -16,9 +17,6 @@ import { lambdaHandler } from './lambda.mjs';
 /**
  * @param {object} env    scalar config (DDB_TABLE, SIGNING_KEY_ID, GATEWAY_PUBLIC_URL, SENTI_API_BASE_URL, TTS_VOICE_ID,
  *                        ELEVENLABS_API_KEY; GEMMA_BASE_URL + GEMMA_MODEL [+ optional GEMMA_API_KEY] to wire /answer+/brief to Gemma;
- *                        DIAL_REGISTRY_HMAC_KEY (>=32 bytes) enables installation-owned Registry V2;
- *                        DIAL_REGISTRY_TOKEN_SCOPE identifies the APNs topic/environment for global token claims;
- *                        DIAL_REGISTRY_V2_REQUIRED=1 fails boot without it; DIAL_REGISTRY_ALLOW_V1/READ_V1=0 cut legacy after migration;
  *                        RESVG_BIN + FFMPEG_BIN + RESVG_EGRESS_SANDBOXED=1 to enable /deck?format=video — the ack asserts
  *                        the deploy runs resvg network-egress-disabled (the SSRF backstop); without it, video 501s)
  * @param {object} deps   injected externals the deploy owns:
@@ -33,13 +31,16 @@ import { lambdaHandler } from './lambda.mjs';
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
  *   - apnsSend({voipToken,platform,payload}): OPTIONAL VoIP push transport (APNs, cert-bound). Present => POST /dial
  *     dispatch is live; absent => /dial 501s (dial-not-configured) while /dial/register still records device tokens.
- *     WIRE CONTRACT (load-bearing — the app decode depends on it): apnsSend MUST place the `payload` dial fields at the
- *     TOP LEVEL of the delivered PKPushPayload.dictionaryPayload (alongside `aps`), NOT nested under a `payload`/`data`
- *     key. The app's DialReceive.receive / SentiCallKit.decode read the dial fields (id/kind/message/…) at the top level;
- *     an `aps` (or other) sibling key is harmless (ignored by the Decodable), but NESTING the DTO makes top-level `id`
- *     absent -> every ring decodes .rejected, silently. NB the arg is literally named `payload` here — do NOT emit
- *     `{ aps, payload: <DTO> }`; SPREAD the DTO at top level. (See part-b criterion #6 for the app-side round-trip test.)
+ *     WIRE CONTRACT (load-bearing — the app decode depends on it): `payload` is already the FINAL top-level APNs
+ *     dictionary, including `aps`, after the gateway's 5,120-byte check. Serialize it verbatim. Do not nest it under
+ *     `payload`/`data`, add fields, or rebuild `aps`. DialReceive.receive / SentiCallKit.decode read id/kind/message/…
+ *     at the top level; nesting makes top-level `id` absent and every ring rejects silently.
  *   - deviceRegistry / pushBackend: OPTIONAL overrides for the store-backed defaults (a dedicated device table, etc.)
+ *     Registry V2 requires explicit DEVICE_REGISTRY_MODE=v2, DEVICE_REGISTRY_V1_PURGED=1,
+ *     DEVICE_REGISTRY_CLIENT_V2_READY=1, and an HMAC key. The acknowledgements prevent a deployment from
+ *     claiming A->B privacy closure while durable V1 rows can still ring or the installed iOS client still speaks V1.
+ *     The injected dynamoClient must then expose get/transactWrite (plus the legacy store methods). Partial config
+ *     fails boot.
  */
 export function createProdGateway(env = {}, deps = {}) {
   // FAIL BOOT if any production binding is absent (Echo P0). SENTI_API_BASE_URL is load-bearing twice: it's where the
@@ -49,12 +50,6 @@ export function createProdGateway(env = {}, deps = {}) {
   if (missingEnv.length) throw new Error('pocket-gateway prod config missing: ' + missingEnv.join(', '));
   if (!deps.dynamoClient || !deps.signingKey || typeof deps.knownSessionIdsFor !== 'function' || typeof deps.fetch !== 'function') {
     throw new Error('pocket-gateway prod deps missing: dynamoClient + signingKey + knownSessionIdsFor + fetch are required');
-  }
-  if (env.DIAL_REGISTRY_V2_REQUIRED === '1' && !env.DIAL_REGISTRY_HMAC_KEY) {
-    throw new Error('pocket-gateway prod config missing: DIAL_REGISTRY_HMAC_KEY is required when DIAL_REGISTRY_V2_REQUIRED=1');
-  }
-  if (env.DIAL_REGISTRY_HMAC_KEY && !env.DIAL_REGISTRY_TOKEN_SCOPE) {
-    throw new Error('pocket-gateway prod config missing: DIAL_REGISTRY_TOKEN_SCOPE is required whenever Registry V2 is enabled');
   }
   const store = createDynamoStore({ client: deps.dynamoClient, table: env.DDB_TABLE });
   // Pocket-native auth (B3): pocket-gateway is Pocket-PRIVATE — all routes are Pocket-app routes, NO external-MCP/DPoP
@@ -79,18 +74,50 @@ export function createProdGateway(env = {}, deps = {}) {
   // so the humanMessage `undefined dep -> TypeError` gap cannot regress.
   const postHumanMessage = createHumanMessageClient({ fetch: deps.fetch, apiBaseUrl: env.SENTI_API_BASE_URL });
 
-  // DIAL-ME: the phone registers its VoIP token (POST /dial/register) into deviceRegistry; POST /dial resolves it via the
-  // registry-backed pushBackend and sends the VoIP push. deviceRegistry DEFAULTS to a store-backed impl (rides the
-  // existing DynamoDB table — zero new infra) so /dial/register works out of the box; a deploy may override it. /dial
-  // DISPATCH additionally needs deps.apnsSend (the VoIP push transport, cert-bound): absent, /dial honestly 501s
-  // (dial-not-configured) while /dial/register still records tokens for when APNs is wired.
-  const deviceRegistry = deps.deviceRegistry || createStoreDeviceRegistry({
-    store,
-    installationHmacKey: env.DIAL_REGISTRY_HMAC_KEY,
-    tokenScope: env.DIAL_REGISTRY_TOKEN_SCOPE || 'legacy-default',
-    allowLegacyRegistration: env.DIAL_REGISTRY_ALLOW_V1 !== '0',
-    readLegacy: env.DIAL_REGISTRY_READ_V1 !== '0',
-  });
+  // DIAL-ME: V2 owns exactly one binding item per installation plus one bounded, strongly-read directory per
+  // authenticated human+session. Binding, global token ownership, and directory membership move atomically; no
+  // eventually-consistent GSI participates in routing correctness. Existing deployments remain on the legacy V1
+  // default. A V2 phone receives an honest 501 from V1, while partial/mixed migration configuration fails boot.
+  const registryMode = env.DEVICE_REGISTRY_MODE || 'v1';
+  const v2HmacKey = env.DEVICE_REGISTRY_HMAC_KEY_B64;
+  if (env.DEVICE_REGISTRY_TARGET_INDEX) {
+    throw new Error('pocket-gateway DEVICE_REGISTRY_TARGET_INDEX is obsolete; Registry V2 uses bounded target directories');
+  }
+  if (!['v1', 'v2'].includes(registryMode)) {
+    throw new Error('pocket-gateway DEVICE_REGISTRY_MODE must be v1 or v2');
+  }
+  if (registryMode === 'v1' && (
+    v2HmacKey || env.DEVICE_REGISTRY_V1_PURGED || env.DEVICE_REGISTRY_CLIENT_V2_READY
+  )) {
+    throw new Error('pocket-gateway Registry V2 settings require DEVICE_REGISTRY_MODE=v2');
+  }
+  if (registryMode === 'v2' && env.DEVICE_REGISTRY_V1_PURGED !== '1') {
+    throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_V1_PURGED=1 after legacy rows are purged');
+  }
+  if (registryMode === 'v2' && env.DEVICE_REGISTRY_CLIENT_V2_READY !== '1') {
+    throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_CLIENT_V2_READY=1 after the V2 iOS client ships');
+  }
+
+  let deviceRegistry = deps.deviceRegistry;
+  if (deviceRegistry) {
+    if (registryMode === 'v2' && deviceRegistry.protocolVersion !== 2) {
+      throw new Error('pocket-gateway DEVICE_REGISTRY_MODE=v2 requires a Registry V2 implementation');
+    }
+    if (registryMode === 'v1' && deviceRegistry.protocolVersion === 2) {
+      throw new Error('pocket-gateway Registry V2 implementation requires DEVICE_REGISTRY_MODE=v2');
+    }
+  } else {
+    if (registryMode === 'v2' && !v2HmacKey) {
+      throw new Error('pocket-gateway Registry V2 requires DEVICE_REGISTRY_HMAC_KEY_B64');
+    }
+    deviceRegistry = registryMode === 'v2'
+      ? createDynamoDeviceRegistryV2({
+        client: deps.dynamoClient,
+        table: env.DDB_TABLE,
+        hmacKey: v2HmacKey,
+      })
+      : createStoreDeviceRegistry({ store });
+  }
   // DIAL hydration store (PR-B2): a LEAN ring (dialPayloadV1 fetch=true) sheds all governed content; the phone re-loads
   // the full signal via GET /dial?id=, which reads what /dial dispatch persisted here. Rides the SAME store (zero new
   // infra), constructed UNCONDITIONALLY so GET /dial?id= serves a stored signal even before apnsSend (dispatch) is wired.
