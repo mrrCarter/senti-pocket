@@ -14,6 +14,13 @@ import PocketContracts
 @MainActor
 final class PhoneWriteOutboxDurabilityTests: XCTestCase {
 
+    private enum FileSystemFailure: Error {
+        case metadataUnavailable
+        case readUnavailable
+        case installUnavailable
+        case writeUnavailable
+    }
+
     override func setUp() { super.setUp(); OutboxStore.clear() }
     override func tearDown() { OutboxStore.clear(); super.tearDown() }
 
@@ -21,6 +28,315 @@ final class PhoneWriteOutboxDurabilityTests: XCTestCase {
     /// which is all these tests need: they assert the SYNCHRONOUS persist, not the network outcome.
     private func makeClient() -> PocketWriteClient {
         PocketWriteClient(apiBaseURL: URL(string: "https://unit.invalid")!)
+    }
+
+    private func makeIntent(
+        sessionId: String = "session-A",
+        message: String = "Durable local-only write"
+    ) -> PersistedWriteIntent {
+        let proposal = PocketWriteClient.makeHumanMessageProposal(
+            sessionId: sessionId,
+            message: message,
+            at: Date(timeIntervalSince1970: 1_784_000_000)
+        )
+        return PersistedWriteIntent(
+            proposal: proposal,
+            confirmation: GovernedWriteConfirmation(
+                proposalId: proposal.id,
+                confirmedProposalHash: proposal.proposalHash,
+                confirmedAt: Date(timeIntervalSince1970: 1_784_000_001)
+            )
+        )
+    }
+
+    private func makeTemporaryOutboxFileSystem() throws -> (root: URL, fileSystem: OutboxStore.FileSystem) {
+        let root = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let directory = root.appendingPathComponent(
+            "OutboxStoreTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return (directory, OutboxStore.FileSystem.live(in: directory))
+    }
+
+    private func setBackupExcluded(_ excluded: Bool, at url: URL) throws {
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = excluded
+        var mutableURL = url
+        try mutableURL.setResourceValues(values)
+    }
+
+    private func isBackupExcluded(at url: URL) throws -> Bool {
+        try url.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true
+    }
+
+    private func prepareExcludedStagingDirectory(_ fileSystem: OutboxStore.FileSystem) throws -> URL {
+        let directory = try XCTUnwrap(fileSystem.stagingDirectoryURL)
+        try fileSystem.createDirectory(directory)
+        try setBackupExcluded(true, at: directory)
+        XCTAssertTrue(try isBackupExcluded(at: directory))
+        return directory
+    }
+
+    func test_successful_claim_is_excluded_from_backup_and_round_trips_exactly() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        let stagingDirectoryURL = try XCTUnwrap(location.fileSystem.stagingDirectoryURL)
+        let intent = makeIntent()
+
+        XCTAssertEqual(OutboxStore.claimForTesting(intent, using: location.fileSystem), .claimed)
+        XCTAssertTrue(try isBackupExcluded(at: stagingDirectoryURL))
+        XCTAssertTrue(try isBackupExcluded(at: canonicalURL))
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intent)
+    }
+
+    func test_legacy_unexcluded_outbox_is_upgraded_before_exact_restore() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        let intent = makeIntent(message: "Restore only after metadata upgrade")
+        XCTAssertEqual(OutboxStore.claimForTesting(intent, using: location.fileSystem), .claimed)
+
+        try setBackupExcluded(false, at: canonicalURL)
+        XCTAssertFalse(try isBackupExcluded(at: canonicalURL), "precondition: emulate a legacy unexcluded outbox")
+
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intent)
+        XCTAssertTrue(try isBackupExcluded(at: canonicalURL),
+                      "a legacy file must be upgraded and verified before its intent is exposed")
+    }
+
+    func test_backup_metadata_failure_returns_storage_unavailable_and_removes_partial_outbox() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let stagingDirectoryURL = try prepareExcludedStagingDirectory(location.fileSystem)
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        var fileSystem = location.fileSystem
+        fileSystem.isExcludedFromBackup = { $0 == stagingDirectoryURL }
+        fileSystem.excludeFromBackup = { _ in throw FileSystemFailure.metadataUnavailable }
+
+        XCTAssertEqual(OutboxStore.claimForTesting(makeIntent(), using: fileSystem), .storageUnavailable)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: canonicalURL.path))
+        XCTAssertNil(OutboxStore.loadForTesting(using: location.fileSystem))
+    }
+
+    func test_read_back_mismatch_returns_storage_unavailable_and_removes_partial_outbox() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        var fileSystem = location.fileSystem
+        let read = fileSystem.read
+        fileSystem.read = { url in
+            var data = try read(url)
+            data.append(0)
+            return data
+        }
+
+        XCTAssertEqual(OutboxStore.claimForTesting(makeIntent(), using: fileSystem), .storageUnavailable)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stagingURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: canonicalURL.path))
+    }
+
+    func test_unprotectable_legacy_outbox_is_unavailable_without_deleting_its_owner() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        let stagingDirectoryURL = try XCTUnwrap(location.fileSystem.stagingDirectoryURL)
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let intent = makeIntent()
+        XCTAssertEqual(OutboxStore.claimForTesting(intent, using: location.fileSystem), .claimed)
+        try setBackupExcluded(false, at: canonicalURL)
+        let originalBytes = try Data(contentsOf: canonicalURL)
+
+        var failingFileSystem = location.fileSystem
+        let liveIsExcluded = failingFileSystem.isExcludedFromBackup
+        failingFileSystem.isExcludedFromBackup = { url in
+            if url == canonicalURL || url == stagingURL { return false }
+            return try liveIsExcluded(url)
+        }
+        failingFileSystem.excludeFromBackup = { _ in throw FileSystemFailure.metadataUnavailable }
+
+        XCTAssertNil(OutboxStore.loadForTesting(using: failingFileSystem))
+        XCTAssertEqual(try Data(contentsOf: canonicalURL), originalBytes)
+        XCTAssertTrue(try isBackupExcluded(at: stagingDirectoryURL))
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intent,
+                       "a later healthy load may upgrade the same owner; the failed load may not erase it")
+    }
+
+    func test_read_failure_during_B_claim_cannot_overwrite_existing_A() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        let intentA = makeIntent(sessionId: "session-A", message: "A owns the slot")
+        let intentB = makeIntent(sessionId: "session-B", message: "B must wait")
+        XCTAssertEqual(OutboxStore.claimForTesting(intentA, using: location.fileSystem), .claimed)
+        let originalBytes = try Data(contentsOf: canonicalURL)
+
+        var failingFileSystem = location.fileSystem
+        failingFileSystem.read = { _ in throw FileSystemFailure.readUnavailable }
+
+        XCTAssertEqual(OutboxStore.claimForTesting(intentB, using: failingFileSystem), .storageUnavailable)
+        XCTAssertEqual(try Data(contentsOf: canonicalURL), originalBytes)
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intentA)
+    }
+
+    func test_metadata_failure_during_late_A_clear_cannot_delete_newer_B() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let intentA = makeIntent(sessionId: "session-A", message: "Stale A")
+        let intentB = makeIntent(sessionId: "session-B", message: "Current B")
+        XCTAssertEqual(OutboxStore.claimForTesting(intentB, using: location.fileSystem), .claimed)
+        try setBackupExcluded(false, at: canonicalURL)
+        let originalBytes = try Data(contentsOf: canonicalURL)
+
+        var failingFileSystem = location.fileSystem
+        let liveIsExcluded = failingFileSystem.isExcludedFromBackup
+        failingFileSystem.isExcludedFromBackup = { url in
+            if url == canonicalURL || url == stagingURL { return false }
+            return try liveIsExcluded(url)
+        }
+        failingFileSystem.excludeFromBackup = { _ in throw FileSystemFailure.metadataUnavailable }
+
+        OutboxStore.clearForTesting(matching: intentA, using: failingFileSystem)
+
+        XCTAssertEqual(try Data(contentsOf: canonicalURL), originalBytes)
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intentB)
+    }
+
+    func test_interruption_before_staging_file_exclusion_strands_bytes_only_in_excluded_directory() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let stagingDirectoryURL = try prepareExcludedStagingDirectory(location.fileSystem)
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        var fileSystem = location.fileSystem
+        fileSystem.isExcludedFromBackup = { $0 == stagingDirectoryURL }
+        fileSystem.excludeFromBackup = { _ in throw FileSystemFailure.metadataUnavailable }
+        fileSystem.remove = { _ in } // emulate cleanup reporting success without removing anything
+
+        let intent = makeIntent()
+        XCTAssertEqual(OutboxStore.claimForTesting(intent, using: fileSystem), .storageUnavailable)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingURL.path))
+        XCTAssertTrue(try isBackupExcluded(at: stagingDirectoryURL),
+                      "the directory must be excluded before any confirmed staging bytes are written")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: canonicalURL.path))
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intent,
+                       "a later launch must recover a complete excluded candidate rather than lose confirmation")
+    }
+
+    func test_install_failure_with_noop_cleanup_leaves_only_an_excluded_staging_file() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let stagingDirectoryURL = try XCTUnwrap(location.fileSystem.stagingDirectoryURL)
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        var fileSystem = location.fileSystem
+        fileSystem.install = { _, _ in throw FileSystemFailure.installUnavailable }
+        fileSystem.remove = { _ in }
+
+        let intent = makeIntent()
+        XCTAssertEqual(OutboxStore.claimForTesting(intent, using: fileSystem), .storageUnavailable)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingURL.path))
+        XCTAssertTrue(try isBackupExcluded(at: stagingDirectoryURL))
+        XCTAssertTrue(try isBackupExcluded(at: stagingURL))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: canonicalURL.path))
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intent)
+    }
+
+    func test_principal_boundary_clear_tombstones_stranded_candidate_when_removal_is_noop() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        var interruptedFileSystem = location.fileSystem
+        interruptedFileSystem.install = { _, _ in throw FileSystemFailure.installUnavailable }
+        interruptedFileSystem.remove = { _ in }
+
+        let priorPrincipalIntent = makeIntent(message: "Must not survive the account boundary")
+        XCTAssertEqual(
+            OutboxStore.claimForTesting(priorPrincipalIntent, using: interruptedFileSystem),
+            .storageUnavailable
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingURL.path),
+                      "precondition: a complete excluded recovery candidate was stranded")
+
+        var clearingFileSystem = location.fileSystem
+        clearingFileSystem.remove = { _ in } // deletion reports success without deleting the stranded candidate
+        OutboxStore.clearForTesting(using: clearingFileSystem)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: canonicalURL.path),
+                      "clear must leave a durable canonical tombstone rather than depend on deletion")
+        XCTAssertTrue(try isBackupExcluded(at: canonicalURL))
+        XCTAssertTrue(try Data(contentsOf: canonicalURL).isEmpty)
+        XCTAssertNil(OutboxStore.loadForTesting(using: location.fileSystem),
+                     "a later healthy launch must not recover the prior principal's confirmed intent")
+    }
+
+    func test_principal_boundary_clear_truncates_prior_bytes_when_tombstone_write_cannot_allocate() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        let priorPrincipalIntent = makeIntent(message: "Erase even when the volume is full")
+        XCTAssertEqual(OutboxStore.claimForTesting(priorPrincipalIntent, using: location.fileSystem), .claimed)
+        XCTAssertFalse(try Data(contentsOf: canonicalURL).isEmpty)
+
+        var fullVolumeFileSystem = location.fileSystem
+        fullVolumeFileSystem.write = { _, _ in throw FileSystemFailure.writeUnavailable }
+        fullVolumeFileSystem.remove = { _ in } // force the allocation-free truncation fallback
+
+        OutboxStore.clearForTesting(using: fullVolumeFileSystem)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: canonicalURL.path))
+        XCTAssertTrue(try Data(contentsOf: canonicalURL).isEmpty,
+                      "tombstone ENOSPC must fall back to verified in-place erasure")
+        XCTAssertNil(OutboxStore.loadForTesting(using: location.fileSystem),
+                     "prior-principal bytes may not remain loadable after the auth boundary")
+    }
+
+    func test_staged_recovery_cannot_overwrite_a_canonical_owner_created_during_recovery() throws {
+        let location = try makeTemporaryOutboxFileSystem()
+        defer { try? FileManager.default.removeItem(at: location.root) }
+        let stagingURL = try XCTUnwrap(location.fileSystem.stagingURL)
+        let canonicalURL = try XCTUnwrap(location.fileSystem.canonicalURL)
+        let intentA = makeIntent(sessionId: "session-A", message: "Interrupted candidate A")
+        let intentB = makeIntent(sessionId: "session-B", message: "Concurrent canonical owner B")
+
+        XCTAssertEqual(OutboxStore.claimForTesting(intentB, using: location.fileSystem), .claimed)
+        let bytesB = try Data(contentsOf: canonicalURL)
+        try FileManager.default.removeItem(at: canonicalURL)
+
+        var interruptedFileSystem = location.fileSystem
+        interruptedFileSystem.install = { _, _ in throw FileSystemFailure.installUnavailable }
+        interruptedFileSystem.remove = { _ in }
+        XCTAssertEqual(OutboxStore.claimForTesting(intentA, using: interruptedFileSystem), .storageUnavailable)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingURL.path))
+
+        var racingFileSystem = location.fileSystem
+        let noReplaceRecovery = racingFileSystem.recover
+        racingFileSystem.recover = { source, destination in
+            try bytesB.write(to: destination, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var mutableDestination = destination
+            try mutableDestination.setResourceValues(values)
+            try noReplaceRecovery(source, destination)
+        }
+
+        XCTAssertNil(OutboxStore.loadForTesting(using: racingFileSystem),
+                     "the colliding recovery attempt must fail closed instead of returning either owner")
+        XCTAssertEqual(try Data(contentsOf: canonicalURL), bytesB)
+        XCTAssertEqual(OutboxStore.loadForTesting(using: location.fileSystem), intentB,
+                       "canonical B must win; staged A may never replace it")
     }
 
     /// THE FIX: confirm() persists the intent synchronously (top of post(), before `state = .sending` and before the
