@@ -11,6 +11,24 @@ Offline speech recognition, duplex capture, deterministic barge-in, and pluggabl
 
 `WhisperCPPRecognizer.prepareModel` retains and hashes the exact bytes read from the model, then initializes whisper.cpp from that verified in-memory snapshot. A caller-visible path replacement cannot change the bytes loaded after verification. Transcription accepts only finite 16 kHz mono PCM from 0.1 through 30 seconds and uses whisper.cpp's abort callback for cancellation.
 
+## Local Model Provisioning
+
+`WhisperModelStore` receives a caller-provided, already materialized local copy; an iOS document
+picker should use import/as-copy mode before calling it. The store owns no network client and
+rejects iCloud-ubiquitous source URLs. The source must have the descriptor's exact safe filename,
+size, and pinned SHA-256. Imports use security-scoped, coordinated access plus a bounded 1 MiB copy
+into a same-directory `O_EXCL|O_NOFOLLOW` staging file. The staging bytes are fully verified before
+one atomic rename exposes the canonical file.
+
+Production construction fixes the store under the app's Application Support directory. Parent and
+store directory descriptors anchor every create, verify, policy, and rename operation against path
+replacement. The store directory is owner-only (`0700`), the installed model is read-only to the
+app process (`0400`), and both are excluded from backups. On iOS they use
+complete-until-first-user-authentication protection so background CallKit work can access the model
+after the device's first unlock. Handled invalid, changed, concurrent, or cancelled imports never
+expose a partial file as canonical, preserve an existing verified model, and attempt to unlink their
+private stage. `WhisperModelStoreError` and verifier errors carry no selected-file or container paths.
+
 ## Voice Loop
 
 1. `MicrophoneCapture` configures duplex voice-chat audio and emits bounded Float32 mono frames. Microphone, offline narration, and gateway PCM playback share reference-counted audio-session leases, so overlapping barge-in cannot deactivate another active owner and the last owner attempts process-session deactivation. Deactivation failures are surfaced through the active speech, playback, or microphone-stream operation instead of being silently discarded. The audio callback writes directly to one locked continuation, preserving callback order without spawning a task per frame. If the eight-frame buffer overflows, capture terminates with an explicit error instead of silently producing a corrupted transcript.
