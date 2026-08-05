@@ -324,9 +324,7 @@ final class WhisperModelStoreTests: XCTestCase {
         let first = Task {
             try await firstStore.installLocalFile(at: fixture.source)
         }
-        let didEnter = await Task.detached {
-            entered.wait(timeout: .now() + 5) == .success
-        }.value
+        let didEnter = await waitForSemaphore(entered, timeout: 5)
         guard didEnter else {
             release.signal()
             first.cancel()
@@ -432,7 +430,15 @@ final class WhisperModelStoreTests: XCTestCase {
         let replacement = fixture.storeRoot.appendingPathComponent("replacement.bin")
         try fixture.data.write(to: replacement)
 
-        _ = try FileManager.default.replaceItemAt(installed.url, withItemAt: replacement)
+        let renameResult = replacement.path.withCString { replacementPath in
+            installed.url.path.withCString { installedPath in
+                Darwin.rename(replacementPath, installedPath)
+            }
+        }
+        let renameError = errno
+        guard renameResult == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(renameError))
+        }
 
         XCTAssertThrowsError(try installed.revalidate()) { error in
             XCTAssertEqual(error as? VoiceError, .modelVerificationFailed)
@@ -622,13 +628,23 @@ private final class OneShotGate: @unchecked Sendable {
     }
 
     func waitUntilBlocked() async -> Bool {
-        await Task.detached {
-            self.entered.wait(timeout: .now() + 5) == .success
-        }.value
+        await waitForSemaphore(entered, timeout: 5)
     }
 
     func release() {
         releaseSemaphore.signal()
+    }
+}
+
+private func waitForSemaphore(
+    _ semaphore: DispatchSemaphore,
+    timeout: TimeInterval
+) async -> Bool {
+    let deadline = DispatchTime.now() + timeout
+    return await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(returning: semaphore.wait(timeout: deadline) == .success)
+        }
     }
 }
 

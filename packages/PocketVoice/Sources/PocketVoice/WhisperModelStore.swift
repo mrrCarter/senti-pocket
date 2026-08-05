@@ -1022,13 +1022,26 @@ extension WhisperModelStore {
                 in: directory.parent,
                 named: rootDirectory.lastPathComponent
             )
-            guard parentPath == parentDescriptor,
-                  rootPath == rootDescriptor,
-                  rootEntry == rootDescriptor,
-                  parentDescriptor.isDirectory,
-                  rootDescriptor.isDirectory else {
+            guard isSameOwnedDirectory(parentPath, parentDescriptor),
+                  isSameOwnedDirectory(rootPath, rootDescriptor),
+                  isSameOwnedDirectory(rootEntry, rootDescriptor) else {
                 throw WhisperModelStoreError.invalidStoreURL
             }
+        }
+
+        private static func isSameOwnedDirectory(
+            _ pathIdentity: POSIXFileIdentity?,
+            _ descriptorIdentity: POSIXFileIdentity
+        ) -> Bool {
+            guard let pathIdentity,
+                  pathIdentity.isDirectory,
+                  pathIdentity.isOwnedByProcess,
+                  descriptorIdentity.isDirectory,
+                  descriptorIdentity.isOwnedByProcess else {
+                return false
+            }
+            return pathIdentity.deviceNumber == descriptorIdentity.deviceNumber
+                && pathIdentity.fileNumber == descriptorIdentity.fileNumber
         }
 
         @discardableResult
