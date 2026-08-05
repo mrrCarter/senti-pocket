@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
+      - ".gitattributes"
       - ".github/workflows/ios-verify.yml"
       - "apps/SentiPocketApp/**"
       - "packages/PocketCall/**"
@@ -13,8 +14,10 @@ on:
       - "packages/PocketSyncClient/**"
       - "packages/PocketUI/**"
       - "packages/PocketVoice/**"
+      - "scripts/ios/**"
   pull_request:
     paths:
+      - ".gitattributes"
       - ".github/workflows/ios-verify.yml"
       - "apps/SentiPocketApp/**"
       - "packages/PocketCall/**"
@@ -24,6 +27,7 @@ on:
       - "packages/PocketSyncClient/**"
       - "packages/PocketUI/**"
       - "packages/PocketVoice/**"
+      - "scripts/ios/**"
 
 permissions:
   contents: read
@@ -59,14 +63,32 @@ jobs:
   hosted-app-tests:
     name: Hosted app build and tests
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Validate iOS release tooling
+        shell: bash
+        run: |
+          test -x scripts/ios/archive_ipa.sh
+          bash -n scripts/ios/archive_ipa.sh
+          bash scripts/ios/tests/archive_ipa_validation_test.sh
+          /usr/bin/plutil -lint apps/SentiPocketApp/ExportOptions.example.plist
+          /usr/bin/plutil -lint apps/SentiPocketApp/Sources/SentiPocketApp.entitlements
+          /usr/bin/plutil -lint apps/SentiPocketApp/Resources/PrivacyInfo.xcprivacy
+          for script in scripts/ios/archive_ipa.sh scripts/ios/tests/archive_ipa_validation_test.sh; do
+            test "$(git check-attr eol -- "$script")" = "$script: eol: lf"
+            if LC_ALL=C grep -n $'\r' "$script"; then
+              echo "$script contains CR bytes" >&2
+              exit 1
+            fi
+          done
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project
         working-directory: apps/SentiPocketApp
         run: xcodegen generate
+      - name: Validate generated Info.plist
+        run: /usr/bin/plutil -lint apps/SentiPocketApp/Sources/Info.plist
       - name: Resolve local packages
         run: >-
           xcodebuild
@@ -74,6 +96,23 @@ jobs:
           -scheme SentiPocketApp
           -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
           -resolvePackageDependencies
+      - name: Build unsigned Release device closure
+        run: >-
+          xcodebuild
+          -project apps/SentiPocketApp/SentiPocketApp.xcodeproj
+          -scheme SentiPocketApp
+          -configuration Release
+          -destination 'generic/platform=iOS'
+          -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+          -derivedDataPath "$RUNNER_TEMP/ReleaseDeviceDerivedData"
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+          DEVELOPMENT_TEAM=
+          ONLY_ACTIVE_ARCH=NO
+          APS_ENVIRONMENT=production
+          SENTI_API_URL=https://api.ci.invalid
+          SENTI_GATEWAY_URL=https://gateway.ci.invalid
+          build
       - name: Build simulator closure
         run: >-
           xcodebuild
