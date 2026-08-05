@@ -16,7 +16,7 @@ open SentiPocketApp.xcodeproj
 `git pull` + the three commands above is the whole loop. The `.xcodeproj` is intentionally **not** in
 git (only `project.yml` + Swift sources are) so there are no project-file merge conflicts between lanes.
 
-## Export a signed development IPA
+## Export a signed device IPA
 
 The repository never accepts an Apple ID password. Sign into the authorized Developer Program account once in
 Xcode (`Settings → Accounts`), let Xcode keep its signing identity in the login Keychain, attach and trust the intended
@@ -73,6 +73,20 @@ always runs from a fresh detached worktree at the recorded commit, so ignored lo
 an IPA. For a non-device-bound App Store or enterprise export, first run
 `unset SENTI_DEVICE_UDID SENTI_REGISTER_CONNECTED_DEVICE SENTI_INSTALL_CONNECTED_DEVICE`; the script rejects device
 selectors and device actions for those channels.
+
+Build configuration and distribution channel are separate controls: the script always archives the optimized Release
+configuration. A `debugging`/`development` export still uses a development provisioning profile and
+`aps-environment=development`; it does not change the archive to the Debug configuration. Ad-hoc, App Store Connect,
+and enterprise exports require production APNs provisioning, and the signed profile/entitlements—not the configuration
+name alone—are authoritative for the exported app's APNs environment.
+
+Keep Apple key material roles separate. An APNs provider `.p8` authenticates the backend that sends pushes; it is never
+given to Xcode or bundled in the app. An App Store Connect API `.p8` authenticates automation for App Store Connect,
+provisioning, or upload; it is not an APNs provider key or a code-signing identity. A `.p12` contains a signing
+certificate plus its private key and belongs only in a private Keychain, while `.mobileprovision`/`.provisionprofile`
+files contain private provisioning metadata that may expose registered UDIDs. The archive script accepts neither type
+of `.p8`; it relies on Xcode account state and a Keychain signing identity. These artifacts are ignored as
+defense-in-depth, but an exposed or committed credential still requires revocation and Git-history remediation.
 
 No `ggml-base.en.bin` model is tracked in this repository, and the detached build intentionally excludes an ignored
 local copy. A fresh signed install therefore degrades the dial path to briefing-only/no capture until the exact pinned

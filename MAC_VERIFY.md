@@ -11,6 +11,10 @@ conditional crypto test path runs; full Xcode is required for device-SDK, signin
   Accounts. Check `xcodebuild -version`, `xcrun --sdk iphoneos --show-sdk-version`, and `xcodegen --version`.
 - The exact intended iPhone attached, unlocked, trusted, and in Developer Mode. Copy its physical provisioning UDID
   from Xcode's Devices and Simulators window; do not post that value to GitHub or Senti.
+- Keep key roles separate: an APNs provider `.p8` authenticates only the push-sending backend; an App Store Connect API
+  `.p8` authenticates App Store Connect automation; neither is a code-signing identity or input to this archive script.
+  A signing `.p12` belongs only in a private Keychain, and provisioning profiles can expose registered UDIDs. See the
+  app runbook for the complete private-artifact boundary.
 
 ## Steps
 ```bash
@@ -70,6 +74,11 @@ export SENTI_APPLE_TEAM_ID SENTI_DEVICE_UDID SENTI_API_URL SENTI_GATEWAY_URL
 # export SENTI_INSTALL_CONNECTED_DEVICE=1
 scripts/ios/archive_ipa.sh
 ```
+
+The script always archives the Release configuration. Its `debugging`/`development` export method instead selects a
+development provisioning channel and `aps-environment=development`; the signed profile/entitlements are authoritative.
+Every real archive/export passes `-allowProvisioningUpdates`, which may contact Apple and refresh signing/provisioning
+state even when explicit device registration remains off. Run it only against the intended Developer Program team.
 
 The archive gate requires exact UDID membership in the decoded embedded profile and requires its
 `DeveloperCertificates` array to contain the actual signing leaf before an opted-in install can run. The device/OS

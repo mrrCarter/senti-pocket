@@ -94,6 +94,54 @@ require_binary_flag() {
   [[ "$value" == "0" || "$value" == "1" ]] || fail "$name must be exactly 0 or 1"
 }
 
+configure_export_policy() {
+  local requested_method="$1"
+
+  [[ "$requested_method" =~ ^[A-Za-z0-9-]+$ ]] \
+    || fail "SENTI_EXPORT_METHOD contains unsupported characters"
+
+  EXPORT_METHOD="$requested_method"
+  case "$EXPORT_METHOD" in
+    debugging|development)
+      REQUIRED_APS_ENVIRONMENT="development"
+      REQUIRED_PROFILE_CLASS="development"
+      ;;
+    release-testing|ad-hoc)
+      REQUIRED_APS_ENVIRONMENT="production"
+      REQUIRED_PROFILE_CLASS="ad-hoc"
+      ;;
+    app-store-connect|app-store)
+      REQUIRED_APS_ENVIRONMENT="production"
+      REQUIRED_PROFILE_CLASS="app-store"
+      ;;
+    enterprise)
+      REQUIRED_APS_ENVIRONMENT="production"
+      REQUIRED_PROFILE_CLASS="enterprise"
+      ;;
+    *)
+      fail "unsupported iOS IPA export method: $EXPORT_METHOD"
+      ;;
+  esac
+
+  if [[ -n "${SENTI_APS_ENVIRONMENT:-}" && "$SENTI_APS_ENVIRONMENT" != "$REQUIRED_APS_ENVIRONMENT" ]]; then
+    fail "SENTI_APS_ENVIRONMENT conflicts with export method $EXPORT_METHOD (requires $REQUIRED_APS_ENVIRONMENT)"
+  fi
+  APS_ENVIRONMENT="$REQUIRED_APS_ENVIRONMENT"
+
+  DEVICE_BOUND_PROFILE=false
+  if [[ "$REQUIRED_PROFILE_CLASS" == "development" || "$REQUIRED_PROFILE_CLASS" == "ad-hoc" ]]; then
+    DEVICE_BOUND_PROFILE=true
+    [[ -n "$DEVICE_UDID" ]] \
+      || fail "SENTI_DEVICE_UDID is required for a device-bound $EXPORT_METHOD export"
+  elif [[ -n "$DEVICE_UDID" || "$REGISTER_CONNECTED_DEVICE" == "1" || "$INSTALL_CONNECTED_DEVICE" == "1" ]]; then
+    fail "connected-device attribution is supported only for debugging/development or release-testing/ad-hoc exports"
+  fi
+
+  if [[ "$REGISTER_CONNECTED_DEVICE" == "1" && "$REQUIRED_PROFILE_CLASS" != "development" ]]; then
+    fail "SENTI_REGISTER_CONNECTED_DEVICE=1 is supported only for debugging/development exports; register the device in Xcode before an ad-hoc export"
+  fi
+}
+
 sha256_text() {
   printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
 }
@@ -150,7 +198,14 @@ if [[ "$OUTPUT_ROOT" == *$'\n'* || "$OUTPUT_ROOT" == *$'\r'* ]] || \
   fail "SENTI_IPA_OUTPUT_DIR must not contain control characters"
 fi
 if [[ "$VALIDATE_INPUTS_ONLY" == "true" ]]; then
-  printf 'archive_ipa: input syntax validation passed; no build or external action was performed\n'
+  # Validation must stay hermetic on non-Mac hosts. The canonical modern development alias exercises the same policy as
+  # legacy `development`; explicit methods exercise their exact distribution channel without probing Xcode.
+  configure_export_policy "${SENTI_EXPORT_METHOD:-debugging}"
+  printf 'archive_ipa: input and export-policy validation passed; export_method=%s; aps_environment=%s; profile_class=%s; device_bound=%s; no build or external action was performed\n' \
+    "$EXPORT_METHOD" \
+    "$APS_ENVIRONMENT" \
+    "$REQUIRED_PROFILE_CLASS" \
+    "$DEVICE_BOUND_PROFILE"
   exit 0
 fi
 
@@ -182,48 +237,10 @@ else
     EXPORT_METHOD="development"
   fi
 fi
-[[ "$EXPORT_METHOD" =~ ^[A-Za-z0-9-]+$ ]] \
-  || fail "SENTI_EXPORT_METHOD contains unsupported characters"
-
-case "$EXPORT_METHOD" in
-  debugging|development)
-    REQUIRED_APS_ENVIRONMENT="development"
-    REQUIRED_PROFILE_CLASS="development"
-    ;;
-  release-testing|ad-hoc)
-    REQUIRED_APS_ENVIRONMENT="production"
-    REQUIRED_PROFILE_CLASS="ad-hoc"
-    ;;
-  app-store-connect|app-store)
-    REQUIRED_APS_ENVIRONMENT="production"
-    REQUIRED_PROFILE_CLASS="app-store"
-    ;;
-  enterprise)
-    REQUIRED_APS_ENVIRONMENT="production"
-    REQUIRED_PROFILE_CLASS="enterprise"
-    ;;
-  *)
-    fail "unsupported iOS IPA export method: $EXPORT_METHOD"
-    ;;
-esac
-if [[ -n "${SENTI_APS_ENVIRONMENT:-}" && "$SENTI_APS_ENVIRONMENT" != "$REQUIRED_APS_ENVIRONMENT" ]]; then
-  fail "SENTI_APS_ENVIRONMENT conflicts with export method $EXPORT_METHOD (requires $REQUIRED_APS_ENVIRONMENT)"
-fi
-APS_ENVIRONMENT="$REQUIRED_APS_ENVIRONMENT"
-DEVICE_BOUND_PROFILE=false
-if [[ "$REQUIRED_PROFILE_CLASS" == "development" || "$REQUIRED_PROFILE_CLASS" == "ad-hoc" ]]; then
-  DEVICE_BOUND_PROFILE=true
-  [[ -n "$DEVICE_UDID" ]] \
-    || fail "SENTI_DEVICE_UDID is required for a device-bound $EXPORT_METHOD export"
-elif [[ -n "$DEVICE_UDID" || "$REGISTER_CONNECTED_DEVICE" == "1" || "$INSTALL_CONNECTED_DEVICE" == "1" ]]; then
-  fail "connected-device attribution is supported only for debugging/development or release-testing/ad-hoc exports"
-fi
+configure_export_policy "$EXPORT_METHOD"
 if [[ "$REGISTER_CONNECTED_DEVICE" == "1" ]] && \
     ! grep -q -- '-allowProvisioningDeviceRegistration' <<<"$XCODEBUILD_HELP"; then
   fail "this Xcode does not support opt-in command-line device registration"
-fi
-if [[ "$REGISTER_CONNECTED_DEVICE" == "1" && "$REQUIRED_PROFILE_CLASS" != "development" ]]; then
-  fail "SENTI_REGISTER_CONNECTED_DEVICE=1 is supported only for debugging/development exports; register the device in Xcode before an ad-hoc export"
 fi
 if [[ "$INSTALL_CONNECTED_DEVICE" == "1" ]]; then
   xcrun --find devicectl >/dev/null 2>&1 \
