@@ -152,7 +152,7 @@ final class SentiNativeAuth: NSObject {
     init(apiBaseURL: URL,
          appVersion: String,
          ideLabel: String = "Senti Pocket",
-         urlSession: URLSession = .shared,
+         urlSession: URLSession = SentiHTTPTransportPolicy.liveSession,
          pollInterval: Duration = .seconds(2),
          overallTimeout: Duration = .seconds(180)) {
         self.apiBaseURL = apiBaseURL

@@ -47,6 +47,8 @@ jobs:
             path: packages/PocketVoice
           - name: PocketDialVoice
             path: packages/PocketDialVoice
+          - name: PocketSyncClient
+            path: packages/PocketSyncClient
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain

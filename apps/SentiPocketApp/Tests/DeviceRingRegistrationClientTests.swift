@@ -327,6 +327,7 @@ final class DeviceRingRegistrationClientTests: XCTestCase {
         XCTAssertEqual(sent.value(forHTTPHeaderField: "Cache-Control"), "no-store")
         XCTAssertEqual(sent.value(forHTTPHeaderField: "Pragma"), "no-cache")
         XCTAssertEqual(sent.cachePolicy, .reloadIgnoringLocalCacheData)
+        XCTAssertEqual(sent.timeoutInterval, 8)
         XCTAssertNil(sent.httpBody)
         XCTAssertTrue(RegisterStubURLProtocol.bodies.last?.isEmpty == true)
 
