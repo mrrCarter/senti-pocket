@@ -472,6 +472,547 @@ final class WhisperModelStoreTests: XCTestCase {
         }
     }
 
+    func testInstallProgressIsMonotonicAndOrdered() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let events = LockedArrayBox<WhisperModelInstallProgress>()
+        let store = WhisperModelStore(rootDirectory: fixture.storeRoot, descriptor: fixture.descriptor)
+
+        let installed = try await store.installLocalFile(at: fixture.source) { event in
+            events.append(event)
+        }
+
+        try installed.revalidate()
+        let observed = events.snapshot()
+        XCTAssertEqual(
+            observed.first,
+            .copying(completed: 0, total: Int64(fixture.data.count))
+        )
+        XCTAssertEqual(Array(observed.suffix(2)), [.verifying, .finishing])
+        let copiedBytes = observed.compactMap { event -> Int64? in
+            guard case let .copying(completed, total) = event else { return nil }
+            XCTAssertEqual(total, Int64(fixture.data.count))
+            return completed
+        }
+        XCTAssertEqual(copiedBytes, copiedBytes.sorted())
+        XCTAssertEqual(copiedBytes.last, Int64(fixture.data.count))
+    }
+
+    func testFailedInstallDoesNotEmitFinishingProgress() async throws {
+        let fixture = try makeFixture(
+            data: Data("jello".utf8),
+            descriptorData: Data("hello".utf8)
+        )
+        defer { fixture.remove() }
+        let events = LockedArrayBox<WhisperModelInstallProgress>()
+        let store = WhisperModelStore(rootDirectory: fixture.storeRoot, descriptor: fixture.descriptor)
+
+        await assertStoreError(.digestMismatch) {
+            _ = try await store.installLocalFile(at: fixture.source) { event in
+                events.append(event)
+            }
+        }
+
+        let observed = events.snapshot()
+        XCTAssertEqual(observed.last, .verifying)
+        XCTAssertFalse(observed.contains(.finishing))
+        try assertNoCanonicalOrPartialFiles(fixture)
+    }
+
+    func testRemoveIsDurableIdempotentAndInvalidatesInstalledToken() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let syncCount = LockedCounter()
+        let store = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                didSynchronizeRemovalDirectory: { syncCount.increment() }
+            )
+        )
+        let installed = try await store.installLocalFile(at: fixture.source)
+
+        try await store.removeInstalledModel()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+        XCTAssertThrowsError(try installed.revalidate()) { error in
+            XCTAssertEqual(error as? VoiceError, .modelVerificationFailed)
+        }
+        await assertStoreError(.notInstalled) {
+            _ = try await store.verifyInstalledModel()
+        }
+        try await store.removeInstalledModel()
+        XCTAssertEqual(syncCount.value(), 2)
+        try assertNoPartialFiles(in: fixture.storeRoot)
+    }
+
+    func testMissingRemoveCreatesOnlyPrivateStoreAndSynchronizes() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let syncCount = LockedCounter()
+        let store = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                didSynchronizeRemovalDirectory: { syncCount.increment() }
+            )
+        )
+
+        try await store.removeInstalledModel()
+        try await store.removeInstalledModel()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.storeRoot.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+        XCTAssertEqual(try permissions(at: fixture.storeRoot), 0o700)
+        XCTAssertEqual(
+            try fixture.storeRoot.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup,
+            true
+        )
+        XCTAssertEqual(syncCount.value(), 2)
+        let names = try FileManager.default.contentsOfDirectory(atPath: fixture.storeRoot.path)
+        XCTAssertEqual(names, [".whisper-model-store.lock"])
+    }
+
+    func testRemoveRecoversCorruptOwnedRegularCanonical() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let store = WhisperModelStore(rootDirectory: fixture.storeRoot, descriptor: fixture.descriptor)
+        _ = try await store.installLocalFile(at: fixture.source)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: fixture.installed.path
+        )
+        try Data("jello".utf8).write(to: fixture.installed, options: [])
+        var mutableInstalled = fixture.installed
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = false
+        try? mutableInstalled.setResourceValues(values)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: fixture.installed.path
+        )
+
+        try await store.removeInstalledModel()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+    }
+
+    func testRemoveRejectsSymlinkDirectoryFIFOAndHardLinkWithoutTouchingTargets() async throws {
+        do {
+            let fixture = try makeFixture(data: Data("hello".utf8))
+            defer { fixture.remove() }
+            try FileManager.default.createDirectory(at: fixture.storeRoot, withIntermediateDirectories: false)
+            let outside = fixture.base.appendingPathComponent("outside.bin")
+            try Data("outside".utf8).write(to: outside)
+            try FileManager.default.createSymbolicLink(
+                at: fixture.installed,
+                withDestinationURL: outside
+            )
+            let store = WhisperModelStore(rootDirectory: fixture.storeRoot, descriptor: fixture.descriptor)
+
+            await assertStoreError(.removalFailed) {
+                try await store.removeInstalledModel()
+            }
+            XCTAssertEqual(try Data(contentsOf: outside), Data("outside".utf8))
+            XCTAssertEqual(
+                try fixture.installed.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink,
+                true
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(data: Data("hello".utf8))
+            defer { fixture.remove() }
+            try FileManager.default.createDirectory(at: fixture.storeRoot, withIntermediateDirectories: false)
+            try FileManager.default.createDirectory(at: fixture.installed, withIntermediateDirectories: false)
+            let store = WhisperModelStore(rootDirectory: fixture.storeRoot, descriptor: fixture.descriptor)
+
+            await assertStoreError(.removalFailed) {
+                try await store.removeInstalledModel()
+            }
+            var isDirectory: ObjCBool = false
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: fixture.installed.path,
+                    isDirectory: &isDirectory
+                )
+            )
+            XCTAssertTrue(isDirectory.boolValue)
+        }
+
+        do {
+            let fixture = try makeFixture(data: Data("hello".utf8))
+            defer { fixture.remove() }
+            try FileManager.default.createDirectory(at: fixture.storeRoot, withIntermediateDirectories: false)
+            XCTAssertEqual(fixture.installed.path.withCString { Darwin.mkfifo($0, 0o600) }, 0)
+            let store = WhisperModelStore(rootDirectory: fixture.storeRoot, descriptor: fixture.descriptor)
+
+            await assertStoreError(.removalFailed) {
+                try await store.removeInstalledModel()
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.installed.path))
+        }
+
+        do {
+            let fixture = try makeFixture(data: Data("hello".utf8))
+            defer { fixture.remove() }
+            try FileManager.default.createDirectory(at: fixture.storeRoot, withIntermediateDirectories: false)
+            let outside = fixture.base.appendingPathComponent("outside.bin")
+            try Data("outside".utf8).write(to: outside)
+            let linkResult = outside.path.withCString { outsidePath in
+                fixture.installed.path.withCString { installedPath in
+                    Darwin.link(outsidePath, installedPath)
+                }
+            }
+            XCTAssertEqual(linkResult, 0)
+            let store = WhisperModelStore(rootDirectory: fixture.storeRoot, descriptor: fixture.descriptor)
+
+            await assertStoreError(.removalFailed) {
+                try await store.removeInstalledModel()
+            }
+            XCTAssertEqual(try Data(contentsOf: outside), Data("outside".utf8))
+            XCTAssertEqual(try inode(at: outside), try inode(at: fixture.installed))
+        }
+    }
+
+    func testCanonicalRegularFileSwapBeforeUnlinkIsRejected() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let moved = fixture.storeRoot.appendingPathComponent("preserved.bin")
+        let replacement = Data("replacement".utf8)
+        let mutationErrors = LockedErrorBox()
+        let store = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                willRemoveCanonical: {
+                    do {
+                        try FileManager.default.moveItem(at: fixture.installed, to: moved)
+                        try replacement.write(to: fixture.installed)
+                    } catch {
+                        mutationErrors.store(error)
+                    }
+                }
+            )
+        )
+        _ = try await store.installLocalFile(at: fixture.source)
+
+        await assertStoreError(.removalFailed) {
+            try await store.removeInstalledModel()
+        }
+
+        try mutationErrors.rethrowIfPresent()
+        XCTAssertEqual(try Data(contentsOf: moved), fixture.data)
+        XCTAssertEqual(try Data(contentsOf: fixture.installed), replacement)
+    }
+
+    func testRootReplacementBeforeUnlinkCannotEscape() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let movedRoot = fixture.base.appendingPathComponent("moved-PocketModels", isDirectory: true)
+        let outside = fixture.base.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        let outsideModel = outside.appendingPathComponent(fixture.descriptor.fileName)
+        try Data("outside".utf8).write(to: outsideModel)
+        let mutationErrors = LockedErrorBox()
+        let storeRoot = fixture.storeRoot
+        let store = WhisperModelStore(
+            rootDirectory: storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                willRemoveCanonical: {
+                    do {
+                        try FileManager.default.moveItem(at: storeRoot, to: movedRoot)
+                        try FileManager.default.createSymbolicLink(
+                            at: storeRoot,
+                            withDestinationURL: outside
+                        )
+                    } catch {
+                        mutationErrors.store(error)
+                    }
+                }
+            )
+        )
+        _ = try await store.installLocalFile(at: fixture.source)
+
+        await assertStoreError(.invalidStoreURL) {
+            try await store.removeInstalledModel()
+        }
+
+        try mutationErrors.rethrowIfPresent()
+        XCTAssertEqual(
+            try Data(contentsOf: movedRoot.appendingPathComponent(fixture.descriptor.fileName)),
+            fixture.data
+        )
+        XCTAssertEqual(try Data(contentsOf: outsideModel), Data("outside".utf8))
+    }
+
+    func testRemoveSerializesInstallVerifyAndAnotherRemove() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let gate = OneShotGate()
+        let removingStore = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                willRemoveCanonical: { gate.blockOnce() }
+            )
+        )
+        let competingStore = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor
+        )
+        _ = try await removingStore.installLocalFile(at: fixture.source)
+        let removal = Task { try await removingStore.removeInstalledModel() }
+        guard await gate.waitUntilBlocked() else {
+            gate.release()
+            removal.cancel()
+            _ = try? await removal.value
+            XCTFail("removal did not reach the deterministic lease gate")
+            return
+        }
+
+        await assertStoreError(.installationInProgress) {
+            try await competingStore.removeInstalledModel()
+        }
+        await assertStoreError(.installationInProgress) {
+            _ = try await competingStore.verifyInstalledModel()
+        }
+        await assertStoreError(.installationInProgress) {
+            _ = try await removingStore.installLocalFile(at: fixture.source)
+        }
+
+        gate.release()
+        try await removal.value
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+    }
+
+    func testCallerCancellationBeforeUnlinkPreservesModelAndReleasesLease() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let gate = OneShotGate()
+        let store = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                willRemoveCanonical: { gate.blockOnce() }
+            )
+        )
+        _ = try await store.installLocalFile(at: fixture.source)
+        let inodeBefore = try inode(at: fixture.installed)
+        let removal = Task { try await store.removeInstalledModel() }
+        guard await gate.waitUntilBlocked() else {
+            gate.release()
+            removal.cancel()
+            _ = try? await removal.value
+            XCTFail("removal did not reach the deterministic cancellation gate")
+            return
+        }
+
+        removal.cancel()
+        gate.release()
+        do {
+            try await removal.value
+            XCTFail("cancelled removal unexpectedly succeeded")
+        } catch {
+            XCTAssertEqual(error as? WhisperModelStoreError, .cancelled)
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.installed), fixture.data)
+        XCTAssertEqual(try inode(at: fixture.installed), inodeBefore)
+
+        try await store.removeInstalledModel()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+    }
+
+    func testMissingRemoveSerializesWithFirstInstall() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let gate = OneShotGate()
+        let removingStore = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                didAcquireRemovalLease: { gate.blockOnce() }
+            )
+        )
+        let competingStore = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor
+        )
+        let removal = Task { try await removingStore.removeInstalledModel() }
+        guard await gate.waitUntilBlocked() else {
+            gate.release()
+            removal.cancel()
+            _ = try? await removal.value
+            XCTFail("missing removal did not acquire the deterministic lease")
+            return
+        }
+
+        await assertStoreError(.installationInProgress) {
+            _ = try await competingStore.installLocalFile(at: fixture.source)
+        }
+        await assertStoreError(.installationInProgress) {
+            try await competingStore.removeInstalledModel()
+        }
+
+        gate.release()
+        try await removal.value
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+    }
+
+    func testCancellationAfterUnlinkStillCommitsDurableRemoval() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let syncCount = LockedCounter()
+        let store = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                didUnlinkCanonical: {
+                    withUnsafeCurrentTask { task in task?.cancel() }
+                },
+                didSynchronizeRemovalDirectory: { syncCount.increment() }
+            )
+        )
+        _ = try await store.installLocalFile(at: fixture.source)
+
+        try await store.removeInstalledModel()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+        XCTAssertEqual(syncCount.value(), 1)
+    }
+
+    func testFinalUnlinkENOENTStillSynchronizesAndSucceeds() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let mutationErrors = LockedErrorBox()
+        let syncCount = LockedCounter()
+        let store = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                willUnlinkCanonical: {
+                    do {
+                        try FileManager.default.removeItem(at: fixture.installed)
+                    } catch {
+                        mutationErrors.store(error)
+                    }
+                },
+                didSynchronizeRemovalDirectory: { syncCount.increment() }
+            )
+        )
+        _ = try await store.installLocalFile(at: fixture.source)
+
+        try await store.removeInstalledModel()
+
+        try mutationErrors.rethrowIfPresent()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.installed.path))
+        XCTAssertEqual(syncCount.value(), 1)
+    }
+
+    func testLeafRecreatedAfterDirectorySyncCannotProduceFalseSuccess() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let mutationErrors = LockedErrorBox()
+        let replacement = Data("replacement".utf8)
+        let store = WhisperModelStore(
+            rootDirectory: fixture.storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                didSynchronizeRemovalDirectory: {
+                    do {
+                        try replacement.write(to: fixture.installed)
+                    } catch {
+                        mutationErrors.store(error)
+                    }
+                }
+            )
+        )
+        _ = try await store.installLocalFile(at: fixture.source)
+
+        await assertStoreError(.removalFailed) {
+            try await store.removeInstalledModel()
+        }
+
+        try mutationErrors.rethrowIfPresent()
+        XCTAssertEqual(try Data(contentsOf: fixture.installed), replacement)
+    }
+
+    func testRootReplacementAfterDirectorySyncCannotEscapeOrSucceed() async throws {
+        let fixture = try makeFixture(data: Data("hello".utf8))
+        defer { fixture.remove() }
+        let movedRoot = fixture.base.appendingPathComponent("moved-PocketModels", isDirectory: true)
+        let outside = fixture.base.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        let outsideModel = outside.appendingPathComponent(fixture.descriptor.fileName)
+        try Data("outside".utf8).write(to: outsideModel)
+        let mutationErrors = LockedErrorBox()
+        let storeRoot = fixture.storeRoot
+        let store = WhisperModelStore(
+            rootDirectory: storeRoot,
+            descriptor: fixture.descriptor,
+            hooks: .init(
+                didOpenSource: {},
+                didCopyChunk: { _ in },
+                didFinishCopy: {},
+                didSynchronizeRemovalDirectory: {
+                    do {
+                        try FileManager.default.moveItem(at: storeRoot, to: movedRoot)
+                        try FileManager.default.createSymbolicLink(
+                            at: storeRoot,
+                            withDestinationURL: outside
+                        )
+                    } catch {
+                        mutationErrors.store(error)
+                    }
+                }
+            )
+        )
+        _ = try await store.installLocalFile(at: fixture.source)
+
+        await assertStoreError(.invalidStoreURL) {
+            try await store.removeInstalledModel()
+        }
+
+        try mutationErrors.rethrowIfPresent()
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: movedRoot.appendingPathComponent(fixture.descriptor.fileName).path
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: outsideModel), Data("outside".utf8))
+    }
+
     func testDescriptorRejectsUnsafeCanonicalFilenames() throws {
         let unsafeNames = [
             "../model.bin",
@@ -665,5 +1206,41 @@ private final class LockedErrorBox: @unchecked Sendable {
         let captured = error
         lock.unlock()
         if let captured { throw captured }
+    }
+}
+
+private final class LockedArrayBox<Element: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var elements: [Element] = []
+
+    func append(_ element: Element) {
+        lock.lock()
+        elements.append(element)
+        lock.unlock()
+    }
+
+    func snapshot() -> [Element] {
+        lock.lock()
+        let snapshot = elements
+        lock.unlock()
+        return snapshot
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    func value() -> Int {
+        lock.lock()
+        let snapshot = count
+        lock.unlock()
+        return snapshot
     }
 }
