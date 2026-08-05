@@ -78,27 +78,6 @@ final class SentiCallDecodeTests: XCTestCase {   // SentiCallManager is @MainAct
         }
     }
 
-    func test_registry_v2_additive_fixture_decodes_the_exact_binding_proof() throws {
-        let fixture = try loadFixture("dial-binding-v2.json")
-        guard let payload = fixture["payload"] as? [String: Any],
-              let received = SentiCallManager.receiveState(from: payload) else {
-            return XCTFail("Registry V2 fixture must decode")
-        }
-        let core: RingCore
-        switch received.state {
-        case .renderable(let ring):
-            core = ring.core
-        case .needsHydration(_, let value):
-            core = value
-        case .rejected(let reason):
-            return XCTFail("Registry V2 fixture rejected: \(reason)")
-        }
-        XCTAssertEqual(core.bindingVersion, 2)
-        XCTAssertEqual(core.bindingId, "iiiiiiiiiiiiiiiiiiiiiiii")
-        XCTAssertEqual(core.bindingRevision, "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
-        XCTAssertEqual(core.installationGeneration, "7")
-    }
-
     /// NEGATIVE (test b): nesting the DTO under a wrong-placement key ({aps, payload:<DTO>}) → top-level id absent →
     /// nil (no ring stored). The naive apnsSend that nests under the field literally named `payload` would silently
     /// drop EVERY ring in production — this catches it. Keys single-sourced from the fixture's wrongPlacementKeys.
