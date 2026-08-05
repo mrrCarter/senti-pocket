@@ -124,13 +124,14 @@ before setting `DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1`; there is no dual-read
 With no Registry settings the compatibility mode is V1, and a V2 phone receives an honest 501. Do not place V2
 settings beside implicit/V1 mode: partial or mixed configuration fails boot.
 
-**Registry migration gate:** V1 rows (`pk` beginning `dial:dev:`) are durable, unversioned, and cannot be safely
-transformed into installation-owned rows. Before setting `DEVICE_REGISTRY_V1_PURGED=1`, turn off registration and ring
-traffic at ingress, remove old V1 alias/weighted targets, wait at least the maximum Lambda timeout plus propagation time,
-and verify no old invocation remains. Only then delete every legacy row, verify the prefix is still empty using a fully
-paginated base-table read with `ConsistentRead=true` through the final absent `LastEvaluatedKey`, retain the zero-count
-evidence, and perform the atomic homogeneous V2 alias flip. An in-flight V1 registration after the empty-prefix proof
-reopens the old route.
+**Registry migration gate:** historical V1 rows (`pk` beginning `dial:dev:`) are durable and untagged; current V1 rows
+(`pk` beginning `dial:v1:dev:`) are exact-principal tagged and expiring. Neither can be safely transformed into
+installation-owned rows. Before setting `DEVICE_REGISTRY_V1_PURGED=1`, turn off registration and ring traffic at
+ingress, remove old V1 alias/weighted targets, wait at least the maximum Lambda timeout plus propagation time, and
+verify no old invocation remains. Only then delete every row under both prefixes, verify both prefixes remain empty
+using fully paginated base-table reads with `ConsistentRead=true` through the final absent `LastEvaluatedKey`, retain
+the zero-count evidence, and perform the atomic homogeneous V2 alias flip. An in-flight V1 registration after the
+empty-prefix proof reopens the old route.
 There is deliberately no unsafe dual-delivery mode: retaining V1 rows would leave an old A target addressable after B.
 Do not set `DEVICE_REGISTRY_CLIENT_V2_READY=1` until the iOS build that persists/reconciles both server fences and gates
 V2 pushes is released to the intended devices; the currently shipping legacy registrar receives 426 and cannot operate

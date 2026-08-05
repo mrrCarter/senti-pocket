@@ -365,6 +365,12 @@ included before the deterministic RICH→LEAN size ladder, so the bare DTO remai
 (5,120-byte PushKit cap less envelope reserve). The final `{...dto,aps}` builder also measures the complete serialized
 dictionary and refuses any transport extension that exceeds 5,120 bytes.
 
+Immediately before transport, the gateway performs one second bounded target lookup after any hydration write and
+retains only routes whose exact `(platform, token, binding.id, binding.revision)` tuple is still present. A failed second
+snapshot sends nothing and surfaces `registry-revalidation-failed`; zero survivors sends nothing and surfaces
+`stale-device-binding`. Surviving routes fan out concurrently within the fixed 20-installation admission bound. V1 uses
+the same two-snapshot rule with exact `(platform, token)` matching inside its exact-principal compatibility namespace.
+
 ## Error envelope
 JSON `{error: string, reason?: string}` on every non-2xx (except `/tts` binary success). Treat any non-200 on execute as
 NOT posted; a `pending` receipt is a real receipt (offline/queued), a 422 is a rejected proposal, a 409 needs reconcile-or-retry.

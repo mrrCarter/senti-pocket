@@ -16,8 +16,8 @@
 // non-member session -> 403. Zero-dep; injected deviceRegistry (deploy wires Dynamo) + now (deterministic/testable).
 //
 // deviceRegistry contract (deploy wires it; this module CALLS register, the deploy's pushBackend CALLS lookup):
-//   register({humanId, sessionId, voipToken, platform, registeredAt}) -> Promise<{deviceCount?:number}>   // idempotent upsert
-//   lookup({humanId, sessionId}) -> Promise<Array<{voipToken, platform}>>                                  // used OUTSIDE the gateway
+//   register({principal,humanId,sessionId,voipToken,platform,registeredAt}) -> Promise<{deviceCount?:number}>
+//   lookup({principal,humanId,sessionId}) -> Promise<Array<{voipToken,platform,bindingId?,bindingRevision?}>>
 
 import { createHash } from 'node:crypto';
 import {
@@ -46,6 +46,52 @@ const DEVICE_REGISTRY_V2_METHODS = Object.freeze([
   'denyRegistration',
   'unregister',
   'lookup',
+]);
+const DEVICE_REGISTRY_V2_REQUEST_MARKERS = Object.freeze([
+  'registrationVersion',
+  'registryVersion',
+  'ownerVersion',
+  'ownerHandle',
+  'installationId',
+  'installationGeneration',
+  'previousInstallationGeneration',
+  'idempotencyKey',
+  'tokenDigest',
+  'binding',
+  'bindingVersion',
+  'bindingId',
+  'bindingRevision',
+  'tokenClaimId',
+  'tokenClaimRevision',
+  'expectedBindingId',
+  'expectedBindingRevision',
+  'expectedTokenClaimId',
+  'expectedTokenClaimRevision',
+]);
+// Lookup rows have a smaller public schema than registration requests. Keep this list separate so adding a legitimate
+// V1 stored/request field can never accidentally disable all V1 routing.
+const DEVICE_REGISTRY_V2_ROUTE_MARKERS = Object.freeze([
+  'registrationVersion',
+  'registryVersion',
+  'ownerVersion',
+  'ownerHandle',
+  'installationId',
+  'installationGeneration',
+  'installationHash',
+  'previousInstallationGeneration',
+  'idempotencyKey',
+  'tokenDigest',
+  'binding',
+  'bindingVersion',
+  'bindingId',
+  'bindingRevision',
+  'expiresAtEpochSec',
+  'tokenClaimId',
+  'tokenClaimRevision',
+  'expectedBindingId',
+  'expectedBindingRevision',
+  'expectedTokenClaimId',
+  'expectedTokenClaimRevision',
 ]);
 
 export function assertDeviceRegistryV2Capabilities(deviceRegistry, owner = 'Registry V2') {
@@ -713,17 +759,8 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
      * @returns {Promise<{status:number, body:object}>}
      */
     async register({ principal, humanId, body, isMember } = {}) {
-      const requestedV2 = body && typeof body === 'object' && (
-        Object.hasOwn(body, 'registrationVersion') ||
-        Object.hasOwn(body, 'ownerVersion') ||
-        Object.hasOwn(body, 'ownerHandle') ||
-        Object.hasOwn(body, 'installationId') ||
-        Object.hasOwn(body, 'idempotencyKey') ||
-        Object.hasOwn(body, 'expectedBindingId') ||
-        Object.hasOwn(body, 'expectedBindingRevision') ||
-        Object.hasOwn(body, 'expectedTokenClaimId') ||
-        Object.hasOwn(body, 'expectedTokenClaimRevision')
-      );
+      const requestedV2 = body && typeof body === 'object' &&
+        DEVICE_REGISTRY_V2_REQUEST_MARKERS.some((key) => Object.hasOwn(body, key));
       if (usesRegistryV2) {
         const v = validateDeviceRegistrationV2(body);
         if (!v.ok) return { status: v.status, body: { error: v.error, reason: 'registration-v2-required' } };
@@ -871,6 +908,7 @@ export function createDialRegistry({ deviceRegistry, now } = {}) {
       let res;
       try {
         res = await deviceRegistry.register({
+          principal: principal || humanId,
           humanId, sessionId: v.value.sessionId, voipToken: v.value.voipToken, platform: v.value.platform,
           registeredAt: new Date(clock()).toISOString(),
         });
@@ -956,31 +994,61 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
   const clock = typeof now === 'function' ? now : () => Date.now();
   const cap = Number.isInteger(maxDevices) && maxDevices > 0 ? maxDevices : 20;
   const requiresBindingFence = deviceRegistry?.protocolVersion === DEVICE_REGISTRATION_VERSION;
-  return async function pushBackend({ message, context, priority, sessionId, principal, humanId, id, kind, callerName, options, checkpointId, evidenceSeqs, confidence, storedSignal } = {}) {
-    if (!deviceRegistry || typeof deviceRegistry.lookup !== 'function') return { dispatched: false, reason: 'dial-not-configured' };
-    let devices;
-    try { devices = await deviceRegistry.lookup({ principal: principal || humanId, humanId, sessionId }); }
-    catch { return { dispatched: false, reason: 'registry-lookup-failed' }; }
-    // Group by the normalized routing identity `(platform, token)` BEFORE fanout capping. The same token text in APNs
-    // and FCM is two routes. Exact duplicate V2 rows may collapse, but conflicting binding fences make that route
-    // ambiguous and therefore un-routable—never first-writer-wins.
+  let registryLookup;
+  try {
+    const lookup = deviceRegistry?.lookup;
+    registryLookup = typeof lookup === 'function'
+      ? Function.prototype.bind.call(lookup, deviceRegistry)
+      : undefined;
+  } catch {
+    registryLookup = undefined;
+  }
+  const normalizeRoutes = (records, limit) => {
+    // Group by `(platform, token)` before fanout capping. The same token text in APNs and FCM is two routes. Exact
+    // duplicate V2 rows may collapse, but conflicting binding fences make that route ambiguous and therefore unusable.
     const routes = new Map();
-    for (const d of (Array.isArray(devices) ? devices : [])) {
-      if (!d || typeof d.voipToken !== 'string' || !d.voipToken) continue;
-      const platform = typeof d.platform === 'string' ? d.platform.toLowerCase() : 'apns';
+    for (const d of (Array.isArray(records) ? records : [])) {
+      if (!d || typeof d !== 'object' || Array.isArray(d)) continue;
+      let voipToken;
+      let rawPlatform;
+      let bindingId;
+      let bindingRevision;
+      let carriesV2Metadata;
+      try {
+        // Snapshot only public routing authority once. Adapter getters and unrelated fields cannot change between
+        // validation, comparison, payload construction, and transport.
+        carriesV2Metadata = DEVICE_REGISTRY_V2_ROUTE_MARKERS.some((key) => Object.hasOwn(d, key));
+        voipToken = d.voipToken;
+        rawPlatform = d.platform;
+        if (requiresBindingFence) {
+          bindingId = d.bindingId;
+          bindingRevision = d.bindingRevision;
+        }
+      } catch {
+        continue;
+      }
+      if (typeof voipToken !== 'string' || !voipToken) continue;
+      const platform = typeof rawPlatform === 'string' ? rawPlatform.toLowerCase() : 'apns';
       if (!DIAL_PLATFORMS.includes(platform)) continue;
-      if (requiresBindingFence && (
-        typeof d.bindingId !== 'string' || !/^bind_[0-9a-f]{32}$/.test(d.bindingId) ||
-        !Number.isSafeInteger(d.bindingRevision) || d.bindingRevision <= 0
-      )) continue;
-      const routeKey = JSON.stringify([platform, d.voipToken]);
+      if (requiresBindingFence) {
+        if (typeof bindingId !== 'string' || !/^bind_[0-9a-f]{32}$/.test(bindingId) ||
+            !Number.isSafeInteger(bindingRevision) || bindingRevision <= 0) continue;
+      } else if (carriesV2Metadata) {
+        // A partial/misrouted V2 record must never silently become an unfenced V1 delivery.
+        continue;
+      }
+      const routeKey = JSON.stringify([platform, voipToken]);
       const fenceKey = requiresBindingFence
-        ? JSON.stringify([d.bindingId, d.bindingRevision])
+        ? JSON.stringify([bindingId, bindingRevision])
         : '';
       const existing = routes.get(routeKey);
       if (!existing) {
         routes.set(routeKey, {
-          device: { ...d, platform },
+          device: {
+            voipToken,
+            platform,
+            ...(requiresBindingFence ? { bindingId, bindingRevision } : {}),
+          },
           fenceKey,
           ambiguous: false,
         });
@@ -989,19 +1057,36 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
       }
     }
     const ambiguousRoutes = [...routes.values()].filter((route) => route.ambiguous).length;
-    devices = [...routes.values()]
+    const routable = [...routes.values()]
       .filter((route) => !route.ambiguous)
-      .map((route) => route.device)
-      .slice(0, cap);
+      .map((route) => route.device);
+    return {
+      ambiguousRoutes,
+      devices: Number.isSafeInteger(limit) && limit > 0 ? routable.slice(0, limit) : routable,
+    };
+  };
+  const deliveryAuthorityKey = (device) => JSON.stringify(requiresBindingFence
+    ? [device.platform, device.voipToken, device.bindingId, device.bindingRevision]
+    : [device.platform, device.voipToken]);
+  return async function pushBackend({ message, context, priority, sessionId, principal, humanId, id, kind, callerName, options, checkpointId, evidenceSeqs, confidence, storedSignal } = {}) {
+    if (!registryLookup) return { dispatched: false, reason: 'dial-not-configured' };
+    const lookupArgs = { principal: principal || humanId, humanId, sessionId };
+    let lookupResult;
+    try { lookupResult = await registryLookup({ ...lookupArgs }); }
+    catch { return { dispatched: false, reason: 'registry-lookup-failed' }; }
+    const normalized = normalizeRoutes(lookupResult, cap);
+    let devices = normalized.devices;
     if (devices.length === 0) {
-      return { dispatched: false, reason: ambiguousRoutes ? 'registry-route-conflict' : 'no-device-token' };
+      return { dispatched: false, reason: normalized.ambiguousRoutes ? 'registry-route-conflict' : 'no-device-token' };
     }
     if (typeof apnsSend !== 'function') return { dispatched: false, reason: 'push-transport-not-configured' };
     let payload;
     let deviceDeliveries;
     const payloadNow = clock();
     const payloadFields = {
-      humanId, sessionId, message, context, priority, id, kind, callerName, options, checkpointId,
+      // Generated dial IDs are durable hydration identities, so namespace them by the same full principal as the route.
+      humanId: principal || humanId,
+      sessionId, message, context, priority, id, kind, callerName, options, checkpointId,
       evidenceSeqs, confidence,
     };
     // RICH dialPayloadV1 fields flow through when present (ring-owner path); absent -> legacy defaults (kind=info, computed id).
@@ -1029,8 +1114,8 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
     }
     // HYDRATION store-write (PR-B2): persist the full signal so the phone can GET /dial?id= it. A LEAN ring shed ALL
     // governed content -> it MUST hydrate -> FAIL CLOSED if it can't persist (never a dead doorbell); a RICH ring is
-    // self-contained -> best-effort (a GET-consistency/audit copy). Written AFTER all pre-ring checks so a ring that will
-    // never fire leaves no orphan record; written BEFORE fan-out so a LEAN ring never reaches the phone unhydratable.
+    // self-contained -> best-effort (a GET-consistency/audit copy). Written BEFORE the final authority snapshot and fanout,
+    // so a LEAN ring never reaches the phone unhydratable. A race-lost record is bounded by the signal store's own TTL.
     if (storedSignal !== undefined) {
       const lean = deliveredPayloadNeedsHydration;
       if (!signalStore || typeof signalStore.put !== 'function') {
@@ -1040,59 +1125,130 @@ export function createDialPushBackend({ deviceRegistry, apnsSend, now, maxDevice
         catch { if (lean) return { dispatched: false, reason: 'signal-store-write-failed' }; }
       }
     }
+    // Close the lookup→send race with one bounded registry snapshot immediately before transport. This stays O(1) in
+    // registry calls as the installation cap grows: only exact public route tuples still authoritative in the second
+    // snapshot survive. The app's binding check remains the final fence if authority changes after this point.
+    let currentLookup;
+    try { currentLookup = await registryLookup({ ...lookupArgs }); }
+    catch {
+      return { dispatched: false, reason: 'registry-revalidation-failed', dialId: payload.id };
+    }
+    const currentAuthority = new Set(
+      normalizeRoutes(currentLookup).devices.map((device) => deliveryAuthorityKey(device)),
+    );
+    deviceDeliveries = deviceDeliveries.filter(({ device }) => currentAuthority.has(deliveryAuthorityKey(device)));
+    devices = deviceDeliveries.map(({ device }) => device);
+    if (devices.length === 0) {
+      return { dispatched: false, reason: 'stale-device-binding', dialId: payload.id, devices: 0 };
+    }
     // Fan out; dispatched iff AT LEAST ONE device acked. Per-device failure is isolated (one dead token never fails the ring).
     // WIRE CONTRACT: the gateway constructs the FINAL APNs dictionary so the top-level shape and 5,120-byte PushKit cap
     // are enforced before transport. The injected transport must serialize `payload` verbatim; it must not wrap it or add
     // fields. The app reads id/kind/… top-level; nesting => top-level `id` absent => every ring rejects silently.
-    let delivered = 0;
-    for (const { device, payload: devicePayload } of deviceDeliveries) {
+    const deliveryResults = await Promise.all(deviceDeliveries.map(async ({ device, payload: devicePayload }) => {
       try {
         const wirePayload = buildVoipPushDictionary(devicePayload);
-        const r = await apnsSend({
+        const result = await apnsSend({
           voipToken: device.voipToken,
           platform: device.platform || 'apns',
           payload: wirePayload,
         });
-        if (r && r.delivered) delivered += 1;
+        return result?.delivered === true;
+      } catch {
+        return false;
       }
-      catch { /* isolated: continue to the next device */ }
-    }
+    }));
+    const delivered = deliveryResults.filter(Boolean).length;
     return delivered > 0
       ? { dispatched: true, dialId: payload.id, delivered, devices: devices.length }
       : { dispatched: false, reason: 'all-deliveries-failed', dialId: payload.id, devices: devices.length };
   };
 }
 
-/** Injection-safe device-record key: humanId is length-prefixed so ("a","b:c") and ("a:b","c") can never collide. */
-const DEVICE_KEY = (humanId, sessionId) => `dial:dev:${String(humanId ?? '').length}:${humanId ?? ''}:${sessionId ?? ''}`;
+const LEGACY_REGISTRATION_LEASE_SECONDS = 30 * 24 * 60 * 60;
+
+/**
+ * V1 is a bounded migration lane, but it must share V2's full-principal authority boundary. Historical `dial:dev:*`
+ * records had no principal tag and are deliberately never read: equal human IDs issued in different sites must not
+ * become authority for each other's devices.
+ */
+const legacyTargetAuthority = (humanId, principal) =>
+  typeof principal === 'string' && principal ? principal : String(humanId ?? '');
+const LEGACY_DEVICE_KEY = (humanId, principal, sessionId) => {
+  const authority = legacyTargetAuthority(humanId, principal);
+  return `dial:v1:dev:${utf8(authority)}:${authority}:${sessionId ?? ''}`;
+};
 
 /**
  * A deps.deviceRegistry backed by the gateway's own {get,put,delete} store — ZERO new infra (it rides the existing
  * DynamoDB table the gateway already uses), so a deploy can wire /dial/register with nothing but the store it already
- * has. v1 stores ONE device per (humanId, sessionId): register is an ATOMIC put (race-free, latest device wins — no
- * lost-update, no lock needed) and lookup a single get. Multi-device-per-session is a v2 nicety; createDialPushBackend
- * already fans out to a device LIST, so a future multi-device registry drops in with NO pushBackend change. A deploy
- * that wants a dedicated device table can inject its own deps.deviceRegistry instead — this is only the default.
- * @param {{ store: {get:Function, put:Function}, now?: ()=>number }} cfg
+ * has. V1 stores ONE expiring device per (principal, sessionId): register is an ATOMIC put (race-free, latest device
+ * wins) and lookup is a single get. A deploy that wants a dedicated device table can inject its own registry instead.
+ * @param {{ store: {get:Function, put:Function}, now?: ()=>number, leaseSeconds?: number }} cfg
  */
-export function createStoreDeviceRegistry({ store, now = () => Date.now() } = {}) {
+export function createStoreDeviceRegistry({
+  store,
+  now = () => Date.now(),
+  leaseSeconds,
+} = {}) {
   if (!store || typeof store.get !== 'function' || typeof store.put !== 'function') {
     throw new Error('createStoreDeviceRegistry requires a { get, put } store');
   }
   const clock = typeof now === 'function' ? now : () => Date.now();
+  if (leaseSeconds !== undefined && (!Number.isSafeInteger(leaseSeconds) || leaseSeconds <= 0)) {
+    throw new Error('createStoreDeviceRegistry leaseSeconds must be a positive safe integer');
+  }
+  const leaseTtl = leaseSeconds ?? LEGACY_REGISTRATION_LEASE_SECONDS;
+  const readClock = () => {
+    const nowMs = clock();
+    if (!Number.isFinite(nowMs)) {
+      throw new Error('createStoreDeviceRegistry requires a valid non-negative clock');
+    }
+    const epochSecond = Math.floor(nowMs / 1000);
+    if (!Number.isSafeInteger(epochSecond) || epochSecond < 0) {
+      throw new Error('createStoreDeviceRegistry requires a valid non-negative clock');
+    }
+    return { nowMs, epochSecond };
+  };
   return {
     protocolVersion: 1,
-    async register({ humanId, sessionId, voipToken, platform, registeredAt } = {}) {
-      // atomic full-item put: no read-modify-write, so two concurrent registers for the same (human,session) can't lose
-      // an update (last-writer-wins is the intended v1 single-device semantics, not a race bug).
-      await store.put(DEVICE_KEY(humanId, sessionId), {
-        voipToken, platform: platform || 'apns', registeredAt: registeredAt || new Date(clock()).toISOString(),
-      });
+    async register({ humanId, principal, sessionId, voipToken, platform, registeredAt } = {}) {
+      const authority = legacyTargetAuthority(humanId, principal);
+      const { nowMs, epochSecond } = readClock();
+      const expiresAtSec = epochSecond + leaseTtl;
+      if (!Number.isSafeInteger(expiresAtSec) || expiresAtSec <= 0) {
+        throw new Error('createStoreDeviceRegistry lease expiry is outside the safe epoch range');
+      }
+      // Atomic full-item put: last writer wins within one exact principal/session compatibility lane.
+      await store.put(LEGACY_DEVICE_KEY(humanId, principal, sessionId), {
+        principal: authority,
+        voipToken,
+        platform: platform || 'apns',
+        registeredAt: registeredAt || new Date(nowMs).toISOString(),
+        expiresAtSec,
+      }, { ttlEpochSec: expiresAtSec });
       return { deviceCount: 1 };
     },
-    async lookup({ humanId, sessionId } = {}) {
-      const d = await store.get(DEVICE_KEY(humanId, sessionId));
-      return d && typeof d.voipToken === 'string' && d.voipToken ? [{ voipToken: d.voipToken, platform: d.platform || 'apns' }] : [];
+    async lookup({ humanId, principal, sessionId } = {}) {
+      const authority = legacyTargetAuthority(humanId, principal);
+      const d = await store.get(LEGACY_DEVICE_KEY(humanId, principal, sessionId));
+      let storedPrincipal;
+      let expiresAtSec;
+      let voipToken;
+      let platform;
+      try {
+        storedPrincipal = d?.principal;
+        expiresAtSec = d?.expiresAtSec;
+        voipToken = d?.voipToken;
+        platform = d?.platform;
+      } catch {
+        return [];
+      }
+      return storedPrincipal === authority &&
+        Number.isSafeInteger(expiresAtSec) && expiresAtSec > readClock().epochSecond &&
+        typeof voipToken === 'string' && voipToken
+        ? [{ voipToken, platform: platform || 'apns' }]
+        : [];
     },
   };
 }

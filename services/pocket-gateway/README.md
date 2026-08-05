@@ -22,28 +22,15 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 - **API (done):** `src/handlers.mjs` (`GET /health`, `GET /sync`, `POST /actions/execute`, `POST /tts`). Fail-closed auth; per-human namespaced idempotency; cross-instance exactly-once writeback (durable in-flight reservation + content-based crash recovery).
 - **Auth (done):** `src/auth.mjs` — REAL AIdenID bearer verification: JWT signature against a JWKS, `iss/aud/exp/nbf`, RFC 8707 resource indicator, and DPoP proof-of-possession (RFC 9449 — thumbprint binding + `htm/htu/ath/iat` + single-use `jti` replay defense). Not a stub; JWKS/issuer/audience/resource are deploy config.
 - **Store (done):** `src/store.mjs` — async store: in-memory (dev/tests) + `createDynamoStore` (real conditional-put, OWNER-FENCED lock + `putIfAbsent` + TTL; deploy injects the `@aws-sdk/lib-dynamodb` client → package stays zero-dep) + `createStoreReplayGuard` (cross-instance DPoP jti single-use).
-- **Device Registry V2 (code-complete, deploy-unverified):** `src/device-registry-v2.mjs` — one server-HMAC-keyed
-  top-level item per installation, one HMAC-keyed global `(platform,token)` owner claim, and one strongly-read bounded
-  target directory. Every affected record moves in one DynamoDB transaction; lookup resolves at most 20 exact
-  directory/base/claim triples and has no GSI correctness dependency. Server-issued binding + token-claim CAS fences,
-  atomic displaced-owner eviction, `{directoryId,revision}` ABA fencing, hard 20-installation admission, exact
-  transactional revoke, seven-day logical lease, five-minute skew-safe physical/reclaim grace, stable-read fencing,
-  bounded 21-attempt serialization, and strict V2 wire are covered hermetically. Same intent renews without rotation;
-  principal/session/token/platform change rotates. Pushes use a fail-closed `v:2` nested binding envelope included in
-  both bare and final PushKit byte gates. V2 boot requires explicit legacy-row-purge and V2-iOS-ready acknowledgements
-  in `DEPLOY.md`; it remains unavailable to the currently shipping legacy registrar.
+- **Device Registry V2 (code-complete, deploy-unverified):** `src/device-registry-v2.mjs` — server-HMAC-keyed
+  installation, token-owner, and bounded target-directory authority moves atomically in DynamoDB without a GSI
+  correctness dependency. Stable owner handles, durable operation outcomes, exact binding/token-claim CAS fences,
+  displaced-owner eviction, ABA-safe directories, hard 20-installation admission, exact revoke, logical leases,
+  reclaim grace, stable-read fencing, and bounded serialization are covered hermetically. Pushes carry the server's
+  nested `v:2` binding fence and perform one bounded exact-route snapshot immediately before concurrent APNs fanout.
+  The V1 migration lane is exact-principal scoped, expiring, and ignores historical untagged rows. Registry V2 remains
+  disabled until the explicit backend/iOS/purge acknowledgements in `API.md` and `DEPLOY.md` are satisfied.
 - **Backends/adapters (done):** `src/lambda.mjs` (API Gateway HTTP API v2 ⇄ gateway, base64 binary, DPoP url/method), `src/tts.mjs` (ElevenLabs backend; key server-side only, `fetch` injected), `src/app.mjs` (deploy composition → `createLambda(env, deps)`).
-- **Device Registry V2 (done in source):** installation-global monotonic generation heads use Dynamo conditional
-  writes; targets use the verifier's full principal namespace while membership remains human-ID based. Bounded
-  target-slot reservations and one global, topic/environment-scoped APNs token claim are acquired before a head can
-  change, so a cap/duplicate-token loser cannot strand its prior binding; a synchronous token-claim loser also
-  conditionally releases its exact earlier target reservation without erasing a same-generation sibling retry.
-  Installation/target/token values are
-  HMAC-derived, while the raw APNs token is confined to its generation-specific expiring lease. Unregister advances to
-  a durable tombstone and conditionally releases only the exact token owner. Lookup and pre-send revalidation require
-  index, head, lease, and token claim to agree. A durable token claim also prevents a migrated token from resurfacing
-  through V1. New V1 compatibility rows are tagged and keyed by the same full principal; historical untagged rows fail
-  closed rather than becoming cross-site authority. Distinct scoped legacy devices can remain during the grace window.
 - **Writeback (done):** governed writeback (snapshot-frozen deterministic target → single-use confirm bound to proposal hash → server-time freshness → reserve-before-post exactly-once → `sl session reply` → read-back verify → signed `ActionReceipt`; offline ⇒ `pendingConnectivity`). Live-proven twice.
 - **Open (deploy/cross-lane):** DynamoDB table/TTL + IAM + AWS creds; Registry V1 row purge + HMAC secret; real APNs
   VoIP transport; JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled
@@ -62,24 +49,3 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 ```
 cd services/pocket-gateway && node --test
 ```
-
-## Registry V2 rollout
-
-Set `DIAL_REGISTRY_HMAC_KEY` to independent high-entropy secret material of at least 32 bytes. Set the non-secret
-`DIAL_REGISTRY_TOKEN_SCOPE` to the exact APNs topic/environment namespace, for example
-`com.plexaura.sentipocket.app:development`; production refuses to enable V2 without it. Rotate either only with an
-explicit registry migration because changing them changes derived ownership keys. During rollout, V1 registration and
-lookup remain enabled by default, but only for new exact-principal-tagged V1 rows; historical human-only rows are not
-accepted because their originating site cannot be proven. Once supported iOS builds have renewed onto V2, set:
-
-```text
-DIAL_REGISTRY_V2_REQUIRED=1
-DIAL_REGISTRY_TOKEN_SCOPE=com.plexaura.sentipocket.app:development
-DIAL_REGISTRY_ALLOW_V1=0
-DIAL_REGISTRY_READ_V1=0
-```
-
-`DIAL_REGISTRY_V2_REQUIRED=1` makes a missing HMAC key a boot error; any configured HMAC key makes a missing token
-scope a boot error. Durable V2 installation heads, token migration claims, and CAS records must not receive a Dynamo
-TTL. Leases and short reservations enforce logical expiry even while physical records remain. The table role needs the
-existing Get/Put/Delete actions plus permission for conditional `PutItem`.
