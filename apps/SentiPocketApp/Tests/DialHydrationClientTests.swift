@@ -5,7 +5,7 @@ import PocketContracts
 /// Locks DialHydrationClient — the single authed-fetch seam (`hydrate(_:) -> RenderableRing`) the crew converged on
 /// (warden + relay: 410-correct + contract-complete). Uses a URLProtocol stub (forge's DialSignalClient #97 pattern)
 /// + the injectable tokenProvider, so the fetch is hermetic. Covers: RICH passthrough (no fetch), LEAN fetch+merge,
-/// the full status taxonomy (410→unavailable / 401→notAuthorized / 5xx→retryable), substitution refusal, no-token.
+/// the full status taxonomy (410→unavailable / 401→reauthentication / 5xx→retryable), substitution refusal, no-token.
 final class HydrationStubURLProtocol: URLProtocol {
     static let lock = NSLock()
     static var responder: ((URLRequest) -> (HTTPURLResponse, Data))?
@@ -40,14 +40,21 @@ final class DialHydrationClientTests: XCTestCase {
     }
 
     private func makeClient(token: String = "tok123",
-                            responder: @escaping (URLRequest) -> (HTTPURLResponse, Data)) -> DialHydrationClient {
+                             tokenProvider: (() -> String?)? = nil,
+                             onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in },
+                             responder: @escaping (URLRequest) -> (HTTPURLResponse, Data)) -> DialHydrationClient {
         HydrationStubURLProtocol.lock.lock()
         HydrationStubURLProtocol.responder = responder
         HydrationStubURLProtocol.lastRequest = nil
         HydrationStubURLProtocol.lock.unlock()
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [HydrationStubURLProtocol.self]
-        return DialHydrationClient(apiBaseURL: base, urlSession: URLSession(configuration: cfg), tokenProvider: { token.isEmpty ? nil : token })
+        return DialHydrationClient(
+            apiBaseURL: base,
+            urlSession: URLSession(configuration: cfg),
+            tokenProvider: tokenProvider ?? { token.isEmpty ? nil : token },
+            onReauthenticationRequired: onReauthenticationRequired
+        )
     }
 
     private func http(_ url: URL, _ code: Int) -> HTTPURLResponse {
@@ -97,9 +104,31 @@ final class DialHydrationClientTests: XCTestCase {
         await expect(client, .needsHydration(id: "need_1", core: core()), .unavailable)  // uniform gone — never distinguished
     }
 
-    func test_401_is_notAuthorized() async {
-        let client = makeClient { (self.http($0.url!, 401), Data("{}".utf8)) }
-        await expect(client, .needsHydration(id: "need_1", core: core()), .notAuthorized)
+    func test_401_requires_reauthentication_and_signals_the_request_token() async {
+        let signal = HydrationAuthSignal()
+        let client = makeClient(
+            onReauthenticationRequired: { signal.record($0) },
+            responder: { (self.http($0.url!, 401), Data("{}".utf8)) }
+        )
+        await expect(client, .needsHydration(id: "need_1", core: core()), .reauthenticationRequired)
+        XCTAssertEqual(signal.tokens, ["tok123"])
+    }
+
+    func test_late_401_for_an_old_token_is_superseded_without_auth_signal() async {
+        let token = HydrationTokenSequence(["principal-A", "principal-B"])
+        let signal = HydrationAuthSignal()
+        let client = makeClient(
+            tokenProvider: { token.next() },
+            onReauthenticationRequired: { signal.record($0) },
+            responder: { (self.http($0.url!, 401), Data("{}".utf8)) }
+        )
+
+        await expect(
+            client,
+            .needsHydration(id: "need_1", core: core()),
+            .supersededAuthentication
+        )
+        XCTAssertEqual(signal.tokens, [])
     }
 
     func test_5xx_is_retryable() async {
@@ -135,5 +164,41 @@ final class DialHydrationClientTests: XCTestCase {
         let client = makeClient { (self.http($0.url!, 200), self.signalJSON) }
         await expect(client, .rejected(reason: "bad version"), .rejected("bad version"))
         XCTAssertNil(HydrationStubURLProtocol.lastRequest, "a rejected push must NOT hit the network")
+    }
+}
+
+private final class HydrationAuthSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedTokens: [String?] = []
+
+    var tokens: [String?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedTokens
+    }
+
+    func record(_ token: String?) {
+        lock.lock()
+        storedTokens.append(token)
+        lock.unlock()
+    }
+}
+
+private final class HydrationTokenSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let values: [String]
+    private var index = 0
+
+    init(_ values: [String]) {
+        self.values = values
+    }
+
+    func next() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !values.isEmpty else { return nil }
+        let value = values[min(index, values.count - 1)]
+        index += 1
+        return value
     }
 }
