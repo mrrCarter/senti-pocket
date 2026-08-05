@@ -11,7 +11,7 @@ const FULL_ENV = {
   GATEWAY_PUBLIC_URL: 'https://pocket-api.sentinelayer.com',
   SENTI_API_BASE_URL: 'https://api.sentinelayer.com',
 };
-const FULL_DEPS = { dynamoClient: {}, signingKey: generateKeyPairSync('ed25519').privateKey, knownSessionIdsFor: async () => [], fetch: async () => ({ ok: true, status: 200, text: async () => '{}' }) };
+const FULL_DEPS = { dynamoClient: {}, signingKey: generateKeyPairSync('ed25519').privateKey, fetch: async () => ({ ok: true, status: 200, text: async () => '{}' }) };
 const V2_ENV = {
   ...FULL_ENV,
   DEVICE_REGISTRY_MODE: 'v2',
@@ -52,7 +52,6 @@ test('createProdGateway FAILS BOOT on any missing production binding', () => {
 test('createProdGateway FAILS BOOT on missing/empty deps', () => {
   assert.throws(() => createProdGateway(FULL_ENV, {}), /prod deps missing/);
   assert.throws(() => createProdGateway(FULL_ENV, { ...FULL_DEPS, dynamoClient: undefined }), /prod deps missing/, 'missing dynamoClient fails boot');
-  assert.throws(() => createProdGateway(FULL_ENV, { ...FULL_DEPS, knownSessionIdsFor: undefined }), /prod deps missing/);
   assert.throws(() => createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: undefined }), /prod deps missing/, 'missing fetch fails boot (human-write client needs it)');
 });
 
@@ -196,9 +195,23 @@ test('createProdGateway Registry V2 requires mode, migration gates, secret, and 
 
 // DIAL-ME prod wiring: a valid session must reach /dial* (pocket:dial in the verifier's granted set), the device binds
 // under the VERIFIED identity, and /dial rings via deps.apnsSend — else honestly 501.
-const dialFetch = (id = 'u1') => async (url) => (String(url).includes('/auth/me')
-  ? { ok: true, status: 200, json: async () => ({ id }) }
-  : { ok: true, status: 200, json: async () => ({}), text: async () => '{}' });
+const dialFetch = (id = 'u1', role = 'owner') => async (url) => {
+  const href = String(url);
+  if (href.includes('/auth/me')) return new Response(JSON.stringify({ id }), { status: 200 });
+  if (href.includes('/membership')) {
+    const encoded = href.split('/sessions/')[1].split('/membership')[0];
+    const sessionId = decodeURIComponent(encoded);
+    return new Response(JSON.stringify({ sessionId, membershipRole: role }), {
+      status: 200,
+      headers: {
+        'content-type': 'application/json',
+        'cache-control': 'no-store',
+        pragma: 'no-cache',
+      },
+    });
+  }
+  return new Response('{}', { status: 200 });
+};
 
 test('createProdGateway wires DIAL-ME: /dial/register binds under the VERIFIED humanId; /dial rings via apnsSend', async () => {
   const registered = [];
@@ -207,7 +220,7 @@ test('createProdGateway wires DIAL-ME: /dial/register binds under the VERIFIED h
     async lookup({ humanId, sessionId }) { return registered.filter((d) => d.humanId === humanId && d.sessionId === sessionId).map((d) => ({ voipToken: d.voipToken, platform: d.platform })); },
   };
   const apnsSent = [];
-  const gw = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), knownSessionIdsFor: async () => ['sess-1'], deviceRegistry, apnsSend: async (a) => { apnsSent.push(a); return { delivered: true }; } });
+  const gw = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), deviceRegistry, apnsSend: async (a) => { apnsSent.push(a); return { delivered: true }; } });
   const reg = await gw.handle({ method: 'POST', path: '/dial/register', headers: { authorization: 'Bearer t' }, body: { voipToken: 'tok', sessionId: 'sess-1' } });
   assert.equal(reg.status, 200, 'a valid session reaches /dial/register (pocket:dial is granted)');
   assert.equal(registered[0].humanId, 'u1', 'device bound to the /auth/me identity, never the body');
@@ -218,7 +231,7 @@ test('createProdGateway wires DIAL-ME: /dial/register binds under the VERIFIED h
 
 test('createProdGateway: /dial honestly 501s without apnsSend, but /dial/register still records', async () => {
   const deviceRegistry = { async register() { return { deviceCount: 1 }; }, async lookup() { return []; } };
-  const gw = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), knownSessionIdsFor: async () => ['sess-1'], deviceRegistry }); // NO apnsSend
+  const gw = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), deviceRegistry }); // NO apnsSend
   assert.equal((await gw.handle({ method: 'POST', path: '/dial/register', headers: { authorization: 'Bearer t' }, body: { voipToken: 'tok', sessionId: 'sess-1' } })).status, 200, 'register works before APNs is wired');
   const dial = await gw.handle({ method: 'POST', path: '/dial', headers: { authorization: 'Bearer t2' }, body: { message: 'ring', sessionId: 'sess-1' } });
   assert.equal(dial.status, 501, 'no apnsSend -> pushBackend undefined -> dial-not-configured');

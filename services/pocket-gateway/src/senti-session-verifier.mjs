@@ -6,8 +6,8 @@
 // it can confirm "this token is a real user session for humanId X" but can never mint a session for anyone.
 //
 // Drop-in for the gateway's verifyToken(headers): returns { humanId, principal, scopes, site, tokenClaims } or null
-// (fail-closed). The gateway then uses humanId for its existing membership lookup (knownSessionIdsFor) + forwards the
-// SAME token downstream to /human-message (one native token end-to-end).
+// (fail-closed). Production then probes the exact target role under this SAME bearer (never under humanId) and forwards
+// it downstream only for the governed /human-message write: one native token end-to-end.
 
 import { createHash } from 'node:crypto';
 import { timeoutSignal } from './http-timeout.mjs';
@@ -19,8 +19,8 @@ import { timeoutSignal } from './http-timeout.mjs';
 // one TTL at worst, immediately once the cache entry lapses.
 const DEFAULT_CACHE_TTL_MS = 20_000;
 // A validated user session is not scope-limited on its OWN data, so it gets the full Pocket scope set. NOTE: this makes
-// each route's hasScope() gate effectively always-true for a valid session — the REAL per-write authz is MEMBERSHIP
-// (knownSessionIdsFor + the /execute membership precheck), not scope granularity. Correct for the native-door model.
+// each route's hasScope() gate effectively always-true for a valid session — the REAL per-write authz is the bearer-
+// bound target role plus the /execute contributor precheck, not scope granularity. Correct for the native-door model.
 // The FULL Pocket scope set — MUST list every SCOPES value handlers.mjs gates on (sync/execute/tts/dial), else a valid
 // session 403s on that route. pocket:dial was added with DIAL-ME; omitting it here made /dial + /dial/register
 // unreachable in prod despite a valid session. Keep in sync with createGateway's SCOPES.

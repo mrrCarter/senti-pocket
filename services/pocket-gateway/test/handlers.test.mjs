@@ -354,6 +354,8 @@ test('GET /dial?id=: member gets the FULL stored NeedCarterSignal (the exact obj
   const r = await gw.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: { authorization: 'Bearer dial' } });
   assert.equal(r.status, 200);
   assert.deepEqual(r.body, DIAL_SIGNAL, 'the full signal is returned verbatim for hydration');
+  assert.equal(r.headers['cache-control'], 'no-store');
+  assert.equal(r.headers.pragma, 'no-cache');
 });
 
 test('GET /dial?id=: absent/expired signal -> 410 gone (honest unavailable, never a fabricated signal)', async () => {
@@ -361,6 +363,8 @@ test('GET /dial?id=: absent/expired signal -> 410 gone (honest unavailable, neve
   const r = await gw.handle({ method: 'GET', path: '/dial', query: { id: 'need_missing' }, headers: { authorization: 'Bearer dial' } });
   assert.equal(r.status, 410);
   assert.equal(r.body.reason, 'gone');
+  assert.equal(r.headers['cache-control'], 'no-store');
+  assert.equal(r.headers.pragma, 'no-cache');
 });
 
 test('GET /dial?id=: non-member gets the SAME 410 (opaque-id: no existence oracle for a signal you cannot access)', async () => {
@@ -368,6 +372,8 @@ test('GET /dial?id=: non-member gets the SAME 410 (opaque-id: no existence oracl
   const r = await nonMember.handle({ method: 'GET', path: '/dial', query: { id: 'need_1' }, headers: { authorization: 'Bearer dial' } });
   assert.equal(r.status, 410, 'non-member is indistinguishable from absent (410), not 403 — closes the id-validity oracle');
   assert.equal(r.body.reason, 'gone');
+  assert.equal(r.headers['cache-control'], 'no-store');
+  assert.equal(r.headers.pragma, 'no-cache');
 });
 
 test('GET /dial?id=: fail-closed on scope / auth / id / store', async () => {
