@@ -26,6 +26,16 @@ public struct InstalledWhisperModel: Equatable, Sendable {
     }
 }
 
+/// Ordered, best-effort progress emitted while a pinned local model is installed.
+///
+/// Callbacks run on the store's detached worker. UI callers should hop to `MainActor` before
+/// mutating presentation state. A thrown or cancelled install emits no phases after it terminates.
+public enum WhisperModelInstallProgress: Equatable, Sendable {
+    case copying(completed: Int64, total: Int64)
+    case verifying
+    case finishing
+}
+
 /// Sanitized import failures. Cases deliberately carry no selected-file or container paths.
 public enum WhisperModelStoreError: Error, Equatable, Sendable {
     case invalidStoreURL
@@ -41,6 +51,7 @@ public enum WhisperModelStoreError: Error, Equatable, Sendable {
     case storageUnavailable
     case storagePolicyFailed
     case commitFailed
+    case removalFailed
     case installationInProgress
     case cancelled
 }
@@ -74,10 +85,12 @@ extension WhisperModelStoreError: LocalizedError {
             return "The speech model could not be protected on this device"
         case .commitFailed:
             return "The verified speech model could not be installed"
+        case .removalFailed:
+            return "The speech model could not be removed"
         case .installationInProgress:
-            return "A speech-model import is already in progress"
+            return "A speech-model store operation is already in progress"
         case .cancelled:
-            return "Speech-model import was cancelled"
+            return "The speech-model store operation was cancelled"
         }
     }
 }
@@ -166,7 +179,10 @@ public actor WhisperModelStore {
 
     /// Imports a user-selected local file. A second import is refused while the detached bounded
     /// copy is active; actor reentrancy cannot create two committers for the same canonical leaf.
-    public func installLocalFile(at sourceURL: URL) async throws -> InstalledWhisperModel {
+    public func installLocalFile(
+        at sourceURL: URL,
+        progress: @escaping @Sendable (WhisperModelInstallProgress) -> Void = { _ in }
+    ) async throws -> InstalledWhisperModel {
         guard activeTransactionID == nil else {
             throw WhisperModelStoreError.installationInProgress
         }
@@ -186,7 +202,8 @@ public actor WhisperModelStore {
                 sourceURL: sourceURL,
                 rootDirectory: root,
                 descriptor: pinned,
-                hooks: transactionHooks
+                hooks: transactionHooks,
+                progress: progress
             )
         }
 
@@ -203,6 +220,48 @@ public actor WhisperModelStore {
             }
         )
     }
+
+    /// Durably removes the canonical model if present.
+    ///
+    /// The operation is idempotent. Success means the canonical leaf is absent and the anchored
+    /// store directory has been synchronized. The private store directory and transaction lock
+    /// remain in place so removal serializes with a simultaneous first install.
+    public func removeInstalledModel() async throws {
+        guard activeTransactionID == nil else {
+            throw WhisperModelStoreError.installationInProgress
+        }
+        let transactionID = UUID()
+        activeTransactionID = transactionID
+        defer {
+            if activeTransactionID == transactionID {
+                activeTransactionID = nil
+            }
+        }
+
+        let root = rootDirectory
+        let pinned = descriptor
+        let transactionHooks = hooks
+        let worker = Task.detached(priority: .userInitiated) {
+            try Transaction.removeInstalled(
+                rootDirectory: root,
+                descriptor: pinned,
+                hooks: transactionHooks
+            )
+        }
+
+        try await withTaskCancellationHandler(
+            operation: {
+                do {
+                    try await worker.value
+                } catch is CancellationError {
+                    throw WhisperModelStoreError.cancelled
+                }
+            },
+            onCancel: {
+                worker.cancel()
+            }
+        )
+    }
 }
 
 extension WhisperModelStore {
@@ -210,6 +269,31 @@ extension WhisperModelStore {
         let didOpenSource: @Sendable () -> Void
         let didCopyChunk: @Sendable (Int64) -> Void
         let didFinishCopy: @Sendable () -> Void
+        let didAcquireRemovalLease: @Sendable () -> Void
+        let willRemoveCanonical: @Sendable () -> Void
+        let willUnlinkCanonical: @Sendable () -> Void
+        let didUnlinkCanonical: @Sendable () -> Void
+        let didSynchronizeRemovalDirectory: @Sendable () -> Void
+
+        init(
+            didOpenSource: @escaping @Sendable () -> Void,
+            didCopyChunk: @escaping @Sendable (Int64) -> Void,
+            didFinishCopy: @escaping @Sendable () -> Void,
+            didAcquireRemovalLease: @escaping @Sendable () -> Void = {},
+            willRemoveCanonical: @escaping @Sendable () -> Void = {},
+            willUnlinkCanonical: @escaping @Sendable () -> Void = {},
+            didUnlinkCanonical: @escaping @Sendable () -> Void = {},
+            didSynchronizeRemovalDirectory: @escaping @Sendable () -> Void = {}
+        ) {
+            self.didOpenSource = didOpenSource
+            self.didCopyChunk = didCopyChunk
+            self.didFinishCopy = didFinishCopy
+            self.didAcquireRemovalLease = didAcquireRemovalLease
+            self.willRemoveCanonical = willRemoveCanonical
+            self.willUnlinkCanonical = willUnlinkCanonical
+            self.didUnlinkCanonical = didUnlinkCanonical
+            self.didSynchronizeRemovalDirectory = didSynchronizeRemovalDirectory
+        }
 
         static let production = Hooks(
             didOpenSource: {},
@@ -228,7 +312,8 @@ extension WhisperModelStore {
             sourceURL: URL,
             rootDirectory: URL,
             descriptor: WhisperModelDescriptor,
-            hooks: Hooks
+            hooks: Hooks,
+            progress: @escaping @Sendable (WhisperModelInstallProgress) -> Void
         ) async throws -> InstalledWhisperModel {
             try checkCancellation()
             guard sourceURL.isFileURL else {
@@ -280,15 +365,18 @@ extension WhisperModelStore {
             stagingExists = true
 
             try requireLocallyMaterializedSource(sourceURL)
+            progress(.copying(completed: 0, total: descriptor.byteCount))
 
             try await coordinatedCopy(
                 sourceURL: sourceURL,
                 stagingFD: stagingFD,
                 descriptor: descriptor,
-                hooks: hooks
+                hooks: hooks,
+                progress: progress
             )
             try synchronize(stagingFD)
 
+            progress(.verifying)
             let stagedIdentity: WhisperFileIdentity
             do {
                 stagedIdentity = try WhisperModelVerifier.verifyFileDescriptor(
@@ -300,6 +388,7 @@ extension WhisperModelStore {
             } catch {
                 throw WhisperModelStoreError.digestMismatch
             }
+            progress(.finishing)
             try applyInstalledPolicy(
                 to: stagingURL,
                 named: stagingLeaf,
@@ -342,6 +431,85 @@ extension WhisperModelStore {
                 descriptor: descriptor,
                 fileIdentity: stagedIdentity
             )
+        }
+
+        static func removeInstalled(
+            rootDirectory: URL,
+            descriptor: WhisperModelDescriptor,
+            hooks: Hooks
+        ) throws {
+            try checkCancellation()
+            let directory = try openPrivateDirectory(rootDirectory, create: true)
+            defer {
+                _ = Darwin.close(directory.root)
+                _ = Darwin.close(directory.parent)
+            }
+            try applyDirectoryPolicy(to: rootDirectory, directory: directory)
+            let transactionLease = try acquireTransactionLock(in: directory.root)
+            defer { releaseTransactionLock(transactionLease) }
+            hooks.didAcquireRemovalLease()
+
+            try checkCancellation()
+            let leaf = descriptor.fileName
+            let canonicalURL = rootDirectory.appendingPathComponent(leaf, isDirectory: false)
+            guard let initialIdentity = try removableAnchoredEntry(
+                at: canonicalURL,
+                named: leaf,
+                rootDirectory: rootDirectory,
+                directory: directory
+            ) else {
+                try synchronizeMissingRemoval(
+                    rootDirectory: rootDirectory,
+                    directory: directory,
+                    leaf: leaf,
+                    hooks: hooks
+                )
+                return
+            }
+            hooks.willRemoveCanonical()
+            try checkCancellation()
+            guard let finalIdentity = try removableAnchoredEntry(
+                at: canonicalURL,
+                named: leaf,
+                rootDirectory: rootDirectory,
+                directory: directory
+            ), finalIdentity.refersToSameFile(as: initialIdentity) else {
+                throw WhisperModelStoreError.removalFailed
+            }
+            try checkCancellation()
+            hooks.willUnlinkCanonical()
+
+            var unlinkedCanonical = false
+            while true {
+                let result = leaf.withCString { Darwin.unlinkat(directory.root, $0, 0) }
+                let unlinkError = errno
+                if result == 0 {
+                    unlinkedCanonical = true
+                    break
+                }
+                if unlinkError == EINTR { continue }
+                if unlinkError == ENOENT { break }
+                throw WhisperModelStoreError.removalFailed
+            }
+            if unlinkedCanonical {
+                hooks.didUnlinkCanonical()
+            }
+
+            // The point of no return has passed. Do not turn caller cancellation into a false
+            // claim that the still-required durability/postcondition work was skipped.
+            do {
+                try synchronize(directory.root)
+                hooks.didSynchronizeRemovalDirectory()
+                try requireDirectoryAnchor(rootDirectory, directory: directory)
+                guard try relativeIdentity(in: directory.root, named: leaf) == nil else {
+                    throw WhisperModelStoreError.removalFailed
+                }
+                try requireDirectoryAnchor(rootDirectory, directory: directory)
+            } catch let error as WhisperModelStoreError where error == .invalidStoreURL {
+                throw error
+            } catch {
+                throw WhisperModelStoreError.removalFailed
+            }
         }
 
         static func verifyInstalled(
@@ -651,7 +819,8 @@ extension WhisperModelStore {
             sourceURL: URL,
             stagingFD: Int32,
             descriptor: WhisperModelDescriptor,
-            hooks: Hooks
+            hooks: Hooks,
+            progress: @escaping @Sendable (WhisperModelInstallProgress) -> Void
         ) async throws {
             let state = CoordinationState()
             try await withTaskCancellationHandler(
@@ -667,7 +836,8 @@ extension WhisperModelStore {
                                 coordinatedSourceURL: coordinatedURL,
                                 stagingFD: stagingFD,
                                 descriptor: descriptor,
-                                hooks: hooks
+                                hooks: hooks,
+                                progress: progress
                             )
                         })
                     }
@@ -731,7 +901,8 @@ extension WhisperModelStore {
             coordinatedSourceURL: URL,
             stagingFD: Int32,
             descriptor: WhisperModelDescriptor,
-            hooks: Hooks
+            hooks: Hooks,
+            progress: @Sendable (WhisperModelInstallProgress) -> Void
         ) throws {
             let pathIdentityBefore: POSIXFileIdentity
             do {
@@ -781,6 +952,12 @@ extension WhisperModelStore {
                 }
                 try writeAll(stagingFD, bytes: buffer, count: count)
                 hooks.didCopyChunk(observedByteCount)
+                progress(
+                    .copying(
+                        completed: observedByteCount,
+                        total: descriptor.byteCount
+                    )
+                )
                 try checkCancellation()
             }
             guard observedByteCount == descriptor.byteCount else {
@@ -1086,6 +1263,57 @@ extension WhisperModelStore {
                 throw WhisperModelStoreError.storagePolicyFailed
             }
             try requireDirectoryAnchor(rootDirectory, directory: directory)
+        }
+
+        private static func removableAnchoredEntry(
+            at url: URL,
+            named leaf: String,
+            rootDirectory: URL,
+            directory: DirectoryDescriptors
+        ) throws -> POSIXFileIdentity? {
+            do {
+                try requireDirectoryAnchor(rootDirectory, directory: directory)
+                let entry = try relativeIdentity(in: directory.root, named: leaf)
+                let path = try pathIdentity(url)
+                guard entry != nil || path != nil else { return nil }
+                guard let entry,
+                      let path,
+                      entry.refersToSameFile(as: path),
+                      entry.isOwnedRegularFile,
+                      path.isOwnedRegularFile else {
+                    throw WhisperModelStoreError.removalFailed
+                }
+                try requireDirectoryAnchor(rootDirectory, directory: directory)
+                return entry
+            } catch let error as WhisperModelStoreError where error == .invalidStoreURL {
+                throw error
+            } catch let error as WhisperModelStoreError where error == .removalFailed {
+                throw error
+            } catch {
+                throw WhisperModelStoreError.removalFailed
+            }
+        }
+
+        private static func synchronizeMissingRemoval(
+            rootDirectory: URL,
+            directory: DirectoryDescriptors,
+            leaf: String,
+            hooks: Hooks
+        ) throws {
+            do {
+                try requireDirectoryAnchor(rootDirectory, directory: directory)
+                try synchronize(directory.root)
+                hooks.didSynchronizeRemovalDirectory()
+                try requireDirectoryAnchor(rootDirectory, directory: directory)
+                guard try relativeIdentity(in: directory.root, named: leaf) == nil else {
+                    throw WhisperModelStoreError.removalFailed
+                }
+                try requireDirectoryAnchor(rootDirectory, directory: directory)
+            } catch let error as WhisperModelStoreError where error == .invalidStoreURL {
+                throw error
+            } catch {
+                throw WhisperModelStoreError.removalFailed
+            }
         }
 
         private static func pathIdentity(_ url: URL) throws -> POSIXFileIdentity? {
