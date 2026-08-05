@@ -11,6 +11,8 @@ import PocketSyncClient
 @main
 struct SentiPocketApp: App {
     @Environment(\.scenePhase) private var scenePhase
+    /// Device-local model ownership is app-lifetime and deliberately independent of authentication.
+    @StateObject private var whisperModel = WhisperModelProvisioningCoordinator()
     #if DEBUG
     @StateObject private var model = PocketAppModel()
     #endif
@@ -30,6 +32,7 @@ struct SentiPocketApp: App {
     var body: some Scene {
         WindowGroup {
             rootView
+                .onAppear { whisperModel.start() }
             #if canImport(CallKit) && canImport(PushKit)
                 // The host is app-lifetime, but it constructs PushKit/CallKit only with a valid trusted gateway config.
                 .environmentObject(dialHost)
@@ -94,13 +97,15 @@ struct SentiPocketApp: App {
 
     @ViewBuilder private var rootView: some View {
         #if DEBUG
-        RootAppView(model: model)
+        RootAppView(model: model, whisperModelCoordinator: whisperModel)
         #else
         // WARDEN gate #1 (322268): the authed surfaces are unreachable until a REAL token is stored.
         if signIn.isAuthenticated {
             #if canImport(CallKit) && canImport(PushKit)
             AuthenticatedRootView(
                 authenticationEpoch: signIn.authenticationEpoch,
+                whisperModelCoordinator: whisperModel,
+                onSignOut: { signIn.send(.signOut) },
                 onReauthenticationRequired: { expectedEpoch in
                     guard signIn.isCurrentAuthentication(expectedEpoch) else { return }
                     signIn.invalidateAuthentication(expectedEpoch: expectedEpoch)
@@ -114,6 +119,8 @@ struct SentiPocketApp: App {
             #else
             AuthenticatedRootView(
                 authenticationEpoch: signIn.authenticationEpoch,
+                whisperModelCoordinator: whisperModel,
+                onSignOut: { signIn.send(.signOut) },
                 onReauthenticationRequired: { expectedEpoch in
                     signIn.invalidateAuthentication(expectedEpoch: expectedEpoch)
                 }
@@ -150,11 +157,16 @@ private struct AuthenticatedRootView: View {
     @StateObject private var checkpointPocket: CheckpointPocketCoordinator
     @StateObject private var checkpointNarrationRevocation: VerifiedCheckpointNarrationRevocationRelay
     @StateObject private var revocationRelay: AuthenticatedSessionRevocationRelay
+    @ObservedObject private var whisperModelCoordinator: WhisperModelProvisioningCoordinator
     @State private var selectedTab: PocketTab = .sessions
+    @State private var presentsSettings = false
     private let authenticationRevision: UInt64
+    private let onSignOut: @MainActor () -> Void
 
     init(
         authenticationEpoch: UInt64,
+        whisperModelCoordinator: WhisperModelProvisioningCoordinator,
+        onSignOut: @escaping @MainActor () -> Void,
         onReauthenticationRequired: @escaping @MainActor @Sendable (UInt64) -> Void,
         onSessionSelectionChanged: @escaping @MainActor (UInt64, String?) -> Void = { _, _ in }
     ) {
@@ -226,7 +238,9 @@ private struct AuthenticatedRootView: View {
         _checkpointPocket = StateObject(wrappedValue: checkpointPocket)
         _checkpointNarrationRevocation = StateObject(wrappedValue: checkpointNarrationRevocation)
         _revocationRelay = StateObject(wrappedValue: revocationRelay)
+        _whisperModelCoordinator = ObservedObject(wrappedValue: whisperModelCoordinator)
         self.authenticationRevision = authenticationEpoch
+        self.onSignOut = onSignOut
     }
 
     var body: some View {
@@ -239,6 +253,18 @@ private struct AuthenticatedRootView: View {
                         if case .selectSession(let sessionId) = intent,
                            sessions.selectedSessionId == sessionId {
                             selectedTab = .pocket
+                        }
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button {
+                                presentsSettings = true
+                            } label: {
+                                Label("Settings", systemImage: "gearshape")
+                                    .labelStyle(.iconOnly)
+                            }
+                            .accessibilityLabel("Settings")
+                            .accessibilityIdentifier("sessions.settings")
                         }
                     }
                 }
@@ -266,6 +292,15 @@ private struct AuthenticatedRootView: View {
             if isActive {
                 selectedTab = .pocket
             }
+        }
+        .sheet(isPresented: $presentsSettings) {
+            WhisperModelSettingsView(
+                coordinator: whisperModelCoordinator,
+                onSignOut: {
+                    presentsSettings = false
+                    onSignOut()
+                }
+            )
         }
         .onAppear {
             checkpointPocket.setSelectedSession(
@@ -635,12 +670,32 @@ private enum UnavailableSessionReasoningError: LocalizedError {
 /// DEBUG uses the canonical verified fixture and the in-module demo seam. Release never names that seam.
 private struct RootAppView: View {
     @ObservedObject var model: PocketAppModel
+    @ObservedObject var whisperModelCoordinator: WhisperModelProvisioningCoordinator
+    @State private var presentsSettings = false
 
     var body: some View {
-        if model.verifiedBundle != nil {
-            PocketRootView(state: model.state, send: model.send)
-        } else {
-            RootView()
+        Group {
+            if model.verifiedBundle != nil {
+                PocketRootView(state: model.state, send: model.send)
+            } else {
+                RootView()
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            Button {
+                presentsSettings = true
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.circle)
+            .padding()
+            .accessibilityLabel("Settings")
+            .accessibilityIdentifier("debug.settings")
+        }
+        .sheet(isPresented: $presentsSettings) {
+            WhisperModelSettingsView(coordinator: whisperModelCoordinator)
         }
     }
 }
