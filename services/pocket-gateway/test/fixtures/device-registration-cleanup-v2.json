@@ -1,0 +1,58 @@
+{
+  "schema": "device-registration-cleanup-v2-kav",
+  "version": 2,
+  "vectors": [
+    {
+      "name": "opaque-token-wire-string",
+      "voipTokenWireString": "private-routing-token",
+      "request": {
+        "registrationVersion": 2,
+        "ownerVersion": 1,
+        "ownerHandle": "Ph9rEW0mQRf8CLxVeoNbmwSvNmG1A2t67XWfGPqr-4c",
+        "installationId": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
+        "idempotencyKey": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "tokenDigest": "HWgRM-GkhXqtDURRILGi6vArh3ABV9w0KnLUmzTUe_8",
+        "sessionId": "session-v2",
+        "platform": "apns"
+      },
+      "successResponse": {
+        "registrationVersion": 2,
+        "ownerVersion": 1,
+        "ownerHandle": "Ph9rEW0mQRf8CLxVeoNbmwSvNmG1A2t67XWfGPqr-4c",
+        "idempotencyKey": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "sessionId": "session-v2",
+        "platform": "apns",
+        "registered": false,
+        "authorized": false,
+        "cleanupComplete": true,
+        "serverTime": "2026-02-02T02:40:00.000Z"
+      }
+    },
+    {
+      "name": "pushkit-hex-wire-string",
+      "voipTokenWireString": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "request": {
+        "registrationVersion": 2,
+        "ownerVersion": 1,
+        "ownerHandle": "Ph9rEW0mQRf8CLxVeoNbmwSvNmG1A2t67XWfGPqr-4c",
+        "installationId": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
+        "idempotencyKey": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "tokenDigest": "qK5ubukpq-o6_PxSWMjM1vhSc-DUYm0mxyefMlD3fI4",
+        "sessionId": "session-v2-hex",
+        "platform": "apns"
+      },
+      "successResponse": {
+        "registrationVersion": 2,
+        "ownerVersion": 1,
+        "ownerHandle": "Ph9rEW0mQRf8CLxVeoNbmwSvNmG1A2t67XWfGPqr-4c",
+        "idempotencyKey": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "sessionId": "session-v2-hex",
+        "platform": "apns",
+        "registered": false,
+        "authorized": false,
+        "cleanupComplete": true,
+        "serverTime": "2026-02-02T02:40:00.000Z"
+      }
+    }
+  ]
+}

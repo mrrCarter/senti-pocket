@@ -22,9 +22,21 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 - **API (done):** `src/handlers.mjs` (`GET /health`, `GET /sync`, `POST /actions/execute`, `POST /tts`). Fail-closed auth; per-human namespaced idempotency; cross-instance exactly-once writeback (durable in-flight reservation + content-based crash recovery).
 - **Auth (done):** `src/auth.mjs` — REAL AIdenID bearer verification: JWT signature against a JWKS, `iss/aud/exp/nbf`, RFC 8707 resource indicator, and DPoP proof-of-possession (RFC 9449 — thumbprint binding + `htm/htu/ath/iat` + single-use `jti` replay defense). Not a stub; JWKS/issuer/audience/resource are deploy config.
 - **Store (done):** `src/store.mjs` — async store: in-memory (dev/tests) + `createDynamoStore` (real conditional-put, OWNER-FENCED lock + `putIfAbsent` + TTL; deploy injects the `@aws-sdk/lib-dynamodb` client → package stays zero-dep) + `createStoreReplayGuard` (cross-instance DPoP jti single-use).
+- **Device Registry V2 (code-complete, deploy-unverified):** `src/device-registry-v2.mjs` — server-HMAC-keyed
+  installation, token-owner, and bounded target-directory authority moves atomically in DynamoDB without a GSI
+  correctness dependency. Stable owner handles, durable operation outcomes, exact binding/token-claim CAS fences,
+  displaced-owner eviction, ABA-safe directories, hard 20-installation admission, exact revoke, logical leases,
+  reclaim grace, stable-read fencing, and bounded serialization are covered hermetically. Pushes carry the server's
+  nested `v:2` binding fence and perform one bounded exact-route snapshot immediately before concurrent APNs fanout.
+  The V1 migration lane is exact-principal scoped, expiring, and ignores historical untagged rows. Registry V2 remains
+  disabled until the explicit backend/iOS/purge acknowledgements in `API.md` and `DEPLOY.md` are satisfied.
 - **Backends/adapters (done):** `src/lambda.mjs` (API Gateway HTTP API v2 ⇄ gateway, base64 binary, DPoP url/method), `src/tts.mjs` (ElevenLabs backend; key server-side only, `fetch` injected), `src/app.mjs` (deploy composition → `createLambda(env, deps)`).
 - **Writeback (done):** governed writeback (snapshot-frozen deterministic target → single-use confirm bound to proposal hash → server-time freshness → reserve-before-post exactly-once → `sl session reply` → read-back verify → signed `ActionReceipt`; offline ⇒ `pendingConnectivity`). Live-proven twice.
-- **Open (deploy/cross-lane):** DynamoDB table + IAM + AWS creds; JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled `sl` or senti API client); bind checkpoint provenance/`contentTrust` into the SIGNED bundle canonical (Atlas's contract); LLM-enriched summary prose (same grounded evidence); Swift client packages (need a Mac).
+- **Open (deploy/cross-lane):** DynamoDB table/TTL + IAM + AWS creds; Registry V1 row purge + HMAC secret; real APNs
+  VoIP transport; JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled
+  `sl` or senti API client); bind checkpoint provenance/`contentTrust` into the SIGNED bundle canonical (Atlas's
+  contract); LLM-enriched summary prose (same grounded evidence); Swift/Xcode build, simulator, device, and signing
+  validation on a Mac.
 
 ## Safety invariants (Relay-owned)
 - **Secret redaction is BEST-EFFORT, not a guarantee.** `scrub.mjs` is a known-format denylist + conservative high-entropy heuristics; it cannot prove content is secret-free (an arbitrary/natural-language secret survives). Mitigated by defense-in-depth: minimal-field projection + size bounds (`extract.mjs`), a **final egress scrub over every phone-visible string before signing** (`bundle.mjs`), and treating all residual content as untrusted. Raw room events never cross to the phone — only the summary + bounded evidence do.

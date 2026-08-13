@@ -12,6 +12,32 @@ const FULL_ENV = {
   SENTI_API_BASE_URL: 'https://api.sentinelayer.com',
 };
 const FULL_DEPS = { dynamoClient: {}, signingKey: generateKeyPairSync('ed25519').privateKey, knownSessionIdsFor: async () => [], fetch: async () => ({ ok: true, status: 200, text: async () => '{}' }) };
+const V2_ENV = {
+  ...FULL_ENV,
+  DEVICE_REGISTRY_MODE: 'v2',
+  DEVICE_REGISTRY_V1_PURGED: '1',
+  DEVICE_REGISTRY_CLIENT_V2_READY: '1',
+  DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY: '1',
+  DEVICE_REGISTRY_OPERATION_ADMISSION_READY: '1',
+  DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '1',
+  DEVICE_REGISTRY_HMAC_KEY_B64: Buffer.alloc(32, 0x51).toString('base64'),
+};
+const V2_DYNAMO = {
+  async get() { return {}; },
+  async put() { return {}; },
+  async delete() { return {}; },
+  async transactWrite() { return {}; },
+};
+const V2_REGISTRY = {
+  protocolVersion: 2,
+  operationOutcomeVersion: 1,
+  async registrationContext() { return { registrationVersion: 2, ownerVersion: 1, ownerHandle: Buffer.alloc(32).toString('base64url') }; },
+  async register() {},
+  async reconcileRegistration() { return null; },
+  async denyRegistration() { return { state: 'denied' }; },
+  async unregister() { return { removed: false }; },
+  async lookup() { return []; },
+};
 
 test('createProdGateway FAILS BOOT on any missing production binding', () => {
   assert.throws(() => createProdGateway({}, FULL_DEPS), /prod config missing/);
@@ -41,6 +67,108 @@ test('createProdGateway + createLambda boot with complete config', () => {
   const gw = createProdGateway(FULL_ENV, FULL_DEPS);
   assert.equal(typeof gw.handle, 'function');
   assert.equal(typeof createLambda(FULL_ENV, FULL_DEPS), 'function');
+});
+
+test('createProdGateway Registry V2 requires mode, migration gates, secret, and transactional client', () => {
+  assert.equal(typeof createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }).handle, 'function');
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_HMAC_KEY_B64: undefined }, {
+      ...FULL_DEPS, dynamoClient: V2_DYNAMO,
+    }),
+    /requires DEVICE_REGISTRY_HMAC_KEY_B64/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_V1_PURGED: '0' }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_V1_PURGED=1/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...V2_ENV,
+      DEVICE_REGISTRY_CLIENT_V2_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_CLIENT_V2_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...V2_ENV,
+      DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...V2_ENV,
+      DEVICE_REGISTRY_OPERATION_ADMISSION_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({
+      ...V2_ENV,
+      DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '0',
+    }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...FULL_ENV, DEVICE_REGISTRY_OWNER_CONTINUITY_READY: '1' }, FULL_DEPS),
+    /Registry V2 settings require DEVICE_REGISTRY_MODE=v2/,
+    'the owner-continuity gate is never accepted as a partial V1 setting',
+  );
+  assert.throws(
+    () => createProdGateway({ ...FULL_ENV, DEVICE_REGISTRY_HMAC_KEY_B64: V2_ENV.DEVICE_REGISTRY_HMAC_KEY_B64 }, FULL_DEPS),
+    /require DEVICE_REGISTRY_MODE=v2/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_MODE: 'dual' }, { ...FULL_DEPS, dynamoClient: V2_DYNAMO }),
+    /must be v1 or v2/,
+  );
+  assert.throws(
+    () => createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: { get() {}, put() {}, delete() {} } }),
+    /get, transactWrite/,
+  );
+  assert.throws(
+    () => createProdGateway({ ...V2_ENV, DEVICE_REGISTRY_TARGET_INDEX: 'obsolete' }, {
+      ...FULL_DEPS, dynamoClient: V2_DYNAMO,
+    }),
+    /DEVICE_REGISTRY_TARGET_INDEX is obsolete/,
+    'an old GSI setting fails boot instead of pretending it is still load-bearing',
+  );
+  assert.throws(
+    () => createProdGateway(FULL_ENV, {
+      ...FULL_DEPS,
+      deviceRegistry: { protocolVersion: 2, register() {}, unregister() {}, lookup() {} },
+    }),
+    /requires DEVICE_REGISTRY_MODE=v2/,
+    'an injected V2 implementation cannot bypass the migration mode/purge gate',
+  );
+  assert.throws(
+    () => createProdGateway(V2_ENV, {
+      ...FULL_DEPS,
+      deviceRegistry: { protocolVersion: 1, register() {}, lookup() {} },
+    }),
+    /requires a Registry V2 implementation/,
+  );
+  assert.equal(
+    typeof createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: V2_DYNAMO, deviceRegistry: V2_REGISTRY }).handle,
+    'function',
+  );
+  for (const missingCapability of [
+    'operationOutcomeVersion',
+    'registrationContext',
+    'register',
+    'reconcileRegistration',
+    'denyRegistration',
+    'unregister',
+    'lookup',
+  ]) {
+    const partial = { ...V2_REGISTRY };
+    delete partial[missingCapability];
+    assert.throws(
+      () => createProdGateway(V2_ENV, { ...FULL_DEPS, dynamoClient: V2_DYNAMO, deviceRegistry: partial }),
+      /requires operationOutcomeVersion=1 and registrationContext, register, reconcileRegistration, denyRegistration, unregister, lookup/,
+      `an injected V2 registry missing ${missingCapability} must fail production boot`,
+    );
+  }
 });
 
 // DIAL-ME prod wiring: a valid session must reach /dial* (pocket:dial in the verifier's granted set), the device binds

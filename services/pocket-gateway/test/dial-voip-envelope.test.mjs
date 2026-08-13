@@ -1,15 +1,19 @@
-// dial-voip-envelope.test.mjs — the CONFORMANCE LOCK on the one dial-ring seam with zero in-repo coverage: the shape of
-// the PKPushPayload.dictionaryPayload the deploy's apnsSend delivers to the phone. The gateway suite exercises a FAKE
-// apnsSend that only captures `payload`, so a REAL-transport envelope bug (nesting the DTO) can't be caught there. This
-// pins buildVoipPushDictionary to the contract SentiCallKit.receiveState enforces (reads id/who/callerName/… TOP-LEVEL,
-// ignores `aps`; nested DTO => top-level `id` absent => decode nil => every ring silently declines).
+// dial-voip-envelope.test.mjs — the CONFORMANCE LOCK for the final APNs dictionary handed to the deploy's transport.
+// createDialPushBackend now invokes buildVoipPushDictionary before apnsSend; these KAVs pin that helper to the contract
+// SentiCallKit.receiveState enforces (reads id/who/callerName/… TOP-LEVEL, ignores `aps`; nested DTO => top-level `id`
+// absent => decode nil => every ring silently declines).
 //
 // It ALSO pins the `who` CONTRACT (DialPayloadV1): `who` is the ring SOURCE ('senti-pocket'), NOT the requesting agent.
 // The requesting agent identity is `requestedBy`, kept AUTHED (hydrated via GET /dial?id=), never on the unauthenticated
 // push. These tests guard against re-threading requestedBy->who (a caller-spoof seam on the unauth push).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildDialPayload, buildVoipPushDictionary } from '../src/dial-registry.mjs';
+import {
+  buildDialPayload,
+  buildVoipPushDictionary,
+  DIAL_PAYLOAD_MAX_BYTES,
+  DIAL_PUSHKIT_CAP,
+} from '../src/dial-registry.mjs';
 import { mapSignalToPushInput } from '../src/need-carter-dial.mjs';
 
 const NOW = 1_770_000_000_000;
@@ -87,6 +91,36 @@ test('aps overrides merge; the dial fields are never clobbered by aps', () => {
   assert.equal(dict.aps['content-available'], 1);
   assert.equal(dict.aps['apns-priority'], 10);
   assert.equal(dict.id, 'need_a1', 'the dial id is untouched by the aps envelope');
+});
+
+test('Registry V2 near-boundary payload measures the FINAL aps-wrapped dictionary against the PushKit cap', () => {
+  const payload = buildDialPayload({
+    humanId: 'h',
+    sessionId: KNOWN,
+    message: 'M'.repeat(4000),
+    context: 'C'.repeat(400),
+    id: 'need_v2_boundary',
+    kind: 'info',
+    callerName: 'Senti needs you',
+    binding: {
+      v: 2,
+      id: 'bind_0123456789abcdef0123456789abcdef',
+      revision: Number.MAX_SAFE_INTEGER,
+    },
+  }, NOW);
+  const bareBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+  assert.equal(payload.v, 2);
+  assert.equal(payload.fetch, false);
+  assert.ok(bareBytes > 4_500 && bareBytes <= DIAL_PAYLOAD_MAX_BYTES,
+    `fixture must stay near the bare DTO boundary (got ${bareBytes})`);
+
+  const dictionary = buildVoipPushDictionary(payload, { 'content-available': 1 });
+  assert.ok(Buffer.byteLength(JSON.stringify(dictionary), 'utf8') <= DIAL_PUSHKIT_CAP);
+  assert.throws(
+    () => buildVoipPushDictionary(payload, { pad: 'x'.repeat(DIAL_PUSHKIT_CAP - bareBytes) }),
+    /final dictionary exceeds 5120-byte PushKit cap/,
+    'an unbounded aps extension cannot consume more than the reserved envelope budget',
+  );
 });
 
 test('fail-closed: a blank/nested/invalid payload throws (never emits a dead-id dictionary)', () => {

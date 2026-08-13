@@ -433,6 +433,24 @@ test('POST /dial/ring-owner: fail-closed — scope / auth / question / sessionId
   assert.equal((await nonMember.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'q', context: { sessionId: KNOWN } } })).status, 403, 'non-member -> 403');
   const noBackend = createGateway(baseDeps({ verifyToken: dialVerify }));
   assert.equal((await noBackend.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: 'q', context: { sessionId: KNOWN } } })).status, 501, 'no pushBackend -> 501');
+  const routeConflict = createGateway(baseDeps({
+    verifyToken: dialVerify,
+    pushBackend: async (input) => ({
+      dispatched: false,
+      dialId: input.id,
+      reason: 'registry-route-conflict',
+    }),
+  }));
+  const conflict = await routeConflict.handle({
+    method: 'POST',
+    path: '/dial/ring-owner',
+    headers: { authorization: 'Bearer dial' },
+    body: { question: 'q', context: { sessionId: KNOWN } },
+  });
+  assert.equal(conflict.status, 502);
+  assert.equal(conflict.body.error, 'dial dispatch failed');
+  assert.equal(conflict.body.dispatched, false);
+  assert.equal(conflict.body.reason, 'registry-route-conflict');
 });
 
 // ── PR-B4: idempotency + soft rate-limit on POST /dial/ring-owner (Warden #86 follow-up) ─────────────────────────

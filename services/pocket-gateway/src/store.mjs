@@ -6,6 +6,8 @@ import { randomUUID } from 'node:crypto';
 //   - acquireLock(key)/releaseLock(key): a short-TTL mutex so only one instance runs the post for a proposal.id.
 //   - get(key)/put(key,value): durable record of the terminal receipt OR the emitted marker (so a later request on a
 //     DIFFERENT instance loads the emitted actionId and RE-VERIFIES instead of re-posting).
+//   - advanceGeneration(key,value): monotonic durable-head CAS; only a strictly larger fixed-width generationOrder wins.
+//   - compareAndSwap(key,expectedVersion,value): exact-version CAS for bounded secondary indexes.
 //
 // PROD adapter (DynamoDB) — documented contract, not deployed here (no AWS creds in this env):
 //   acquireLock  -> PutItem {pk:key, sk:'lock', ttl:now+30s} with ConditionExpression attribute_not_exists(pk)
@@ -29,6 +31,20 @@ function resolveTtlOption(opts) {
   return v;
 }
 
+function canonicalRecordVersion(value, name = 'recordVersion') {
+  if (typeof value !== 'string' || !/^[1-9][0-9]{0,19}$/.test(value)) {
+    throw new Error(`store: ${name} must be a canonical positive uint64 decimal string`);
+  }
+  return value;
+}
+
+function fixedGenerationOrder(value) {
+  if (typeof value !== 'string' || !/^[0-9]{20}$/.test(value) || value === '00000000000000000000') {
+    throw new Error('store: generationOrder must be a fixed-width positive uint64 decimal string');
+  }
+  return value;
+}
+
 /**
  * In-memory store — single process, so the primitives are trivially atomic. Used for dev + hermetic tests.
  * acquireLock returns an OWNER TOKEN (or null if held); releaseLock only releases if the caller still owns it
@@ -47,6 +63,32 @@ export function createInMemoryStore() {
     async releaseLock(key, token) { if (locks.get(key) === token) locks.delete(key); },
     /** atomic reserve: true if stored, false if the key already existed. */
     async putIfAbsent(key, value, opts) { resolveTtlOption(opts); if (records.has(key)) return false; records.set(key, value); return true; },
+    /**
+     * Monotonic durable-head update. A stalled lower-generation writer can never replace a newer installation head.
+     * Returns the current value on refusal so callers can distinguish an idempotent retry from a stale/conflicting one.
+     */
+    async advanceGeneration(key, value) {
+      const next = fixedGenerationOrder(value && value.generationOrder);
+      const current = records.get(key);
+      if (current && fixedGenerationOrder(current.generationOrder) >= next) {
+        return { advanced: false, current };
+      }
+      records.set(key, value);
+      return { advanced: true, current: value };
+    },
+    /** Exact-version CAS used by bounded candidate indexes; null means the record must still be absent. */
+    async compareAndSwap(key, expectedVersion, value) {
+      const nextVersion = canonicalRecordVersion(value && value.recordVersion);
+      const current = records.get(key);
+      if (expectedVersion === null) {
+        if (current !== undefined) return { swapped: false, current };
+      } else {
+        canonicalRecordVersion(expectedVersion, 'expectedVersion');
+        if (!current || current.recordVersion !== expectedVersion) return { swapped: false, current };
+      }
+      records.set(key, { ...value, recordVersion: nextVersion });
+      return { swapped: true, current: value };
+    },
     // test/debug introspection only
     _records: records,
     _locks: locks,
@@ -67,8 +109,12 @@ export function createDynamoStore(cfg = {}) {
   const lk = (key) => ({ pk: key, sk: 'lock' });
   const isCond = (e) => e && (e.name === 'ConditionalCheckFailedException' || e.code === 'ConditionalCheckFailedException');
   const nowSec = () => Math.floor(now() / 1000);
+  const getRecord = async (key) => {
+    const r = await client.get({ TableName: table, Key: rk(key) });
+    return r && r.Item ? r.Item.value : undefined;
+  };
   return {
-    async get(key) { const r = await client.get({ TableName: table, Key: rk(key) }); return r && r.Item ? r.Item.value : undefined; },
+    get: getRecord,
     async put(key, value, opts = {}) {
       // optional TOP-LEVEL `ttl` (absolute epoch-seconds) so DynamoDB TTL can auto-delete the record (e.g. dial-signal-store's
       // 900s signals). Records without ttlEpochSec are durable (idempotency/emitted markers), unchanged.
@@ -109,6 +155,42 @@ export function createDynamoStore(cfg = {}) {
         return true;
       } catch (e) { if (isCond(e)) return false; throw e; }
     },
+    async advanceGeneration(key, value) {
+      const next = fixedGenerationOrder(value && value.generationOrder);
+      try {
+        await client.put({
+          TableName: table,
+          Item: { ...rk(key), value, generationOrder: next },
+          ConditionExpression: 'attribute_not_exists(pk) OR #go < :next',
+          ExpressionAttributeNames: { '#go': 'generationOrder' },
+          ExpressionAttributeValues: { ':next': next },
+        });
+        return { advanced: true, current: value };
+      } catch (e) {
+        if (!isCond(e)) throw e;
+        return { advanced: false, current: await getRecord(key) };
+      }
+    },
+    async compareAndSwap(key, expectedVersion, value) {
+      const nextVersion = canonicalRecordVersion(value && value.recordVersion);
+      const Item = { ...rk(key), value: { ...value, recordVersion: nextVersion }, recordVersion: nextVersion };
+      const params = expectedVersion === null
+        ? { TableName: table, Item, ConditionExpression: 'attribute_not_exists(pk)' }
+        : {
+            TableName: table,
+            Item,
+            ConditionExpression: '#rv = :expected',
+            ExpressionAttributeNames: { '#rv': 'recordVersion' },
+            ExpressionAttributeValues: { ':expected': canonicalRecordVersion(expectedVersion, 'expectedVersion') },
+          };
+      try {
+        await client.put(params);
+        return { swapped: true, current: value };
+      } catch (e) {
+        if (!isCond(e)) throw e;
+        return { swapped: false, current: await getRecord(key) };
+      }
+    },
   };
 }
 
@@ -120,6 +202,8 @@ export function createDynamoStore(cfg = {}) {
  *
  * The Command classes are INJECTED (not imported) so this module stays ZERO-DEP + testable WITHOUT `@aws-sdk` installed:
  * the deploy passes the real `{ GetCommand, PutCommand, DeleteCommand }`; tests pass fakes that capture their params.
+ * Registry V2 additionally needs `TransactWriteCommand`; routing uses strongly-read bounded target directories, not a
+ * query/GSI surface.
  *
  * SHAPE CONTRACT (must match what `createDynamoStore` reads — see its get / acquireLock / putIfAbsent):
  *   - `get` MUST resolve to the FULL response `{ Item }` (the store reads `r.Item.value`) — NOT a bare `r.Item`.
@@ -129,21 +213,25 @@ export function createDynamoStore(cfg = {}) {
  *     pass straight through.
  *
  * @param {{ send:Function }} docClient  a v3 DynamoDBDocumentClient (`DynamoDBDocumentClient.from(new DynamoDBClient())`)
- * @param {{ GetCommand:Function, PutCommand:Function, DeleteCommand:Function }} commands  lib-dynamodb Command classes
- * @returns {{ get:Function, put:Function, delete:Function }}  exactly the shape `createDynamoStore({ client })` expects
+ * @param {{ GetCommand:Function, PutCommand:Function, DeleteCommand:Function, TransactWriteCommand?:Function }} commands
+ * @returns {{ get:Function, put:Function, delete:Function, transactWrite?:Function }}
  */
 export function createDynamoClientAdapter(docClient, commands = {}) {
   if (!docClient || typeof docClient.send !== 'function') throw new Error('createDynamoClientAdapter: a v3 DynamoDBDocumentClient (with .send) is required');
-  const { GetCommand, PutCommand, DeleteCommand } = commands;
+  const { GetCommand, PutCommand, DeleteCommand, TransactWriteCommand } = commands;
   if (typeof GetCommand !== 'function' || typeof PutCommand !== 'function' || typeof DeleteCommand !== 'function') {
     throw new Error('createDynamoClientAdapter: { GetCommand, PutCommand, DeleteCommand } from @aws-sdk/lib-dynamodb must be injected');
   }
+  const hasTransactWrite = typeof TransactWriteCommand === 'function';
   return {
     // Return the FULL send() response ({ Item, $metadata, ... }); the store reads `r.Item.value`. Do NOT `.then(r=>r.Item)`.
     get: (params) => docClient.send(new GetCommand(params)),
     // Return unused by the store; a ConditionalCheckFailedException propagates unchanged (no try/catch here — by design).
     put: (params) => docClient.send(new PutCommand(params)),
     delete: (params) => docClient.send(new DeleteCommand(params)),
+    ...(hasTransactWrite ? {
+      transactWrite: (params) => docClient.send(new TransactWriteCommand(params)),
+    } : {}),
   };
 }
 
