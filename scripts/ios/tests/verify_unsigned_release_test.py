@@ -1727,8 +1727,30 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertIn("COMPILATION_CACHE_ENABLE_PLUGIN=NO", capture)
         self.assertIn("SWIFT_ENABLE_COMPILE_CACHE=NO", capture)
         self.assertIn("ALTERNATE_LINKER_PATH=", capture)
-        self.assertEqual(3, workflow.count("PRODUCT_SPECIFIC_LDFLAGS="))
-        self.assertNotIn("PRODUCT_SPECIFIC_LDFLAGS=$(inherited)", workflow)
+        product_specific_assignments = [
+            line.strip()
+            for line in workflow.splitlines()
+            if line.lstrip().startswith("PRODUCT_SPECIFIC_LDFLAGS=")
+        ]
+        expected_workflow_assignments = [
+            "PRODUCT_SPECIFIC_LDFLAGS=",
+            "PRODUCT_SPECIFIC_LDFLAGS= \\",
+            "PRODUCT_SPECIFIC_LDFLAGS=",
+        ]
+        self.assertEqual(expected_workflow_assignments, product_specific_assignments)
+        malicious_workflow = workflow.replace(
+            "PRODUCT_SPECIFIC_LDFLAGS=",
+            "PRODUCT_SPECIFIC_LDFLAGS=-Wl,-load,/tmp/evil.dylib",
+            1,
+        )
+        self.assertNotEqual(
+            expected_workflow_assignments,
+            [
+                line.strip()
+                for line in malicious_workflow.splitlines()
+                if line.lstrip().startswith("PRODUCT_SPECIFIC_LDFLAGS=")
+            ],
+        )
         self.assertIn(
             "'SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'",
             capture,
@@ -1742,8 +1764,26 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertIn('"COMPILATION_CACHE_ENABLE_PLUGIN=NO"', archive)
         self.assertIn('"SWIFT_ENABLE_COMPILE_CACHE=NO"', archive)
         self.assertIn('"ALTERNATE_LINKER_PATH="', archive)
-        self.assertIn('"PRODUCT_SPECIFIC_LDFLAGS="', archive)
-        self.assertNotIn("PRODUCT_SPECIFIC_LDFLAGS=$(inherited)", archive)
+        expected_archive_assignments = ['"PRODUCT_SPECIFIC_LDFLAGS="']
+        archive_assignments = [
+            line.strip()
+            for line in archive.splitlines()
+            if line.lstrip().startswith('"PRODUCT_SPECIFIC_LDFLAGS=')
+        ]
+        self.assertEqual(expected_archive_assignments, archive_assignments)
+        malicious_archive = archive.replace(
+            '"PRODUCT_SPECIFIC_LDFLAGS="',
+            '"PRODUCT_SPECIFIC_LDFLAGS=-Wl,-load,/tmp/evil.dylib"',
+            1,
+        )
+        self.assertNotEqual(
+            expected_archive_assignments,
+            [
+                line.strip()
+                for line in malicious_archive.splitlines()
+                if line.lstrip().startswith('"PRODUCT_SPECIFIC_LDFLAGS=')
+            ],
+        )
         self.assertIn(
             "'SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'",
             archive,
