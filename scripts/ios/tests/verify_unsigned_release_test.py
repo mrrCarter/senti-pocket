@@ -1786,6 +1786,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         spec_path = REPOSITORY_ROOT / verify.PROJECT_SPEC_RELATIVE
         canonical = spec_path.read_bytes().replace(b"\r\n", b"\n")
         self.assertNotIn(b"\r", canonical)
+        self.assertNotIn(b"ALL_OTHER_LDFLAGS:", canonical)
         self.assertNotIn(b"PRODUCT_SPECIFIC_LDFLAGS:", canonical)
         self.assertEqual(
             PINNED_PROJECT_SPEC_SHA256,
@@ -1886,6 +1887,35 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertNotIn('"SWIFT_RESPONSE_FILE_PATH="', archive)
         self.assertIn("/usr/bin/codesign --verify --deep --strict", archive)
         self.assertNotIn("\nif ! codesign --verify", archive)
+
+    def test_simulator_commands_preserve_xcode_debug_dylib_linker_inputs(
+        self,
+    ) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/ios-verify.yml").read_text(
+            encoding="utf-8"
+        )
+        simulator_build = workflow.split(
+            "- name: Build simulator closure", maxsplit=1
+        )[1].split("- name: Select available iPhone simulator", maxsplit=1)[0]
+        hosted_tests = workflow.split(
+            "- name: Run hosted unit tests", maxsplit=1
+        )[1].split("- name: Upload XCTest result bundle", maxsplit=1)[0]
+        for command in (simulator_build, hosted_tests):
+            self.assertNotIn("ALL_OTHER_LDFLAGS", command)
+            self.assertNotIn("ENABLE_DEBUG_DYLIB", command)
+        self.assertNotIn("ENABLE_DEBUG_DYLIB", workflow)
+        self.assertEqual(
+            [
+                "ALL_OTHER_LDFLAGS=",
+                "ALL_OTHER_LDFLAGS= \\",
+                "ALL_OTHER_LDFLAGS=",
+            ],
+            [
+                line.strip()
+                for line in workflow.splitlines()
+                if "ALL_OTHER_LDFLAGS" in line
+            ],
+        )
 
     def test_repository_package_manifests_match_reviewed_release_closure(self) -> None:
         self.assertEqual(
@@ -2090,7 +2120,6 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             ("ALTERNATE_LINKER[config=Release]", "/tmp/evil-linker"),
             ("ALTERNATE_LINKER_PATH", "/tmp/evil-linker"),
             ("LD_FLAGS_normal", "-ld-path=/tmp/evil-linker"),
-            ("ALL_OTHER_LDFLAGS[config=Release]", "-ld-path=/tmp/e"),
             ("LD_OBJC_RUNTIME_ARGS", "-ld-path=/tmp/evil-linker"),
             ("LD_OBJC_RUNTIME_ARGS_swiftc", "-ld-path=/tmp/evil-linker"),
             ("INFOPLIST_PREPROCESS", "YES"),
@@ -2150,10 +2179,15 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
         self.assert_error_contains(errors, "invalid build-setting key")
 
-    def test_settings_reject_project_product_specific_ldflags_definitions(
+    def test_settings_reject_project_xcode_owned_linker_definitions(
         self,
     ) -> None:
         mutations: tuple[tuple[str, object], ...] = (
+            ("ALL_OTHER_LDFLAGS", ""),
+            ("ALL_OTHER_LDFLAGS", "$(inherited)"),
+            ("ALL_OTHER_LDFLAGS", "-ld-path=/tmp/evil-linker"),
+            ("ALL_OTHER_LDFLAGS[config=Debug]", ""),
+            ("ALL_OTHER_LDFLAGS_normal", ""),
             ("PRODUCT_SPECIFIC_LDFLAGS", ""),
             ("PRODUCT_SPECIFIC_LDFLAGS", "$(inherited)"),
             ("PRODUCT_SPECIFIC_LDFLAGS", "-ld-path=/tmp/evil-linker"),
@@ -2173,7 +2207,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 _, errors = verify.verify_settings_file(
                     self.settings_path, self.expected
                 )
-                self.assert_error_contains(errors, "append-only linker setting")
+                self.assert_error_contains(errors, "must remain Xcode-owned")
 
     def test_settings_bind_minimal_script_free_release_scheme(self) -> None:
         original = self.scheme_path.read_text(encoding="utf-8")

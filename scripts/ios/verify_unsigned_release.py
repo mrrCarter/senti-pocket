@@ -64,7 +64,7 @@ APP_ICON_NAME = "AppIcon"
 APP_ICON_FILENAME = "SentiPocketAppIcon.png"
 APP_ICON_SHA256 = "495904bf6d5a1fc41cfebfaa1fe1e67cb20a3c6882194408406210c2097a1b8f"
 PROJECT_SPEC_RELATIVE = Path("apps/SentiPocketApp/project.yml")
-PROJECT_SPEC_SHA256 = "dad2577a42f192f804d2cf70cd7000046f7bc691bf12d10f041c58ba47e1734b"
+PROJECT_SPEC_SHA256 = "239535279a2ed664c75ed1ad0de99b0178e389a7ea936dc943b2f481e8636344"
 APP_ICON_WIDTH = 1024
 APP_ICON_HEIGHT = 1024
 APP_ICON_CHANNELS = 3
@@ -241,7 +241,9 @@ RESOURCE_POLICY_SETTING_BASES = frozenset(
         "INCLUDED_SOURCE_FILE_NAMES",
     }
 )
-PROJECT_ABSENT_SETTING_BASES = frozenset({"PRODUCT_SPECIFIC_LDFLAGS"})
+PROJECT_ABSENT_SETTING_BASES = frozenset(
+    {"ALL_OTHER_LDFLAGS", "PRODUCT_SPECIFIC_LDFLAGS"}
+)
 STATIC_EXECUTION_SETTINGS = {
     "COMPILATION_CACHE_ENABLE_PLUGIN": "NO",
     "COMPILATION_CACHE_PLUGIN_PATH": "",
@@ -1515,7 +1517,8 @@ def _generated_app_icon_membership_error(project: Mapping[str, Any]) -> str | No
             key_label = _safe_setting_key_label(key)
             if _is_project_absent_setting_base(base):
                 return (
-                    "generated Xcode project defines an append-only linker setting "
+                    "generated Xcode project defines a linker setting that must remain "
+                    "Xcode-owned "
                     f"at project or target level: {key_label}"
                 )
             if base.startswith("SWIFT_RESPONSE_FILE_PATH_") or any(

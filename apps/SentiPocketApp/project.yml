@@ -112,7 +112,8 @@ targets:
         OTHER_CPLUSPLUSFLAGS: ""
         OTHER_LDFLAGS: ""
         OTHER_LIBTOOLFLAGS: ""
-        ALL_OTHER_LDFLAGS: ""
+        # ALL_OTHER_LDFLAGS must remain absent: Xcode owns this aggregate and
+        # injects the Debug dylib stub executor inputs through it.
         ALTERNATE_LINKER: ""
         ALTERNATE_LINKER_PATH: ""
         CLANG_ALTERNATE_LINKER: ""
