@@ -28,7 +28,7 @@ import xml.etree.ElementTree as ET
 import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 
@@ -43,6 +43,10 @@ MAX_APP_ROOT_ENTRIES = 4096
 MAX_SOURCE_RESOURCE_ENTRIES = 20_000
 MAX_PROJECT_OBJECTS = 100_000
 MAX_PROJECT_REFERENCES = 100_000
+MAX_BUILD_SETTING_KEY_LENGTH = 512
+MAX_RESOLVED_BUILD_SETTINGS = 4096
+MAX_RESOLVED_PATH_LENGTH = 8192
+MAX_RESOLVED_PATH_ENTRIES = 32
 MAX_PLIST_OBJECTS = 100_000
 MAX_XML_PLIST_DEPTH = 256
 MAX_XML_PLIST_BYTES = 256 * 1024
@@ -59,7 +63,7 @@ APP_ICON_NAME = "AppIcon"
 APP_ICON_FILENAME = "SentiPocketAppIcon.png"
 APP_ICON_SHA256 = "495904bf6d5a1fc41cfebfaa1fe1e67cb20a3c6882194408406210c2097a1b8f"
 PROJECT_SPEC_RELATIVE = Path("apps/SentiPocketApp/project.yml")
-PROJECT_SPEC_SHA256 = "430bc3485196a08a1d82ba5718a177def5d3fe7684154d013ad7fabf0185a6c4"
+PROJECT_SPEC_SHA256 = "eedb5f582fa0025a457fd575260a77944f6f10a212a30b1cdb4131a44fd80e72"
 APP_ICON_WIDTH = 1024
 APP_ICON_HEIGHT = 1024
 APP_ICON_CHANNELS = 3
@@ -200,6 +204,28 @@ TRUSTED_OBJC_RUNTIME_ARGS = {
     "LD_OBJC_RUNTIME_ARGS_clang": "-fobjc-link-runtime",
     "LD_OBJC_RUNTIME_ARGS_swiftc": "-link-objc-runtime",
 }
+SWIFT_RESPONSE_FILE_KEY = "SWIFT_RESPONSE_FILE_PATH_normal_arm64"
+CANONICAL_SWIFT_RESPONSE_FILE_VALUE = (
+    "$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))"
+)
+OPTIONAL_EMPTY_RESOLVED_SETTINGS = frozenset(
+    {
+        "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES",
+        "ASSETCATALOG_OTHER_FLAGS",
+        "COMPILATION_CACHE_PLUGIN_PATH",
+        "INCLUDED_SOURCE_FILE_NAMES",
+        "SWIFT_RESPONSE_FILE_PATH",
+        "SWIFT_TOOLCHAIN_FLAGS",
+    }
+)
+RESOURCE_POLICY_SETTING_BASES = frozenset(
+    {
+        "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES",
+        "ASSETCATALOG_OTHER_FLAGS",
+        "EXCLUDED_SOURCE_FILE_NAMES",
+        "INCLUDED_SOURCE_FILE_NAMES",
+    }
+)
 STATIC_EXECUTION_SETTINGS = {
     "COMPILATION_CACHE_ENABLE_PLUGIN": "NO",
     "COMPILATION_CACHE_PLUGIN_PATH": "",
@@ -245,6 +271,8 @@ PROJECT_EXECUTION_OVERRIDE_KEYS = frozenset(
         "SWIFT_TOOLCHAIN_FLAGS",
         "SWIFT_RESPONSE_FILE_PATH",
         "SWIFT_USE_INTEGRATED_DRIVER",
+        *OPTIONAL_EMPTY_RESOLVED_SETTINGS,
+        "EXCLUDED_SOURCE_FILE_NAMES",
     }
 )
 
@@ -289,6 +317,41 @@ def _safe_repr(value: Any) -> str:
     if len(rendered) > 180:
         return rendered[:177] + "..."
     return rendered
+
+
+def _safe_setting_key_label(key: Any) -> str:
+    if (
+        isinstance(key, str)
+        and len(key) <= 256
+        and key.isascii()
+        and all(0x20 <= ord(character) <= 0x7E for character in key)
+    ):
+        return key
+    if isinstance(key, str):
+        encoded = key.encode("utf-8", errors="surrogatepass")
+        length = len(key)
+    else:
+        encoded = repr(type(key).__name__).encode("ascii")
+        length = -1
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"<invalid-setting-key length={length} sha256={digest}>"
+
+
+def _resolved_absolute_path(value: Any) -> Path | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4096
+        or any(ord(character) < 0x20 for character in value)
+    ):
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return None
+    try:
+        return candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _stat_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -574,7 +637,7 @@ def _decode_json(encoded: bytes, label: str) -> tuple[Any | None, list[str]]:
         return None, [f"{label} contains duplicate object keys"]
     except NonstandardJSONConstantError:
         return None, [f"{label} contains a nonstandard numeric constant"]
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         return None, [f"{label} could not be decoded: {type(exc).__name__}"]
 
 
@@ -1077,7 +1140,11 @@ def _safe_project_path(value: Any, *, allow_empty: bool) -> PurePosixPath | None
 
 
 def _build_setting_base(key: str) -> str | None:
-    if not BUILD_SETTING_KEY_RE.fullmatch(key):
+    if (
+        len(key) > MAX_BUILD_SETTING_KEY_LENGTH
+        or not key.isascii()
+        or not BUILD_SETTING_KEY_RE.fullmatch(key)
+    ):
         return None
     return key.partition("[")[0]
 
@@ -1094,6 +1161,10 @@ def _is_execution_override_base(base: str) -> bool:
         or base.startswith("SWIFT_RESPONSE_FILE_PATH_")
         or base.startswith("SWIFT_TOOLCHAIN_FLAGS_")
         or base.startswith("LD_OBJC_RUNTIME_ARGS_")
+        or any(
+            base.startswith(f"{policy_key}_")
+            for policy_key in RESOURCE_POLICY_SETTING_BASES
+        )
         or base.endswith("_COMPILER_LAUNCHER")
     )
 
@@ -1123,9 +1194,13 @@ def _safe_resolved_tool_selector(
 def _safe_resolved_path(
     value: Any, developer_dir: PurePosixPath
 ) -> bool:
-    if not isinstance(value, str) or not value or "\x00" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_RESOLVED_PATH_LENGTH
+        or "\x00" in value
+    ):
         return False
-    entries = value.split(":")
     toolchain_bin = developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/bin"
     expected_entries = (
         toolchain_bin,
@@ -1135,8 +1210,76 @@ def _safe_resolved_path(
         PurePosixPath("/usr/sbin"),
         PurePosixPath("/sbin"),
     )
-    parsed_entries = tuple(PurePosixPath(entry) for entry in entries)
-    return parsed_entries == expected_entries
+    return value == ":".join(str(entry) for entry in expected_entries)
+
+
+def _safe_path_diagnostic(value: Any, developer_dir: PurePosixPath) -> str:
+    if not isinstance(value, str):
+        return f"<non-string {type(value).__name__}>"
+    if len(value) > MAX_RESOLVED_PATH_LENGTH:
+        return f"<oversized path length={len(value)}>"
+    entry_count = value.count(":") + 1
+    if entry_count > MAX_RESOLVED_PATH_ENTRIES:
+        return f"<{entry_count} path entries>"
+    entries = value.split(":")
+    system_entries = {
+        PurePosixPath("/usr/bin"),
+        PurePosixPath("/bin"),
+        PurePosixPath("/usr/sbin"),
+        PurePosixPath("/sbin"),
+    }
+    xcode_contents = developer_dir.parent
+    known_xcode_entries = {
+        developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/bin": (
+            "$DEFAULT_TOOLCHAIN_USR_BIN"
+        ),
+        developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/local/bin": (
+            "$DEFAULT_TOOLCHAIN_USR_LOCAL_BIN"
+        ),
+        developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/libexec": (
+            "$DEFAULT_TOOLCHAIN_USR_LIBEXEC"
+        ),
+        developer_dir / "Platforms/iPhoneOS.platform/usr/bin": (
+            "$IPHONEOS_PLATFORM_USR_BIN"
+        ),
+        developer_dir / "Platforms/iPhoneOS.platform/usr/local/bin": (
+            "$IPHONEOS_PLATFORM_USR_LOCAL_BIN"
+        ),
+        developer_dir / "Platforms/iPhoneOS.platform/Developer/usr/bin": (
+            "$IPHONEOS_DEVELOPER_USR_BIN"
+        ),
+        developer_dir / "Platforms/iPhoneOS.platform/Developer/usr/local/bin": (
+            "$IPHONEOS_DEVELOPER_USR_LOCAL_BIN"
+        ),
+        developer_dir / "usr/bin": "$DEVELOPER_USR_BIN",
+        developer_dir / "usr/local/bin": "$DEVELOPER_USR_LOCAL_BIN",
+        xcode_contents
+        / (
+            "SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/"
+            "SWBBuildService.bundle/Contents/PlugIns/"
+            "SWBUniversalPlatformPlugin.bundle/Contents/Frameworks/"
+            "SWBUniversalPlatform.framework/Resources"
+        ): "$SWIFT_BUILD_PLUGIN_RESOURCES",
+    }
+    rendered: list[str] = []
+    for index, entry in enumerate(entries):
+        candidate = PurePosixPath(entry)
+        is_safe_absolute = (
+            bool(entry)
+            and candidate.is_absolute()
+            and ".." not in candidate.parts
+            and not any(ord(character) < 0x20 for character in entry)
+        )
+        if is_safe_absolute and candidate in system_entries:
+            rendered.append(entry)
+            continue
+        if is_safe_absolute and candidate in known_xcode_entries:
+            rendered.append(known_xcode_entries[candidate])
+            continue
+        digest = hashlib.sha256(entry.encode("utf-8", errors="replace")).hexdigest()
+        rendered.append(f"<{index}:sha256={digest[:12]}>")
+    diagnostic = repr(rendered)
+    return diagnostic if len(diagnostic) <= 8192 else diagnostic[:8189] + "..."
 
 
 def _record_opaque_group_closure(
@@ -1313,6 +1456,45 @@ def _generated_app_icon_membership_error(project: Mapping[str, Any]) -> str | No
             base = _build_setting_base(key)
             if base is None:
                 return "generated Xcode project contains an invalid build-setting key"
+            key_label = _safe_setting_key_label(key)
+            if base.startswith("SWIFT_RESPONSE_FILE_PATH_") or any(
+                base.startswith(f"{policy_key}_")
+                for policy_key in RESOURCE_POLICY_SETTING_BASES
+            ):
+                return (
+                    "generated Xcode project contains an executable tool override: "
+                    f"{key_label}"
+                )
+            if _is_execution_override_base(base) and key != base:
+                return (
+                    "generated Xcode project contains an executable tool override "
+                    f"or conditional resource policy: {key_label}"
+                )
+            configuration_name = value.get("name")
+            if base == "SWIFT_RESPONSE_FILE_PATH":
+                if setting != CANONICAL_SWIFT_RESPONSE_FILE_VALUE:
+                    return (
+                        "generated Xcode project contains an executable tool override: "
+                        f"{key_label}"
+                    )
+                continue
+            if base in OPTIONAL_EMPTY_RESOLVED_SETTINGS:
+                if setting != "":
+                    return (
+                        "generated Xcode project contains an executable tool override: "
+                        f"{key_label}"
+                    )
+                continue
+            if base == "EXCLUDED_SOURCE_FILE_NAMES":
+                required_exclusion = (
+                    FIXTURE_NAME if configuration_name == "Release" else ""
+                )
+                if setting != required_exclusion:
+                    return (
+                        "generated Xcode project contains an executable tool override "
+                        f"or resource-policy override: {key_label}"
+                    )
+                continue
             safe_canonical_project_setting = (
                 key == base
                 and (
@@ -1327,7 +1509,7 @@ def _generated_app_icon_membership_error(project: Mapping[str, Any]) -> str | No
             ):
                 return (
                     "generated Xcode project contains an executable tool override: "
-                    f"{key}"
+                    f"{key_label}"
                 )
     global_asset_refs = [
         value
@@ -2121,6 +2303,10 @@ def load_target_settings(
         isinstance(key, str) for key in settings
     ):
         return None, ["target buildSettings must be a string-keyed dictionary"]
+    if len(settings) > MAX_RESOLVED_BUILD_SETTINGS:
+        return None, [
+            "target buildSettings exceeds the bounded resolved-setting limit"
+        ]
     return settings, []
 
 
@@ -2136,6 +2322,50 @@ def _require_exact(
                 errors.append(
                     f"{key}: expected {_safe_repr(wanted)}, got {_safe_repr(actual)}"
                 )
+
+
+def _require_empty_or_absent(
+    values: Mapping[str, Any], keys: Iterable[str], errors: list[str]
+) -> None:
+    for key in sorted(keys):
+        if key not in values:
+            continue
+        actual = values[key]
+        if actual != "":
+            errors.append(f"{key}: expected an empty or omitted value")
+
+
+def _verify_swift_response_file_settings(
+    settings: Mapping[str, Any], expected: Expectations, errors: list[str]
+) -> None:
+    generated_keys = {
+        key
+        for key in settings
+        if (base := _build_setting_base(key)) is not None
+        and base.startswith("SWIFT_RESPONSE_FILE_PATH_")
+    }
+    if generated_keys != {SWIFT_RESPONSE_FILE_KEY}:
+        errors.append(
+            "resolved Swift response-file settings must contain exactly "
+            f"{SWIFT_RESPONSE_FILE_KEY}"
+        )
+        return
+    expected_path = (
+        expected.products_root.parent
+        / "Intermediates.noindex"
+        / f"{expected.target}.build"
+        / f"{expected.configuration}-iphoneos"
+        / f"{expected.target}.build"
+        / "Objects-normal"
+        / "arm64"
+        / f"{expected.target}.SwiftFileList"
+    )
+    actual = settings[SWIFT_RESPONSE_FILE_KEY]
+    if actual != str(expected_path):
+        errors.append(
+            f"{SWIFT_RESPONSE_FILE_KEY}: generated response file is outside the "
+            "independently expected DerivedData path; got <redacted>"
+        )
 
 
 def _resolved_setting_tokens(
@@ -2230,14 +2460,16 @@ def verify_settings_file(
 
     errors.extend(verify_source(expected.project_file))
     project_file_path = settings.get("PROJECT_FILE_PATH")
-    if (
-        not isinstance(project_file_path, str)
-        or not Path(project_file_path).is_absolute()
-    ):
+    resolved_project_directory = _resolved_absolute_path(project_file_path)
+    expected_project_directory = _resolved_absolute_path(
+        str(expected.project_file.parent)
+    )
+    if resolved_project_directory is None:
         errors.append("PROJECT_FILE_PATH must resolve to an absolute project path")
-    elif Path(project_file_path).resolve(
-        strict=False
-    ) != expected.project_file.parent.resolve(strict=False):
+    elif (
+        expected_project_directory is None
+        or resolved_project_directory != expected_project_directory
+    ):
         errors.append("PROJECT_FILE_PATH does not match the inspected Xcode project")
 
     _require_exact(
@@ -2256,28 +2488,30 @@ def verify_settings_file(
             "SENTI_GATEWAY_URL": expected.gateway_url,
             "GENERATE_INFOPLIST_FILE": "NO",
             "INFOPLIST_PREPROCESS": "NO",
-            "SWIFT_TOOLCHAIN_FLAGS": "",
-            "SWIFT_RESPONSE_FILE_PATH": "",
-            **STATIC_EXECUTION_SETTINGS,
+            "COMPILATION_CACHE_ENABLE_PLUGIN": "NO",
+            "SWIFT_ENABLE_COMPILE_CACHE": "NO",
             "IPHONEOS_DEPLOYMENT_TARGET": expected.deployment_target,
             "ASSETCATALOG_COMPILER_APPICON_NAME": APP_ICON_NAME,
-            "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES": "",
             "ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS": "NO",
             "ASSETCATALOG_COMPILER_SKIP_APP_STORE_DEPLOYMENT": "NO",
             "ASSETCATALOG_COMPILER_STANDALONE_ICON_BEHAVIOR": "default",
-            "ASSETCATALOG_OTHER_FLAGS": "",
             "TARGETED_DEVICE_FAMILY": "1",
-            "EXCLUDED_SOURCE_FILE_NAMES": (
-                FIXTURE_NAME if expected.configuration == "Release" else ""
-            ),
-            "INCLUDED_SOURCE_FILE_NAMES": "",
         },
         errors,
     )
+    optional_empty_settings = set(OPTIONAL_EMPTY_RESOLVED_SETTINGS)
+    if expected.configuration == "Debug":
+        optional_empty_settings.add("EXCLUDED_SOURCE_FILE_NAMES")
+    _require_empty_or_absent(settings, optional_empty_settings, errors)
     if expected.configuration == "Release":
         _require_exact(
             settings,
-            {key: "" for key in sorted(EMPTY_RELEASE_FLAG_KEYS)},
+            {"EXCLUDED_SOURCE_FILE_NAMES": FIXTURE_NAME},
+            errors,
+        )
+        _require_empty_or_absent(
+            settings,
+            EMPTY_RELEASE_FLAG_KEYS,
             errors,
         )
     for key in sorted(EMPTY_INFO_PLIST_PREPROCESSOR_KEYS):
@@ -2288,19 +2522,32 @@ def verify_settings_file(
         errors.append("DEVELOPMENT_TEAM must be empty for unsigned verification")
 
     _verify_swift_compilation_conditions(settings, expected.configuration, errors)
+    _verify_swift_response_file_settings(settings, expected, errors)
 
     for key, value in settings.items():
         base = _build_setting_base(key)
+        key_label = _safe_setting_key_label(key)
         if base is None:
-            errors.append(f"{key}: resolved build-setting key is invalid")
+            errors.append(f"{key_label}: resolved build-setting key is invalid")
             continue
+        if any(
+            base.startswith(f"{policy_key}_")
+            for policy_key in RESOURCE_POLICY_SETTING_BASES
+        ):
+            errors.append(f"{key_label}: resource-policy override is not permitted")
         if _is_execution_override_base(base) and key != base:
-            errors.append(f"{key}: conditional execution override is not permitted")
+            errors.append(
+                f"{key_label}: conditional execution or resource-policy override "
+                "is not permitted"
+            )
         if (
             base in EMPTY_EXECUTION_OVERRIDE_KEYS
             or base in EMPTY_INFO_PLIST_PREPROCESSOR_KEYS
             or base in {"SWIFT_TOOLCHAIN_FLAGS", "SWIFT_RESPONSE_FILE_PATH"}
-            or base.startswith("SWIFT_RESPONSE_FILE_PATH_")
+            or (
+                base.startswith("SWIFT_RESPONSE_FILE_PATH_")
+                and key != SWIFT_RESPONSE_FILE_KEY
+            )
             or (
                 base.startswith("LD_OBJC_RUNTIME_ARGS_")
                 and base not in TRUSTED_OBJC_RUNTIME_ARGS
@@ -2317,14 +2564,16 @@ def verify_settings_file(
             )
             or base.endswith("_COMPILER_LAUNCHER")
         ) and value not in (None, ""):
-            errors.append(f"{key}: executable override must be empty")
+            errors.append(f"{key_label}: executable override must be empty")
         if base == "INFOPLIST_PREPROCESS" and value != "NO":
-            errors.append(f"{key}: Info.plist preprocessing must be disabled")
+            errors.append(f"{key_label}: Info.plist preprocessing must be disabled")
     for key, basenames in {**TOOL_SELECTOR_BASENAMES, **SWIFT_TOOL_SELECTORS}.items():
         if key in settings and not _safe_resolved_tool_selector(
             settings[key], basenames, expected.developer_dir
         ):
-            errors.append(f"{key}: resolved compiler tool is not trusted")
+            errors.append(
+                f"{_safe_setting_key_label(key)}: resolved compiler tool is not trusted"
+            )
     if settings.get("ASSETCATALOG_EXEC") != str(
         expected.developer_dir / "usr/bin/actool"
     ):
@@ -2339,8 +2588,16 @@ def verify_settings_file(
         errors.append("CODESIGN_ALLOCATE: resolved signing helper is not trusted")
     for key, trusted_value in TRUSTED_OBJC_RUNTIME_ARGS.items():
         if settings.get(key) != trusted_value:
+            actual = settings.get(key)
+            trusted_observed = actual is None or (
+                isinstance(actual, str)
+                and actual
+                in {"", "-fobjc-link-runtime", "-link-objc-runtime"}
+            )
+            observed = _safe_repr(actual) if trusted_observed else "<redacted>"
             errors.append(
-                f"{key}: resolved Objective-C runtime linker args are not trusted"
+                f"{key}: resolved Objective-C runtime linker args are not trusted; "
+                f"got {observed}"
             )
     swift_tools_dir = settings.get("SWIFT_TOOLS_DIR")
     expected_swift_tools_dir = str(
@@ -2355,7 +2612,37 @@ def verify_settings_file(
         errors.append("TOOLCHAINS: resolved toolchain selection is not trusted")
     sdk_root = settings.get("SDKROOT")
     if sdk_root != str(expected.sdk_root):
-        errors.append("SDKROOT: resolved iPhoneOS SDK is not trusted")
+        sdk_candidate = (
+            PurePosixPath(sdk_root) if isinstance(sdk_root, str) else None
+        )
+        symbolic_sdk = (
+            sdk_root
+            if isinstance(sdk_root, str)
+            and re.fullmatch(r"iphoneos(?:[0-9]+(?:\.[0-9]+)*)?", sdk_root)
+            else None
+        )
+        selected_sdk_basename = (
+            sdk_candidate.name
+            if sdk_candidate is not None
+            and ".." not in sdk_candidate.parts
+            and sdk_candidate.parent
+            == expected.developer_dir
+            / "Platforms/iPhoneOS.platform/Developer/SDKs"
+            and re.fullmatch(
+                r"iPhoneOS(?:[0-9]+(?:\.[0-9]+)*)?\.sdk", sdk_candidate.name
+            )
+            else None
+        )
+        if symbolic_sdk is not None:
+            observed_sdk = _safe_repr(symbolic_sdk)
+        elif selected_sdk_basename is not None:
+            observed_sdk = _safe_repr(selected_sdk_basename)
+        else:
+            observed_sdk = "<redacted>"
+        errors.append(
+            "SDKROOT: resolved iPhoneOS SDK is not trusted; "
+            f"got {observed_sdk}"
+        )
     developer_dir = settings.get("DEVELOPER_DIR")
     if developer_dir != str(expected.developer_dir):
         errors.append("DEVELOPER_DIR: resolved Xcode root does not match the selected toolchain")
@@ -2364,12 +2651,18 @@ def verify_settings_file(
         if value != str(
             expected.developer_dir / "Toolchains/XcodeDefault.xctoolchain"
         ):
-            errors.append(f"{key}: resolved Xcode toolchain directory is not trusted")
+            errors.append(
+                f"{_safe_setting_key_label(key)}: resolved Xcode toolchain directory "
+                "is not trusted"
+            )
     path_value = settings.get("PATH")
     if not _safe_resolved_path(
         path_value, expected.developer_dir
     ):
-        errors.append("PATH: resolved tool search path is not anchored to selected Xcode")
+        errors.append(
+            "PATH: resolved tool search path is not anchored to selected Xcode; "
+            f"got {_safe_path_diagnostic(path_value, expected.developer_dir)}"
+        )
 
     info_plist = settings.get("INFOPLIST_FILE")
     if info_plist != INFO_PLIST_SUFFIX:
@@ -2380,15 +2673,14 @@ def verify_settings_file(
         errors.append(f"unexpected CODE_SIGN_ENTITLEMENTS: {_safe_repr(entitlements)}")
 
     target_build_dir = settings.get("TARGET_BUILD_DIR")
-    if (
-        not isinstance(target_build_dir, str)
-        or not Path(target_build_dir).is_absolute()
-    ):
+    resolved_build_dir = _resolved_absolute_path(target_build_dir)
+    products_root = _resolved_absolute_path(str(expected.products_root))
+    if resolved_build_dir is None:
         errors.append("TARGET_BUILD_DIR must be an absolute path")
+    elif products_root is None:
+        errors.append("independently expected products root could not be resolved")
     else:
-        products_root = expected.products_root.resolve(strict=False)
         expected_build_dir = products_root / f"{expected.configuration}-iphoneos"
-        resolved_build_dir = Path(target_build_dir).resolve(strict=False)
         if resolved_build_dir != expected_build_dir:
             errors.append(
                 "TARGET_BUILD_DIR is outside the independently expected products root"

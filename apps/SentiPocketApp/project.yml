@@ -122,7 +122,8 @@ targets:
         SECTORDER_FLAGS: ""
         SWIFTC_ALTERNATE_LINKER: ""
         SWIFTC_ALTERNATE_LINKER_PATH: ""
-        SWIFT_RESPONSE_FILE_PATH: ""
+        # Preserve Xcode's per-variant/architecture Swift input-file-list expansion.
+        SWIFT_RESPONSE_FILE_PATH: "$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))"
         SWIFT_TOOLCHAIN_FLAGS: ""
         WARNING_CFLAGS: ""
         VERSIONING_SYSTEM: apple-generic

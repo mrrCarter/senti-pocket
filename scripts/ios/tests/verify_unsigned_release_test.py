@@ -160,6 +160,16 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             ),
             "SWIFT_TOOLCHAIN_FLAGS": "",
             "SWIFT_RESPONSE_FILE_PATH": "",
+            "SWIFT_RESPONSE_FILE_PATH_normal_arm64": str(
+                self.products_root.parent
+                / "Intermediates.noindex"
+                / "SentiPocketApp.build"
+                / f"{configuration}-iphoneos"
+                / "SentiPocketApp.build"
+                / "Objects-normal"
+                / "arm64"
+                / "SentiPocketApp.SwiftFileList"
+            ),
             "SWIFT_USE_INTEGRATED_DRIVER": "YES",
             "COMPILATION_CACHE_ENABLE_PLUGIN": "NO",
             "COMPILATION_CACHE_PLUGIN_PATH": "",
@@ -289,7 +299,12 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 },
                 self.release_configuration_id: {
                     "isa": "XCBuildConfiguration",
-                    "buildSettings": {"SDKROOT": "iphoneos"},
+                    "buildSettings": {
+                        "SDKROOT": "iphoneos",
+                        "SWIFT_RESPONSE_FILE_PATH": (
+                            verify.CANONICAL_SWIFT_RESPONSE_FILE_VALUE
+                        ),
+                    },
                     "name": "Release",
                 },
             },
@@ -618,6 +633,80 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
 
         self.assert_error_contains(errors, "duplicate object keys")
 
+    def test_settings_reject_oversized_json_integer_without_crashing(self) -> None:
+        encoded = (
+            '[{"target":"SentiPocketApp","buildSettings":{"CONFIGURATION":'
+            + "9" * 4301
+            + "}}]"
+        ).encode("ascii")
+
+        payload, errors = verify._decode_json(encoded, "settings JSON")
+
+        self.assertIsNone(payload)
+        self.assert_error_contains(errors, "could not be decoded: ValueError")
+
+    def test_settings_escape_invalid_or_unbounded_setting_keys(self) -> None:
+        malicious_keys = (
+            "EVIL\n::error title=forged::private-token-shaped-name\x1b[31m",
+            "X" * 1_000_000,
+            "BAD\ud800",
+        )
+        for key in malicious_keys:
+            with self.subTest(length=len(key)):
+                changed = dict(self.settings)
+                changed[key] = "untrusted"
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                rendered = "\n".join(errors)
+                self.assertIn("<invalid-setting-key", rendered)
+                self.assertIn("sha256=", rendered)
+                self.assertNotIn("private-token-shaped-name", rendered)
+                self.assertNotIn("\x1b", rendered)
+                self.assertLess(len(rendered), 4096)
+
+    def test_settings_bound_aggregate_setting_diagnostics(self) -> None:
+        changed = dict(self.settings)
+        changed.update(
+            {f"BAD\n{index}": "untrusted" for index in range(8)}
+        )
+        self.write_settings(changed)
+
+        with mock.patch.object(verify, "MAX_RESOLVED_BUILD_SETTINGS", 4):
+            settings, errors = verify.verify_settings_file(
+                self.settings_path, self.expected
+            )
+
+        self.assertIsNone(settings)
+        self.assertEqual(
+            ["target buildSettings exceeds the bounded resolved-setting limit"],
+            errors,
+        )
+        self.assertLess(len("\n".join(errors)), 256)
+
+    def test_settings_reject_unresolvable_setting_paths_without_crashing(self) -> None:
+        mutations = (
+            (
+                "PROJECT_FILE_PATH",
+                str(self.project_file.parent) + "\x00/private-token-shaped-name",
+            ),
+            (
+                "TARGET_BUILD_DIR",
+                str(self.products_root) + "\x00/private-token-shaped-name",
+            ),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                changed = dict(self.settings)
+                changed[key] = value
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, key)
+                self.assertNotIn("private-token-shaped-name", "\n".join(errors))
+
     def test_security_file_reader_is_descriptor_anchored_and_fails_on_drift(
         self,
     ) -> None:
@@ -870,13 +959,10 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
     def test_settings_require_app_icon_settings(self) -> None:
         for key in (
             "ASSETCATALOG_COMPILER_APPICON_NAME",
-            "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES",
             "ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS",
             "ASSETCATALOG_COMPILER_SKIP_APP_STORE_DEPLOYMENT",
             "ASSETCATALOG_COMPILER_STANDALONE_ICON_BEHAVIOR",
-            "ASSETCATALOG_OTHER_FLAGS",
             "TARGETED_DEVICE_FAMILY",
-            "INCLUDED_SOURCE_FILE_NAMES",
         ):
             with self.subTest(key=key):
                 changed = dict(self.settings)
@@ -886,6 +972,242 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                     self.settings_path, self.expected
                 )
                 self.assert_error_contains(errors, key)
+
+    def test_settings_accept_xcode_omitted_effective_empty_values(self) -> None:
+        optional_empty_keys = {
+            "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES",
+            "ASSETCATALOG_OTHER_FLAGS",
+            "COMPILATION_CACHE_PLUGIN_PATH",
+            "INCLUDED_SOURCE_FILE_NAMES",
+            "SWIFT_RESPONSE_FILE_PATH",
+            "SWIFT_TOOLCHAIN_FLAGS",
+        }
+        changed = dict(self.settings)
+        for key in optional_empty_keys:
+            del changed[key]
+        self.write_settings(changed)
+
+        resolved, errors = verify.verify_settings_file(
+            self.settings_path, self.expected
+        )
+
+        self.assertEqual([], errors)
+        self.assertEqual(changed, resolved)
+
+        debug = self.valid_settings("Debug")
+        for key in {*optional_empty_keys, "EXCLUDED_SOURCE_FILE_NAMES"}:
+            del debug[key]
+        self.write_settings(debug)
+        expected_debug = self.expected_with(
+            configuration="Debug", aps_environment="development"
+        )
+        resolved, errors = verify.verify_settings_file(
+            self.settings_path, expected_debug
+        )
+        self.assertEqual([], errors)
+        self.assertEqual(debug, resolved)
+
+    def test_settings_reject_nonempty_or_nonstrings_for_optional_empty_values(self) -> None:
+        for key in (
+            "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES",
+            "ASSETCATALOG_OTHER_FLAGS",
+            "COMPILATION_CACHE_PLUGIN_PATH",
+            "INCLUDED_SOURCE_FILE_NAMES",
+            "SWIFT_RESPONSE_FILE_PATH",
+            "SWIFT_TOOLCHAIN_FLAGS",
+        ):
+            for value in ("untrusted", None, ["untrusted"]):
+                with self.subTest(key=key, value=value):
+                    changed: dict[str, object] = dict(self.settings)
+                    changed[key] = value
+                    self.write_settings(changed)
+                    _, errors = verify.verify_settings_file(
+                        self.settings_path, self.expected
+                    )
+                    self.assert_error_contains(errors, key)
+
+    def test_settings_reject_conditional_resource_policy_overrides(self) -> None:
+        mutations = (
+            (
+                "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES[config=Release]",
+                "OtherIcon",
+            ),
+            ("ASSETCATALOG_OTHER_FLAGS[config=Release]", "--untrusted"),
+            ("INCLUDED_SOURCE_FILE_NAMES[config=Release]", "Other.swift"),
+            ("EXCLUDED_SOURCE_FILE_NAMES[config=Release]", "*"),
+            ("ASSETCATALOG_OTHER_FLAGS_normal", "--untrusted"),
+            ("EXCLUDED_SOURCE_FILE_NAMES_normal", "*"),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key):
+                changed = dict(self.settings)
+                changed[key] = value
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, key)
+
+    def test_settings_bind_generated_swift_response_file(self) -> None:
+        mutations: tuple[object, ...] = (
+            str(self.root / "outside" / "SentiPocketApp.SwiftFileList"),
+            str(
+                self.products_root.parent
+                / "Intermediates.noindex"
+                / "SentiPocketApp.build"
+                / "Release-iphoneos"
+                / "Other.build"
+                / "Objects-normal"
+                / "arm64"
+                / "SentiPocketApp.SwiftFileList"
+            ),
+            str(
+                self.products_root.parent
+                / "Intermediates.noindex"
+                / "SentiPocketApp.build"
+                / "Release-iphoneos"
+                / "SentiPocketApp.build"
+                / "Objects-normal"
+                / "x86_64"
+                / "SentiPocketApp.SwiftFileList"
+            ),
+            None,
+            ["untrusted"],
+        )
+        for value in mutations:
+            with self.subTest(value=value):
+                changed = dict(self.settings)
+                changed["SWIFT_RESPONSE_FILE_PATH_normal_arm64"] = value
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(
+                    errors, "SWIFT_RESPONSE_FILE_PATH_normal_arm64"
+                )
+
+        changed = dict(self.settings)
+        del changed["SWIFT_RESPONSE_FILE_PATH_normal_arm64"]
+        changed["SWIFT_RESPONSE_FILE_PATH_debug_arm64"] = str(
+            self.root / "SentiPocketApp.SwiftFileList"
+        )
+        self.write_settings(changed)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "must contain exactly")
+
+    def test_settings_diagnostics_are_bounded_and_redact_untrusted_paths(self) -> None:
+        untrusted = "/tmp/private-token-shaped-name"
+        path_value = ":".join(
+            (
+                str(
+                    self.developer_dir
+                    / "Toolchains/XcodeDefault.xctoolchain/usr/bin"
+                ),
+                str(
+                    self.developer_dir.parent
+                    / "SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns"
+                    / "SWBBuildService.bundle/Contents/PlugIns"
+                    / "SWBUniversalPlatformPlugin.bundle/Contents/Frameworks"
+                    / "SWBUniversalPlatform.framework/Resources"
+                ),
+                str(self.developer_dir / "private-token-shaped-name/bin"),
+                untrusted,
+                "/usr/bin",
+            )
+        )
+        diagnostic = verify._safe_path_diagnostic(
+            path_value, verify.PurePosixPath(str(self.developer_dir))
+        )
+        self.assertIn("$DEFAULT_TOOLCHAIN_USR_BIN", diagnostic)
+        self.assertIn("$SWIFT_BUILD_PLUGIN_RESOURCES", diagnostic)
+        self.assertIn("/usr/bin", diagnostic)
+        self.assertIn("sha256=", diagnostic)
+        self.assertNotIn("private-token-shaped-name", diagnostic)
+        self.assertLessEqual(len(diagnostic), 8192)
+
+        too_many = ":".join(f"/tmp/private-{index}" for index in range(33))
+        diagnostic = verify._safe_path_diagnostic(
+            too_many, verify.PurePosixPath(str(self.developer_dir))
+        )
+        self.assertEqual("<33 path entries>", diagnostic)
+        self.assertNotIn("private-", diagnostic)
+
+        with mock.patch.object(verify, "MAX_RESOLVED_PATH_LENGTH", 8):
+            diagnostic = verify._safe_path_diagnostic(
+                ":" * 500_000,
+                verify.PurePosixPath(str(self.developer_dir)),
+            )
+        self.assertEqual("<oversized path length=500000>", diagnostic)
+
+        diagnostic = verify._safe_path_diagnostic(
+            ["private-token-shaped-name"],
+            verify.PurePosixPath(str(self.developer_dir)),
+        )
+        self.assertEqual("<non-string list>", diagnostic)
+        self.assertNotIn("private-token-shaped-name", diagnostic)
+
+    def test_settings_diagnostics_redact_untrusted_sdk_and_linker_values(self) -> None:
+        changed = dict(self.settings)
+        changed["SDKROOT"] = "/tmp/private-sdk-name"
+        changed["LD_OBJC_RUNTIME_ARGS"] = "/tmp/private-linker-name"
+        self.write_settings(changed)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        rendered = "\n".join(errors)
+        self.assertIn("SDKROOT", rendered)
+        self.assertIn("LD_OBJC_RUNTIME_ARGS", rendered)
+        self.assertIn("<redacted>", rendered)
+        self.assertNotIn("private-sdk-name", rendered)
+        self.assertNotIn("private-linker-name", rendered)
+
+        changed = dict(self.settings)
+        changed["SDKROOT"] = "iphoneos26.5"
+        changed["LD_OBJC_RUNTIME_ARGS"] = "-link-objc-runtime"
+        self.write_settings(changed)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        rendered = "\n".join(errors)
+        self.assertIn("'iphoneos26.5'", rendered)
+        self.assertIn("'-link-objc-runtime'", rendered)
+
+        changed = dict(self.settings)
+        changed["SDKROOT"] = str(
+            self.developer_dir
+            / "Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS99.9.sdk"
+        )
+        self.write_settings(changed)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        rendered = "\n".join(errors)
+        self.assertIn("'iPhoneOS99.9.sdk'", rendered)
+        self.assertNotIn(str(self.developer_dir), rendered)
+
+        for value in ([], {}):
+            with self.subTest(linker_value=value):
+                changed_values: dict[str, object] = dict(self.settings)
+                changed_values["LD_OBJC_RUNTIME_ARGS"] = value
+                self.write_settings(changed_values)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, "LD_OBJC_RUNTIME_ARGS")
+
+        secret_response = str(
+            self.products_root.parent
+            / "Intermediates.noindex/private-token-shaped-name/SwiftFileList"
+        )
+        changed = dict(self.settings)
+        changed["SWIFT_RESPONSE_FILE_PATH_normal_arm64"] = secret_response
+        self.write_settings(changed)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        rendered = "\n".join(errors)
+        self.assertIn("SWIFT_RESPONSE_FILE_PATH_normal_arm64", rendered)
+        self.assertNotIn("private-token-shaped-name", rendered)
+
+        changed = dict(self.settings)
+        changed["SWIFT_RESPONSE_FILE_PATH_normal_x86_64"] = str(
+            self.root / "SentiPocketApp.SwiftFileList"
+        )
+        self.write_settings(changed)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "must contain exactly")
 
     def test_settings_reject_invalid_source_app_icon_evidence(self) -> None:
         catalog = self.root / "Resources" / "Assets.xcassets"
@@ -1283,6 +1605,11 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertIn("COMPILATION_CACHE_ENABLE_PLUGIN=NO", capture)
         self.assertIn("SWIFT_ENABLE_COMPILE_CACHE=NO", capture)
         self.assertIn("ALTERNATE_LINKER_PATH=", capture)
+        self.assertIn(
+            "'SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'",
+            capture,
+        )
+        self.assertNotIn("SWIFT_RESPONSE_FILE_PATH= \\", capture)
 
         archive = (REPOSITORY_ROOT / "scripts/ios/archive_ipa.sh").read_text(
             encoding="utf-8"
@@ -1291,6 +1618,11 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertIn('"COMPILATION_CACHE_ENABLE_PLUGIN=NO"', archive)
         self.assertIn('"SWIFT_ENABLE_COMPILE_CACHE=NO"', archive)
         self.assertIn('"ALTERNATE_LINKER_PATH="', archive)
+        self.assertIn(
+            "'SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'",
+            archive,
+        )
+        self.assertNotIn('"SWIFT_RESPONSE_FILE_PATH="', archive)
         self.assertIn("/usr/bin/codesign --verify --deep --strict", archive)
         self.assertNotIn("\nif ! codesign --verify", archive)
 
@@ -1508,7 +1840,17 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 "SWIFT_TOOLCHAIN_FLAGS[config=Release]",
                 "-driver-use-frontend-path /tmp/evil",
             ),
+            ("SWIFT_RESPONSE_FILE_PATH", ""),
+            ("SWIFT_RESPONSE_FILE_PATH", "$(UNTRUSTED_RESPONSE_FILE)"),
             ("SWIFT_RESPONSE_FILE_PATH[config=Release]", "/tmp/evil.rsp"),
+            ("SWIFT_RESPONSE_FILE_PATH_normal_arm64", ""),
+            (
+                "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES[config=Release]",
+                "OtherIcon",
+            ),
+            ("ASSETCATALOG_OTHER_FLAGS[config=Release]", "--untrusted"),
+            ("INCLUDED_SOURCE_FILE_NAMES[config=Release]", "Other.swift"),
+            ("EXCLUDED_SOURCE_FILE_NAMES[config=Release]", "*"),
             ("SWIFT_USE_INTEGRATED_DRIVER[config=Release]", "NO"),
             ("COMPILATION_CACHE_ENABLE_PLUGIN", "YES"),
             ("COMPILATION_CACHE_PLUGIN_PATH[config=Release]", "/tmp/e.dylib"),
@@ -2059,8 +2401,34 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         )
         _, errors = verify.verify_settings_file(self.settings_path, expected)
         self.assert_error_contains(
-            errors, "EXCLUDED_SOURCE_FILE_NAMES: expected '', got"
+            errors, "EXCLUDED_SOURCE_FILE_NAMES: expected an empty or omitted value"
         )
+
+    def test_settings_reject_missing_release_fixture_exclusion(self) -> None:
+        changed = dict(self.settings)
+        del changed["EXCLUDED_SOURCE_FILE_NAMES"]
+        self.write_settings(changed)
+
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+
+        self.assert_error_contains(errors, "EXCLUDED_SOURCE_FILE_NAMES")
+
+    def test_settings_reject_nonstrings_for_debug_exclusions(self) -> None:
+        expected = self.expected_with(
+            configuration="Debug", aps_environment="development"
+        )
+        for value in (None, ["canonical_checkpoint.json"]):
+            with self.subTest(value=value):
+                debug: dict[str, object] = self.valid_settings("Debug")
+                debug["EXCLUDED_SOURCE_FILE_NAMES"] = value
+                self.write_settings(debug)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, expected
+                )
+                self.assert_error_contains(
+                    errors,
+                    "EXCLUDED_SOURCE_FILE_NAMES: expected an empty or omitted value",
+                )
 
     def test_settings_reject_debug_wildcard_that_excludes_fixture(self) -> None:
         debug = self.valid_settings("Debug")
@@ -2072,7 +2440,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         )
         _, errors = verify.verify_settings_file(self.settings_path, expected)
         self.assert_error_contains(
-            errors, "EXCLUDED_SOURCE_FILE_NAMES: expected '', got"
+            errors, "EXCLUDED_SOURCE_FILE_NAMES: expected an empty or omitted value"
         )
 
     def test_expectations_reject_unsafe_origins(self) -> None:
