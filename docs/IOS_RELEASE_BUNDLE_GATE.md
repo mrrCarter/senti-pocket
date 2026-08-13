@@ -90,6 +90,7 @@ unsigned overrides used by the build. Use `development` for Debug and `productio
 repository_root="$(pwd -P)"
 developer_dir="$(cd "$(xcode-select -p)" && pwd -P)"
 sdk_root="$(cd "$(DEVELOPER_DIR="$developer_dir" xcrun --sdk iphoneos --show-sdk-path)" && pwd -P)"
+sdk_version="$(DEVELOPER_DIR="$developer_dir" xcrun --sdk iphoneos --show-sdk-version)"
 safe_xcode_path="$developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin:$developer_dir/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 swift_tools_dir="$developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/bin"
 export DEVELOPER_DIR="$developer_dir"
@@ -145,7 +146,8 @@ python3 scripts/ios/verify_unsigned_release.py settings \
   --marketing-version 0.1.0 --build-number 4242 \
   --api-url https://api.ci.invalid --gateway-url https://gateway.ci.invalid \
   --products-root "$products_root" \
-  --developer-dir "$developer_dir" --sdk-root "$sdk_root"
+  --developer-dir "$developer_dir" --sdk-root "$sdk_root" \
+  --sdk-version "$sdk_version"
 ```
 
 Build through the same derived-data path and exact overrides:
@@ -188,7 +190,8 @@ python3 scripts/ios/verify_unsigned_release.py bundle \
   --marketing-version 0.1.0 --build-number 4242 \
   --api-url https://api.ci.invalid --gateway-url https://gateway.ci.invalid \
   --products-root "$products_root" \
-  --developer-dir "$developer_dir" --sdk-root "$sdk_root"
+  --developer-dir "$developer_dir" --sdk-root "$sdk_root" \
+  --sdk-version "$sdk_version"
 ```
 
 The cross-platform synthetic regression suite requires only Python 3:

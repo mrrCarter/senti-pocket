@@ -300,6 +300,7 @@ class Expectations:
     project_file: Path
     developer_dir: PurePosixPath
     sdk_root: PurePosixPath
+    sdk_version: str
 
 
 @dataclass(frozen=True)
@@ -587,6 +588,18 @@ def validate_expectations(expected: Expectations) -> list[str]:
         )
     ):
         errors.append("sdk_root must be the selected Xcode iPhoneOS SDK path")
+    if (
+        not isinstance(expected.sdk_version, str)
+        or len(expected.sdk_version) > 32
+        or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", expected.sdk_version)
+    ):
+        errors.append("sdk_version must be a bounded numeric dotted version")
+    elif (
+        isinstance(sdk_root, PurePosixPath)
+        and sdk_root.name != "iPhoneOS.sdk"
+        and sdk_root.name != f"iPhoneOS{expected.sdk_version}.sdk"
+    ):
+        errors.append("sdk_root and sdk_version must identify the same selected SDK")
     return errors
 
 
@@ -1201,16 +1214,36 @@ def _safe_resolved_path(
         or "\x00" in value
     ):
         return False
-    toolchain_bin = developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/bin"
-    expected_entries = (
-        toolchain_bin,
+    expected_entries = _expected_resolved_path_entries(developer_dir)
+    return value == ":".join(str(entry) for entry in expected_entries)
+
+
+def _expected_resolved_path_entries(
+    developer_dir: PurePosixPath,
+) -> tuple[PurePosixPath, ...]:
+    xcode_contents = developer_dir.parent
+    return (
+        xcode_contents
+        / (
+            "SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/"
+            "SWBBuildService.bundle/Contents/PlugIns/"
+            "SWBUniversalPlatformPlugin.bundle/Contents/Frameworks/"
+            "SWBUniversalPlatform.framework/Resources"
+        ),
+        developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/bin",
+        developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/local/bin",
+        developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/libexec",
+        developer_dir / "Platforms/iPhoneOS.platform/usr/bin",
+        developer_dir / "Platforms/iPhoneOS.platform/usr/local/bin",
+        developer_dir / "Platforms/iPhoneOS.platform/Developer/usr/bin",
+        developer_dir / "Platforms/iPhoneOS.platform/Developer/usr/local/bin",
         developer_dir / "usr/bin",
+        developer_dir / "usr/local/bin",
         PurePosixPath("/usr/bin"),
         PurePosixPath("/bin"),
         PurePosixPath("/usr/sbin"),
         PurePosixPath("/sbin"),
     )
-    return value == ":".join(str(entry) for entry in expected_entries)
 
 
 def _safe_path_diagnostic(value: Any, developer_dir: PurePosixPath) -> str:
@@ -2461,9 +2494,10 @@ def verify_settings_file(
     errors.extend(verify_source(expected.project_file))
     project_file_path = settings.get("PROJECT_FILE_PATH")
     resolved_project_directory = _resolved_absolute_path(project_file_path)
-    expected_project_directory = _resolved_absolute_path(
-        str(expected.project_file.parent)
-    )
+    try:
+        expected_project_directory = expected.project_file.parent.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        expected_project_directory = None
     if resolved_project_directory is None:
         errors.append("PROJECT_FILE_PATH must resolve to an absolute project path")
     elif (
@@ -2587,8 +2621,8 @@ def verify_settings_file(
     if settings.get("CODESIGN_ALLOCATE") != expected_codesign_allocate:
         errors.append("CODESIGN_ALLOCATE: resolved signing helper is not trusted")
     for key, trusted_value in TRUSTED_OBJC_RUNTIME_ARGS.items():
-        if settings.get(key) != trusted_value:
-            actual = settings.get(key)
+        actual = settings.get(key)
+        if key in settings and actual != trusted_value:
             trusted_observed = actual is None or (
                 isinstance(actual, str)
                 and actual
@@ -2611,7 +2645,11 @@ def verify_settings_file(
     if toolchains not in (None, "", "com.apple.dt.toolchain.XcodeDefault"):
         errors.append("TOOLCHAINS: resolved toolchain selection is not trusted")
     sdk_root = settings.get("SDKROOT")
-    if sdk_root != str(expected.sdk_root):
+    approved_sdk_settings = (
+        str(expected.sdk_root),
+        f"iPhoneOS{expected.sdk_version}.sdk",
+    )
+    if sdk_root not in approved_sdk_settings:
         sdk_candidate = (
             PurePosixPath(sdk_root) if isinstance(sdk_root, str) else None
         )
@@ -3346,6 +3384,7 @@ def _add_expectation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--products-root", required=True, type=Path)
     parser.add_argument("--developer-dir", required=True, type=PurePosixPath)
     parser.add_argument("--sdk-root", required=True, type=PurePosixPath)
+    parser.add_argument("--sdk-version", required=True)
 
 
 def _expectations_from_args(args: argparse.Namespace) -> Expectations:
@@ -3363,6 +3402,7 @@ def _expectations_from_args(args: argparse.Namespace) -> Expectations:
         project_file=args.project_file,
         developer_dir=args.developer_dir,
         sdk_root=args.sdk_root,
+        sdk_version=args.sdk_version,
     )
 
 

@@ -50,6 +50,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.sdk_root = self.developer_dir / (
             "Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk"
         )
+        self.sdk_version = "26.5"
         self.expected = verify.Expectations(
             target="SentiPocketApp",
             configuration="Release",
@@ -64,6 +65,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             project_file=self.project_file,
             developer_dir=self.developer_dir,
             sdk_root=self.sdk_root,
+            sdk_version=self.sdk_version,
         )
         self.write_valid_project()
         self.real_project_converter = verify._structured_project_from_plutil
@@ -179,9 +181,6 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 self.developer_dir
                 / "Toolchains/XcodeDefault.xctoolchain/usr/bin/codesign_allocate"
             ),
-            "LD_OBJC_RUNTIME_ARGS": "-fobjc-link-runtime",
-            "LD_OBJC_RUNTIME_ARGS_clang": "-fobjc-link-runtime",
-            "LD_OBJC_RUNTIME_ARGS_swiftc": "-link-objc-runtime",
             "DEVELOPER_DIR": str(self.developer_dir),
             "DT_TOOLCHAIN_DIR": str(
                 self.developer_dir / "Toolchains/XcodeDefault.xctoolchain"
@@ -190,20 +189,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 self.developer_dir / "Toolchains/XcodeDefault.xctoolchain"
             ),
             "TOOLCHAINS": "com.apple.dt.toolchain.XcodeDefault",
-            "SDKROOT": str(self.sdk_root),
-            "PATH": ":".join(
-                (
-                    str(
-                        self.developer_dir
-                        / "Toolchains/XcodeDefault.xctoolchain/usr/bin"
-                    ),
-                    str(self.developer_dir / "usr/bin"),
-                    "/usr/bin",
-                    "/bin",
-                    "/usr/sbin",
-                    "/sbin",
-                )
-            ),
+            "SDKROOT": f"iPhoneOS{self.sdk_version}.sdk",
+            "PATH": self.hosted_resolved_path(),
             "EXCLUDED_SOURCE_FILE_NAMES": "canonical_checkpoint.json"
             if is_release
             else "",
@@ -211,6 +198,33 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             "WRAPPER_NAME": "SentiPocketApp.app",
             "EXECUTABLE_NAME": "SentiPocketApp",
         }
+
+    def hosted_resolved_path(self) -> str:
+        xcode_contents = self.developer_dir.parent
+        entries = (
+            xcode_contents
+            / (
+                "SharedFrameworks/SwiftBuild.framework/Versions/A/PlugIns/"
+                "SWBBuildService.bundle/Contents/PlugIns/"
+                "SWBUniversalPlatformPlugin.bundle/Contents/Frameworks/"
+                "SWBUniversalPlatform.framework/Resources"
+            ),
+            self.developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/bin",
+            self.developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/local/bin",
+            self.developer_dir / "Toolchains/XcodeDefault.xctoolchain/usr/libexec",
+            self.developer_dir / "Platforms/iPhoneOS.platform/usr/bin",
+            self.developer_dir / "Platforms/iPhoneOS.platform/usr/local/bin",
+            self.developer_dir / "Platforms/iPhoneOS.platform/Developer/usr/bin",
+            self.developer_dir
+            / "Platforms/iPhoneOS.platform/Developer/usr/local/bin",
+            self.developer_dir / "usr/bin",
+            self.developer_dir / "usr/local/bin",
+            PurePosixPath("/usr/bin"),
+            PurePosixPath("/bin"),
+            PurePosixPath("/usr/sbin"),
+            PurePosixPath("/sbin"),
+        )
+        return ":".join(str(entry) for entry in entries)
 
     def write_settings(
         self, settings: dict[str, object], duplicate: bool = False
@@ -1006,6 +1020,69 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         )
         self.assertEqual([], errors)
         self.assertEqual(debug, resolved)
+
+    def test_settings_accept_hosted_objc_runtime_omissions_and_known_values(self) -> None:
+        resolved, errors = verify.verify_settings_file(
+            self.settings_path, self.expected
+        )
+        self.assertEqual([], errors)
+        self.assertEqual(self.settings, resolved)
+
+        changed = dict(self.settings)
+        changed.update(verify.TRUSTED_OBJC_RUNTIME_ARGS)
+        self.write_settings(changed)
+        resolved, errors = verify.verify_settings_file(
+            self.settings_path, self.expected
+        )
+        self.assertEqual([], errors)
+        self.assertEqual(changed, resolved)
+
+        for value in (None, "", [], {}):
+            with self.subTest(linker_value=value):
+                changed_values: dict[str, object] = dict(self.settings)
+                changed_values["LD_OBJC_RUNTIME_ARGS"] = value
+                self.write_settings(changed_values)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, "LD_OBJC_RUNTIME_ARGS")
+
+    def test_settings_accept_relative_inspected_project_argument(self) -> None:
+        relative_project = Path(os.path.relpath(self.project_file, Path.cwd()))
+        expected = self.expected_with(project_file=relative_project)
+
+        resolved, errors = verify.verify_settings_file(
+            self.settings_path, expected
+        )
+
+        self.assertEqual([], errors)
+        self.assertEqual(self.settings, resolved)
+
+    def test_settings_bind_selected_sdk_version_and_xcode_path_shape(self) -> None:
+        for key, value in (
+            ("SDKROOT", "iPhoneOS99.9.sdk"),
+            ("SDKROOT", "iphoneos26.5"),
+            ("PATH", self.settings["PATH"] + ":/tmp/evil"),
+            ("PATH", ":".join(reversed(self.settings["PATH"].split(":")))),
+        ):
+            with self.subTest(key=key, value=value):
+                changed = dict(self.settings)
+                changed[key] = value
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, key)
+
+        for value in (None, [], {}):
+            with self.subTest(sdk_value=value):
+                changed_values: dict[str, object] = dict(self.settings)
+                changed_values["SDKROOT"] = value
+                self.write_settings(changed_values)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, "SDKROOT")
 
     def test_settings_reject_nonempty_or_nonstrings_for_optional_empty_values(self) -> None:
         for key in (
@@ -2485,6 +2562,18 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 )
                 self.assert_error_contains(errors, "sdk_root")
 
+        for sdk_version in ("", "26.beta", "26.5\n", "1" * 33):
+            with self.subTest(sdk_version=sdk_version):
+                errors = verify.validate_expectations(
+                    self.expected_with(sdk_version=sdk_version)
+                )
+                self.assert_error_contains(errors, "sdk_version")
+
+        errors = verify.validate_expectations(
+            self.expected_with(sdk_version="99.9")
+        )
+        self.assert_error_contains(errors, "sdk_root and sdk_version")
+
     def test_bundle_accepts_binary_plists_and_exact_resources(self) -> None:
         self.assertEqual(
             [],
@@ -3284,6 +3373,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             str(self.developer_dir),
             "--sdk-root",
             str(self.sdk_root),
+            "--sdk-version",
+            self.sdk_version,
         ]
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             status = verify.main(args)
@@ -3327,6 +3418,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             str(self.developer_dir),
             "--sdk-root",
             str(self.sdk_root),
+            "--sdk-version",
+            self.sdk_version,
         ]
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             status = verify.main(args)
