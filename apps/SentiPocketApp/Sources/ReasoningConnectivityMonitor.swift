@@ -20,6 +20,8 @@ protocol ReasoningPathStatusMonitoring: AnyObject, Sendable {
 /// Produces one connectivity stream per observation. A stream owns one fresh `NWPathMonitor`; terminating that
 /// stream clears its callback and cancels that exact monitor, so inactive/disappeared phone views retain no network
 /// observer. The one-element newest-value buffer prevents path churn from building an unbounded routing backlog.
+/// No synthetic route is emitted: the first value is always an actual `NWPath` status, so the coordinator's
+/// first-sample admission rule cannot vary with callback-vs-consumer scheduling.
 struct ReasoningConnectivityUpdates: Sendable {
     private let makeMonitor: @Sendable () -> any ReasoningPathStatusMonitoring
 
@@ -34,7 +36,6 @@ struct ReasoningConnectivityUpdates: Sendable {
     func stream() -> AsyncStream<PocketConnectivity> {
         let monitor = makeMonitor()
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            continuation.yield(.reconnecting)
             monitor.statusUpdateHandler = { status in
                 continuation.yield(Self.connectivity(for: status))
             }

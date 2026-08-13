@@ -6,12 +6,13 @@
 import SwiftUI
 import PocketContracts
 import PocketReasoning
+import PocketUI
 
 struct PocketPhoneView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var reasoning: RealReasoningCoordinator
     @ObservedObject var write: PhoneWriteViewModel
-    private let connectivityUpdates: ReasoningConnectivityUpdates
+    private let reasoningLifecycle: PocketPhoneReasoningLifecycle
     @State private var draft: String = ""
 
     init(
@@ -21,7 +22,10 @@ struct PocketPhoneView: View {
     ) {
         _reasoning = ObservedObject(wrappedValue: reasoning)
         _write = ObservedObject(wrappedValue: write)
-        self.connectivityUpdates = connectivityUpdates
+        reasoningLifecycle = PocketPhoneReasoningLifecycle(
+            reasoning: reasoning,
+            makeUpdates: { connectivityUpdates.stream() }
+        )
     }
 
     var body: some View {
@@ -32,18 +36,9 @@ struct PocketPhoneView: View {
             }
             .navigationTitle("Senti Pocket")
             .task(id: scenePhase) {
-                if scenePhase == .active {
-                    let observation = reasoning.observeConnectivity(connectivityUpdates.stream())
-                    await withTaskCancellationHandler {
-                        await observation.value
-                    } onCancel: {
-                        observation.cancel()
-                    }
-                } else {
-                    reasoning.reset()
-                }
+                await reasoningLifecycle.run(isActive: scenePhase == .active)
             }
-            .onDisappear { reasoning.reset() }
+            .onDisappear { reasoningLifecycle.stop() }
         }
     }
 
@@ -153,5 +148,39 @@ struct PocketPhoneView: View {
 
 private extension BriefingSegment {
     var sentiOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(id) }
+}
+
+/// Owns the reasoning observation at the SwiftUI lifecycle boundary while keeping active/inactive/disappearance
+/// behavior directly testable without fabricating `ScenePhase` environment updates. Parent task cancellation is
+/// forwarded to the exact observation task; inactive and disappearing views synchronously fence all late work.
+@MainActor
+struct PocketPhoneReasoningLifecycle {
+    private let reasoning: RealReasoningCoordinator
+    private let makeUpdates: @Sendable () -> AsyncStream<PocketConnectivity>
+
+    init(
+        reasoning: RealReasoningCoordinator,
+        makeUpdates: @escaping @Sendable () -> AsyncStream<PocketConnectivity>
+    ) {
+        self.reasoning = reasoning
+        self.makeUpdates = makeUpdates
+    }
+
+    func run(isActive: Bool) async {
+        guard isActive else {
+            reasoning.reset()
+            return
+        }
+        let observation = reasoning.observeConnectivity(makeUpdates())
+        await withTaskCancellationHandler {
+            await observation.value
+        } onCancel: {
+            observation.cancel()
+        }
+    }
+
+    func stop() {
+        reasoning.reset()
+    }
 }
 #endif

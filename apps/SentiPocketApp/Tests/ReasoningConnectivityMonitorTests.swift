@@ -9,9 +9,14 @@ private enum ReasoningConnectivityMonitorTestError: Error {
 
 private final class ReasoningPathMonitorProbe: ReasoningPathStatusMonitoring, @unchecked Sendable {
     private let lock = NSLock()
+    private let statusOnStart: ReasoningPathStatus?
     private var storedHandler: (@Sendable (ReasoningPathStatus) -> Void)?
     private var startCount = 0
     private var cancelCount = 0
+
+    init(statusOnStart: ReasoningPathStatus? = nil) {
+        self.statusOnStart = statusOnStart
+    }
 
     var statusUpdateHandler: (@Sendable (ReasoningPathStatus) -> Void)? {
         get { lock.withLock { storedHandler } }
@@ -20,6 +25,7 @@ private final class ReasoningPathMonitorProbe: ReasoningPathStatusMonitoring, @u
 
     func start() {
         lock.withLock { startCount += 1 }
+        if let statusOnStart { emit(statusOnStart) }
     }
 
     func cancel() {
@@ -38,10 +44,15 @@ private final class ReasoningPathMonitorProbe: ReasoningPathStatusMonitoring, @u
 
 private final class ReasoningPathMonitorFactoryProbe: @unchecked Sendable {
     private let lock = NSLock()
+    private let statusOnStart: ReasoningPathStatus?
     private var storedMonitors: [ReasoningPathMonitorProbe] = []
 
+    init(statusOnStart: ReasoningPathStatus? = nil) {
+        self.statusOnStart = statusOnStart
+    }
+
     func makeMonitor() -> any ReasoningPathStatusMonitoring {
-        let monitor = ReasoningPathMonitorProbe()
+        let monitor = ReasoningPathMonitorProbe(statusOnStart: statusOnStart)
         lock.withLock { storedMonitors.append(monitor) }
         return monitor
     }
@@ -83,7 +94,7 @@ private actor ReasoningConnectivityConsumerGate {
 }
 
 final class ReasoningConnectivityMonitorTests: XCTestCase {
-    func test_stream_starts_reconnecting_maps_every_path_status_and_cancels_exact_monitor() async throws {
+    func test_stream_maps_every_actual_path_status_and_cancels_exact_monitor() async throws {
         let factory = ReasoningPathMonitorFactoryProbe()
         let values = ReasoningConnectivityValueProbe()
         let updates = ReasoningConnectivityUpdates(makeMonitor: factory.makeMonitor)
@@ -93,22 +104,21 @@ final class ReasoningConnectivityMonitorTests: XCTestCase {
             }
         }
 
-        try await waitUntil { factory.monitors().count == 1 && values.values().count == 1 }
+        try await waitUntil { factory.monitors().count == 1 && factory.monitors()[0].snapshot().starts == 1 }
         let monitor = try XCTUnwrap(factory.monitors().first)
-        XCTAssertEqual(values.values(), [.reconnecting])
+        XCTAssertEqual(values.values(), [])
         XCTAssertEqual(monitor.snapshot().starts, 1)
 
         monitor.emit(.satisfied)
-        try await waitUntil { values.values().count == 2 }
+        try await waitUntil { values.values().count == 1 }
         monitor.emit(.requiresConnection)
-        try await waitUntil { values.values().count == 3 }
+        try await waitUntil { values.values().count == 2 }
         monitor.emit(.unsatisfied)
-        try await waitUntil { values.values().count == 4 }
+        try await waitUntil { values.values().count == 3 }
         monitor.emit(.unknown)
-        try await waitUntil { values.values().count == 5 }
+        try await waitUntil { values.values().count == 4 }
 
         XCTAssertEqual(values.values(), [
-            .reconnecting,
             .online,
             .reconnecting,
             .offline(cachedAt: nil),
@@ -123,7 +133,7 @@ final class ReasoningConnectivityMonitorTests: XCTestCase {
         XCTAssertFalse(monitor.snapshot().hasHandler)
         monitor.emit(.satisfied)
         for _ in 0..<20 { await Task.yield() }
-        XCTAssertEqual(values.values().count, 5, "a terminated monitor must not deliver a late callback")
+        XCTAssertEqual(values.values().count, 4, "a terminated monitor must not deliver a late callback")
     }
 
     func test_stream_buffers_only_the_newest_unconsumed_path_update() async throws {
@@ -142,15 +152,35 @@ final class ReasoningConnectivityMonitorTests: XCTestCase {
             }
         }
 
-        try await waitUntil { factory.monitors().count == 1 && values.values() == [.reconnecting] }
+        try await waitUntil { factory.monitors().count == 1 && factory.monitors()[0].snapshot().starts == 1 }
         let monitor = try XCTUnwrap(factory.monitors().first)
         monitor.emit(.satisfied)
+        try await waitUntil { values.values() == [.online] }
         monitor.emit(.requiresConnection)
         monitor.emit(.unsatisfied)
         await gate.open()
         try await waitUntil { values.values().count == 2 }
 
-        XCTAssertEqual(values.values(), [.reconnecting, .offline(cachedAt: nil)])
+        XCTAssertEqual(values.values(), [.online, .offline(cachedAt: nil)])
+
+        consumer.cancel()
+        await consumer.value
+        try await waitUntil { monitor.snapshot().cancels == 1 }
+    }
+
+    func test_synchronous_start_callback_is_the_single_first_stream_value() async throws {
+        let factory = ReasoningPathMonitorFactoryProbe(statusOnStart: .satisfied)
+        let values = ReasoningConnectivityValueProbe()
+        let updates = ReasoningConnectivityUpdates(makeMonitor: factory.makeMonitor)
+        let consumer = Task {
+            for await value in updates.stream() {
+                values.append(value)
+            }
+        }
+
+        try await waitUntil { values.values() == [.online] }
+        let monitor = try XCTUnwrap(factory.monitors().first)
+        XCTAssertEqual(monitor.snapshot().starts, 1)
 
         consumer.cancel()
         await consumer.value
