@@ -1722,6 +1722,81 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
 
         self.assertEqual([], errors)
 
+    def test_settings_allow_only_the_pinned_opaque_ui_test_source_group(self) -> None:
+        group_id = "E10000000000000000000000"
+        child_id = "E20000000000000000000000"
+        objects = self.project_graph["objects"]
+        assert isinstance(objects, dict)
+        main_group = objects[self.main_group_id]
+        assert isinstance(main_group, dict)
+        children = main_group["children"]
+        assert isinstance(children, list)
+        children.append(group_id)
+        objects[group_id] = {
+            "isa": "PBXGroup",
+            "children": [child_id],
+            "name": "DeviceUITests",
+            "path": "../../packages/PocketUI/DeviceUITests",
+            "sourceTree": "<group>",
+        }
+        objects[child_id] = {
+            "isa": "PBXFileReference",
+            "lastKnownFileType": "sourcecode.swift",
+            "path": "ExampleUITest.swift",
+            "sourceTree": "<group>",
+        }
+
+        self.write_settings(self.settings)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assertEqual([], errors)
+
+        group = objects[group_id]
+        assert isinstance(group, dict)
+        group["path"] = "../../packages/PocketUI/OtherTests"
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "unsafe PBXGroup path")
+
+        group["path"] = "../../packages/PocketUI/DeviceUITests"
+        group["sourceTree"] = "SOURCE_ROOT"
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "canonical <group> source tree")
+
+    def test_settings_reject_opaque_group_alias_and_unhashable_path(self) -> None:
+        opaque_group_id = "E10000000000000000000000"
+        nested_group_id = "E20000000000000000000000"
+        objects = self.project_graph["objects"]
+        assert isinstance(objects, dict)
+        main_group = objects[self.main_group_id]
+        assert isinstance(main_group, dict)
+        children = main_group["children"]
+        assert isinstance(children, list)
+        children.append(opaque_group_id)
+        objects[opaque_group_id] = {
+            "isa": "PBXGroup",
+            "children": [nested_group_id],
+            "path": "../../packages/PocketUI/DeviceUITests",
+            "sourceTree": "<group>",
+        }
+        objects[nested_group_id] = {
+            "isa": "PBXGroup",
+            "children": [self.asset_ref_id],
+            "path": "Nested",
+            "sourceTree": "<group>",
+        }
+
+        self.write_settings(self.settings)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "multiply reachable")
+
+        del objects[opaque_group_id]
+        del objects[nested_group_id]
+        children.remove(opaque_group_id)
+        resources_group = objects[self.resources_group_id]
+        assert isinstance(resources_group, dict)
+        resources_group["path"] = []
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "unsafe PBXGroup path")
+
     def test_settings_reject_decoy_generated_project_path(self) -> None:
         decoy = self.root / "decoy" / "SentiPocketApp.xcodeproj" / "project.pbxproj"
         decoy.parent.mkdir(parents=True)

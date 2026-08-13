@@ -89,6 +89,9 @@ APPROVED_PACKAGE_PRODUCTS = frozenset(
 APPROVED_LOCAL_PACKAGE_PATHS = frozenset(
     f"../../packages/{product}" for product in APPROVED_PACKAGE_PRODUCTS
 )
+APPROVED_OPAQUE_GROUP_PATHS = frozenset(
+    {"../../packages/PocketUI/DeviceUITests"}
+)
 APPROVED_PACKAGE_MANIFEST_SHA256 = {
     "PocketCall": "e3731c3954a29409cf1867ede171cf939ecb863e0589b496f705d68baeb31923",
     "PocketContracts": "e779465a333d13948fb7d41ad56556b7a93bea5e7be72371908f9bcdc125698a",
@@ -1135,6 +1138,38 @@ def _safe_resolved_path(
     return parsed_entries == expected_entries
 
 
+def _record_opaque_group_closure(
+    objects: Mapping[str, Mapping[str, Any]],
+    root_group_id: str,
+    parent_by_child: dict[str, str],
+    visited_groups: set[str],
+) -> str | None:
+    pending = [root_group_id]
+    while pending:
+        group_id = pending.pop()
+        if group_id in visited_groups:
+            return "generated Xcode project main-group graph is cyclic or ambiguous"
+        if len(visited_groups) >= MAX_PROJECT_OBJECTS:
+            return "generated Xcode project main-group graph exceeds its bound"
+        group = objects.get(group_id)
+        if not isinstance(group, dict) or group.get("isa") != "PBXGroup":
+            return "generated Xcode project mainGroup must reach only PBXGroup nodes"
+        visited_groups.add(group_id)
+        children = _pbx_reference_list(group.get("children"))
+        if children is None:
+            return "generated Xcode project contains invalid PBXGroup children"
+        for child_id in children:
+            if child_id in parent_by_child:
+                return "generated Xcode project main-group child is multiply reachable"
+            parent_by_child[child_id] = group_id
+            child = objects.get(child_id)
+            if not isinstance(child, dict) or not isinstance(child.get("isa"), str):
+                return "generated Xcode project main-group graph has a broken reference"
+            if child.get("isa") == "PBXGroup":
+                pending.append(child_id)
+    return None
+
+
 def _resolved_main_group_paths(
     objects: Mapping[str, Mapping[str, Any]], main_group_id: str
 ) -> tuple[dict[str, PurePosixPath], str | None]:
@@ -1157,9 +1192,28 @@ def _resolved_main_group_paths(
         source_tree = group.get("sourceTree")
         if source_tree not in ("<group>", "SOURCE_ROOT"):
             return {}, "generated Xcode project contains an unsupported PBXGroup sourceTree"
-        group_component = _safe_project_path(group.get("path"), allow_empty=True)
+        raw_group_path = group.get("path")
+        if (
+            isinstance(raw_group_path, str)
+            and raw_group_path in APPROVED_OPAQUE_GROUP_PATHS
+        ):
+            if source_tree != "<group>":
+                return {}, (
+                    "generated Xcode project approved external group must use "
+                    "the canonical <group> source tree"
+                )
+            opaque_error = _record_opaque_group_closure(
+                objects, group_id, parent_by_child, visited_groups
+            )
+            if opaque_error is not None:
+                return {}, opaque_error
+            continue
+        group_component = _safe_project_path(raw_group_path, allow_empty=True)
         if group_component is None:
-            return {}, "generated Xcode project contains an unsafe PBXGroup path"
+            return {}, (
+                "generated Xcode project contains an unsafe PBXGroup path: "
+                f"{_safe_repr(raw_group_path)}"
+            )
         group_path = (
             group_component
             if source_tree == "SOURCE_ROOT"
