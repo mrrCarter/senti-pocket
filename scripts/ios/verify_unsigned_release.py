@@ -1224,17 +1224,22 @@ def _generated_app_icon_membership_error(project: Mapping[str, Any]) -> str | No
             base = _build_setting_base(key)
             if base is None:
                 return "generated Xcode project contains an invalid build-setting key"
-            safe_disabled_preprocessing = (
-                base == "INFOPLIST_PREPROCESS"
-                and key == base
-                and setting == "NO"
+            safe_canonical_project_setting = (
+                key == base
+                and (
+                    (base == "INFOPLIST_PREPROCESS" and setting == "NO")
+                    or (base == "SDKROOT" and setting == "iphoneos")
+                )
             )
             if (
                 _is_execution_override_base(base)
                 and setting not in (None, "")
-                and not safe_disabled_preprocessing
+                and not safe_canonical_project_setting
             ):
-                return "generated Xcode project contains an executable tool override"
+                return (
+                    "generated Xcode project contains an executable tool override: "
+                    f"{key}"
+                )
     global_asset_refs = [
         value
         for value in objects.values()

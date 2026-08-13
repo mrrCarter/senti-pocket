@@ -219,6 +219,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.resources_phase_id = "666666666666666666666666"
         self.target_id = "777777777777777777777777"
         self.frameworks_phase_id = "D00000000000000000000000"
+        self.release_configuration_id = "F00000000000000000000000"
         package_products = sorted(verify.APPROVED_PACKAGE_PRODUCTS)
         self.package_reference_ids = {
             product: f"A{index:023X}"
@@ -285,6 +286,11 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                         self.package_product_ids.values()
                     ),
                     "productType": "com.apple.product-type.application",
+                },
+                self.release_configuration_id: {
+                    "isa": "XCBuildConfiguration",
+                    "buildSettings": {"SDKROOT": "iphoneos"},
+                    "name": "Release",
                 },
             },
             "rootObject": self.project_id,
