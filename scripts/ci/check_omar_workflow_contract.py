@@ -36,7 +36,12 @@ ALLOWED_MANAGED_LLM_LINE = "sentinelayer_managed_llm: ${{ secrets.SENTINELAYER_T
 ALLOWED_MODEL_LINE = "model: gpt-5.3-codex"
 ALLOWED_MODEL_FALLBACK_LINE = "model_fallback: gpt-5.3-codex"
 ALLOWED_USE_CODEX_LINE = 'use_codex: "true"'
-TELEMETRY_LOG_DOWNLOAD_FRAGMENT = 'gh run view "${RUN_ID}" --repo "${REPOSITORY}"'
+TELEMETRY_LOG_DOWNLOAD_FRAGMENTS = (
+    "curl --silent --show-error --location --fail-with-body",
+    "--proto-redir '=https' --max-redirs 3",
+    '--header "Authorization: Bearer ${GH_TOKEN}"',
+    '"https://api.github.com/repos/${REPOSITORY}/actions/jobs/${job_id}/logs"',
+)
 
 
 def _repo_llm_configured(workflow_text: str) -> bool:
@@ -289,13 +294,18 @@ def validate_omar_workflow_text(workflow_text: str) -> None:
         "Emit Omar run summary",
         "merge_threshold",
         "Omar Gate Finalize",
-        TELEMETRY_LOG_DOWNLOAD_FRAGMENT,
+        *TELEMETRY_LOG_DOWNLOAD_FRAGMENTS,
     )
     for fragment in required_direct_fragments:
         if fragment not in workflow_text:
             raise OmarWorkflowContractError(
                 f"omar-gate.yml is missing direct Omar Gate evidence fragment: {fragment}"
             )
+
+    _require(
+        "--location-trusted" not in workflow_text,
+        "telemetry job-log download must not forward authorization across origins",
+    )
 
 
 def _assert_fails(workflow_text: str) -> None:
@@ -368,8 +378,13 @@ jobs:
         run: echo "merge_threshold"
       - name: Assert Omar telemetry uploads
         run: |
-          gh run view "${RUN_ID}" --repo "${REPOSITORY}" \
-            --job "${job_id}" --log > "${log_file}"
+          curl --silent --show-error --location --fail-with-body \
+            --proto-redir '=https' --max-redirs 3 \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --output "${log_file}" \
+            "https://api.github.com/repos/${REPOSITORY}/actions/jobs/${job_id}/logs"
   omar-fork-static:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -394,13 +409,23 @@ jobs:
 """
     validate_omar_workflow_text(valid)
 
-    # Job logs can contain ANSI bytes. `gh api` refuses those raw responses but
-    # exposes no corresponding API flag; losing the dedicated authenticated
-    # log command must fail the workflow contract.
+    # Job logs can contain ANSI bytes and must be read before the parent run is
+    # complete. Replacing the bounded job endpoint with either incompatible CLI
+    # transport, or dropping its auth header, must fail the workflow contract.
     _assert_fails(
         valid.replace(
-            TELEMETRY_LOG_DOWNLOAD_FRAGMENT,
-            'gh api --method GET "repos/${REPOSITORY}/actions/jobs/${job_id}/logs"',
+            TELEMETRY_LOG_DOWNLOAD_FRAGMENTS[0],
+            'gh run view "${RUN_ID}" --repo "${REPOSITORY}" --log',
+            1,
+        )
+    )
+    _assert_fails(
+        valid.replace(TELEMETRY_LOG_DOWNLOAD_FRAGMENTS[2], "", 1)
+    )
+    _assert_fails(
+        valid.replace(
+            "--location --fail-with-body",
+            "--location-trusted --fail-with-body",
             1,
         )
     )

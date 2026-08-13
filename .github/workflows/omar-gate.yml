@@ -381,11 +381,19 @@ jobs:
 
           for job_id in ${job_ids}; do
             log_file="${tmp_dir}/${job_id}.log"
-            # `gh api` refuses ANSI-bearing log responses but exposes no API
-            # opt-in for them. Use the dedicated, authenticated log command;
-            # the parser below treats its output as untrusted text.
-            gh run view "${RUN_ID}" --repo "${REPOSITORY}" \
-              --job "${job_id}" --log > "${log_file}"
+            # A completed job's log is available while its parent run is still
+            # active. Fetch that job-scoped endpoint directly: `gh api` refuses
+            # ANSI-bearing responses and `gh run view --log` waits for the whole
+            # run. curl strips Authorization on a cross-origin redirect unless
+            # explicitly made trusted; the parser below treats the body as
+            # untrusted text.
+            curl --silent --show-error --location --fail-with-body \
+              --proto-redir '=https' --max-redirs 3 \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              --output "${log_file}" \
+              "https://api.github.com/repos/${REPOSITORY}/actions/jobs/${job_id}/logs"
             if ! python3 - "${log_file}" "${job_id}" <<'PY'
           import json
           import sys
