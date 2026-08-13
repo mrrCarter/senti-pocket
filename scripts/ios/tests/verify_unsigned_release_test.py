@@ -2096,6 +2096,27 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 )
                 self.assert_error_contains(errors, "api_url")
 
+    def test_expectations_accept_selected_unversioned_sdk_path_only(self) -> None:
+        sdk_directory = self.developer_dir / (
+            "Platforms/iPhoneOS.platform/Developer/SDKs"
+        )
+        errors = verify.validate_expectations(
+            self.expected_with(sdk_root=sdk_directory / "iPhoneOS.sdk")
+        )
+        self.assertEqual([], errors)
+
+        for sdk_root in (
+            sdk_directory / "iPhoneSimulator.sdk",
+            sdk_directory / "iPhoneOSbeta.sdk",
+            PurePosixPath("/tmp/Evil.app/Contents/Developer/Platforms/")
+            / "iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk",
+        ):
+            with self.subTest(sdk_root=sdk_root):
+                errors = verify.validate_expectations(
+                    self.expected_with(sdk_root=sdk_root)
+                )
+                self.assert_error_contains(errors, "sdk_root")
+
     def test_bundle_accepts_binary_plists_and_exact_resources(self) -> None:
         self.assertEqual(
             [],

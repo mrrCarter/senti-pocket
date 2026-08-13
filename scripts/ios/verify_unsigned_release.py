@@ -519,7 +519,9 @@ def validate_expectations(expected: Expectations) -> list[str]:
         not isinstance(sdk_root, PurePosixPath)
         or sdk_root.parent
         != developer_dir / "Platforms/iPhoneOS.platform/Developer/SDKs"
-        or not re.fullmatch(r"iPhoneOS[0-9]+(?:\.[0-9]+)*\.sdk", sdk_root.name)
+        or not re.fullmatch(
+            r"iPhoneOS(?:[0-9]+(?:\.[0-9]+)*)?\.sdk", sdk_root.name
+        )
     ):
         errors.append("sdk_root must be the selected Xcode iPhoneOS SDK path")
     return errors
