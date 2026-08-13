@@ -45,12 +45,17 @@ const NUMERIC_LAMBDA_VERSION_ARN_RE =
  *   - run: a senti writeback runner (bundled sl or a senti API client) — `POST /actions/execute` uses it
  *   - knownSessionIdsFor(humanId): the sessions the human may write to (server-derived authorization)
  *   - bundleStore.listForHuman(humanId, since): signed bundles for `GET /sync`
- *   - apnsSend({voipToken,platform,payload}): OPTIONAL VoIP push transport (APNs, cert-bound). Present => POST /dial
+ *   - apnsSend({voipToken,platform,payload}): OPTIONAL VoIP push transport. The native provider-token implementation is
+ *     createApnsVoipTransport(...).send; deployment must explicitly resolve its pinned .p8 secret into a P-256 KeyObject
+ *     and inject it here. Present => POST /dial
  *     dispatch is live; absent => /dial 501s (dial-not-configured) while /dial/register still records device tokens.
  *     WIRE CONTRACT (load-bearing — the app decode depends on it): `payload` is already the FINAL top-level APNs
  *     dictionary, including `aps`, after the gateway's 5,120-byte check. Serialize it verbatim. Do not nest it under
  *     `payload`/`data`, add fields, or rebuild `aps`. DialReceive.receive / SentiCallKit.decode read id/kind/message/…
- *     at the top level; nesting makes top-level `id` absent and every ring rejects silently.
+ *     at the top level; nesting makes top-level `id` absent and every ring rejects silently. The transport may return
+ *     typed/redacted APNs disposition metadata, but this gateway version treats only `delivered === true` as an APNs
+ *     acceptance ack. It never proves handset delivery or CallKit presentation. Token cleanup and durable delayed
+ *     retry require a separate, registry-fenced follow-up.
  *   - deviceRegistry / pushBackend: OPTIONAL overrides for the store-backed defaults (a dedicated device table, etc.)
  *     Registry V2 requires explicit DEVICE_REGISTRY_MODE=v2, DEVICE_REGISTRY_V1_PURGED=1,
  *     DEVICE_REGISTRY_CLIENT_V2_READY=1, DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1,
