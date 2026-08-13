@@ -1,8 +1,8 @@
 # MAC_VERIFY — compile + test the Swift packages on a Mac
 
-**Why this exists:** the packages are authored on Windows (no Swift/Xcode there), so nothing is
-compile-verified yet. On any Mac with Xcode command-line tools, this is a one-shot verification of
-the three SwiftPM packages. macOS has **CryptoKit**, so every `#if canImport(CryptoKit)` test path
+**Why this exists:** Windows cannot compile the Swift/Xcode closure, so every intended head needs
+attributable Mac evidence. On any Mac with Xcode command-line tools, this verifies the listed SwiftPM packages and
+the `project.yml`-linked app closure. macOS has **CryptoKit**, so every `#if canImport(CryptoKit)` test path
 (hashing, ed25519 signature verification) actually runs — which is exactly what can't run on Windows.
 
 ## Prereqs
@@ -10,6 +10,8 @@ the three SwiftPM packages. macOS has **CryptoKit**, so every `#if canImport(Cry
 
 ## Steps
 ```bash
+set -euo pipefail
+
 git clone https://github.com/mrrCarter/senti-pocket.git   # or: git -C senti-pocket pull
 cd senti-pocket
 git switch <intended-current-branch>
@@ -22,16 +24,17 @@ for pkg in packages/PocketContracts packages/PocketCall packages/PocketBriefing 
   ( cd "$pkg" && swift build && swift test )
 done
 
-# ML packages — pull heavy EXTERNAL deps; `swift build` fetches them (LiteRT-LM source, whisper.cpp binary xcframework).
-# These may be better validated via the app's xcodegen build (iOS SDK) than standalone swift test:
+# ML packages — pull heavy EXTERNAL deps (LiteRT-LM and the whisper.cpp binary XCFramework).
+# Resolution, compilation, and tests are mandatory; do not downgrade a failure to a warning.
 for pkg in packages/PocketInference packages/PocketVoice; do
   echo "==== $pkg (external deps) ===="
-  ( cd "$pkg" && swift build ) || echo "  ^ if LiteRT-LM/whisper resolution fails, route to Echo (owning lane)"
+  ( cd "$pkg" && swift build && swift test )
 done
 ```
 
-## The full app (all six packages wired)
-`apps/SentiPocketApp` depends on all six packages (project.yml). Build it via XcodeGen:
+## The production-linked app closure
+Build the packages actually linked by `apps/SentiPocketApp/project.yml` via XcodeGen. `PocketInference` remains a
+standalone package/device-integration gate here; this app target does not yet link it or `PocketReasoningGemma`.
 ```bash
 cd apps/SentiPocketApp && xcodegen generate && xcodebuild -scheme SentiPocketApp \
   -destination 'generic/platform=iOS Simulator' build
@@ -43,7 +46,7 @@ origins, and optionally an overridden bundle ID/build number; see `apps/SentiPoc
 does not prove provisioning, APNs entitlements, archive export, or installability.
 
 ## Expected
-- **All three build clean and all tests pass** (0 failures). Coverage that MUST pass:
+- **Every package listed above builds clean and all tests pass** (0 failures). Coverage that MUST pass:
   - **PocketContracts** — cross-module construction; Codable round-trips; `ActionResultRef` tagged-union
     Codable + canonical-token KAVs (`6:action…`, `8:sequence…`); receipt canonical **v4** KAV
     (`pocket.actionreceipt.v4\n…15:8:sequence3:200…`); proposal canonical **v3** KAV +
@@ -55,6 +58,8 @@ does not prove provisioning, APNs entitlements, archive export, or installabilit
     (correct key → completed, wrong key → not completed), plan/QA provenance. Uses
     `@testable import PocketCall` for the DEBUG-only `VerifiedBundle.makeUnverifiedForTesting`.
   - **PocketBriefing** — deterministic briefing plan.
+  - **PocketInference** — all package tests pass while compiling the real LiteRT-LM engine; a stubbed or excluded
+    engine is not valid evidence. Physical-device model preparation, answers, and benchmarks remain a separate gate.
 
 ## If something fails
 Report back the **exact** first error with `file:line` (compile error) or the failing XCTest name +
@@ -63,5 +68,5 @@ Senti so Atlas can fix the source.
 
 ## Not covered here (needs Xcode, not just `swift test`)
 `apps/SentiPocketApp` is an iOS app target built via **XcodeGen** — see `apps/SentiPocketApp/README.md`
-(`brew install xcodegen && xcodegen generate && open …`). It requires an iOS simulator; the three
-packages above are the logic/contract core and verify without the simulator.
+(`brew install xcodegen && xcodegen generate && open …`). It requires an iOS simulator; SwiftPM package tests do
+not prove the app's iOS SDK link closure, signing, APNs entitlements, archive export, installability, or device runtime.

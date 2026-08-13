@@ -9,6 +9,7 @@ on:
       - "packages/PocketCall/**"
       - "packages/PocketContracts/**"
       - "packages/PocketDialVoice/**"
+      - "packages/PocketInference/**"
       - "packages/PocketReasoning/**"
       - "packages/PocketSyncClient/**"
       - "packages/PocketUI/**"
@@ -20,6 +21,7 @@ on:
       - "packages/PocketCall/**"
       - "packages/PocketContracts/**"
       - "packages/PocketDialVoice/**"
+      - "packages/PocketInference/**"
       - "packages/PocketReasoning/**"
       - "packages/PocketSyncClient/**"
       - "packages/PocketUI/**"
@@ -47,6 +49,8 @@ jobs:
             path: packages/PocketVoice
           - name: PocketDialVoice
             path: packages/PocketDialVoice
+          - name: PocketInference
+            path: packages/PocketInference
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain
