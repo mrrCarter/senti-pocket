@@ -72,7 +72,8 @@ MARKETING_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,2}$")
 BUILD_NUMBER_RE = re.compile(r"^[1-9][0-9]*$")
 DNS_LABEL_RE = re.compile(r"^(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9])$")
 SWIFT_CONDITION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SWIFT_DEBUG_FLAG_RE = re.compile(r"(?:^|=)-D=?DEBUG(?:$|=)")
+MAX_SWIFT_SETTING_CHARACTERS = 64 * 1024
+MAX_SWIFT_SETTING_TOKENS = 4096
 SENSITIVE_SETTING_KEYS = frozenset({"SENTI_API_URL", "SENTI_GATEWAY_URL"})
 
 
@@ -241,6 +242,8 @@ def _generated_project_errors(path: Path) -> list[str]:
     # simpler and stronger than attempting to interpret OpenStep quoting.
     if "COMPILER_FLAGS" in project:
         errors.append("generated Xcode project contains per-file compiler flags")
+    if "OTHER_SWIFT_FLAGS" in project:
+        errors.append("generated Xcode project contains target-level Swift flags")
     return errors
 
 
@@ -314,44 +317,24 @@ def _resolved_setting_tokens(
     if not isinstance(raw, str):
         errors.append(f"{key} must resolve to a string")
         return None
+    if len(raw) > MAX_SWIFT_SETTING_CHARACTERS:
+        errors.append(f"{key} exceeds the resolved setting character limit")
+        return None
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw):
+        errors.append(f"{key} contains an unsupported control character")
+        return None
     try:
         tokens = tuple(shlex.split(raw))
     except ValueError:
         errors.append(f"{key} contains invalid shell-style quoting")
         return None
+    if len(tokens) > MAX_SWIFT_SETTING_TOKENS:
+        errors.append(f"{key} contains too many resolved tokens")
+        return None
     if any(token.startswith("@") for token in tokens):
         errors.append(f"{key} must not contain an opaque response-file argument")
         return None
     return tokens
-
-
-def _forwarded_frontend_tokens(
-    tokens: tuple[str, ...], key: str, errors: list[str]
-) -> tuple[str, ...] | None:
-    forwarded: list[str] = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "-Xfrontend":
-            index += 1
-            if index >= len(tokens):
-                errors.append(f"{key} contains an incomplete -Xfrontend argument")
-                return None
-            forwarded.append(tokens[index])
-        elif token.startswith("-Xfrontend="):
-            value = token.partition("=")[2]
-            if not value:
-                errors.append(f"{key} contains an empty -Xfrontend argument")
-                return None
-            forwarded.append(value)
-        else:
-            forwarded.append(token)
-        index += 1
-
-    if any(token.startswith("@") for token in forwarded):
-        errors.append(f"{key} must not forward an opaque response-file argument")
-        return None
-    return tuple(forwarded)
 
 
 def _verify_swift_compilation_conditions(
@@ -372,19 +355,8 @@ def _verify_swift_compilation_conditions(
             errors.append("Release configuration must not define DEBUG")
 
     other_flags = _resolved_setting_tokens(settings, "OTHER_SWIFT_FLAGS", errors)
-    if configuration == "Release" and other_flags is not None:
-        other_flags = _forwarded_frontend_tokens(
-            other_flags, "OTHER_SWIFT_FLAGS", errors
-        )
-    if configuration == "Release" and other_flags is not None:
-        defines_debug = any(
-            token == "DEBUG"
-            or token.startswith("DEBUG=")
-            or SWIFT_DEBUG_FLAG_RE.search(token)
-            for token in other_flags
-        )
-        if defines_debug:
-            errors.append("Release OTHER_SWIFT_FLAGS must not define DEBUG")
+    if other_flags:
+        errors.append("OTHER_SWIFT_FLAGS must resolve to no arguments")
 
 
 def verify_settings_file(

@@ -254,19 +254,35 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self,
     ) -> None:
         injections = (
-            ("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "DEBUG"),
-            ("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "FEATURE DEBUG TRACE"),
-            ("OTHER_SWIFT_FLAGS", "-DDEBUG"),
-            ("OTHER_SWIFT_FLAGS", "-D DEBUG"),
-            ("OTHER_SWIFT_FLAGS", "-D DEBUG=1"),
-            ("OTHER_SWIFT_FLAGS", "-Xfrontend -DDEBUG"),
-            ("OTHER_SWIFT_FLAGS", "-Xfrontend=-DDEBUG"),
-            ("OTHER_SWIFT_FLAGS", "-Xfrontend -D -Xfrontend DEBUG"),
-            ("OTHER_SWIFT_FLAGS", "-Xfrontend=-D -Xfrontend=DEBUG"),
-            ("OTHER_SWIFT_FLAGS", "-Xfrontend -D -Xfrontend=DEBUG"),
-            ("OTHER_SWIFT_FLAGS", "-D'DEBUG'"),
+            ("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "DEBUG", "DEBUG"),
+            (
+                "SWIFT_ACTIVE_COMPILATION_CONDITIONS",
+                "FEATURE DEBUG TRACE",
+                "DEBUG",
+            ),
+            ("OTHER_SWIFT_FLAGS", "-DDEBUG", "no arguments"),
+            ("OTHER_SWIFT_FLAGS", "-D DEBUG", "no arguments"),
+            ("OTHER_SWIFT_FLAGS", "-D DEBUG=1", "no arguments"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend -DDEBUG", "no arguments"),
+            ("OTHER_SWIFT_FLAGS", "-Xfrontend=-DDEBUG", "no arguments"),
+            (
+                "OTHER_SWIFT_FLAGS",
+                "-Xfrontend -D -Xfrontend DEBUG",
+                "no arguments",
+            ),
+            (
+                "OTHER_SWIFT_FLAGS",
+                "-Xfrontend=-D -Xfrontend=DEBUG",
+                "no arguments",
+            ),
+            (
+                "OTHER_SWIFT_FLAGS",
+                "-Xfrontend -D -Xfrontend=DEBUG",
+                "no arguments",
+            ),
+            ("OTHER_SWIFT_FLAGS", "-D'DEBUG'", "no arguments"),
         )
-        for key, value in injections:
+        for key, value, expected_error in injections:
             with self.subTest(key=key, value=value):
                 changed = dict(self.settings)
                 changed[key] = value
@@ -274,12 +290,101 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 _, errors = verify.verify_settings_file(
                     self.settings_path, self.expected
                 )
-                self.assert_error_contains(errors, "DEBUG")
+                self.assert_error_contains(errors, expected_error)
+
+    def swift_condition_errors(
+        self, other_swift_flags: str, configuration: str = "Release"
+    ) -> list[str]:
+        errors: list[str] = []
+        verify._verify_swift_compilation_conditions(
+            {
+                "SWIFT_ACTIVE_COMPILATION_CONDITIONS": ""
+                if configuration == "Release"
+                else "DEBUG",
+                "OTHER_SWIFT_FLAGS": other_swift_flags,
+            },
+            configuration,
+            errors,
+        )
+        return errors
+
+    def test_other_swift_flags_must_resolve_empty_in_both_configurations(self) -> None:
+        for flags in (
+            "-O",
+            "-DDEBUG",
+            "-D DEBUG",
+            "-D",
+            "-D=",
+            "-Xfrontend -O",
+            "-Xfrontend -D",
+            "-Xfrontend -Xfrontend -DDEBUG",
+            "-Xfrontend=-Xfrontend=-D -Xfrontend=-Xfrontend=DEBUG",
+            "-driver-use-frontend-path /absolute/swift-frontend;-DDEBUG",
+            "-tools-directory /absolute/attacker-tools",
+        ):
+            for configuration in ("Debug", "Release"):
+                with self.subTest(flags=flags, configuration=configuration):
+                    self.assert_error_contains(
+                        self.swift_condition_errors(flags, configuration),
+                        "no arguments",
+                    )
+
+    def test_resolved_setting_token_limit_is_bounded(self) -> None:
+        self.assertEqual(verify.MAX_SWIFT_SETTING_TOKENS, 4096)
+        errors: list[str] = []
+        tokens = verify._resolved_setting_tokens(
+            {"OTHER_SWIFT_FLAGS": " ".join(["-O"] * verify.MAX_SWIFT_SETTING_TOKENS)},
+            "OTHER_SWIFT_FLAGS",
+            errors,
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(tokens or ()), verify.MAX_SWIFT_SETTING_TOKENS)
+
+        errors = []
+        self.assertIsNone(
+            verify._resolved_setting_tokens(
+                {
+                    "OTHER_SWIFT_FLAGS": " ".join(
+                        ["-O"] * (verify.MAX_SWIFT_SETTING_TOKENS + 1)
+                    )
+                },
+                "OTHER_SWIFT_FLAGS",
+                errors,
+            )
+        )
+        self.assert_error_contains(errors, "too many resolved tokens")
+
+    def test_resolved_setting_character_limit_is_bounded_before_tokenization(
+        self,
+    ) -> None:
+        self.assertEqual(verify.MAX_SWIFT_SETTING_CHARACTERS, 64 * 1024)
+        errors: list[str] = []
+        tokens = verify._resolved_setting_tokens(
+            {"OTHER_SWIFT_FLAGS": " " * verify.MAX_SWIFT_SETTING_CHARACTERS},
+            "OTHER_SWIFT_FLAGS",
+            errors,
+        )
+        self.assertEqual(tokens, ())
+        self.assertEqual(errors, [])
+
+        errors = []
+        self.assertIsNone(
+            verify._resolved_setting_tokens(
+                {"OTHER_SWIFT_FLAGS": " " * (verify.MAX_SWIFT_SETTING_CHARACTERS + 1)},
+                "OTHER_SWIFT_FLAGS",
+                errors,
+            )
+        )
+        self.assert_error_contains(errors, "character limit")
+
+    def test_both_configurations_accept_no_other_swift_arguments(self) -> None:
+        for configuration in ("Debug", "Release"):
+            with self.subTest(configuration=configuration):
+                self.assertEqual(self.swift_condition_errors("", configuration), [])
 
     def test_settings_allow_distinct_release_compilation_conditions(self) -> None:
         release = dict(self.settings)
         release["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "RELEASE DEBUG_FEATURE"
-        release["OTHER_SWIFT_FLAGS"] = "-DRELEASE_FEATURE -DDEBUG_FEATURE"
         self.write_settings(release)
         resolved, errors = verify.verify_settings_file(
             self.settings_path, self.expected
@@ -332,6 +437,18 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         )
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
         self.assert_error_contains(errors, "per-file compiler flags")
+
+    def test_settings_reject_generated_project_target_swift_flags(self) -> None:
+        self.project_file.write_text(
+            "// !$*UTF8*$!\n"
+            "{ objects = {\n"
+            "A1 = {isa = XCBuildConfiguration; buildSettings = "
+            '{OTHER_SWIFT_FLAGS = "-driver-use-frontend-path /tmp/front;-DDEBUG";};};\n'
+            "}; }\n",
+            encoding="utf-8",
+        )
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "target-level Swift flags")
 
     def test_settings_reject_decoy_generated_project_path(self) -> None:
         decoy = self.root / "decoy" / "SentiPocketApp.xcodeproj" / "project.pbxproj"
