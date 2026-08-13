@@ -35,6 +35,10 @@ enum PocketWriteError: LocalizedError, Equatable {
     case rejected(String)        // TERMINAL 4xx (proposal_rejected / hash mismatch / not a known session / auth) — won't succeed on retry
     case malformedResponse
     case notPosted(String)       // a receipt came back but not a verified .posted (pending/failed) — NEVER render as sent
+    case cancelled               // the POST was cancelled (call torn down / task cancelled) BEFORE a terminal result —
+                                 // DISTINCT from .network (spec C): a cancellation is NOT an offline/connectivity
+                                 // condition, so it must NEVER map to a durable .pending ("queued, will send"). The
+                                 // confirmed intent stays in the durable outbox for a later reconcile; this is not "sent".
     var errorDescription: String? {
         switch self {
         case .notLoggedIn:       return "Sign in first — the write needs your Senti session."
@@ -43,19 +47,32 @@ enum PocketWriteError: LocalizedError, Equatable {
         case .rejected(let m):   return "The gateway rejected the write: \(m)"
         case .malformedResponse: return "The gateway returned an unexpected response."
         case .notPosted(let m):  return "Not sent: \(m)"
+        case .cancelled:         return "The write was interrupted before it completed."
         }
     }
 }
 
 @MainActor
 final class PocketWriteClient {
-    private let apiBaseURL: URL
+    private let apiBaseURL: URL?   // nil = no gateway configured → fail-closed (zero wire), never a hardcoded fallback host
     private let urlSession: URLSession
+    private let tokenProvider: () -> String?
 
-    init(apiBaseURL: URL, urlSession: URLSession = .shared) {
+    /// `apiBaseURL` is the strict, fail-closed resolved endpoint (nil when unconfigured — see GatewayEndpoint).
+    /// `tokenProvider` defaults to the real Keychain session token (SessionTokenStore) but is injectable so the write
+    /// flow is hermetically testable without the Keychain (same pattern as DialHydrationClient).
+    init(apiBaseURL: URL?,
+         urlSession: URLSession = .shared,
+         tokenProvider: @escaping () -> String? = { SessionTokenStore.load() }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession
+        self.tokenProvider = tokenProvider
     }
+
+    /// Endpoint READINESS (Pulse round-8) — a valid, resolved gateway is configured. The caller MUST check this at the
+    /// SYNCHRONOUS ownership boundary (before persisting/authorizing a write): a nil endpoint can never be repaired by a
+    /// reconnect, so a write against it must be refused up front (no durable intent, no token, no request).
+    var isConfigured: Bool { apiBaseURL != nil }
 
     /// Compose the humanMessage proposal for a top-level say. targetSequence is the SENTINEL 0 (mirrored + enforced
     /// on both sides). The producer init computes proposalHash from these fields; the gateway recomputes + binds it.
@@ -75,7 +92,13 @@ final class PocketWriteClient {
     /// throws (never lets a pending/failed receipt read as sent). The caller still verifies the signature against the
     /// gateway public key before rendering "sent — appeared in the room as you".
     func execute(proposal: ActionProposal, confirmation: GovernedWriteConfirmation) async throws -> ActionReceipt {
-        guard let token = SessionTokenStore.load(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
+        // Spec C: a PRE-CANCELLED call short-circuits to a distinct cancellation with ZERO work (no Keychain read, no
+        // URL request) — never a spurious .network→.pending. (Re-checked again just before the POST below.)
+        if Task.isCancelled { throw PocketWriteError.cancelled }
+        // Fail-closed (Pulse round-7 #1): no configured gateway → ZERO wire; the session bearer is never sent to a
+        // stale/unintended host. (Checked BEFORE the token read so a bad config makes no request at all.)
+        guard let apiBaseURL else { throw PocketWriteError.network("no gateway configured") }
+        guard let token = tokenProvider(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
         guard let url = URL(string: "/actions/execute", relativeTo: apiBaseURL) else {
             throw PocketWriteError.network("bad execute url")
         }
@@ -86,8 +109,16 @@ final class PocketWriteClient {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")  // the USER's session token = human-<you>
         req.httpBody = try Self.encoder.encode(ExecuteRequest(proposal: proposal, confirmation: confirmation))
 
+        // Spec C: if the surrounding task is ALREADY cancelled, issue ZERO network requests and surface a distinct
+        // cancellation — never a spurious .network→.pending. (A pre-cancelled write client makes no POST at all.)
+        if Task.isCancelled { throw PocketWriteError.cancelled }
+
         let (data, response): (Data, URLResponse)
         do { (data, response) = try await urlSession.data(for: req) }
+        // A cancellation (task cancelled mid-flight, or URLSession cancelled on app-suspend) stays a CANCELLATION —
+        // kept DISTINCT from .network so PhoneWriteViewModel never surfaces a torn-down write as a durable .pending.
+        catch let urlError as URLError where urlError.code == .cancelled { throw PocketWriteError.cancelled }
+        catch is CancellationError { throw PocketWriteError.cancelled }
         catch { throw PocketWriteError.network(error.localizedDescription) }
 
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {

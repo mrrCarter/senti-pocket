@@ -166,11 +166,15 @@ public struct SpeechPlaybackMetrics: Codable, Equatable, Sendable {
 public enum SpeechSynthesisBackend: String, Codable, Equatable, Sendable {
     case avSpeechOffline
     case elevenLabsGateway
+    /// Full-WAV briefing fetched from the pocket-TTS (Cartesia) gateway and played via `AVAudioPlayer`.
+    case cartesiaGateway
 }
 
 public enum FirstAudioMeasurement: String, Codable, Equatable, Sendable {
     case avSpeechDidStartCallback
     case pcmFirstBufferScheduled
+    /// First-audio instant captured synchronously when `AVAudioPlayer.play()` is scheduled (no delegate callback).
+    case avAudioPlayerPlaybackScheduled
 }
 
 public enum VoiceThermalLevel: String, Codable, Equatable, Sendable {

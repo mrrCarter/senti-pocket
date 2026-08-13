@@ -91,6 +91,14 @@ struct PocketPhoneView: View {
             case .pending(let message):
                 Label(message, systemImage: "wifi.slash").font(.footnote).foregroundStyle(.orange)
                 Button("Retry now") { write.retryPending() }
+            case .reconciling(let message):
+                // An authorized attempt whose network leg was interrupted — retained + reconcilable (it may have landed
+                // server-side, so it is NEVER silently retracted here; it reconciles on next launch). No false "sent"/"failed".
+                Label(message, systemImage: "arrow.triangle.2.circlepath").font(.footnote).foregroundStyle(.orange)
+            case .unavailable(let message):
+                // A previously-authorized write held while NO gateway is configured — RETAINED, but a nil endpoint can't
+                // be repaired by a reconnect, so there is NO retry button (it will send on a configured launch). Honest.
+                Label(message, systemImage: "wifi.exclamationmark").font(.footnote).foregroundStyle(.orange)
             case .refused(let message):
                 Label(message, systemImage: "xmark.seal.fill").font(.footnote).foregroundStyle(.red)
                 Button("Back") { write.cancel() }

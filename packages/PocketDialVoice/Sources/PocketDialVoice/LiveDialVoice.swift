@@ -40,6 +40,14 @@ public final class LiveDialVoice: DialVoice {
     private let vad: VoiceActivityConfiguration
 
     private var modelPrepared = false
+    /// Latched by `stop()` (Forge app-seam teardown). Once stopped, every in-flight speak/listen/answerFollowUp bails
+    /// at its next await instead of starting/continuing speech or capture — so a delayed reasoner/model/permission/mic/
+    /// transcribe await that resolves AFTER teardown can never restart the voice. Terminal for this per-episode instance.
+    private var stopped = false
+
+    /// True when this voice must produce no further audio/capture — an explicit stop() OR task cancellation. Checked
+    /// after EACH await in the pipeline (the recheck the app-seam gate requires).
+    private var isDown: Bool { stopped || Task.isCancelled }
 
     public init(
         reasoner: any DialReasoner,
@@ -73,18 +81,37 @@ public final class LiveDialVoice: DialVoice {
         try! VoiceActivityConfiguration()
     }()
 
+    // MARK: - teardown seam (Forge app-seam, spec B)
+
+    /// Explicit async teardown: stop the synthesizer (its reviewed `stop()`), the microphone, AND the recognizer, and
+    /// latch `stopped` so any in-flight speak/listen/answerFollowUp bails at its next await rather than restarting
+    /// speech or capture after teardown. Idempotent. The DialHost episode controller is the single teardown owner.
+    public func stop() async {
+        stopped = true
+        await synthesizer.stop()
+        await microphone.stop()
+        await recognizer.cancel()   // stop any in-flight transcription/recognition too (no late transcript survives)
+    }
+
     // MARK: - DialVoice
 
     public func speak(_ text: String) async {
+        if isDown { return }
         guard let request = try? SpeechSynthesisRequest(text: text, tone: tone) else { return }
+        if isDown { return }   // recheck immediately BEFORE the synth await — never start speech after a stop()
         _ = try? await synthesizer.speak(request)
     }
 
     public func listen() async -> String {
+        if isDown { return "" }
         guard await ensureModel() else { return "" }
+        if isDown { return "" }                                   // after the (async) model prepare
         guard await requestPermission() else { return "" }
+        if isDown { return "" }                                   // after the (async) permission prompt
         guard let request = await captureUtterance() else { return "" }
+        if isDown { return "" }                                   // after capture
         guard let result = try? await recognizer.transcribe(request) else { return "" }
+        if isDown { return "" }                                   // after transcribe — a late transcript is discarded
         return result.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -92,7 +119,10 @@ public final class LiveDialVoice: DialVoice {
     /// conversing phase — grounded-or-honest (`ProviderDialReasoner` never invents). NOT auto-invoked by `listen()`.
     @discardableResult
     public func answerFollowUp(_ question: String) async -> DialSpokenAnswer {
+        // No reasoner EGRESS after a stop(): bail BEFORE calling the (networked) reasoner if already torn down.
+        if isDown { return DialSpokenAnswer(spokenText: "", grounded: false, evidenceIds: []) }
         let answer = await reasoner.answerFollowUp(question, sessionId: sessionId, checkpointId: checkpointId)
+        if isDown { return answer }   // after the (async) reasoner — do NOT speak a late answer after a stop()
         await speak(answer.spokenText)
         return answer
     }
@@ -115,11 +145,13 @@ public final class LiveDialVoice: DialVoice {
     /// accumulator's cap trips, or the stream ends. Returns a 16 kHz transcription request, or nil if nothing
     /// usable was captured.
     private func captureUtterance() async -> TranscriptionRequest? {
+        if isDown { return nil }   // do not begin capture after a stop()
         guard var accumulator = try? CapturedAudioAccumulator(maximumSeconds: maxListenSeconds) else { return nil }
         var detector = EnergyVoiceActivityDetector(configuration: vad)
         var speechStarted = false
 
         guard let stream = try? await microphone.start() else { return nil }
+        if isDown { await microphone.stop(); return nil }   // stopped while the mic was starting → don't consume frames
 
         do {
             for try await frame in stream {
