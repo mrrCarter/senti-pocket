@@ -3179,6 +3179,73 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assert_error_contains(errors, "entry verification limit")
 
     def test_bundle_accepts_same_primary_app_icon_ipad_metadata(self) -> None:
+        original = self.read_info()
+        for include_name in (False, True):
+            with self.subTest(include_name=include_name):
+                primary = {"CFBundleIconFiles": ["AppIcon76x76"]}
+                if include_name:
+                    primary["CFBundleIconName"] = "AppIcon"
+                info = dict(original)
+                info["CFBundleIcons~ipad"] = {
+                    "CFBundlePrimaryIcon": primary,
+                }
+                self.write_info(info)
+                (self.app_path / "AppIcon76x76@2x~ipad.png").write_bytes(
+                    self.synthetic_png(width=152, height=152)
+                )
+
+                errors = verify.verify_bundle(
+                    self.settings_path, self.source_privacy_path, self.expected
+                )
+
+                self.assertEqual([], errors)
+
+    def test_bundle_allows_declared_nonrepresentative_icon_only_in_assets_car(
+        self,
+    ) -> None:
+        info = self.read_info()
+        info["CFBundleIcons"]["CFBundlePrimaryIcon"]["CFBundleIconFiles"] = [
+            "AppIcon20x20",
+            "AppIcon60x60",
+        ]
+        self.write_info(info)
+
+        errors = verify.verify_bundle(
+            self.settings_path, self.source_privacy_path, self.expected
+        )
+
+        self.assertEqual([], errors)
+
+    def test_bundle_rejects_invalid_ipad_primary_name_and_keys(self) -> None:
+        original = self.read_info()
+        mutations = (
+            {
+                "CFBundleIconFiles": ["AppIcon76x76"],
+                "CFBundleIconName": "OtherIcon",
+            },
+            {
+                "CFBundleIconFiles": ["AppIcon76x76"],
+                "UIPrerenderedIcon": False,
+            },
+        )
+        for primary in mutations:
+            with self.subTest(primary=primary):
+                info = dict(original)
+                info["CFBundleIcons~ipad"] = {
+                    "CFBundlePrimaryIcon": primary,
+                }
+                self.write_info(info)
+                (self.app_path / "AppIcon76x76@2x~ipad.png").write_bytes(
+                    self.synthetic_png(width=152, height=152)
+                )
+
+                errors = verify.verify_bundle(
+                    self.settings_path, self.source_privacy_path, self.expected
+                )
+
+                self.assertTrue(errors)
+
+    def test_bundle_binds_ipad_icon_filename_qualifier(self) -> None:
         info = self.read_info()
         info["CFBundleIcons~ipad"] = {
             "CFBundlePrimaryIcon": {
@@ -3187,15 +3254,101 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
             }
         }
         self.write_info(info)
-        (self.app_path / "AppIcon76x76@2x.png").write_bytes(
-            self.synthetic_png(width=152, height=152)
-        )
+        unqualified = self.app_path / "AppIcon76x76@2x.png"
+        unqualified.write_bytes(self.synthetic_png(width=152, height=152))
 
         errors = verify.verify_bundle(
             self.settings_path, self.source_privacy_path, self.expected
         )
 
-        self.assertEqual([], errors)
+        self.assert_error_contains(errors, "AppIcon76x76@2x~ipad.png")
+        self.assert_error_contains(errors, "alternate icon artifact")
+
+    def test_bundle_icon_failure_diagnostics_are_bounded_and_payload_free(self) -> None:
+        info = self.read_info()
+        info["CFBundleIcons~ipad"] = {
+            "CFBundlePrimaryIcon": {
+                "CFBundleIconFiles": ["AppIcon76x76"],
+                "UIPrerenderedIcon": False,
+                "TOPSECRET": "must-not-appear",
+            }
+        }
+        self.write_info(info)
+        icon_path = self.app_path / "AppIcon60x60@2x.png"
+        icon_path.write_bytes(
+            self.synthetic_png(
+                width=120,
+                height=120,
+                extra_chunks=((b"vpAg", b"secret-payload"),),
+            )
+        )
+
+        errors = verify.verify_bundle(
+            self.settings_path, self.source_privacy_path, self.expected
+        )
+        rendered = "\n".join(errors)
+
+        self.assertIn("UIPrerenderedIcon", rendered)
+        self.assertIn("<sha256=", rendered)
+        self.assertIn(
+            "AppIcon60x60@2x.png chunks=[vpAg(length=14,ordinal=2,position=before-IDAT)]",
+            rendered,
+        )
+        self.assertNotIn("TOPSECRET", rendered)
+        self.assertNotIn("must-not-appear", rendered)
+        self.assertNotIn("secret-payload", rendered)
+
+    def test_bundle_caps_unsupported_png_chunk_diagnostics(self) -> None:
+        chunks = tuple(
+            (
+                bytes(
+                    (
+                        ord("a") + index // 26,
+                        ord("a") + index % 26,
+                        ord("A"),
+                        ord("g"),
+                    )
+                ),
+                f"payload-{index}".encode(),
+            )
+            for index in range(32)
+        )
+        (self.app_path / "AppIcon60x60@2x.png").write_bytes(
+            self.synthetic_png(width=120, height=120, extra_chunks=chunks)
+        )
+
+        errors = verify.verify_bundle(
+            self.settings_path, self.source_privacy_path, self.expected
+        )
+        diagnostics = [
+            error for error in errors if "unapproved ancillary chunk" in error
+        ]
+
+        self.assertEqual(1, len(diagnostics))
+        self.assertLessEqual(len(diagnostics[0]), 2048)
+        self.assertIn("<16 additional omitted>", diagnostics[0])
+        self.assertNotIn("payload-", diagnostics[0])
+
+    def test_bundle_deduplicates_repeated_png_chunk_errors(self) -> None:
+        repeated_chunks = tuple((b"vpAg", b"") for _ in range(32))
+        (self.app_path / "AppIcon60x60@2x.png").write_bytes(
+            self.synthetic_png(
+                width=120,
+                height=120,
+                extra_chunks=repeated_chunks,
+            )
+        )
+
+        errors = verify.verify_bundle(
+            self.settings_path, self.source_privacy_path, self.expected
+        )
+        duplicate_errors = [
+            error for error in errors if "duplicate singleton chunks" in error
+        ]
+
+        self.assertEqual(1, len(duplicate_errors))
+        self.assertIn("vpAg(count=31)", duplicate_errors[0])
+        self.assertLessEqual(len("\n".join(errors)), 4096)
 
     def test_bundle_rejects_app_icon_filename_prefix_collision(self) -> None:
         (self.app_path / "AppIcon60x60@2x.png").unlink()
@@ -3205,7 +3358,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         errors = verify.verify_bundle(
             self.settings_path, self.source_privacy_path, self.expected
         )
-        self.assert_error_contains(errors, "required 2x")
+        self.assert_error_contains(errors, "AppIcon60x60@2x.png")
         (self.app_path / "AppIcon60x60.png").unlink()
         (self.app_path / "AppIcon60x60@unexpected.png").write_bytes(
             self.synthetic_png()

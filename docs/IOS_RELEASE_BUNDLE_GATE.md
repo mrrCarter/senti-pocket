@@ -26,10 +26,12 @@ The same commands can run in hosted CI or on Forge's Mac without an Apple accoun
 - Release excludes the canonical DEBUG fixture before compilation.
 - The built `.app` contains the expected expanded `Info.plist`, a structurally bounded executable-mode thin arm64
   `MH_EXECUTE` Mach-O with a file-backed `__TEXT` segment, exact `audio` + `voip` background modes, and a type-sensitive
-  semantic copy of the source privacy manifest. Its `UIDeviceFamily` is type-exact `[1]`, its primary icon metadata names
-  `AppIcon`, and its bounded `Assets.car` and declared rendered icon files are present as regular files. The exact
-  standalone-icon behavior is pinned to Xcode's `default`, and the required iPhone 120x120 `AppIcon60x60@2x.png` is
-  structurally decoded rather than accepting an arbitrary scale as proof.
+  semantic copy of the source privacy manifest. Its `UIDeviceFamily` is type-exact `[1]`; the generic primary icon names
+  `AppIcon`; and optional iPad compatibility metadata remains primary-only and either omits `CFBundleIconName` or names
+  the same `AppIcon`. The exact standalone-icon behavior is pinned to Xcode's `default`. The required iPhone 120x120
+  `AppIcon60x60@2x.png` and, when iPad compatibility metadata is emitted, 152x152
+  `AppIcon76x76@2x~ipad.png` are structurally decoded. Every additional present declared loose rendition is also decoded;
+  other declared renditions may remain solely in the bounded `Assets.car` under Xcode's `default` behavior.
 - The unsigned bundle contains no symlink and no path whose case-insensitive basename or suffix matches the gate's
   enumerated fixture, model, provisioning, signing, environment, or credential filename patterns (including
   `canonical_checkpoint.json`, `ggml-*.bin`, `*whisper*.bin`, `.gguf`, `.tflite`, `.litertlm`, `.task`,
@@ -53,7 +55,8 @@ runtime behavior of those binary bytes remain outside this verifier's proof.
 The `Assets.car` check proves only a bounded regular CoreUI-looking artifact with the expected `BOMStore` signature.
 It does not independently decode or inventory every rendition in that private-format archive. The stronger icon-input
 boundary is the exact pinned source catalog, generated-project resource graph, compiler settings, absence of alternate
-icon inputs/scripts/build rules, and structurally decoded declared loose rendered PNGs.
+icon inputs/scripts/build rules, the exact required loose representatives above, and structural decoding of every
+additional declared loose rendered PNG that Xcode emits.
 
 Security-sensitive JSON, plist, PBX, scheme, PNG, CoreUI, and Mach-O reads use final-component no-follow file descriptors,
 are bounded by `fstat`, and reject observable path or inode changes during verification. Checked final directories and

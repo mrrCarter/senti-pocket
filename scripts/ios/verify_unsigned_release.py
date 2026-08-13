@@ -37,6 +37,7 @@ MAX_PROJECT_BYTES = 16 * 1024 * 1024
 MAX_COMPILED_ASSET_BYTES = 64 * 1024 * 1024
 MAX_BUNDLE_ENTRIES = 100_000
 MAX_PNG_CHUNKS = 4096
+MAX_PNG_DIAGNOSTIC_CHUNKS = 16
 MAX_ASSET_CATALOG_ENTRIES = 4096
 MAX_APP_ICON_SET_ENTRIES = 2
 MAX_APP_ROOT_ENTRIES = 4096
@@ -2867,7 +2868,58 @@ def _type_sensitive_plist_equal(left: Any, right: Any) -> bool:
     return True
 
 
-def _validated_icon_names(icons: Any, label: str, errors: list[str]) -> list[str]:
+def _safe_icon_key_diagnostic(value: Mapping[str, Any]) -> str:
+    approved_labels = {
+        "CFBundleAlternateIcons",
+        "CFBundleIconFiles",
+        "CFBundleIconName",
+        "CFBundlePrimaryIcon",
+        "UIPrerenderedIcon",
+    }
+    rendered: list[str] = []
+    for key in value:
+        if key in approved_labels:
+            rendered.append(key)
+        else:
+            digest = hashlib.sha256(
+                key.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()[:12]
+            rendered.append(f"<sha256={digest}>")
+        if len(rendered) == 16:
+            break
+    rendered.sort()
+    if len(value) > len(rendered):
+        rendered.append(f"<{len(value) - len(rendered)} more keys>")
+    return _safe_repr(rendered)
+
+
+def _safe_icon_name_diagnostic(value: Any) -> str:
+    if value is None:
+        return "<absent>"
+    if value == APP_ICON_NAME or (
+        isinstance(value, str) and value in APPROVED_BUILT_ICON_SIZES
+    ):
+        return repr(value)
+    if isinstance(value, str):
+        digest = hashlib.sha256(
+            value.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:12]
+        return f"<string length={len(value)} sha256={digest}>"
+    return f"<non-string {type(value).__name__}>"
+
+
+def _safe_icon_files_diagnostic(value: Any) -> str:
+    if not isinstance(value, list):
+        return f"<non-list {type(value).__name__}>"
+    rendered = [_safe_icon_name_diagnostic(item) for item in value[:8]]
+    if len(value) > len(rendered):
+        rendered.append(f"<{len(value) - len(rendered)} more items>")
+    return _safe_repr(rendered)
+
+
+def _validated_icon_names(
+    icons: Any, label: str, errors: list[str]
+) -> list[tuple[str, bool]]:
     if not isinstance(icons, dict) or not all(isinstance(key, str) for key in icons):
         errors.append(f"{label} must be a string-keyed dictionary")
         return []
@@ -2880,12 +2932,31 @@ def _validated_icon_names(icons: Any, label: str, errors: list[str]) -> list[str
     ):
         errors.append(f"{label} CFBundlePrimaryIcon must be a string-keyed dictionary")
         return []
-    if set(primary) != {"CFBundleIconName", "CFBundleIconFiles"}:
-        errors.append(
-            f"{label} CFBundlePrimaryIcon must contain only the exact primary icon keys"
+    primary_keys = set(primary)
+    approved_primary_key_sets = (
+        (
+            {"CFBundleIconFiles"},
+            {"CFBundleIconFiles", "CFBundleIconName"},
         )
-    if primary.get("CFBundleIconName") != APP_ICON_NAME:
-        errors.append(f"{label} CFBundleIconName must be exactly {APP_ICON_NAME}")
+        if label == "CFBundleIcons~ipad"
+        else ({"CFBundleIconFiles", "CFBundleIconName"},)
+    )
+    if primary_keys not in approved_primary_key_sets:
+        errors.append(
+            f"{label} CFBundlePrimaryIcon must contain only the exact primary icon keys; "
+            f"got {_safe_icon_key_diagnostic(primary)}; files="
+            f"{_safe_icon_files_diagnostic(primary.get('CFBundleIconFiles'))}"
+        )
+    if "CFBundleIconName" in primary and primary.get("CFBundleIconName") != APP_ICON_NAME:
+        errors.append(
+            f"{label} CFBundleIconName must be exactly {APP_ICON_NAME}; got "
+            f"{_safe_icon_name_diagnostic(primary.get('CFBundleIconName'))}; files="
+            f"{_safe_icon_files_diagnostic(primary.get('CFBundleIconFiles'))}"
+        )
+    elif label != "CFBundleIcons~ipad" and "CFBundleIconName" not in primary:
+        errors.append(
+            f"{label} CFBundleIconName must be exactly {APP_ICON_NAME}; got <absent>"
+        )
 
     icon_files = primary.get("CFBundleIconFiles")
     if (
@@ -2893,14 +2964,18 @@ def _validated_icon_names(icons: Any, label: str, errors: list[str]) -> list[str
         or not 1 <= len(icon_files) <= 8
         or any(not isinstance(name, str) for name in icon_files)
     ):
-        errors.append(f"{label} CFBundleIconFiles must contain 1 to 8 icon names")
+        errors.append(
+            f"{label} CFBundleIconFiles must contain 1 to 8 icon names; got "
+            f"{_safe_icon_files_diagnostic(icon_files)}"
+        )
         return []
 
     validated: list[str] = []
     for name in icon_files:
         if name not in APPROVED_BUILT_ICON_SIZES:
             errors.append(
-                f"{label} CFBundleIconFiles contains an unsafe or extension-bearing icon name: {_safe_repr(name)}"
+                f"{label} CFBundleIconFiles contains an unsafe or extension-bearing icon name: "
+                f"{_safe_icon_name_diagnostic(name)}"
             )
         else:
             validated.append(name)
@@ -2913,11 +2988,16 @@ def _validated_icon_names(icons: Any, label: str, errors: list[str]) -> list[str
         errors.append(
             f"{label} CFBundleIconFiles must include {required_primary}"
         )
-    return validated
+    is_ipad = label == "CFBundleIcons~ipad"
+    return [(name, is_ipad) for name in validated]
 
 
 def _compiled_icon_png_errors(
-    path: Path, *, expected_width: int, expected_height: int
+    path: Path,
+    *,
+    expected_width: int,
+    expected_height: int,
+    evidence_label: str,
 ) -> list[str]:
     encoded, read_errors = _read_bounded_regular_file(
         path,
@@ -2932,6 +3012,13 @@ def _compiled_icon_png_errors(
         return ["built AppIcon candidate has an invalid PNG signature"]
 
     errors: list[str] = []
+    recorded_errors: set[str] = set()
+
+    def record_error(message: str) -> None:
+        if message not in recorded_errors:
+            recorded_errors.add(message)
+            errors.append(message)
+
     offset = len(PNG_SIGNATURE)
     chunk_count = 0
     saw_ihdr = False
@@ -2944,55 +3031,76 @@ def _compiled_icon_png_errors(
     width = 0
     height = 0
     channels = 0
+    unsupported_chunk_facts: list[str] = []
+    unsupported_chunk_count = 0
+    unsupported_chunk_kinds: set[str] = set()
+    duplicate_chunk_counts: dict[bytes, int] = {}
     while offset < len(encoded):
         chunk_count += 1
         if chunk_count > MAX_PNG_CHUNKS:
             return ["built AppIcon candidate exceeds the chunk verification limit"]
         if len(encoded) - offset < 12:
-            errors.append("built AppIcon candidate has a truncated chunk envelope")
+            record_error("built AppIcon candidate has a truncated chunk envelope")
             break
         chunk_size = struct.unpack_from(">I", encoded, offset)[0]
         chunk_end = offset + 12 + chunk_size
         if chunk_end > len(encoded):
-            errors.append("built AppIcon candidate chunk exceeds the file")
+            record_error("built AppIcon candidate chunk exceeds the file")
             break
         chunk_type = encoded[offset + 4 : offset + 8]
         payload = encoded[offset + 8 : offset + 8 + chunk_size]
         recorded_crc = struct.unpack_from(">I", encoded, offset + 8 + chunk_size)[0]
         if zlib.crc32(chunk_type + payload) & 0xFFFFFFFF != recorded_crc:
-            errors.append("built AppIcon candidate has an invalid chunk checksum")
+            record_error("built AppIcon candidate has an invalid chunk checksum")
             break
         if len(chunk_type) != 4 or any(
             byte not in range(ord("A"), ord("Z") + 1)
             and byte not in range(ord("a"), ord("z") + 1)
             for byte in chunk_type
         ):
-            errors.append("built AppIcon candidate contains an invalid chunk type")
+            record_error("built AppIcon candidate contains an invalid chunk type")
             break
         approved_chunks = APPROVED_PNG_CHUNKS | {b"CgBI"}
         if chunk_type not in approved_chunks:
-            if chunk_type[0] & 0x20 == 0:
-                errors.append("built AppIcon candidate contains an unknown critical chunk")
-            else:
-                errors.append("built AppIcon candidate contains an unapproved ancillary chunk")
+            chunk_kind = (
+                "unknown critical chunk"
+                if chunk_type[0] & 0x20 == 0
+                else "unapproved ancillary chunk"
+            )
+            unsupported_chunk_kinds.add(chunk_kind)
+            unsupported_chunk_count += 1
+            if len(unsupported_chunk_facts) < MAX_PNG_DIAGNOSTIC_CHUNKS:
+                chunk_label = chunk_type.decode("ascii")
+                if not saw_ihdr:
+                    position = "before-IHDR"
+                elif not saw_idat:
+                    position = "before-IDAT"
+                else:
+                    position = "after-IDAT"
+                unsupported_chunk_facts.append(
+                    f"{chunk_label}(length={chunk_size},ordinal={chunk_count},"
+                    f"position={position})"
+                )
         if chunk_type != b"IDAT":
             if chunk_type in seen_unique_chunks:
-                errors.append("built AppIcon candidate contains a duplicate singleton chunk")
+                duplicate_chunk_counts[chunk_type] = (
+                    duplicate_chunk_counts.get(chunk_type, 0) + 1
+                )
             seen_unique_chunks.add(chunk_type)
         if chunk_count == 1 and chunk_type not in {b"IHDR", b"CgBI"}:
-            errors.append("built AppIcon candidate must begin with IHDR or CgBI")
+            record_error("built AppIcon candidate must begin with IHDR or CgBI")
         if saw_idat and chunk_type not in {b"IDAT", b"IEND"}:
             idat_closed = True
         if saw_idat and chunk_type in {b"PLTE", b"sRGB", b"gAMA", b"pHYs"}:
-            errors.append("built AppIcon candidate metadata chunks must precede IDAT")
+            record_error("built AppIcon candidate metadata chunks must precede IDAT")
         if chunk_type == b"CgBI":
             if chunk_count != 1 or chunk_size not in {0, 4}:
-                errors.append("built AppIcon candidate has an invalid CgBI chunk")
+                record_error("built AppIcon candidate has an invalid CgBI chunk")
             saw_cgbi = True
         if chunk_type == b"IHDR":
             expected_position = 2 if saw_cgbi else 1
             if saw_ihdr or chunk_size != 13 or chunk_count != expected_position:
-                errors.append("built AppIcon candidate has an invalid IHDR")
+                record_error("built AppIcon candidate has an invalid IHDR")
             else:
                 saw_ihdr = True
                 (
@@ -3005,58 +3113,88 @@ def _compiled_icon_png_errors(
                     interlace,
                 ) = struct.unpack(">IIBBBBB", payload)
                 if (width, height) != (expected_width, expected_height):
-                    errors.append("built AppIcon candidate dimensions do not match its declared filename and scale")
+                    record_error(
+                        "built AppIcon candidate dimensions do not match its declared filename and scale"
+                    )
                 if bit_depth != 8 or color_type not in (2, 6):
-                    errors.append("built AppIcon candidate has an unsupported pixel format")
+                    record_error(
+                        "built AppIcon candidate has an unsupported pixel format"
+                    )
                 channels = 3 if color_type == 2 else 4
                 if (compression, filtering, interlace) != (0, 0, 0):
-                    errors.append("built AppIcon candidate uses unsupported encoding methods")
+                    record_error(
+                        "built AppIcon candidate uses unsupported encoding methods"
+                    )
         elif chunk_type != b"CgBI" and not saw_ihdr:
-            errors.append("built AppIcon candidate must place IHDR immediately after CgBI")
+            record_error(
+                "built AppIcon candidate must place IHDR immediately after CgBI"
+            )
         elif chunk_type == b"IDAT":
             if not saw_ihdr or not payload or idat_closed:
-                errors.append("built AppIcon candidate has invalid image data")
+                record_error("built AppIcon candidate has invalid image data")
             saw_idat = True
             idat_payloads.append(payload)
         elif chunk_type == b"PLTE":
             if not 3 <= chunk_size <= 768 or chunk_size % 3 != 0:
-                errors.append("built AppIcon candidate contains an invalid PLTE chunk")
+                record_error("built AppIcon candidate contains an invalid PLTE chunk")
         elif chunk_type == b"sRGB":
             if chunk_size != 1 or payload[0] > 3:
-                errors.append("built AppIcon candidate contains an invalid sRGB chunk")
+                record_error("built AppIcon candidate contains an invalid sRGB chunk")
         elif chunk_type == b"gAMA":
             if chunk_size != 4 or struct.unpack(">I", payload)[0] == 0:
-                errors.append("built AppIcon candidate contains an invalid gAMA chunk")
+                record_error("built AppIcon candidate contains an invalid gAMA chunk")
         elif chunk_type == b"pHYs":
             if chunk_size != 9 or payload[-1] not in (0, 1):
-                errors.append("built AppIcon candidate contains an invalid pHYs chunk")
+                record_error("built AppIcon candidate contains an invalid pHYs chunk")
         elif chunk_type == b"IEND":
             if chunk_size != 0 or chunk_end != len(encoded):
-                errors.append("built AppIcon candidate has an invalid IEND")
+                record_error("built AppIcon candidate has an invalid IEND")
             saw_iend = True
             offset = chunk_end
             break
         offset = chunk_end
 
     if not saw_ihdr:
-        errors.append("built AppIcon candidate is missing IHDR")
+        record_error("built AppIcon candidate is missing IHDR")
     if not saw_idat:
-        errors.append("built AppIcon candidate is missing image data")
+        record_error("built AppIcon candidate is missing image data")
     if not saw_iend:
-        errors.append("built AppIcon candidate is missing IEND")
-    if idat_payloads and width > 0 and height > 0 and channels > 0:
-        errors.extend(
-            _png_image_data_errors(
-                idat_payloads,
-                width=width,
-                height=height,
-                channels=channels,
-                label="built AppIcon candidate",
-                exact_scanline_description=f"{height} decoded scanlines",
-                require_opaque_alpha=channels == 4,
-                wbits=-zlib.MAX_WBITS if saw_cgbi else zlib.MAX_WBITS,
-            )
+        record_error("built AppIcon candidate is missing IEND")
+    if unsupported_chunk_count:
+        omitted = unsupported_chunk_count - len(unsupported_chunk_facts)
+        omitted_suffix = f", <{omitted} additional omitted>" if omitted else ""
+        record_error(
+            "built AppIcon candidate contains "
+            f"{' and '.join(sorted(unsupported_chunk_kinds))}: {evidence_label} "
+            f"chunks=[{', '.join(unsupported_chunk_facts)}{omitted_suffix}]"
         )
+    if duplicate_chunk_counts:
+        duplicate_facts = [
+            f"{chunk_type.decode('ascii')}(count={count})"
+            for chunk_type, count in sorted(duplicate_chunk_counts.items())[
+                :MAX_PNG_DIAGNOSTIC_CHUNKS
+            ]
+        ]
+        omitted_types = len(duplicate_chunk_counts) - len(duplicate_facts)
+        omitted_suffix = (
+            f", <{omitted_types} additional types omitted>" if omitted_types else ""
+        )
+        record_error(
+            "built AppIcon candidate contains duplicate singleton chunks: "
+            f"{evidence_label} chunks=[{', '.join(duplicate_facts)}{omitted_suffix}]"
+        )
+    if idat_payloads and width > 0 and height > 0 and channels > 0:
+        for image_data_error in _png_image_data_errors(
+            idat_payloads,
+            width=width,
+            height=height,
+            channels=channels,
+            label="built AppIcon candidate",
+            exact_scanline_description=f"{height} decoded scanlines",
+            require_opaque_alpha=channels == 4,
+            wbits=-zlib.MAX_WBITS if saw_cgbi else zlib.MAX_WBITS,
+        ):
+            record_error(image_data_error)
     return errors
 
 
@@ -3108,51 +3246,46 @@ def _compiled_app_icon_errors(app_path: Path, info: Mapping[str, Any]) -> list[s
     )
     errors.extend(listing_errors)
 
-    approved_rendered_names: set[str] = set()
-    for declared_name in sorted(set(validated_icon_names)):
+    approved_rendered_names: dict[str, tuple[float, int]] = {}
+    for declared_name, is_ipad in sorted(set(validated_icon_names)):
         logical_size = APPROVED_BUILT_ICON_SIZES.get(declared_name)
         if logical_size is None:
             continue
+        idiom_suffix = "~ipad" if is_ipad else ""
         allowed_names = {
-            f"{declared_name}.png",
-            f"{declared_name}@2x.png",
-            f"{declared_name}@3x.png",
+            f"{declared_name}{idiom_suffix}.png": 1,
+            f"{declared_name}@2x{idiom_suffix}.png": 2,
+            f"{declared_name}@3x{idiom_suffix}.png": 3,
         }
-        approved_rendered_names.update(allowed_names)
-        candidates = [entry for entry in entries if entry.name in allowed_names]
-        if not candidates:
-            errors.append(
-                f"built app is missing declared AppIcon files for {declared_name}"
-            )
-            continue
-        required_candidate = (
-            f"{declared_name}@2x.png"
-            if declared_name in {"AppIcon60x60", "AppIcon76x76"}
-            else None
+        approved_rendered_names.update(
+            (filename, (logical_size, scale))
+            for filename, scale in allowed_names.items()
         )
-        if required_candidate is not None and not any(
-            entry.name == required_candidate for entry in candidates
-        ):
-            errors.append(
-                f"built app is missing required 2x AppIcon file {required_candidate}"
+
+    required_rendered_names = {"AppIcon60x60@2x.png"}
+    if any(is_ipad for _, is_ipad in validated_icon_names):
+        required_rendered_names.add("AppIcon76x76@2x~ipad.png")
+    entry_names = {entry.name for entry in entries}
+    for required_name in sorted(required_rendered_names - entry_names):
+        errors.append(f"built app is missing required AppIcon file {required_name}")
+
+    for entry in entries:
+        rendered_metadata = approved_rendered_names.get(entry.name)
+        if rendered_metadata is None:
+            continue
+        logical_size, scale = rendered_metadata
+        expected_size = logical_size * scale
+        if not expected_size.is_integer():
+            errors.append("built AppIcon candidate has a non-integral declared pixel size")
+            continue
+        errors.extend(
+            _compiled_icon_png_errors(
+                Path(entry.path),
+                expected_width=int(expected_size),
+                expected_height=int(expected_size),
+                evidence_label=entry.name,
             )
-        for entry in candidates:
-            scale = 1
-            if entry.name.endswith("@2x.png"):
-                scale = 2
-            elif entry.name.endswith("@3x.png"):
-                scale = 3
-            expected_size = logical_size * scale
-            if not expected_size.is_integer():
-                errors.append("built AppIcon candidate has a non-integral declared pixel size")
-                continue
-            errors.extend(
-                _compiled_icon_png_errors(
-                    Path(entry.path),
-                    expected_width=int(expected_size),
-                    expected_height=int(expected_size),
-                )
-            )
+        )
 
     if any(
         entry.name.lower().endswith(".png")
