@@ -1723,20 +1723,41 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertEqual([], errors)
 
     def test_settings_allow_only_the_pinned_opaque_ui_test_source_group(self) -> None:
-        group_id = "E10000000000000000000000"
-        child_id = "E20000000000000000000000"
+        root_group_id = "E10000000000000000000000"
+        packages_group_id = "E20000000000000000000000"
+        pocket_ui_group_id = "E30000000000000000000000"
+        device_tests_group_id = "E40000000000000000000000"
+        child_id = "E50000000000000000000000"
         objects = self.project_graph["objects"]
         assert isinstance(objects, dict)
         main_group = objects[self.main_group_id]
         assert isinstance(main_group, dict)
         children = main_group["children"]
         assert isinstance(children, list)
-        children.append(group_id)
-        objects[group_id] = {
+        children.append(root_group_id)
+        objects[root_group_id] = {
+            "isa": "PBXGroup",
+            "children": [packages_group_id],
+            "name": ".",
+            "path": "../..",
+            "sourceTree": "<group>",
+        }
+        objects[packages_group_id] = {
+            "isa": "PBXGroup",
+            "children": [pocket_ui_group_id],
+            "path": "packages",
+            "sourceTree": "<group>",
+        }
+        objects[pocket_ui_group_id] = {
+            "isa": "PBXGroup",
+            "children": [device_tests_group_id],
+            "path": "PocketUI",
+            "sourceTree": "<group>",
+        }
+        objects[device_tests_group_id] = {
             "isa": "PBXGroup",
             "children": [child_id],
-            "name": "DeviceUITests",
-            "path": "../../packages/PocketUI/DeviceUITests",
+            "path": "DeviceUITests",
             "sourceTree": "<group>",
         }
         objects[child_id] = {
@@ -1750,47 +1771,178 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
         self.assertEqual([], errors)
 
-        group = objects[group_id]
-        assert isinstance(group, dict)
-        group["path"] = "../../packages/PocketUI/OtherTests"
+        root_group = objects[root_group_id]
+        assert isinstance(root_group, dict)
+        root_group["path"] = "../../.."
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
         self.assert_error_contains(errors, "unsafe PBXGroup path")
 
-        group["path"] = "../../packages/PocketUI/DeviceUITests"
-        group["sourceTree"] = "SOURCE_ROOT"
+        root_group["path"] = "../.."
+        pocket_ui_group = objects[pocket_ui_group_id]
+        assert isinstance(pocket_ui_group, dict)
+        pocket_ui_group["path"] = "OtherUI"
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
-        self.assert_error_contains(errors, "canonical <group> source tree")
+        self.assert_error_contains(errors, "approved canonical chain")
 
-    def test_settings_reject_opaque_group_alias_and_unhashable_path(self) -> None:
-        opaque_group_id = "E10000000000000000000000"
-        nested_group_id = "E20000000000000000000000"
+        pocket_ui_group["path"] = "PocketUI"
+        root_group["sourceTree"] = "SOURCE_ROOT"
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "approved canonical chain")
+
+        root_group["sourceTree"] = "<group>"
+        wrapper_group_id = "E60000000000000000000000"
+        children.remove(root_group_id)
+        children.append(wrapper_group_id)
+        objects[wrapper_group_id] = {
+            "isa": "PBXGroup",
+            "children": [root_group_id],
+            "path": "Wrapper",
+            "sourceTree": "<group>",
+        }
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "unsafe PBXGroup path")
+
+    def test_settings_reject_duplicate_external_ui_test_root(self) -> None:
         objects = self.project_graph["objects"]
         assert isinstance(objects, dict)
         main_group = objects[self.main_group_id]
         assert isinstance(main_group, dict)
         children = main_group["children"]
         assert isinstance(children, list)
-        children.append(opaque_group_id)
-        objects[opaque_group_id] = {
+        chain_ids = [f"E{index:023X}" for index in range(1, 11)]
+        for offset in (0, 5):
+            root_id, packages_id, pocket_ui_id, device_tests_id, file_id = chain_ids[
+                offset : offset + 5
+            ]
+            children.append(root_id)
+            objects[root_id] = {
+                "isa": "PBXGroup",
+                "children": [packages_id],
+                "path": "../..",
+                "sourceTree": "<group>",
+            }
+            objects[packages_id] = {
+                "isa": "PBXGroup",
+                "children": [pocket_ui_id],
+                "path": "packages",
+                "sourceTree": "<group>",
+            }
+            objects[pocket_ui_id] = {
+                "isa": "PBXGroup",
+                "children": [device_tests_id],
+                "path": "PocketUI",
+                "sourceTree": "<group>",
+            }
+            objects[device_tests_id] = {
+                "isa": "PBXGroup",
+                "children": [file_id],
+                "path": "DeviceUITests",
+                "sourceTree": "<group>",
+            }
+            objects[file_id] = {
+                "isa": "PBXFileReference",
+                "path": f"Example{offset}.swift",
+                "sourceTree": "<group>",
+            }
+
+        self.write_settings(self.settings)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "multiple external UI-test roots")
+
+    def test_settings_reject_opaque_group_alias_and_unhashable_path(self) -> None:
+        root_group_id = "E10000000000000000000000"
+        packages_group_id = "E20000000000000000000000"
+        pocket_ui_group_id = "E30000000000000000000000"
+        device_tests_group_id = "E40000000000000000000000"
+        nested_group_id = "E50000000000000000000000"
+        nested_file_id = "E60000000000000000000000"
+        objects = self.project_graph["objects"]
+        assert isinstance(objects, dict)
+        main_group = objects[self.main_group_id]
+        assert isinstance(main_group, dict)
+        children = main_group["children"]
+        assert isinstance(children, list)
+        children.append(root_group_id)
+        objects[root_group_id] = {
+            "isa": "PBXGroup",
+            "children": [packages_group_id],
+            "path": "../..",
+            "sourceTree": "<group>",
+        }
+        objects[packages_group_id] = {
+            "isa": "PBXGroup",
+            "children": [pocket_ui_group_id],
+            "path": "packages",
+            "sourceTree": "<group>",
+        }
+        objects[pocket_ui_group_id] = {
+            "isa": "PBXGroup",
+            "children": [device_tests_group_id],
+            "path": "PocketUI",
+            "sourceTree": "<group>",
+        }
+        objects[device_tests_group_id] = {
             "isa": "PBXGroup",
             "children": [nested_group_id],
-            "path": "../../packages/PocketUI/DeviceUITests",
+            "path": "DeviceUITests",
             "sourceTree": "<group>",
         }
         objects[nested_group_id] = {
             "isa": "PBXGroup",
-            "children": [self.asset_ref_id],
+            "children": [nested_file_id],
             "path": "Nested",
+            "sourceTree": "<group>",
+        }
+        objects[nested_file_id] = {
+            "isa": "PBXFileReference",
+            "lastKnownFileType": "sourcecode.swift",
+            "path": "NestedUITest.swift",
             "sourceTree": "<group>",
         }
 
         self.write_settings(self.settings)
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assertEqual([], errors)
+
+        source_build_file_id = "E70000000000000000000000"
+        source_phase_id = "E80000000000000000000000"
+        objects[source_build_file_id] = {
+            "isa": "PBXBuildFile",
+            "fileRef": nested_file_id,
+        }
+        objects[source_phase_id] = {
+            "isa": "PBXSourcesBuildPhase",
+            "buildActionMask": "2147483647",
+            "files": [source_build_file_id],
+            "runOnlyForDeploymentPostprocessing": "0",
+        }
+        target = objects[self.target_id]
+        assert isinstance(target, dict)
+        build_phases = target["buildPhases"]
+        assert isinstance(build_phases, list)
+        build_phases.append(source_phase_id)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assert_error_contains(errors, "unsafe source path")
+        build_phases.remove(source_phase_id)
+        del objects[source_phase_id]
+        del objects[source_build_file_id]
+
+        nested_group = objects[nested_group_id]
+        assert isinstance(nested_group, dict)
+        nested_group["children"] = [self.asset_ref_id]
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
         self.assert_error_contains(errors, "multiply reachable")
 
-        del objects[opaque_group_id]
-        del objects[nested_group_id]
-        children.remove(opaque_group_id)
+        for object_id in (
+            root_group_id,
+            packages_group_id,
+            pocket_ui_group_id,
+            device_tests_group_id,
+            nested_group_id,
+            nested_file_id,
+        ):
+            del objects[object_id]
+        children.remove(root_group_id)
         resources_group = objects[self.resources_group_id]
         assert isinstance(resources_group, dict)
         resources_group["path"] = []

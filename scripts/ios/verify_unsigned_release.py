@@ -89,9 +89,8 @@ APPROVED_PACKAGE_PRODUCTS = frozenset(
 APPROVED_LOCAL_PACKAGE_PATHS = frozenset(
     f"../../packages/{product}" for product in APPROVED_PACKAGE_PRODUCTS
 )
-APPROVED_OPAQUE_GROUP_PATHS = frozenset(
-    {"../../packages/PocketUI/DeviceUITests"}
-)
+APPROVED_OPAQUE_GROUP_ROOT_PATH = "../.."
+APPROVED_OPAQUE_GROUP_CHAIN = ("packages", "PocketUI", "DeviceUITests")
 APPROVED_PACKAGE_MANIFEST_SHA256 = {
     "PocketCall": "e3731c3954a29409cf1867ede171cf939ecb863e0589b496f705d68baeb31923",
     "PocketContracts": "e779465a333d13948fb7d41ad56556b7a93bea5e7be72371908f9bcdc125698a",
@@ -1144,9 +1143,9 @@ def _record_opaque_group_closure(
     parent_by_child: dict[str, str],
     visited_groups: set[str],
 ) -> str | None:
-    pending = [root_group_id]
+    pending = [(root_group_id, 0)]
     while pending:
-        group_id = pending.pop()
+        group_id, chain_depth = pending.pop()
         if group_id in visited_groups:
             return "generated Xcode project main-group graph is cyclic or ambiguous"
         if len(visited_groups) >= MAX_PROJECT_OBJECTS:
@@ -1154,10 +1153,34 @@ def _record_opaque_group_closure(
         group = objects.get(group_id)
         if not isinstance(group, dict) or group.get("isa") != "PBXGroup":
             return "generated Xcode project mainGroup must reach only PBXGroup nodes"
+        raw_group_path = group.get("path")
+        expected_path = (
+            APPROVED_OPAQUE_GROUP_ROOT_PATH
+            if chain_depth == 0
+            else APPROVED_OPAQUE_GROUP_CHAIN[chain_depth - 1]
+            if chain_depth <= len(APPROVED_OPAQUE_GROUP_CHAIN)
+            else None
+        )
+        if expected_path is not None:
+            if raw_group_path != expected_path or group.get("sourceTree") != "<group>":
+                return (
+                    "generated Xcode project external UI-test group does not match "
+                    "the approved canonical chain"
+                )
+        elif (
+            group.get("sourceTree") != "<group>"
+            or _safe_project_path(raw_group_path, allow_empty=False) is None
+        ):
+            return "generated Xcode project external UI-test group has an unsafe descendant"
         visited_groups.add(group_id)
         children = _pbx_reference_list(group.get("children"))
         if children is None:
             return "generated Xcode project contains invalid PBXGroup children"
+        if chain_depth < len(APPROVED_OPAQUE_GROUP_CHAIN) and len(children) != 1:
+            return (
+                "generated Xcode project external UI-test group does not match "
+                "the approved canonical chain"
+            )
         for child_id in children:
             if child_id in parent_by_child:
                 return "generated Xcode project main-group child is multiply reachable"
@@ -1166,7 +1189,18 @@ def _record_opaque_group_closure(
             if not isinstance(child, dict) or not isinstance(child.get("isa"), str):
                 return "generated Xcode project main-group graph has a broken reference"
             if child.get("isa") == "PBXGroup":
-                pending.append(child_id)
+                pending.append((child_id, chain_depth + 1))
+            elif chain_depth < len(APPROVED_OPAQUE_GROUP_CHAIN) or (
+                child.get("isa") != "PBXFileReference"
+                or child.get("sourceTree") != "<group>"
+                or _safe_project_path(
+                    child.get("path", child.get("name")), allow_empty=False
+                )
+                is None
+            ):
+                return (
+                    "generated Xcode project external UI-test group has an unsafe descendant"
+                )
     return None
 
 
@@ -1179,6 +1213,7 @@ def _resolved_main_group_paths(
         (main_group_id, PurePosixPath())
     ]
     visited_groups: set[str] = set()
+    opaque_root_seen = False
 
     while pending:
         group_id, parent_path = pending.pop()
@@ -1194,14 +1229,12 @@ def _resolved_main_group_paths(
             return {}, "generated Xcode project contains an unsupported PBXGroup sourceTree"
         raw_group_path = group.get("path")
         if (
-            isinstance(raw_group_path, str)
-            and raw_group_path in APPROVED_OPAQUE_GROUP_PATHS
+            raw_group_path == APPROVED_OPAQUE_GROUP_ROOT_PATH
+            and parent_by_child.get(group_id) == main_group_id
         ):
-            if source_tree != "<group>":
-                return {}, (
-                    "generated Xcode project approved external group must use "
-                    "the canonical <group> source tree"
-                )
+            if opaque_root_seen:
+                return {}, "generated Xcode project contains multiple external UI-test roots"
+            opaque_root_seen = True
             opaque_error = _record_opaque_group_closure(
                 objects, group_id, parent_by_child, visited_groups
             )
