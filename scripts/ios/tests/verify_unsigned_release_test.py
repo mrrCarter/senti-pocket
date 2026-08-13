@@ -987,6 +987,38 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 )
                 self.assert_error_contains(errors, key)
 
+    def test_settings_bind_product_specific_ldflags_to_exact_empty(self) -> None:
+        for present in (False, True):
+            with self.subTest(present=present):
+                changed = dict(self.settings)
+                changed.pop("PRODUCT_SPECIFIC_LDFLAGS")
+                if present:
+                    changed["PRODUCT_SPECIFIC_LDFLAGS"] = ""
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assertEqual([], errors)
+
+        mutations: tuple[tuple[str, object], ...] = (
+            ("PRODUCT_SPECIFIC_LDFLAGS", "$(inherited)"),
+            ("PRODUCT_SPECIFIC_LDFLAGS", "-ld-path=/tmp/evil-linker"),
+            ("PRODUCT_SPECIFIC_LDFLAGS", None),
+            ("PRODUCT_SPECIFIC_LDFLAGS", []),
+            ("PRODUCT_SPECIFIC_LDFLAGS_normal", ""),
+            ("PRODUCT_SPECIFIC_LDFLAGS_normal", "-ld-path=/tmp/evil-linker"),
+            ("PRODUCT_SPECIFIC_LDFLAGS[config=Release]", ""),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                changed: dict[str, object] = dict(self.settings)
+                changed[key] = value
+                self.write_settings(changed)
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, "PRODUCT_SPECIFIC_LDFLAGS")
+
     def test_settings_accept_xcode_omitted_effective_empty_values(self) -> None:
         optional_empty_keys = {
             "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES",
@@ -1659,6 +1691,7 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         spec_path = REPOSITORY_ROOT / verify.PROJECT_SPEC_RELATIVE
         canonical = spec_path.read_bytes().replace(b"\r\n", b"\n")
         self.assertNotIn(b"\r", canonical)
+        self.assertNotIn(b"PRODUCT_SPECIFIC_LDFLAGS:", canonical)
         self.assertEqual(
             PINNED_PROJECT_SPEC_SHA256,
             hashlib.sha256(canonical).hexdigest(),
@@ -1694,6 +1727,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertIn("COMPILATION_CACHE_ENABLE_PLUGIN=NO", capture)
         self.assertIn("SWIFT_ENABLE_COMPILE_CACHE=NO", capture)
         self.assertIn("ALTERNATE_LINKER_PATH=", capture)
+        self.assertEqual(3, workflow.count("PRODUCT_SPECIFIC_LDFLAGS="))
+        self.assertNotIn("PRODUCT_SPECIFIC_LDFLAGS=$(inherited)", workflow)
         self.assertIn(
             "'SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'",
             capture,
@@ -1707,6 +1742,8 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertIn('"COMPILATION_CACHE_ENABLE_PLUGIN=NO"', archive)
         self.assertIn('"SWIFT_ENABLE_COMPILE_CACHE=NO"', archive)
         self.assertIn('"ALTERNATE_LINKER_PATH="', archive)
+        self.assertIn('"PRODUCT_SPECIFIC_LDFLAGS="', archive)
+        self.assertNotIn("PRODUCT_SPECIFIC_LDFLAGS=$(inherited)", archive)
         self.assertIn(
             "'SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'",
             archive,
@@ -1977,6 +2014,31 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         }
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
         self.assert_error_contains(errors, "invalid build-setting key")
+
+    def test_settings_reject_project_product_specific_ldflags_definitions(
+        self,
+    ) -> None:
+        mutations: tuple[tuple[str, object], ...] = (
+            ("PRODUCT_SPECIFIC_LDFLAGS", ""),
+            ("PRODUCT_SPECIFIC_LDFLAGS", "$(inherited)"),
+            ("PRODUCT_SPECIFIC_LDFLAGS", "-ld-path=/tmp/evil-linker"),
+            ("PRODUCT_SPECIFIC_LDFLAGS[config=Release]", ""),
+            ("PRODUCT_SPECIFIC_LDFLAGS_normal", ""),
+        )
+        for key, setting in mutations:
+            with self.subTest(key=key, setting=setting):
+                self.write_valid_project()
+                objects = self.project_graph["objects"]
+                assert isinstance(objects, dict)
+                objects["E00000000000000000000000"] = {
+                    "isa": "XCBuildConfiguration",
+                    "buildSettings": {key: setting},
+                    "name": "Release",
+                }
+                _, errors = verify.verify_settings_file(
+                    self.settings_path, self.expected
+                )
+                self.assert_error_contains(errors, "append-only linker setting")
 
     def test_settings_bind_minimal_script_free_release_scheme(self) -> None:
         original = self.scheme_path.read_text(encoding="utf-8")

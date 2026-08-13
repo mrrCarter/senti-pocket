@@ -288,4 +288,12 @@ if grep -Fq '"SWIFT_RESPONSE_FILE_PATH="' "$ARCHIVE_SCRIPT"; then
 fi
 PASS_COUNT=$((PASS_COUNT + 1))
 
+grep -Fq '"PRODUCT_SPECIFIC_LDFLAGS="' "$ARCHIVE_SCRIPT" \
+  || { printf 'FAIL archive does not pin product-specific linker flags empty\n' >&2; exit 1; }
+if grep -Fq 'PRODUCT_SPECIFIC_LDFLAGS=$(inherited)' "$ARCHIVE_SCRIPT"; then
+  printf 'FAIL archive inherits unreviewed product-specific linker flags\n' >&2
+  exit 1
+fi
+PASS_COUNT=$((PASS_COUNT + 1))
+
 printf 'archive_ipa_validation_test: %d acceptance/rejection vectors passed\n' "$PASS_COUNT"

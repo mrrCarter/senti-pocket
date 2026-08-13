@@ -63,7 +63,7 @@ APP_ICON_NAME = "AppIcon"
 APP_ICON_FILENAME = "SentiPocketAppIcon.png"
 APP_ICON_SHA256 = "495904bf6d5a1fc41cfebfaa1fe1e67cb20a3c6882194408406210c2097a1b8f"
 PROJECT_SPEC_RELATIVE = Path("apps/SentiPocketApp/project.yml")
-PROJECT_SPEC_SHA256 = "eedb5f582fa0025a457fd575260a77944f6f10a212a30b1cdb4131a44fd80e72"
+PROJECT_SPEC_SHA256 = "dad2577a42f192f804d2cf70cd7000046f7bc691bf12d10f041c58ba47e1734b"
 APP_ICON_WIDTH = 1024
 APP_ICON_HEIGHT = 1024
 APP_ICON_CHANNELS = 3
@@ -226,6 +226,7 @@ RESOURCE_POLICY_SETTING_BASES = frozenset(
         "INCLUDED_SOURCE_FILE_NAMES",
     }
 )
+PROJECT_ABSENT_SETTING_BASES = frozenset({"PRODUCT_SPECIFIC_LDFLAGS"})
 STATIC_EXECUTION_SETTINGS = {
     "COMPILATION_CACHE_ENABLE_PLUGIN": "NO",
     "COMPILATION_CACHE_PLUGIN_PATH": "",
@@ -1182,6 +1183,13 @@ def _is_execution_override_base(base: str) -> bool:
     )
 
 
+def _is_project_absent_setting_base(base: str) -> bool:
+    return any(
+        base == setting_base or base.startswith(f"{setting_base}_")
+        for setting_base in PROJECT_ABSENT_SETTING_BASES
+    )
+
+
 def _is_execution_override_key(key: str) -> bool:
     base = _build_setting_base(key)
     return base is not None and _is_execution_override_base(base)
@@ -1490,6 +1498,11 @@ def _generated_app_icon_membership_error(project: Mapping[str, Any]) -> str | No
             if base is None:
                 return "generated Xcode project contains an invalid build-setting key"
             key_label = _safe_setting_key_label(key)
+            if _is_project_absent_setting_base(base):
+                return (
+                    "generated Xcode project defines an append-only linker setting "
+                    f"at project or target level: {key_label}"
+                )
             if base.startswith("SWIFT_RESPONSE_FILE_PATH_") or any(
                 base.startswith(f"{policy_key}_")
                 for policy_key in RESOURCE_POLICY_SETTING_BASES
@@ -2569,6 +2582,13 @@ def verify_settings_file(
             for policy_key in RESOURCE_POLICY_SETTING_BASES
         ):
             errors.append(f"{key_label}: resource-policy override is not permitted")
+        if (
+            _is_project_absent_setting_base(base)
+            and base not in PROJECT_ABSENT_SETTING_BASES
+        ):
+            errors.append(
+                f"{key_label}: specialized append-only linker setting is not permitted"
+            )
         if _is_execution_override_base(base) and key != base:
             errors.append(
                 f"{key_label}: conditional execution or resource-policy override "
