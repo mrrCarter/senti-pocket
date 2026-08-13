@@ -2647,6 +2647,7 @@ def verify_settings_file(
     sdk_root = settings.get("SDKROOT")
     approved_sdk_settings = (
         str(expected.sdk_root),
+        str(expected.sdk_root.parent / f"iPhoneOS{expected.sdk_version}.sdk"),
         f"iPhoneOS{expected.sdk_version}.sdk",
     )
     if sdk_root not in approved_sdk_settings:

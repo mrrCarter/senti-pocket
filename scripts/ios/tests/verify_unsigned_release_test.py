@@ -1059,6 +1059,18 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         self.assertEqual(self.settings, resolved)
 
     def test_settings_bind_selected_sdk_version_and_xcode_path_shape(self) -> None:
+        unversioned_expected = self.expected_with(
+            sdk_root=self.sdk_root.parent / "iPhoneOS.sdk"
+        )
+        changed = dict(self.settings)
+        changed["SDKROOT"] = str(self.sdk_root)
+        self.write_settings(changed)
+        resolved, errors = verify.verify_settings_file(
+            self.settings_path, unversioned_expected
+        )
+        self.assertEqual([], errors)
+        self.assertEqual(changed, resolved)
+
         for key, value in (
             ("SDKROOT", "iPhoneOS99.9.sdk"),
             ("SDKROOT", "iphoneos26.5"),
