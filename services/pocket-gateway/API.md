@@ -20,7 +20,10 @@ production ingress routes its two operation-creating POSTs through `src/operatio
 - No verifier wired or an invalid/expired bearer => **deny** (401 `{error:"authentication required"}`, `www-authenticate: Bearer`).
   A missing/invalid/expired/replayed internal Registry V2 assertion is the uniform fail-closed 503 described below.
 - The **human identity comes from the token** (`ConsumerAccount.id`), NEVER from the request body.
-- **Authorization to write is server-derived**: `knownSessionIdsFor(humanId)` — a client can never name an arbitrary target session.
+- **Per-session authorization is server-derived and bearer-bound**: production calls
+  `GET /api/v1/sessions/{sessionId}/membership` under the exact authenticated bearer and preserves the returned role.
+  The client cannot supply identity or an allowlist. Viewer is sufficient only for read/self-device paths;
+  `/actions/execute` and `/dial/ring-owner` require contributor, admin, or owner.
 - **Cross-tenant isolation**: durable state and locks are namespaced by the verifier-owned full principal. The current
   Senti verifier uses the collision-free `pocket.principal.senti.v1` namespace plus a length-prefixed stable user id;
   an AIdenID verifier uses issuer/audience/resource/site/pairwise-sub context.
@@ -43,7 +46,8 @@ production ingress routes its two operation-creating POSTs through `src/operatio
 Body: `{ proposal: ActionProposal, confirmation: Confirmation }` (frozen shapes in PocketContracts).
 - Success → **200 `ActionReceipt`** (`status: posted | pending`), Ed25519-signed, `confirmedProposalHash` non-null.
 - **422 `{error:"proposal_rejected", reason}`** — proposal could NOT be bound to a confirmation (never a null-hash "receipt").
-- 400 invalid JSON / `proposal.id` required · 403 missing scope · 500 authorization lookup failed.
+- 400 invalid JSON / target · 401 stale/rejected credential · 403 missing scope, nonmember, or insufficient role ·
+  429 membership-probe rate limit · 503 retryable membership-probe outage/contract failure.
 - **409** — either a prior send outcome is unknown (reconciliation required — do NOT auto-retry blindly) or execution is
   in progress on another instance (safe to retry).
 - **Idempotent + exactly-once** per `(principal, proposal.id)`: replaying a terminal `posted` receipt returns it as-is;
@@ -55,6 +59,15 @@ Body: `{ text, voiceId?, modelId?, outputFormat?, tone? }` (`text` 1..8192 UTF-8
 - 200 → `application/octet-stream` audio; format in `x-senti-audio-format` (default `pcm_s16le_24000`). `isBase64Encoded`
   on API Gateway. The voice-provider key lives ONLY server-side — it never reaches the phone.
 - 400 text required · 413 text > 8192 bytes · 501 not configured · 502 backend error.
+
+### `GET /dial?id=<opaque dial id>` — LEAN-ring hydration (scope `pocket:dial`)
+
+Returns the full stored `NeedCarterSignal` only after resolving the stored signal's exact session under the caller's
+original bearer. A missing/expired id, nonmembership, malformed stored target, or target-membership failure is the same
+**410** `{error:"dial signal unavailable",reason:"gone"}`; callers must not infer which case occurred. Both an authorized
+200 and every opaque 410 carry `Cache-Control: no-store` and `Pragma: no-cache`, so a private client cache cannot turn a
+transient authorization outage into a persistent terminal result. The store-first implementation relies on a
+gateway-generated high-entropy id and uniform status/body/cache policy; it does not claim constant-time behavior.
 
 ### `GET /dial/register/context` — Registry V2 owner bootstrap (authenticated)
 

@@ -433,19 +433,24 @@ if (process.env.DEVICE_REGISTRY_MODE === 'v2') {
 export const handler = createLambda(runtimeEnv, {
   dynamoClient,
   signingKey,
-  fetch,                                   // Node 20+ global; validates sessions + posts the human write
+  fetch,                                   // validates sessions/target roles + posts the human write
   run: /* senti writeback runner */,       // shells the bundled `sl` or a senti API client (POST /actions/execute)
-  knownSessionIdsFor: /* (humanId) => Promise<string[]> */,   // the sessions a human may write to (server-derived authz)
   bundleStore: /* { listForHuman(humanId, since) } */,        // signed bundles for GET /sync
   // optional feature deps (see §4):
   // apnsSend, rasterize, encodeVideo,
 });
 ```
 
-`createProdGateway` **fails boot** if any baseline dependency (`dynamoClient / signingKey / knownSessionIdsFor / fetch`)
+`createProdGateway` constructs the fixed-origin, role-preserving target-membership resolver from
+`SENTI_API_BASE_URL + fetch`; production has no static/list allowlist injection. It **fails boot** if any baseline
+dependency (`dynamoClient / signingKey / fetch`)
 or required baseline environment value is missing. Registry V2 additionally requires its HMAC key, exact secret
 ARN/VersionId, readiness acknowledgements, and private admission-assertion verifier/replay store; a misconfigured
 deployment never starts half-wired.
+
+The target-membership API route is a hard release dependency. Keep the gateway route dark until sentinelayer-api PR
+#783 is merged and deployed, then smoke-prove one exact known-member 200 and one uniform nonmember 404 before promoting
+a numeric gateway version. A pre-prerequisite 404 fails closed as nonmembership; it is not evidence the deploy works.
 
 **IAM:** the Lambda role needs `dynamodb:{GetItem,PutItem,DeleteItem}` on the table. DynamoDB authorizes each
 `TransactWriteItems` sub-operation through its underlying `PutItem` / `DeleteItem` permission (there is no separate

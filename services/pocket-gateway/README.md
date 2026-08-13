@@ -25,6 +25,13 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 - **Auth (done):** `src/senti-session-verifier.mjs` is the deployed reusable-session path: bounded `GET /auth/me`,
   positive-only process-local cache, deeply frozen identity, and strict invalid-vs-upstream-outage handling. `src/auth.mjs`
   remains the supported AIdenID alternative: JWT/JWKS verification plus RFC 8707 resource and RFC 9449 DPoP binding.
+- **Target membership (code-complete, dark):** `src/senti-target-membership.mjs` asks the fixed SentinelLayer API origin
+  for exactly one bearer-bound session role, streams the response through a 4 KiB cap, validates the exact no-store
+  contract, and caches only short-lived role/null decisions under hashed credential+target keys. Route policy preserves
+  role: viewer may read/self-dial/register/hydrate; `/actions/execute` and `/dial/ring-owner` require contributor or
+  higher before any durable mutation, runner, post, or push. Production composition never accepts a static membership
+  allowlist. Keep the gateway route dark until sentinelayer-api PR #783 is merged, deployed, and smoke-proven with an
+  exact known-member 200 plus a uniform nonmember 404.
 - **Store (done):** `src/store.mjs` — async store: in-memory (dev/tests) + `createDynamoStore` (real conditional-put,
   OWNER-FENCED lock + `putIfAbsent` + TTL; deploy injects the `@aws-sdk/lib-dynamodb` client → package stays zero-dep)
   + `createStoreReplayGuard` (cross-instance single-use for DPoP and internal admission-assertion JTIs).
@@ -52,7 +59,8 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
   bucket supports the protected lane's 60-request contract across cold/multi-instance egress.
 - **Backends/adapters (done):** `src/lambda.mjs` (API Gateway HTTP API v2 ⇄ gateway, base64 binary, DPoP url/method), `src/tts.mjs` (ElevenLabs backend; key server-side only, `fetch` injected), `src/app.mjs` (deploy composition → `createLambda(env, deps)`).
 - **Writeback (done):** governed writeback (snapshot-frozen deterministic target → single-use confirm bound to proposal hash → server-time freshness → reserve-before-post exactly-once → `sl session reply` → read-back verify → signed `ActionReceipt`; offline ⇒ `pendingConnectivity`). Live-proven twice.
-- **Open (deploy/cross-lane):** DynamoDB table/TTL + IAM + AWS creds; Registry V1 row purge + HMAC secret; real APNs
+- **Open (deploy/cross-lane):** merge/deploy/smoke-prove the target-membership API prerequisite; DynamoDB table/TTL +
+  IAM + AWS creds; Registry V1 row purge + HMAC secret; real APNs
   VoIP transport; JWKS fetch/cache + Ed25519 signing key from KMS/Secrets; a senti `run`ner available in Lambda (bundled
   `sl` or senti API client); bind checkpoint provenance/`contentTrust` into the SIGNED bundle canonical (Atlas's
   contract); LLM-enriched summary prose (same grounded evidence); Swift/Xcode build, simulator, device, and signing
