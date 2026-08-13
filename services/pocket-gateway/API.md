@@ -3,23 +3,32 @@
 Authoritative wire contract for `services/pocket-gateway` (Relay lane). This is what the phone's `PocketSyncClient`
 (read/briefing) and `PocketActionsClient` (Phase-B governed write) call. The gateway is framework-agnostic:
 `createGateway(deps).handle({method,path,query,headers,body}) -> {status,headers,body,isBase64Encoded?}`, mounted on
-Lambda/API-Gateway (`src/lambda.mjs`) or a local HTTP server (`src/app.mjs` / `scripts/local-server.mjs`).
+Lambda/API Gateway (`src/lambda.mjs`) or a local HTTP server (`src/app.mjs` / `scripts/local-server.mjs`). Registry V2
+production ingress routes its two operation-creating POSTs through `src/operation-admission-proxy.mjs` first.
 
 ## Modes
-- **Deployed** (product path): every non-health route requires a valid **AIdenID** token (human-bound, audience/
-  resource-scoped, DPoP-bound; minted via `/v1/sessions/exchange`). `deps.verifyToken` owns the check (`src/auth.mjs`).
+- **Deployed** (current product path): every non-health route requires the reusable **Senti user-session bearer**.
+  Direct/V1 routes validate it remotely at `GET /api/v1/auth/me`; the two protected Registry V2 POSTs validate it once
+  at admission and require the signed single-use assertion inside the private gateway. The gateway holds no symmetric
+  Senti session-signing secret and cannot mint a session. `src/auth.mjs` remains an alternative AIdenID/DPoP verifier,
+  but changing the Registry V2 admission verifier requires a versioned auth-mode migration (see below).
 - **LAN demo** (Phase-B on Carter's network): `scripts/local-server.mjs` — loopback by default, `LAN=1` opt-in. Prints a
   pairing token (bearer) + the raw base64url signing pubkey the phone pins. NOTE: LAN is cleartext unless the (c)
   TLS+cert-pinning launcher is used — a stolen bearer on cleartext LAN is arbitrary write authority (demo risk-acceptance).
 
 ## Auth boundary (fail-closed)
-- No verifier wired, or an invalid/expired/replayed token => **deny** (401 `{error:"authentication required"}`, `www-authenticate: Bearer`).
+- No verifier wired or an invalid/expired bearer => **deny** (401 `{error:"authentication required"}`, `www-authenticate: Bearer`).
+  A missing/invalid/expired/replayed internal Registry V2 assertion is the uniform fail-closed 503 described below.
 - The **human identity comes from the token** (`ConsumerAccount.id`), NEVER from the request body.
 - **Authorization to write is server-derived**: `knownSessionIdsFor(humanId)` — a client can never name an arbitrary target session.
-- **Cross-tenant isolation**: all durable state + the exactly-once lock are namespaced by the FULL principal
-  (issuer + aud/resource + site + pairwise sub), not the sub alone.
-- **Scopes** (least-privilege): `sessions:read` (sync), `sessions:write` (execute), `pocket:voice` (tts), and
-  `pocket:dial` (device binding/ringing). A read+write token must NOT authorize voice or ringing. Missing scope => 403.
+- **Cross-tenant isolation**: durable state and locks are namespaced by the verifier-owned full principal. The current
+  Senti verifier uses the collision-free `pocket.principal.senti.v1` namespace plus a length-prefixed stable user id;
+  an AIdenID verifier uses issuer/audience/resource/site/pairwise-sub context.
+- **Scopes**: the generic gateway understands `sessions:read`, `sessions:write`, `pocket:voice`, and `pocket:dial`.
+  The current Senti user-session verifier grants that full Pocket set after `/auth/me`; admission cryptographically
+  preserves its canonical scope array, including an empty grant, rather than manufacturing privilege. Server-derived
+  membership remains the per-session authorization boundary. A future least-privilege exchanged-token deployment must
+  preserve each route's existing scope checks.
 
 ## Endpoints
 
@@ -201,9 +210,9 @@ definitive miss.
   every identifier. At or after physical TTL, a still-retained base/claim is treated as reclaimable without waiting for
   DynamoDB's asynchronous deletion. Same-owner token movement during grace still requires the returned claim tuple so
   displaced base/directory state moves atomically.
-- 400 malformed/non-canonical/unknown field · 403 non-member/missing scope · 410 exact committed lease expired · 426
-  unversioned request · 429 `operation-rate-limited` at the required admission boundary · 501 V2 not configured · 502
-  registry failure.
+- 400 malformed/non-canonical/unknown field · 403 non-member/missing scope · 410 exact committed lease expired · 413
+  decoded admission body exceeds 4,096 bytes · 426 unversioned request · 429 `operation-rate-limited` at the required
+  admission boundary · 501 V2 not configured · 502 registry failure.
 - The raw installation id and token are never returned. The server persists only an HMAC of installation identity;
   the opaque PushKit token necessarily remains protected at rest because APNs cannot route using only a hash.
 
@@ -294,14 +303,72 @@ The only successful body is exact:
 - 409 `registry-owner-conflict` means the authenticated owner differs from the requested or protected stored owner;
   retain local state, expose no handle/fence from the server response, and require the correct account.
 - 503 `registration-cleanup-conflict` means the barrier/delete could not serialize; retry the identical request.
-- 400 malformed/noncanonical/unknown field · 401 invalid bearer · 429 `operation-rate-limited` at the required admission
-  boundary · 501 V2 unavailable · 502 storage/corruption/adapter failure. Every non-200 retains the pending operation on
-  the phone.
+- 400 malformed/noncanonical/unknown field · 401 invalid bearer · 413 decoded admission body exceeds 4,096 bytes · 429
+  `operation-rate-limited` at the required admission boundary · 501 V2 unavailable · 502 registry
+  storage/corruption/adapter failure · 503
+  `operation-admission-unavailable` when the admission verifier/store/private invocation is unavailable. Every non-200
+  retains the pending operation on the phone.
 
-For both registration endpoints, the external admission boundary's 429 response is exact JSON
-`{"error":"registration operation rate limited","reason":"operation-rate-limited"}` with a positive integer
-`Retry-After` header in seconds. It keys the shared quota by the verifier-owned principal/human plus installation and
-idempotency UUID—not by IP, mutable request fingerprint, or UUID alone—and returns before any registry mutation.
+#### Registry V2 operation-admission boundary
+
+For both registration POSTs, API Gateway sends the original HTTP API v2 event only to the admission Lambda. It
+first captures a strict immutable request snapshot (rejecting a caller-supplied private proof), accepts at most 4,096
+decoded bytes of strict JSON, then authenticates the bearer exactly once. It reuses the frozen V2 validator and
+owner-identity rules and constant-time compares the request owner handle before allocating state.
+The same length-prefixed HMAC tuple `(verified principal, verified human, installationId, idempotencyKey)` identifies
+register and digest-only reconcile. The owner ledger is keyed by a pseudonymous HMAC handle; it stores only opaque
+operation digests, expiries, rolling timestamps, configuration, and a CAS revision.
+
+One strongly-read, conditionally replaced ledger enforces all three bounds atomically across instances:
+
+- at most **256** live unique operations over the seven-day lease plus five-minute reclaim horizon;
+- at most **30** new unique operations in a strict rolling 60 seconds; and
+- at most **60** total valid operation requests in the same strict rolling window, so one replay cannot create an
+  unbounded verifier/CAS/gateway work stream.
+
+An exact replay consumes neither another unique slot nor another new-operation slot, but it does consume the total
+request lane and refreshes its bounded retention. The admission marker commits before private gateway invocation and
+is never rolled back after an invocation failure; retrying the same tuple therefore remains replay-safe. Changed
+non-identity fields share the admission identity and are forwarded—the gateway remains the authority that returns
+`idempotency-conflict` for a changed semantic fingerprint.
+
+Every limit uses exact 429 JSON
+`{"error":"registration operation rate limited","reason":"operation-rate-limited"}` plus a positive integer
+`Retry-After` header. Admission/verifier/storage/private-invoke failure uses exact generic 503 JSON
+`{"error":"registration operation admission unavailable","reason":"operation-admission-unavailable"}` and discloses
+no dependency detail. Invalid authentication is 401; owner mismatch is the generic 409 above. No denial invokes the
+gateway, and no raw bearer, principal, human id, installation id, UUID, request body, token, or session is persisted or
+logged by admission.
+
+The bounded pre-auth snapshot returns 413 with exact JSON
+`{"error":"registry operation request exceeds 4096 bytes","reason":"operation-admission-body-too-large"}` when the
+decoded body exceeds 4,096 bytes; malformed JSON, fatal UTF-8, or non-canonical base64 returns 400. Once the private
+gateway produces a structurally valid API Gateway response, admission forwards it unchanged—including valid 4xx/5xx,
+headers, cookies, and base64 bodies. Transport errors, Lambda `FunctionError`, malformed or oversized payloads,
+missing/mismatched `ExecutedVersion`, assertion/replay-store failures, and deadline exhaustion all collapse to the same
+generic admission 503 above.
+
+The proxy is deliberately scoped to the current reusable Senti session verifier. After admission commits, it forwards
+the original bearer/body unchanged to one immutable numeric gateway version with a 10-second domain-separated HMAC
+assertion. That assertion binds the exact Secret ARN + VersionId, numeric version ARN, request hashes, verified identity
+and canonical scopes, owner/operation digests, timestamps, and a random 256-bit `jti`. The gateway verifies the raw
+event, re-derives the frozen request identity, and atomically consumes the `jti` in shared storage before reconstructing
+the signed authorization context; it never calls `/auth/me` again on these two routes. A second use of the same
+assertion `jti`, or replay-store failure, is the generic 503 and performs no registry mutation. A public replay of an
+admitted operation is separately authenticated and receives a fresh assertion `jti`, while retaining the operation
+ledger's documented idempotent replay semantics. The signer sets `exp = iat + 10`; expiry is exclusive with no grace,
+and `iat` may be at most two seconds ahead of the gateway clock. The version ARN is validated before invocation and AWS's
+returned `ExecutedVersion` must match, so named-alias drift cannot run an un-attested protected write. The admission
+Lambda rejects every other method/path without authentication, body access, ledger allocation, or gateway invocation,
+so it cannot act as a general private proxy. A DPoP-capable successor must keep external verification single-pass and
+version the declared admission auth mode before reusing this private assertion boundary.
+
+Public activation remains blocked on two fleet-level capacity proofs. `GET /dial/register/context` still requires a
+distributed verified-principal limiter. Separately, Senti `/api/v1/auth/me` currently permits 30 requests per rolling
+60 seconds per client IP while admission permits 60 total valid requests per principal; the verifier's 20-second cache
+is process-local and does not prove cold-start or multi-instance capacity. Do not claim the 60/minute protected-route
+contract until a service-authenticated upstream bucket/capacity change or representative egress-burst test closes that
+gap.
 
 ### `DELETE /dial/register` — authenticated exact conditional revoke
 

@@ -3,13 +3,14 @@
 The core gateway is a **zero-dependency ESM Lambda**. Its core (`createGateway`) takes a `{method,path,query,headers,body}`
 request and returns `{status,headers,body}` — no framework, no ambient I/O. Everything it touches (DynamoDB, the signing
 key, `fetch`, the senti runner, the feature backends) is an **injected external** the deploy owns. V1 needs the four core
-AWS resources below. Registry V2 additionally requires a body-reading admission service with shared state; it may reuse
-the DynamoDB table but it is separate compute and is not implemented by `createLambda`. Nothing here reaches the network
-on its own; every boundary is explicit.
+AWS resources below. Registry V2 additionally uses the body-reading service in `operation-admission*.mjs`, a separate
+admission table, and the dark Terraform boundary under `infra/terraform/operation-admission`. The core and admission
+Lambdas remain separate compute; every network/AWS boundary is explicit and injected.
 
 > **Honesty note:** this documents the deploy *contract*. The core gateway is tested (`node --test`), but it is **not
-> live** until this runbook is executed against a real AWS account. Registry V2 is not deploy-complete until the separate
-> admission proxy/IaC atom is implemented and its evidence retained; keep V2 disabled. Each optional feature backend
+> live** until this runbook is executed against a real AWS account. The admission source and dark IaC are implemented,
+> but Registry V2 is not deploy-complete until live two-instance Dynamo, route/IAM, auth, and cutover evidence is
+> retained; keep V2 disabled. Each optional feature backend
 > below fails **closed** (a `501` with a typed reason) until its dependency is wired—never a fabricated response.
 
 ---
@@ -18,11 +19,11 @@ on its own; every boundary is explicit.
 
 | Resource | Purpose | Notes |
 |---|---|---|
-| **Lambda** (Node 20+, ESM) | runs `createLambda(process.env, deps)` | behind a Function URL or API Gateway (HTTP API) |
-| **DynamoDB table** | durable state: idempotency/emitted markers + cross-instance locks + DPoP jti | single-table, schema below |
+| **Lambda** (Node 20+, ESM) | runs `createLambda(process.env, deps)` | immutable numeric versions behind explicit API Gateway routes; no Function URL in Registry V2 |
+| **DynamoDB table** | durable state: idempotency/emitted markers + cross-instance locks + proof-jti replay records | single-table, schema below |
 | **Secrets Manager secrets** | the Ed25519 **signing key** (receipts/bundles), plus the Registry V2 HMAC key when V2 is enabled | KMS asymmetric does **not** do EdDSA — store the PKCS#8 PEM and independent 32-byte-or-longer HMAC key in separate secrets |
-| **API Gateway (HTTP API)** *(or Lambda Function URL behind the admission proxy)* | public HTTPS ingress | its origin URL is `GATEWAY_PUBLIC_URL` (DPoP htu pinning); V2 must not use a bare Function URL |
-| **Body-reading admission proxy** *(Registry V2 only; additional Lambda/service)* | verifies the caller and atomically admits bounded register/reconcile operation identities before invoking the gateway | uses distributed state (the table may be reused); an API Gateway/Lambda authorizer alone cannot inspect the JSON body and is insufficient; this component/IaC is a separate required atom |
+| **API Gateway (HTTP API)** | sole public HTTPS ingress | explicit routes only; no `$default`, Function URL, or public gateway-Lambda integration for either protected POST |
+| **Body-reading admission proxy** *(Registry V2 only; additional Lambda/service)* | verifies the caller and atomically admits bounded register/reconcile operation identities before invoking one immutable numeric gateway version | uses a separate encrypted DynamoDB table; an API Gateway/Lambda authorizer alone cannot inspect the JSON body and is insufficient |
 
 ### DynamoDB table schema
 
@@ -31,8 +32,9 @@ Single table, composite key, TTL enabled:
 - **Partition key** `pk` (String)
 - **Sort key** `sk` (String) — the store writes `sk = "record"` (durable state) and `sk = "lock"` (self-healing locks)
 - **TTL attribute** `ttl` (Number, epoch-seconds) — **enable DynamoDB TTL on this attribute**. Locks carry a `ttl`
-  so a crash-before-release self-heals; DPoP jti replay records carry a `ttl` so they expire. Durable records have no
-  `ttl` and never expire.
+  so a crash-before-release self-heals; DPoP jti replay records carry a `ttl` so they expire. Internal admission
+  assertion replay records use `pk=operation-admission-assertion-jti:v1:<jti>`, `sk=record`, and top-level `ttl=exp`.
+  Schema records intended to be non-expiring omit `ttl`; other schema-owned rows use their documented bounded TTL.
 - **Registry V2 items** (required only for `DEVICE_REGISTRY_MODE=v2`; no GSI):
   - Installation base: `pk=dial:install:v2:<server-HMAC>`, `sk=binding`. It stores `ownerVersion:1` plus the canonical
     opaque `ownerHandle` derived from the verifier-owned principal and human identity.
@@ -56,6 +58,23 @@ Single table, composite key, TTL enabled:
     optimization, not a correctness dependency.
 - Billing: on-demand is appropriate only behind the verified-principal unique-operation admission gate below; it is not
   a substitute for a cardinality/rate bound.
+
+### Admission table schema
+
+Use a separate table so the admission role cannot read or mutate registry bindings, claims, directories, outcomes, or
+gateway state. It has the same `pk` String / `sk` String key convention and top-level DynamoDB TTL attribute `ttl`:
+
+- `pk=dial:admission:v1:<owner HMAC>`, `sk=record`;
+- one exact-schema ledger per verified owner, containing a uint64 CAS revision, at most 256 opaque operation digests and
+  expiries, at most 30 new-operation timestamps, and at most 60 total-request timestamps;
+- on-demand billing, strongly consistent reads, conditional whole-item puts, SSE-KMS, PITR, TTL on `ttl`, production
+  deletion protection, and no scan/query permission for the Lambda role; and
+- physical TTL is cleanup only. Runtime pruning enforces operation and strict rolling-window expiry even while DynamoDB
+  retains an expired item. The written TTL covers both the latest operation expiry and the final rolling-window tail.
+
+The runtime rejects a ledger over 64 KiB, schema/config drift, unreachable timestamp relationships, revision overflow,
+clock rollback, storage errors, or exhausted CAS contention. It never resets corrupt state or converts failure into an
+admission.
 
 The gateway's locks tolerate DynamoDB's TTL **deletion lag** (they steal a logically-expired lock via a conditional
 put), so no tight TTL sweep is required. Registry V2 also filters `expiresAtEpochSec <= now` synchronously; it never
@@ -110,7 +129,7 @@ before setting `DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1`; there is no dual-read
 | `DDB_TABLE` | the DynamoDB table name |
 | `SIGNING_KEY_ID` | a stable id string for the signing key (bound into every receipt/bundle signature) |
 | `GATEWAY_PUBLIC_URL` | the deploy's public origin (e.g. `https://pocket-api.sentinelayer.com`) — pins the DPoP htu, not a spoofable Host header |
-| `SENTI_API_BASE_URL` | the senti API origin — the gateway validates the caller's session at `GET {SENTI_API_BASE_URL}/api/v1/auth/me` **and** posts the human write there |
+| `SENTI_API_BASE_URL` | the Senti API origin — direct/V1 routes validate sessions there, protected Registry V2 admission validates once there, and governed human writes post there |
 
 **Optional — each lights up a feature; absent ⇒ that route honestly `501`s:**
 
@@ -119,10 +138,37 @@ before setting `DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1`; there is no dual-read
 | `ELEVENLABS_API_KEY` (+ `TTS_VOICE_ID`) | `/tts` + `/deck` narration + `/brief` audio |
 | `GEMMA_BASE_URL` (+ `GEMMA_MODEL`, optional `GEMMA_API_KEY`) | `/answer` + `/brief` reasoning (OpenAI-compatible Gemma: local Ollama key-free, or AI Studio) |
 | `RESVG_BIN` + `FFMPEG_BIN` + `RESVG_EGRESS_SANDBOXED=1` | `/deck?format=video` (see §4 — the ack is load-bearing) |
-| `DEVICE_REGISTRY_MODE=v2` + `DEVICE_REGISTRY_HMAC_SECRET_ARN` + `DEVICE_REGISTRY_V1_PURGED=1` + `DEVICE_REGISTRY_CLIENT_V2_READY=1` + `DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY=1` + `DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1` + `DEVICE_REGISTRY_OWNER_CONTINUITY_READY=1` | installation-owned Registry V2; every acknowledgement below is load-bearing, and the reference handler resolves the secret to the process-local `DEVICE_REGISTRY_HMAC_KEY_B64` expected by the gateway |
+| Registry V2 settings below | installation-owned Registry V2; every acknowledgement below is load-bearing |
 
-With no Registry settings the compatibility mode is V1, and a V2 phone receives an honest 501. Do not place V2
-settings beside implicit/V1 mode: partial or mixed configuration fails boot.
+**Registry V2 gateway boot contract (all required together):**
+
+| Var | Exact contract |
+|---|---|
+| `DEVICE_REGISTRY_MODE` | `v2` |
+| `DEVICE_REGISTRY_HMAC_SECRET_ARN` | exact Secrets Manager ARN shared with admission |
+| `DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID` | exact immutable 32–64 character VersionId shared with admission |
+| `DEVICE_REGISTRY_HMAC_KEY_B64` | runtime-injected canonical base64 `SecretString`, decoding to 32–1,024 bytes; never a Terraform input |
+| `DEVICE_REGISTRY_V1_PURGED` | `1` |
+| `DEVICE_REGISTRY_CLIENT_V2_READY` | `1` |
+| `DEVICE_REGISTRY_OUTCOME_PROTOCOL_READY` | `1` |
+| `DEVICE_REGISTRY_OWNER_CONTINUITY_READY` | `1` |
+| `AWS_LAMBDA_FUNCTION_VERSION` | AWS-provided positive numeric published version; `$LATEST` is rejected |
+
+**Operation-admission Lambda environment (exactly seven module-owned variables):**
+
+| Var | Exact contract |
+|---|---|
+| `DEVICE_REGISTRY_HMAC_SECRET_ARN` | same exact ARN as the gateway |
+| `DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID` | same exact immutable VersionId as the gateway |
+| `GATEWAY_LAMBDA_VERSION_ARN` | exact positive numeric gateway-version ARN and assertion audience |
+| `GATEWAY_LAMBDA_VERSION` | numeric suffix expected in both the ARN and AWS `ExecutedVersion` |
+| `OPERATION_ADMISSION_DDB_TABLE` | separate admission-ledger table |
+| `REGISTRY_OPERATION_ADMISSION_AUTH_MODE` | `senti_session_reusable_v1` |
+| `SENTI_API_BASE_URL` | canonical Senti API HTTPS origin |
+
+With no Registry settings the compatibility mode is V1, and a V2 phone receives an honest 501. Implicit or explicit V1
+rejects any of the V2-only gateway settings listed above. Explicit V2 refuses boot when any required V2 value or
+acknowledgement is absent.
 
 **Registry migration gate:** historical V1 rows (`pk` beginning `dial:dev:`) are durable and untagged; current V1 rows
 (`pk` beginning `dial:v1:dev:`) are exact-principal tagged and expiring. Neither can be safely transformed into
@@ -130,8 +176,9 @@ installation-owned rows. Before setting `DEVICE_REGISTRY_V1_PURGED=1`, turn off 
 ingress, remove old V1 alias/weighted targets, wait at least the maximum Lambda timeout plus propagation time, and
 verify no old invocation remains. Only then delete every row under both prefixes, verify both prefixes remain empty
 using fully paginated base-table reads with `ConsistentRead=true` through the final absent `LastEvaluatedKey`, retain
-the zero-count evidence, and perform the atomic homogeneous V2 alias flip. An in-flight V1 registration after the
-empty-prefix proof reopens the old route.
+the zero-count evidence, and perform the atomic homogeneous V2 cutover. Every public integration and permission is
+pinned to a numeric Lambda version; change the public traffic mapping only after both immutable targets satisfy the V2
+contract. An in-flight V1 registration after the empty-prefix proof reopens the old route.
 There is deliberately no unsafe dual-delivery mode: retaining V1 rows would leave an old A target addressable after B.
 Do not set `DEVICE_REGISTRY_CLIENT_V2_READY=1` until the iOS build that persists/reconciles both server fences and gates
 V2 pushes is released to the intended devices; the currently shipping legacy registrar receives 426 and cannot operate
@@ -149,11 +196,18 @@ The limiter must fail closed without synthesizing a handle. Before acknowledging
 bearer rotation returns the same handle, a different principal returns a different handle, responses are never cached,
 and unavailable/corrupt dependencies return generic non-authorizing errors.
 
+The upstream reusable-session verifier is also a public-activation gate: Senti `/api/v1/auth/me` currently permits 30
+requests per rolling 60 seconds per client IP, while the admission ledger permits 60 total valid requests per principal
+in the same window. Its 20-second positive cache is process-local, so it does not prove fleet or cold-start capacity.
+Keep protected public traffic off until a service-authenticated upstream bucket/capacity change or representative
+multi-instance egress-burst proof closes this mismatch.
+
 `POST /dial/register/reconcile` and missing-authority registration denial intentionally work for an authenticated
 principal with no current dial scope/membership. Without admission, such a caller can submit unlimited valid UUIDs and
-create one TTL row each. Before setting `DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1`, deploy and prove a distributed,
-  verified-principal-aware, body-reading admission proxy ahead of the gateway Lambda. An API Gateway/Lambda authorizer
-  alone is insufficient because its event does not include the JSON request body needed for this identity. The proxy must:
+create one TTL row each. Before recording `dark_proof_sha256` or enabling the API mapping, deploy and prove a
+distributed, verified-principal-aware, body-reading admission proxy ahead of the gateway Lambda. An API Gateway/Lambda
+authorizer alone is insufficient because its event does not include the JSON request body needed for this identity. The
+proxy must:
 
 - define one operation identity as the canonical length-prefixed tuple of verifier-owned `principal`, verified
   `humanId`, request `installationId`, and request `idempotencyKey`; derive/persist only an opaque keyed digest of that
@@ -164,20 +218,155 @@ create one TTL row each. Before setting `DEVICE_REGISTRY_OPERATION_ADMISSION_REA
   `registry-owner-conflict` 409 and must not disclose either handle or any stored fence;
 - allow an exact replay of that already admitted identity without consuming another unique-operation slot, regardless
   of the other request fields (the registry remains responsible for rejecting a changed fingerprint as
-  `idempotency-conflict`);
+  `idempotency-conflict`); a replay still consumes the separate total-request lane and refreshes bounded retention;
 - cap live unique operation identities to at most **256 per verified principal** over the Registry V2 retention horizon;
-- cap new unique identities to at most **30 per principal per minute**, with a documented bounded burst;
+- cap new unique identities to at most **30 per principal in a strict rolling 60 seconds**;
+- cap all valid register/reconcile requests, including exact replay, to **60 per principal in the same strict rolling
+  window**, preventing one admitted tuple from driving unbounded CAS and registry work;
 - return typed **429 `operation-rate-limited`** before Lambda/Dynamo mutation when either limit is exceeded;
 - share state across every ingress/Lambda instance, fail closed when admission storage is unavailable, and never log or
   persist the raw token, installation id, session id, request body, or bearer.
 
 An IP-only WAF rule, per-instance memory counter, best-effort/fail-open limiter, or API Gateway account-wide throttle is
-not sufficient for this acknowledgement. If the deploy cannot prove replay-aware per-principal admission, leave V2
-off. The source flag asserts the external control; it does not implement it.
-Store the 32-byte-or-longer HMAC key as a separate secret whose value is canonical standard base64, never in source,
-deployed plaintext configuration, or logs. The reference handler below resolves `DEVICE_REGISTRY_HMAC_SECRET_ARN` and
-passes the secret only through its process-local env object. A different handler may inject
-`DEVICE_REGISTRY_HMAC_KEY_B64` by an equivalent secret-to-runtime mechanism.
+not sufficient for this gate. If the deploy cannot prove replay-aware per-principal admission, leave the API unmapped
+and V2 public traffic off. Hash the retained provisioned-dark evidence bundle as canonical lowercase hexadecimal and
+pass that digest as `dark_proof_sha256`; the Terraform module refuses traffic mapping without it.
+
+The current production authentication contract is explicit:
+`REGISTRY_OPERATION_ADMISSION_AUTH_MODE=senti_session_reusable_v1`. Admission validates the reusable Senti user-session
+bearer exactly once at `/api/v1/auth/me`. After durable owner-ledger admission, it privately invokes the attested numeric
+gateway version with the byte-identical bearer/body plus a 10-second HMAC assertion. The assertion is bound to the exact
+secret ARN + VersionId, numeric gateway-version ARN, method/path, bearer hash, decoded-body hash, verified identity and
+canonical scopes, owner/operation digests, issue/expiry, and a random 256-bit `jti`. The gateway verifies the raw event,
+re-derives the owner/operation, atomically consumes that `jti` in shared DynamoDB with TTL=`exp`, and never calls
+`/auth/me` again for either protected V2 POST. Missing, malformed, expired, replayed, wrong-version, or store-failed
+proofs return the same generic 503 before registry work. A later gateway failure never rolls back the admission marker.
+The signer sets `exp = iat + 10`; expiry is exclusive with no grace, and `iat` may be at most two seconds ahead of the
+gateway clock.
+
+Do not substitute the AIdenID single-use DPoP verifier without versioning this declared admission auth mode. A future
+DPoP deployment must verify the external proof exactly once at admission and preserve its authorization semantics in
+the same private, request-bound, single-use assertion contract.
+
+Public routing is exact:
+
+```text
+custom domain
+  -> explicit POST /dial/register ------------------> published admission version
+  -> explicit POST /dial/register/reconcile --------> published admission version
+  -> every explicitly declared non-protected route -> attested gateway version
+  -> no $default route / Function URL / direct protected gateway integration
+
+admission role -> lambda:InvokeFunction on one immutable numeric gateway version only
+```
+
+Disable the default execute-api endpoint when the custom domain is active. Scope API Gateway's gateway permissions by
+individual non-protected method/path source ARN; the protected route ARNs must be absent. The admission role alone gets
+`lambda:InvokeFunction` on the immutable numeric gateway version ARN, plus strongly consistent `GetItem` and conditional `PutItem` on
+the admission table. It gets no registry-table, APNs, signing-key, query/scan, wildcard secret, or wildcard Lambda
+permission. The gateway also requires the signed in-band assertion and atomically consumes its `jti`, so a direct
+same-account invoke without a fresh proof fails closed. Retain the negative IAM/resource-policy proof as defense in
+depth before readiness.
+Store the 32-byte-or-longer HMAC key as a separate `SecretString` whose value is canonical standard base64 and decodes
+to 32-1024 bytes, never in source, deployed plaintext configuration, or logs. `SecretBinary`, non-canonical base64, and
+unbounded material are rejected. Pin an immutable Secrets Manager `VersionId`; do not read only
+`AWSCURRENT`, whose movement would silently create a fresh owner/quota namespace. Admission and gateway must receive
+the same exact secret ARN and `DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID` in one quiesced deployment and resolve that
+exact version. The reference
+gateway handler below passes the value only through its process-local env object. The admission artifact has its own
+committed entrypoint at `deploy/operation-admission/index.mjs`: it requests the exact `SecretId` + `VersionId`, requires
+Secrets Manager to return that same version, and injects the bounded key plus version metadata directly into the
+admission app. Neither handler may fall back to `AWSCURRENT`.
+
+Build the admission artifact from `deploy/operation-admission` with Node 22:
+
+```sh
+npm ci
+npm test
+npm run package
+```
+
+The locked build emits the deterministic **unsigned source ZIP** `dist/operation-admission.zip`, containing exactly one
+bundled root `index.mjs`; the Terraform default handler is therefore `index.handler`. CI proves that unsigned source
+artifact is reproducible but does not sign, upload, or deploy it. For every enabled production deployment, including
+`provisioned-dark`, sign that exact source through the configured active AWS Signer profile. Retain the signing job id,
+exact immutable profile-version ARN, signed destination bucket/key/VersionId, and both source and signed-object digests.
+Bind Terraform to the immutable **signed** S3 object and set `admission_package_sha256` to the canonical base64 encoding
+of the signed ZIP's raw SHA-256 bytes. The hexadecimal `sha256sum`/`Get-FileHash` representation is retained evidence,
+not the Terraform input. Terraform uses the base64 digest as Lambda `source_code_hash` and requires the published
+`code_sha256` to match. The S3 VersionId must be nonempty, bounded, and not the literal `null`.
+
+Enabled production requires `admission_signing_profile_name`. The module resolves its exact active
+`AWSLambda-SHA384-ECDSA` profile version, creates a code-signing configuration that trusts only that immutable version,
+sets `untrusted_artifact_on_deployment = "Enforce"`, and attaches it before the admission Lambda is created. The unsigned
+CI ZIP is never a valid production Terraform object. Rebuilding the same source and lock with the same
+Node/npm/esbuild versions must reproduce the same unsigned source ZIP; AWS Signer's output is separately identified by
+its immutable S3 VersionId and digest. The entrypoint
+constructs the strict Senti verifier, separate Dynamo adapter, and synchronous immutable-version invoker once per warm
+Lambda environment. The configured numeric version ARN must end in `GATEWAY_LAMBDA_VERSION`, and every successful AWS
+response must report that exact `ExecutedVersion`; a named alias is never dereferenced by the private hop. A failed
+secret fetch is retried on a later invocation, but it never falls back to a mutable stage;
+bootstrap and unexpected app failures return the same identifier-free `operation-admission-unavailable` 503 as the
+runtime proxy rather than exposing an SDK/configuration exception through API Gateway.
+
+The admission Lambda accepts only exact `POST /dial/register` and `POST /dial/register/reconcile` events. Every other
+method/path fails closed without authenticating, reading the body, allocating ledger state, or invoking the gateway.
+This single-purpose behavior prevents a direct Lambda caller from using the admission role as a general gateway proxy.
+One invocation-wide deadline is propagated to Senti fetch, DynamoDB, Secrets Manager, and Lambda transports. It is at
+most 24 seconds and shrinks to Lambda remaining time minus the two-second response reserve. Deadline expiry aborts
+in-flight work and returns the exact generic admission 503. Keep the 28-second Lambda timeout below the 29-second API
+integration timeout.
+
+### Operation-admission Terraform activation
+
+`infra/terraform/operation-admission` is dark by default. When enabled, the pinned AWS provider's
+`aws_lambda_invocation` data source invokes the configured positive numeric gateway version with the exact non-mutating
+control request `{"schema":"senti.gateway.operation-admission-attestation.request.v1"}`. The gateway intercepts that
+event before HTTP normalization, authentication, replay storage, or gateway work and returns exactly these 12
+lower-snake-case, non-secret fields:
+
+```text
+schema, capability, invoked_function_arn, function_version,
+registry_mode, v1_purged, client_ready, outcome_ready, owner_ready,
+hmac_secret_arn, hmac_secret_version_id, assertion_schema
+```
+
+Terraform rejects extra/missing keys and refuses the plan unless the response binds the exact numeric ARN/version,
+Registry V2 capability and assertion schema, all remaining gateway boot acknowledgements, and the configured wildcard-
+free Secret ARN plus immutable VersionId. It does not accept a runtime self-claim of control-plane `CodeSha256` or a
+Lambda description. `gateway_release_artifact_sha256` is independent release evidence supplied by the deployment
+process; `gateway_release_manifest` records it alongside a canonical digest of the validated runtime attestation.
+Provider credentials are required, but there is no host AWS CLI command or external Terraform provider, and the full
+Lambda environment never enters Terraform state. Invocation failure or any response drift fails closed.
+
+Both API integrations and every Lambda resource-policy grant target numeric published versions. The protected routes
+invoke the module-published admission version; the 13 direct routes invoke the attested gateway version. No mutable
+Lambda alias exists in the ingress path, so an out-of-band `UpdateAlias` cannot redirect reviewed traffic.
+
+Production state uses the partial encrypted S3 backend in `versions.tf`. Initialize it only with an account-owned,
+private, versioned bucket using SSE-KMS, TLS-only bucket policy, least-privileged state access, and a dedicated DynamoDB
+lock table. The backend CMK must be pre-existing and distinct from the module-managed admission CMK; the role running
+`terraform init/plan/apply` needs `kms:Encrypt`, `kms:Decrypt`, and `kms:GenerateDataKey` on that state key. For example:
+
+```sh
+terraform init \
+  -backend-config="bucket=<private-versioned-state-bucket>" \
+  -backend-config="key=senti-pocket/operation-admission/prod.tfstate" \
+  -backend-config="region=us-east-1" \
+  -backend-config="kms_key_id=<state-CMK-ARN>" \
+  -backend-config="dynamodb_table=<terraform-lock-table>"
+```
+
+Tests use `terraform init -backend=false`. The cutover states are deliberately separate: `enabled=false` creates no
+module resources; `enabled=true, traffic_enabled=false, publish_dns=false` is `provisioned-dark`; traffic true with DNS
+false is `mapped-no-dns` for isolated proof; all three true is `public`. API mapping requires a canonical lowercase
+`dark_proof_sha256` over the retained provisioned-dark evidence bundle. DNS publication requires both that digest and a
+canonical `mapped_proof_sha256` over the retained mapped-no-DNS evidence bundle; both are echoed in `cutover_contract`.
+Use the first two provisioned states for artifact, IAM, two-instance/load, route-negative, telemetry, and rollback proof
+before DNS publication. Roll back in dependency order: first set `publish_dns=false`, then set `traffic_enabled=false`
+(or apply both false atomically), while preserving `enabled=true`. Never use `enabled=false` as emergency rollback:
+retained logs, the admission table, and the KMS key have destruction safeguards, and that change plans resource
+destruction.
 
 Treat this HMAC key as **deployment-immutable across every concurrently running Lambda version**. Do not perform a
 rolling key change: the current schema has no key id/dual-read migration, so mixed keys create parallel installation,
@@ -190,7 +379,7 @@ is an explicit key-id + dual-read/write migration before the first normal rotati
 
 ---
 
-## 3. The handler (reference `index.mjs`)
+## 3. Gateway handler (reference `index.mjs`)
 
 This is the only glue the deploy writes. It resolves the real externals and hands them to `createLambda`:
 
@@ -226,13 +415,18 @@ const signingKey = createPrivateKey(pem);
 // Lambda environment, source, or logs. V1 does not retrieve or require this optional secret.
 let runtimeEnv = process.env;
 if (process.env.DEVICE_REGISTRY_MODE === 'v2') {
-  if (!process.env.DEVICE_REGISTRY_HMAC_SECRET_ARN) {
-    throw new Error('DEVICE_REGISTRY_HMAC_SECRET_ARN is required for Registry V2');
+  if (!process.env.DEVICE_REGISTRY_HMAC_SECRET_ARN || !process.env.DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID) {
+    throw new Error('a pinned Registry V2 HMAC secret ARN + version id are required');
   }
-  const hmacKey = (await sm.send(new GetSecretValueCommand({
+  const configuredVersionId = process.env.DEVICE_REGISTRY_HMAC_SECRET_VERSION_ID;
+  const hmacResponse = await sm.send(new GetSecretValueCommand({
     SecretId: process.env.DEVICE_REGISTRY_HMAC_SECRET_ARN,
-  }))).SecretString;
-  if (!hmacKey) throw new Error('Registry V2 HMAC secret is empty');
+    VersionId: configuredVersionId,
+  }));
+  if (hmacResponse.VersionId !== configuredVersionId || !hmacResponse.SecretString) {
+    throw new Error('Registry V2 pinned HMAC secret is unavailable');
+  }
+  const hmacKey = hmacResponse.SecretString;
   runtimeEnv = { ...process.env, DEVICE_REGISTRY_HMAC_KEY_B64: hmacKey };
 }
 
@@ -248,8 +442,10 @@ export const handler = createLambda(runtimeEnv, {
 });
 ```
 
-`createProdGateway` **fails boot** if any of `dynamoClient / signingKey / knownSessionIdsFor / fetch` (or the four
-required env vars) is missing — so a misconfigured deploy never starts half-wired.
+`createProdGateway` **fails boot** if any baseline dependency (`dynamoClient / signingKey / knownSessionIdsFor / fetch`)
+or required baseline environment value is missing. Registry V2 additionally requires its HMAC key, exact secret
+ARN/VersionId, readiness acknowledgements, and private admission-assertion verifier/replay store; a misconfigured
+deployment never starts half-wired.
 
 **IAM:** the Lambda role needs `dynamodb:{GetItem,PutItem,DeleteItem}` on the table. DynamoDB authorizes each
 `TransactWriteItems` sub-operation through its underlying `PutItem` / `DeleteItem` permission (there is no separate
@@ -281,7 +477,9 @@ required env vars) is missing — so a misconfigured deploy never starts half-wi
 ## 5. Verify
 
 - `GET /health` ⇒ `200 {ok:true}` (no auth).
-- Any other route with no/invalid bearer ⇒ `401` (fail-closed).
+- Direct/V1 routes with no or invalid bearer ⇒ `401` (fail-closed). On either protected V2 POST, malformed JSON,
+  non-canonical base64, or an oversized decoded body returns the documented `400`/`413` before auth; a direct gateway
+  invoke without a valid private assertion returns the generic admission `503`.
 - With a valid senti session bearer: `GET /sync`, `GET /checkpoint?sessionId=…`, `POST /answer`, `POST /brief`,
   `POST /actions/execute`, `POST /tts`, `POST /deck`, `POST /dial`, `POST|DELETE /dial/register`, and authenticated
   `GET /dial/register/context` plus `POST /dial/register/reconcile` per the contract in `API.md`.
@@ -293,9 +491,23 @@ required env vars) is missing — so a misconfigured deploy never starts half-wi
   cleanup/delete. Prove a different owner receives the generic 409 with no handle/fence leak for register, cleanup, and
   delete through `ttl - 1`, then can reclaim a physically retained row exactly at `ttl`. Corrupt stored owner handles
   must fail closed as storage errors rather than being echoed or normalized.
-- Exercise the admission boundary with exact replay, 257 unique live identities, the per-minute threshold, two
-  concurrent Lambda/ingress instances, and an unavailable admission store. Retain the 200/replay, typed 429, and
-  fail-closed evidence before setting `DEVICE_REGISTRY_OPERATION_ADMISSION_READY=1`.
+- Concurrently submit the same private assertion and prove exactly one `jti` consume reaches handler entry. Missing,
+  expired, replayed, wrong-audience, wrong-key/version, route/body/bearer-tampered proofs and replay-store outage must all
+  return the identical generic 503 before any registry mutation.
+- Exercise admission with 31 distinct operations inside one rolling window (exactly 30 admitted), 61 exact requests
+  inside one rolling window (exactly 60 admitted), 257 retained live identities (256 admitted), an older CAS
+  loser/newer-clock winner, two live Lambda instances, TTL deletion lag, and verifier/Dynamo/KMS/gateway outages. Pace
+  the 31/61 cases through the production concurrency/burst ceiling, or use a separately isolated load-proof deployment
+  with temporarily raised capacity, so edge/concurrency rejection cannot masquerade as a ledger-limit result. Retain
+  typed 429/503 responses and prove every failure invokes the gateway zero times except a post-admission gateway
+  failure, whose retry is a replay.
+- Inspect the deployed API/routes and account-wide Lambda policies: no Function URL, `$default`, obsolete stage/domain,
+  protected direct integration, wildcard invoke permission, or unauthorized same-account role may reach the gateway.
+  Prove the admission role cannot read/write the registry table. Include this negative evidence in the retained
+  provisioned-dark bundle before recording `dark_proof_sha256` or enabling traffic mapping.
+- Capture redacted CloudWatch/X-Ray/Dynamo evidence showing no bearer, raw principal/human, installation/session id,
+  UUID, token/body, owner handle, or operation digest is emitted to telemetry. Then run register, reconcile, replay,
+  downstream-timeout recovery, and revoke from a physical phone through the actual custom domain.
 - A route whose feature backend isn't wired returns a **typed `501`** (`no-video-capability`, `dial-not-configured`,
   reasoning-not-configured, …) — confirm these are `501`, not errors: that's the honest "not-configured" signal.
 

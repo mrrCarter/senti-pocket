@@ -537,7 +537,7 @@ function assertUnregisterInput(value) {
   return checked.value;
 }
 
-function assertOwner(principal, humanId) {
+export function assertDeviceRegistryOwnerIdentity(principal, humanId) {
   // `principal` is a trusted verifier-owned namespace and intentionally contains length-prefix separators/newlines in
   // production. Treat it as bounded opaque bytes; do not apply request-body canonicalization to that internal format.
   const principalError =
@@ -551,7 +551,7 @@ function assertOwner(principal, humanId) {
 }
 
 function authenticatedOwnerFields(hmacKey, principal, humanId, value = undefined) {
-  assertOwner(principal, humanId);
+  assertDeviceRegistryOwnerIdentity(principal, humanId);
   const ownerHandle = deriveDeviceOwnerHandle(hmacKey, principal, humanId);
   if (
     value &&
