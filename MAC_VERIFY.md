@@ -26,10 +26,15 @@ done
 
 # ML packages — pull heavy EXTERNAL deps (LiteRT-LM and the whisper.cpp binary XCFramework).
 # Resolution, compilation, and tests are mandatory; do not downgrade a failure to a warning.
-for pkg in packages/PocketInference packages/PocketVoice; do
-  echo "==== $pkg (external deps) ===="
-  ( cd "$pkg" && swift build && swift test )
-done
+# LiteRT-LM's unrelated repository prebuilt/ files include unavailable Android LFS objects;
+# its Apple SwiftPM targets use checksum-verified release XCFrameworks instead.
+echo "==== packages/PocketInference (external deps) ===="
+( cd packages/PocketInference && \
+  GIT_LFS_SKIP_SMUDGE=1 swift build && \
+  GIT_LFS_SKIP_SMUDGE=1 swift test )
+
+echo "==== packages/PocketVoice (external deps) ===="
+( cd packages/PocketVoice && swift build && swift test )
 ```
 
 ## The production-linked app closure

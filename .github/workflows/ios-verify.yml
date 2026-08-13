@@ -51,11 +51,17 @@ jobs:
             path: packages/PocketDialVoice
           - name: PocketInference
             path: packages/PocketInference
+            git_lfs_skip_smudge: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain
         run: swift --version
       - name: Build and test package
+        env:
+          # LiteRT-LM's SwiftPM targets use checksum-pinned release XCFrameworks.
+          # Its unrelated repository prebuilt/ LFS objects are not package inputs,
+          # and upstream v0.15.0 currently has a missing Android LFS object.
+          GIT_LFS_SKIP_SMUDGE: ${{ matrix.git_lfs_skip_smudge }}
         run: swift test --package-path "${{ matrix.path }}"
 
   hosted-app-tests:

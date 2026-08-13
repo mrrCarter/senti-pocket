@@ -61,9 +61,13 @@ Run from the repository root on a Mac with the current Xcode toolchain and a cle
 
 ```bash
 rm -rf packages/PocketInference/.build packages/PocketInference/Package.resolved
-swift test --package-path packages/PocketInference
+GIT_LFS_SKIP_SMUDGE=1 swift test --package-path packages/PocketInference
 ```
 
 The command must compile the real `LiteRTLMInferenceEngine`; do not replace it with a stub or exclude it from the
 target. Then run `benchmark(prefillTokens:decodeTokens:)` on the physical demo phone. This package was authored on
 a Windows host without Swift/Xcode, so a source-parser pass is not a substitute for that build and device gate.
+
+`GIT_LFS_SKIP_SMUDGE=1` skips checkout of LiteRT-LM's unrelated `prebuilt/` repository files. The Apple SwiftPM
+targets instead download the release `CLiteRTLM`/`CLiteRTLM_mac` XCFramework declared by the pinned manifest and
+verify its SHA-256 checksum; skipping repository LFS smudging does not bypass that binary-target verification.
