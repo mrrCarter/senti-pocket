@@ -381,11 +381,11 @@ jobs:
 
           for job_id in ${job_ids}; do
             log_file="${tmp_dir}/${job_id}.log"
-            # Current gh releases reject ANSI-bearing job logs unless this
-            # explicit opt-in is present. The parser below treats the log as
-            # untrusted text and extracts only bounded JSON telemetry records.
-            gh api --allow-escape-sequences --method GET \
-              "repos/${REPOSITORY}/actions/jobs/${job_id}/logs" > "${log_file}"
+            # `gh api` refuses ANSI-bearing log responses but exposes no API
+            # opt-in for them. Use the dedicated, authenticated log command;
+            # the parser below treats its output as untrusted text.
+            gh run view "${RUN_ID}" --repo "${REPOSITORY}" \
+              --job "${job_id}" --log > "${log_file}"
             if ! python3 - "${log_file}" "${job_id}" <<'PY'
           import json
           import sys
@@ -405,6 +405,10 @@ jobs:
                       continue
 
                   message = str(record.get("message", ""))
+                  safe_message = "".join(
+                      character if character.isprintable() else "?"
+                      for character in message
+                  )[:500]
                   stage = str(record.get("stage", ""))
                   status = record.get("status")
                   level = str(record.get("level", "")).lower()
@@ -417,11 +421,11 @@ jobs:
                       continue
                   status_lc = str(status).lower()
                   if level in {"error", "critical"}:
-                      failures.append(message or f"level={level}")
+                      failures.append(safe_message or f"level={level}")
                   if status_lc in {"failed", "failure", "error", "timeout"}:
-                      failures.append(message or f"status={status_lc}")
+                      failures.append(safe_message or f"status={status_lc}")
                   if any(word in message_lc for word in ("failed", "failure", "error", "exception", "timeout")):
-                      failures.append(message)
+                      failures.append(safe_message)
 
           if failures:
               print(f"::error::Telemetry failure signal was detected in Omar job {job_id}: {failures[:3]}")
