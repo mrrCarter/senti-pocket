@@ -43,6 +43,11 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+        # Design notes are tracked beside the Swift implementation for review,
+        # but they are not runtime resources and must not ship in the app.
+        excludes:
+          - DialHydration_README.md
+          - DialPayloadV1Tests_README.md
       - path: Resources
         buildPhase: resources
     dependencies:
