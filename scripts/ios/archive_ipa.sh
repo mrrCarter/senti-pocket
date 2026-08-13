@@ -159,7 +159,7 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SCHEME="SentiPocketApp"
+SCHEME="SentiPocketAppRelease"
 
 TEAM_ID="${SENTI_APPLE_TEAM_ID:-}"
 BUNDLE_ID="${SENTI_BUNDLE_ID:-com.plexaura.sentipocket.app}"
@@ -211,22 +211,112 @@ fi
 
 require_command xcodebuild
 require_command xcodegen
-require_command codesign
 require_command base64
 require_command openssl
 require_command security
 require_command ditto
 require_command plutil
+require_command python3
 require_command shasum
 require_command sw_vers
 require_command unzip
 require_command xcrun
+require_command xcode-select
+[[ -x /usr/bin/codesign ]] || fail "/usr/bin/codesign is unavailable"
 [[ -x /usr/libexec/PlistBuddy ]] || fail "/usr/libexec/PlistBuddy is unavailable"
+
+XCODEGEN_BIN="$(command -v xcodegen)"
+PYTHON3_BIN="$(command -v python3)"
+XCRUN_BIN="$(command -v xcrun)"
+DEVELOPER_DIR_INPUT="${SENTI_XCODE_DEVELOPER_DIR:-$(xcode-select -p)}"
+DEVELOPER_DIR="$(cd "$DEVELOPER_DIR_INPUT" && pwd -P)"
+XCODEBUILD_BIN="$DEVELOPER_DIR/usr/bin/xcodebuild"
+[[ -x "$XCODEBUILD_BIN" ]] || fail "selected Xcode does not contain xcodebuild"
+IOS_SDK_ROOT_INPUT="$(DEVELOPER_DIR="$DEVELOPER_DIR" "$XCRUN_BIN" --sdk iphoneos --show-sdk-path)"
+IOS_SDK_ROOT="$(cd "$IOS_SDK_ROOT_INPUT" && pwd -P)"
+case "$IOS_SDK_ROOT" in
+  "$DEVELOPER_DIR"/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS*.sdk) ;;
+  *) fail "selected iPhoneOS SDK is outside the selected Xcode developer directory" ;;
+esac
+SAFE_XCODE_PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:$DEVELOPER_DIR/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SELECTED_SWIFT_TOOLS_DIR="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+export DEVELOPER_DIR
+
+# Xcode promotes matching environment variables into build settings. Refuse inherited
+# execution selectors/flags, then supply the reviewed values explicitly below.
+for override_key in \
+  ASSETCATALOG_EXEC \
+  CODESIGN CODESIGN_ALLOCATE \
+  COMPILATION_CACHE_ENABLE_PLUGIN COMPILATION_CACHE_PLUGIN_PATH \
+  CC CXX CPLUSPLUS OBJCC OBJCPLUSPLUS LD LDPLUSPLUS LIBTOOL \
+  ALL_OTHER_LDFLAGS ALTERNATE_LINKER ALTERNATE_LINKER_PATH \
+  CLANG_ALTERNATE_LINKER CLANG_ALTERNATE_LINKER_PATH LD_FLAGS \
+  LD_OBJC_RUNTIME_ARGS LD_OBJC_RUNTIME_ARGS_clang LD_OBJC_RUNTIME_ARGS_swiftc \
+  PRODUCT_SPECIFIC_LDFLAGS SECTORDER_FLAGS \
+  SWIFTC_ALTERNATE_LINKER SWIFTC_ALTERNATE_LINKER_PATH \
+  SWIFT_EXEC SWIFT_DRIVER_SWIFT_EXEC SWIFT_DRIVER_SWIFT_FRONTEND_EXEC \
+  SWIFT_ENABLE_COMPILE_CACHE \
+  SWIFT_TOOLS_DIR SWIFT_TOOLCHAIN_FLAGS SWIFT_RESPONSE_FILE_PATH \
+  SWIFT_USE_INTEGRATED_DRIVER \
+  C_COMPILER_LAUNCHER CXX_COMPILER_LAUNCHER SWIFT_COMPILER_LAUNCHER \
+  OTHER_SWIFT_FLAGS OTHER_CFLAGS OTHER_CPLUSPLUSFLAGS OTHER_LDFLAGS \
+  OTHER_LIBTOOLFLAGS WARNING_CFLAGS INFOPLIST_PREPROCESS \
+  INFOPLIST_OTHER_PREPROCESSOR_FLAGS INFOPLIST_PREFIX_HEADER \
+  INFOPLIST_PREPROCESSOR_DEFINITIONS SDKROOT TOOLCHAINS TOOLCHAIN_DIR DT_TOOLCHAIN_DIR; do
+  [[ -z "${!override_key:-}" ]] \
+    || fail "inherited build execution override is not permitted: $override_key"
+done
+
+while IFS= read -r override_key; do
+  case "$override_key" in
+    LD_OBJC_RUNTIME_ARGS_*|SWIFT_EXEC_*_EXEC|SWIFT_DRIVER_*_EXEC|\
+SWIFT_RESPONSE_FILE_PATH_*|SWIFT_TOOLCHAIN_FLAGS_*|*_COMPILER_LAUNCHER)
+      [[ -z "${!override_key:-}" ]] \
+        || fail "inherited build execution override is not permitted: $override_key"
+      ;;
+  esac
+done < <(compgen -A variable)
+
+SECURE_EXECUTION_SETTINGS=(
+  "ASSETCATALOG_EXEC=$DEVELOPER_DIR/usr/bin/actool"
+  "CODESIGN=/usr/bin/codesign"
+  "CODESIGN_ALLOCATE=$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/codesign_allocate"
+  "COMPILATION_CACHE_ENABLE_PLUGIN=NO"
+  "COMPILATION_CACHE_PLUGIN_PATH="
+  "C_COMPILER_LAUNCHER="
+  "CXX_COMPILER_LAUNCHER="
+  "INFOPLIST_OTHER_PREPROCESSOR_FLAGS="
+  "INFOPLIST_PREFIX_HEADER="
+  "INFOPLIST_PREPROCESS=NO"
+  "INFOPLIST_PREPROCESSOR_DEFINITIONS="
+  "OTHER_CFLAGS="
+  "OTHER_CPLUSPLUSFLAGS="
+  "OTHER_LDFLAGS="
+  "OTHER_LIBTOOLFLAGS="
+  "OTHER_SWIFT_FLAGS="
+  "ALL_OTHER_LDFLAGS="
+  "ALTERNATE_LINKER="
+  "ALTERNATE_LINKER_PATH="
+  "CLANG_ALTERNATE_LINKER="
+  "CLANG_ALTERNATE_LINKER_PATH="
+  "LD_FLAGS="
+  "PRODUCT_SPECIFIC_LDFLAGS="
+  "SECTORDER_FLAGS="
+  "SWIFTC_ALTERNATE_LINKER="
+  "SWIFTC_ALTERNATE_LINKER_PATH="
+  "SWIFT_COMPILER_LAUNCHER="
+  "SWIFT_ENABLE_COMPILE_CACHE=NO"
+  'SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'
+  "SWIFT_TOOLCHAIN_FLAGS="
+  "SWIFT_TOOLS_DIR=$SELECTED_SWIFT_TOOLS_DIR"
+  "SWIFT_USE_INTEGRATED_DRIVER=YES"
+  "WARNING_CFLAGS="
+)
 
 [[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=normal)" ]] \
   || fail "the Git worktree must be clean so the IPA can be attributed to an exact commit"
 
-XCODEBUILD_HELP="$(xcodebuild -help 2>&1 || true)"
+XCODEBUILD_HELP="$(PATH="$SAFE_XCODE_PATH" "$XCODEBUILD_BIN" -help 2>&1 || true)"
 if [[ -n "${SENTI_EXPORT_METHOD:-}" ]]; then
   EXPORT_METHOD="$SENTI_EXPORT_METHOD"
 else
@@ -243,9 +333,9 @@ if [[ "$REGISTER_CONNECTED_DEVICE" == "1" ]] && \
   fail "this Xcode does not support opt-in command-line device registration"
 fi
 if [[ "$INSTALL_CONNECTED_DEVICE" == "1" ]]; then
-  xcrun --find devicectl >/dev/null 2>&1 \
+  PATH="$SAFE_XCODE_PATH" "$XCRUN_BIN" --find devicectl >/dev/null 2>&1 \
     || fail "SENTI_INSTALL_CONNECTED_DEVICE=1 requires Xcode devicectl"
-  xcrun devicectl help device install app >/dev/null 2>&1 \
+  PATH="$SAFE_XCODE_PATH" "$XCRUN_BIN" devicectl help device install app >/dev/null 2>&1 \
     || fail "this Xcode devicectl does not support device install app"
 fi
 TARGET_DEVICE_COMMITMENT_SALT="not-applicable"
@@ -259,14 +349,14 @@ fi
 SOURCE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 SOURCE_TREE="$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}')"
 BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-XCODE_VERSION="$(xcodebuild -version | tr '\n' ';')"
+XCODE_VERSION="$(PATH="$SAFE_XCODE_PATH" "$XCODEBUILD_BIN" -version | tr '\n' ';')"
 XCODE_VERSION="${XCODE_VERSION%;}"
-XCODEGEN_VERSION="$(xcodegen --version | tr '\n' ';')"
+XCODEGEN_VERSION="$("$XCODEGEN_BIN" --version | tr '\n' ';')"
 XCODEGEN_VERSION="${XCODEGEN_VERSION%;}"
-XCODEGEN_BINARY_SHA256="$(shasum -a 256 "$(command -v xcodegen)" | awk '{print $1}')"
-SWIFT_VERSION="$(xcrun swift --version 2>&1 | head -n 1)"
-IOS_SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
-IOS_SDK_BUILD="$(xcrun --sdk iphoneos --show-sdk-build-version)"
+XCODEGEN_BINARY_SHA256="$(shasum -a 256 "$XCODEGEN_BIN" | awk '{print $1}')"
+SWIFT_VERSION="$(PATH="$SAFE_XCODE_PATH" "$XCRUN_BIN" swift --version 2>&1 | head -n 1)"
+IOS_SDK_VERSION="$(PATH="$SAFE_XCODE_PATH" "$XCRUN_BIN" --sdk iphoneos --show-sdk-version)"
+IOS_SDK_BUILD="$(PATH="$SAFE_XCODE_PATH" "$XCRUN_BIN" --sdk iphoneos --show-sdk-build-version)"
 MACOS_VERSION="$(sw_vers -productVersion)"
 MACOS_BUILD="$(sw_vers -buildVersion)"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${SOURCE_SHA:0:12}-$$"
@@ -336,19 +426,36 @@ WORKTREE_ADDED=true
 ARCHIVE_SCRIPT_SHA256="$(shasum -a 256 "$SOURCE_ROOT/scripts/ios/archive_ipa.sh" | awk '{print $1}')"
 PROJECT_SPEC_SHA256="$(shasum -a 256 "$APP_DIR/project.yml" | awk '{print $1}')"
 
+if ! "$PYTHON3_BIN" "$SOURCE_ROOT/scripts/ios/verify_unsigned_release.py" \
+  preflight \
+  --repository-root "$SOURCE_ROOT" \
+  >"$PRIVATE_DIAGNOSTICS_DIR/source-preflight.log" 2>&1; then
+  fail_build_step "source release-input preflight"
+fi
+
 if ! (
   cd "$APP_DIR"
-  xcodegen generate
+  "$XCODEGEN_BIN" generate
 ) >"$PRIVATE_DIAGNOSTICS_DIR/xcodegen.log" 2>&1; then
   fail_build_step "Xcode project generation"
 fi
 [[ -d "$PROJECT_PATH" ]] || fail "XcodeGen did not create $PROJECT_PATH"
 
-if ! xcodebuild \
+if ! "$PYTHON3_BIN" "$SOURCE_ROOT/scripts/ios/verify_unsigned_release.py" \
+  source \
+  --project-file "$PROJECT_PATH/project.pbxproj" \
+  >"$PRIVATE_DIAGNOSTICS_DIR/generated-project-preflight.log" 2>&1; then
+  fail_build_step "generated Release project preflight"
+fi
+
+if ! PATH="$SAFE_XCODE_PATH" "$XCODEBUILD_BIN" \
   -resolvePackageDependencies \
   -project "$PROJECT_PATH" \
   -scheme "$SCHEME" \
   -clonedSourcePackagesDirPath "$SOURCE_PACKAGES" \
+  "PATH=$SAFE_XCODE_PATH" \
+  "SDKROOT=$IOS_SDK_ROOT" \
+  "${SECURE_EXECUTION_SETTINGS[@]}" \
   >"$PRIVATE_DIAGNOSTICS_DIR/resolve-packages.log" 2>&1; then
   fail_build_step "Swift package resolution"
 fi
@@ -362,6 +469,9 @@ COMMON_BUILD_SETTINGS=(
   "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"
   "SENTI_API_URL=$API_URL"
   "SENTI_GATEWAY_URL=$GATEWAY_URL"
+  "PATH=$SAFE_XCODE_PATH"
+  "SDKROOT=$IOS_SDK_ROOT"
+  "${SECURE_EXECUTION_SETTINGS[@]}"
 )
 
 DEVICE_REGISTRATION_BUILD_SUCCEEDED=false
@@ -370,7 +480,7 @@ DEVICE_INSTALL_COMMAND_SUCCEEDED=false
 if [[ "$REGISTER_CONNECTED_DEVICE" == "1" ]]; then
   # Explicit opt-in only: this may register the connected device and refresh automatic signing assets in the selected
   # Developer Program team. The later embedded-profile check is the authority that proves the exact UDID was included.
-  if ! xcodebuild \
+  if ! PATH="$SAFE_XCODE_PATH" "$XCODEBUILD_BIN" \
     -project "$PROJECT_PATH" \
     -scheme "$SCHEME" \
     -configuration Debug \
@@ -387,13 +497,16 @@ if [[ "$REGISTER_CONNECTED_DEVICE" == "1" ]]; then
     "APS_ENVIRONMENT=development" \
     "SENTI_API_URL=$API_URL" \
     "SENTI_GATEWAY_URL=$GATEWAY_URL" \
+    "PATH=$SAFE_XCODE_PATH" \
+    "SDKROOT=$IOS_SDK_ROOT" \
+    "${SECURE_EXECUTION_SETTINGS[@]}" \
     build >"$PRIVATE_DIAGNOSTICS_DIR/device-registration-build.log" 2>&1; then
     fail_build_step "automatic development device-registration build"
   fi
   DEVICE_REGISTRATION_BUILD_SUCCEEDED=true
 fi
 
-if ! xcodebuild \
+if ! PATH="$SAFE_XCODE_PATH" "$XCODEBUILD_BIN" \
   -project "$PROJECT_PATH" \
   -scheme "$SCHEME" \
   -configuration Release \
@@ -414,7 +527,7 @@ cp "$APP_DIR/ExportOptions.example.plist" "$EXPORT_OPTIONS"
 /usr/libexec/PlistBuddy -c "Set :teamID $TEAM_ID" "$EXPORT_OPTIONS"
 plutil -lint "$EXPORT_OPTIONS" >/dev/null
 
-if ! xcodebuild \
+if ! PATH="$SAFE_XCODE_PATH" "$XCODEBUILD_BIN" \
   -exportArchive \
   -archivePath "$ARCHIVE_PATH" \
   -exportPath "$EXPORT_DIR" \
@@ -433,7 +546,20 @@ ditto -x -k "$IPA_PATH" "$VERIFY_DIR"
 APP_COUNT="$(find "$VERIFY_DIR/Payload" -maxdepth 1 -type d -name '*.app' | wc -l | tr -d '[:space:]')"
 [[ "$APP_COUNT" == "1" ]] || fail "expected exactly one Payload/*.app bundle, found $APP_COUNT"
 APP_PATH="$(find "$VERIFY_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
-if ! codesign --verify --deep --strict "$APP_PATH" \
+if ! "$PYTHON3_BIN" "$SOURCE_ROOT/scripts/ios/verify_unsigned_release.py" \
+  signed-bundle \
+  --app-path "$APP_PATH" \
+  --source-privacy "$APP_DIR/Resources/PrivacyInfo.xcprivacy" \
+  --bundle-id "$BUNDLE_ID" \
+  --marketing-version "$MARKETING_VERSION" \
+  --build-number "$BUILD_NUMBER" \
+  --api-url "$API_URL" \
+  --gateway-url "$GATEWAY_URL" \
+  --deployment-target "16.0" \
+  >"$PRIVATE_DIAGNOSTICS_DIR/signed-release-bundle.log" 2>&1; then
+  fail_build_step "signed Release icon, privacy, and bundle verification"
+fi
+if ! /usr/bin/codesign --verify --deep --strict "$APP_PATH" \
     >"$PRIVATE_DIAGNOSTICS_DIR/codesign-verify.log" 2>&1; then
   fail_build_step "strict code-signature verification"
 fi
@@ -456,7 +582,7 @@ SIGNED_GATEWAY_URL="$(/usr/libexec/PlistBuddy -c 'Print :SENTI_GATEWAY_URL' "$AP
 SIGNED_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
 [[ "$SIGNED_EXECUTABLE" =~ ^[A-Za-z0-9._+-]+$ && -f "$APP_PATH/$SIGNED_EXECUTABLE" ]] \
   || fail "the signed app has an invalid or missing CFBundleExecutable"
-SIGNED_ARCHITECTURES="$(xcrun lipo -archs "$APP_PATH/$SIGNED_EXECUTABLE")"
+SIGNED_ARCHITECTURES="$(PATH="$SAFE_XCODE_PATH" "$XCRUN_BIN" lipo -archs "$APP_PATH/$SIGNED_EXECUTABLE")"
 case " $SIGNED_ARCHITECTURES " in
   *" arm64 "*) ;;
   *) fail "the signed app executable does not contain arm64" ;;
@@ -467,7 +593,7 @@ SIGNED_MINIMUM_OS_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion
 
 (
   cd "$SIGNING_CERT_DIR"
-  codesign --display --extract-certificates "$APP_PATH" >/dev/null 2>&1
+  /usr/bin/codesign --display --extract-certificates "$APP_PATH" >/dev/null 2>&1
 ) || fail "the signing certificate chain could not be extracted from the signed app"
 SIGNING_LEAF_CERTIFICATE="$SIGNING_CERT_DIR/codesign0"
 [[ -s "$SIGNING_LEAF_CERTIFICATE" ]] || fail "codesign did not extract the signing leaf certificate"
@@ -478,7 +604,7 @@ SIGNING_LEAF_CERTIFICATE_NOT_AFTER="$(openssl x509 -inform DER -in "$SIGNING_LEA
 [[ -n "$SIGNING_LEAF_CERTIFICATE_NOT_AFTER" ]] || fail "the signing leaf certificate has no validity end date"
 
 SIGNED_ENTITLEMENTS="$PRIVATE_VERIFICATION_DIR/signed-entitlements.plist"
-codesign -d --entitlements :- "$APP_PATH" >"$SIGNED_ENTITLEMENTS" 2>/dev/null
+/usr/bin/codesign -d --entitlements :- "$APP_PATH" >"$SIGNED_ENTITLEMENTS" 2>/dev/null
 plutil -lint "$SIGNED_ENTITLEMENTS" >/dev/null
 SIGNED_TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$SIGNED_ENTITLEMENTS")"
 [[ "$SIGNED_TEAM_ID" == "$TEAM_ID" ]] \
@@ -596,7 +722,7 @@ done
 
 if [[ "$INSTALL_CONNECTED_DEVICE" == "1" ]]; then
   PRIVATE_DEVICE_OUTPUT="$PRIVATE_VERIFICATION_DIR/device-install-result.json"
-  if ! xcrun devicectl device install app \
+  if ! PATH="$SAFE_XCODE_PATH" "$XCRUN_BIN" devicectl device install app \
     --device "$DEVICE_UDID" \
     "$APP_PATH" \
     --quiet \

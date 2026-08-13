@@ -43,6 +43,11 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+        # Design notes are tracked beside the Swift implementation for review,
+        # but they are not runtime resources and must not ship in the app.
+        excludes:
+          - DialHydration_README.md
+          - DialPayloadV1Tests_README.md
       - path: Resources
         buildPhase: resources
     dependencies:
@@ -77,17 +82,55 @@ targets:
         SENTI_GATEWAY_URL: "$(SENTI_GATEWAY_URL)"
     settings:
       base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES: ""
+        ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: "NO"
+        ASSETCATALOG_COMPILER_SKIP_APP_STORE_DEPLOYMENT: "NO"
+        # Preserve Xcode's representative loose primary-icon output; the
+        # unsigned Release gate validates its exact 120x120 iPhone rendition.
+        ASSETCATALOG_COMPILER_STANDALONE_ICON_BEHAVIOR: default
+        ASSETCATALOG_OTHER_FLAGS: ""
         CODE_SIGN_ENTITLEMENTS: Sources/SentiPocketApp.entitlements
         CODE_SIGN_STYLE: Automatic
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: false
+        # Disable every Info.plist C-preprocessor surface; forwarded Clang
+        # flags could otherwise load an executable plugin during the build.
+        INFOPLIST_PREPROCESS: "NO"
+        INFOPLIST_OTHER_PREPROCESSOR_FLAGS: ""
+        INFOPLIST_PREFIX_HEADER: ""
+        INFOPLIST_PREPROCESSOR_DEFINITIONS: ""
         MARKETING_VERSION: "0.1.0"
         PRODUCT_BUNDLE_IDENTIFIER: com.plexaura.sentipocket.app
         SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        INCLUDED_SOURCE_FILE_NAMES: ""
+        # Release evidence rejects every unreviewed compiler/linker flag surface;
+        # compiler plugins and dynamic libraries can otherwise execute during build.
+        OTHER_SWIFT_FLAGS: ""
+        OTHER_CFLAGS: ""
+        OTHER_CPLUSPLUSFLAGS: ""
+        OTHER_LDFLAGS: ""
+        OTHER_LIBTOOLFLAGS: ""
+        # ALL_OTHER_LDFLAGS must remain absent: Xcode owns this aggregate and
+        # injects the Debug dylib stub executor inputs through it.
+        ALTERNATE_LINKER: ""
+        ALTERNATE_LINKER_PATH: ""
+        CLANG_ALTERNATE_LINKER: ""
+        CLANG_ALTERNATE_LINKER_PATH: ""
+        LD_FLAGS: ""
+        SECTORDER_FLAGS: ""
+        SWIFTC_ALTERNATE_LINKER: ""
+        SWIFTC_ALTERNATE_LINKER_PATH: ""
+        # Preserve Xcode's per-variant/architecture Swift input-file-list expansion.
+        SWIFT_RESPONSE_FILE_PATH: "$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))"
+        SWIFT_TOOLCHAIN_FLAGS: ""
+        WARNING_CFLAGS: ""
         VERSIONING_SYSTEM: apple-generic
       configs:
         Debug:
           APS_ENVIRONMENT: development
+          EXCLUDED_SOURCE_FILE_NAMES: ""
         Release:
           APS_ENVIRONMENT: production
           # The signed canonical bundle is a DEBUG/preview fixture, never a Release app resource.
@@ -135,6 +178,7 @@ targets:
 schemes:
   SentiPocketApp:
     build:
+      buildImplicitDependencies: false
       targets:
         SentiPocketApp: all
         SentiPocketAppUITests: [test]
@@ -146,3 +190,14 @@ schemes:
       targets:
         - SentiPocketAppTests
         - SentiPocketAppUITests
+  # Release/archive evidence uses a deliberately minimal scheme: one app
+  # target, no test build entries, no implicit target discovery, and no
+  # execution actions. The verifier binds the generated XML back to the
+  # validated PBXNativeTarget before accepting build evidence.
+  SentiPocketAppRelease:
+    build:
+      buildImplicitDependencies: false
+      targets:
+        SentiPocketApp: all
+    archive:
+      config: Release

@@ -279,4 +279,20 @@ if [[ "$WORKTREE_STATE_CHECK_AVAILABLE" == "true" ]]; then
     || { printf 'FAIL validation-only mode changed the Git worktree\n' >&2; exit 1; }
 fi
 
+CANONICAL_SWIFT_RESPONSE_SETTING='SWIFT_RESPONSE_FILE_PATH=$(SWIFT_RESPONSE_FILE_PATH_$(variant)_$(arch))'
+grep -Fq "'$CANONICAL_SWIFT_RESPONSE_SETTING'" "$ARCHIVE_SCRIPT" \
+  || { printf 'FAIL archive does not pin the canonical Swift response-file expansion\n' >&2; exit 1; }
+if grep -Fq '"SWIFT_RESPONSE_FILE_PATH="' "$ARCHIVE_SCRIPT"; then
+  printf 'FAIL archive suppresses Xcode Swift response-file expansion\n' >&2
+  exit 1
+fi
+PASS_COUNT=$((PASS_COUNT + 1))
+
+PRODUCT_SPECIFIC_ASSIGNMENTS="$(grep -F 'PRODUCT_SPECIFIC_LDFLAGS=' "$ARCHIVE_SCRIPT" || true)"
+if [[ "$PRODUCT_SPECIFIC_ASSIGNMENTS" != '  "PRODUCT_SPECIFIC_LDFLAGS="' ]]; then
+  printf 'FAIL archive does not contain exactly one empty product-specific linker assignment\n' >&2
+  exit 1
+fi
+PASS_COUNT=$((PASS_COUNT + 1))
+
 printf 'archive_ipa_validation_test: %d acceptance/rejection vectors passed\n' "$PASS_COUNT"
