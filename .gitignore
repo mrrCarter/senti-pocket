@@ -2,6 +2,10 @@
 .DS_Store
 xcuserdata/
 *.xcuserstate
+*.xcodeproj/
+*.xcarchive/
+*.ipa
+apps/SentiPocketApp/Sources/Info.plist
 DerivedData/
 build/
 *.xcworkspace/xcshareddata/swiftpm/.build/
