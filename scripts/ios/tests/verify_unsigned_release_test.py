@@ -479,6 +479,101 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
         chunks.append(UnsignedReleaseVerifierTests.png_chunk(b"IEND", b""))
         return b"\x89PNG\r\n\x1a\n" + b"".join(chunks)
 
+    @classmethod
+    def xcode26_icon_png(
+        cls, *, width: int, height: int, second_filter: int = 0
+    ) -> bytes:
+        if height % 2 != 0:
+            raise ValueError("the synthetic Xcode iDOT fixture requires an even height")
+        if not 0 <= second_filter <= 4:
+            raise ValueError("second_filter must be a legal PNG filter")
+        rows_per_segment = height // 2
+        opaque_pixel = b"\0\0\0\xff"
+        first_scanline = b"\0" + opaque_pixel * width
+        second_scanline = bytes((second_filter,)) + opaque_pixel * width
+        compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        first_idat = (
+            compressor.compress(first_scanline * rows_per_segment)
+            + compressor.flush(zlib.Z_FULL_FLUSH)
+        )
+        second_idat = (
+            compressor.compress(second_scanline * rows_per_segment)
+            + compressor.flush(zlib.Z_FINISH)
+        )
+        exif = b"".join(
+            (
+                b"MM\x00\x2a",
+                struct.pack(">I", 8),
+                struct.pack(">H", 1),
+                struct.pack(">HHII", 0x8769, 4, 1, 26),
+                struct.pack(">I", 0),
+                struct.pack(">H", 3),
+                struct.pack(">HHI", 0xA001, 3, 1),
+                struct.pack(">H", 1) + b"\x00\x00",
+                struct.pack(">HHII", 0xA002, 4, 1, width),
+                struct.pack(">HHII", 0xA003, 4, 1, height),
+                struct.pack(">I", 0),
+            )
+        )
+        if len(exif) != 68:
+            raise AssertionError("synthetic Xcode eXIf fixture drifted")
+        idot = struct.pack(
+            ">7I",
+            2,
+            0,
+            rows_per_segment,
+            40,
+            rows_per_segment,
+            rows_per_segment,
+            40 + 12 + len(first_idat),
+        )
+        header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+        chunks = (
+            cls.png_chunk(b"CgBI", verify.XCODE_CGBI_PAYLOAD),
+            cls.png_chunk(b"IHDR", header),
+            cls.png_chunk(b"gAMA", struct.pack(">I", 45455)),
+            cls.png_chunk(b"sRGB", b"\x00"),
+            cls.png_chunk(b"cHRM", struct.pack(">8I", *verify.SRGB_CHROMATICITIES)),
+            cls.png_chunk(b"eXIf", exif),
+            cls.png_chunk(b"iDOT", idot),
+            cls.png_chunk(b"IDAT", first_idat),
+            cls.png_chunk(b"IDAT", second_idat),
+            cls.png_chunk(b"IEND", b""),
+        )
+        return verify.PNG_SIGNATURE + b"".join(chunks)
+
+    @staticmethod
+    def decoded_png_chunks(encoded: bytes) -> list[tuple[bytes, bytes]]:
+        if not encoded.startswith(verify.PNG_SIGNATURE):
+            raise ValueError("not a PNG fixture")
+        chunks: list[tuple[bytes, bytes]] = []
+        offset = len(verify.PNG_SIGNATURE)
+        while offset < len(encoded):
+            chunk_size = struct.unpack_from(">I", encoded, offset)[0]
+            chunk_type = encoded[offset + 4 : offset + 8]
+            chunk_end = offset + 12 + chunk_size
+            chunks.append((chunk_type, encoded[offset + 8 : offset + 8 + chunk_size]))
+            offset = chunk_end
+        return chunks
+
+    @classmethod
+    def assembled_png(cls, chunks: list[tuple[bytes, bytes]]) -> bytes:
+        return verify.PNG_SIGNATURE + b"".join(
+            cls.png_chunk(chunk_type, payload) for chunk_type, payload in chunks
+        )
+
+    def compiled_png_errors(
+        self, encoded: bytes, *, width: int = 120, height: int = 120
+    ) -> list[str]:
+        candidate = self.root / "compiled-icon-candidate.png"
+        candidate.write_bytes(encoded)
+        return verify._compiled_icon_png_errors(
+            candidate,
+            expected_width=width,
+            expected_height=height,
+            evidence_label=candidate.name,
+        )
+
     def write_valid_app_icon_source(self) -> None:
         catalog = self.root / "Resources" / "Assets.xcassets"
         icon_set = catalog / "AppIcon.appiconset"
@@ -3199,6 +3294,240 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 )
 
                 self.assertEqual([], errors)
+
+    def test_bundle_accepts_hosted_xcode26_icon_png_shape(self) -> None:
+        info = self.read_info()
+        info["CFBundleIcons~ipad"] = {
+            "CFBundlePrimaryIcon": {
+                "CFBundleIconFiles": ["AppIcon60x60", "AppIcon76x76"],
+            }
+        }
+        self.write_info(info)
+        (self.app_path / "AppIcon60x60@2x.png").write_bytes(
+            self.xcode26_icon_png(width=120, height=120)
+        )
+        (self.app_path / "AppIcon76x76@2x~ipad.png").write_bytes(
+            self.xcode26_icon_png(width=152, height=152)
+        )
+
+        errors = verify.verify_bundle(
+            self.settings_path, self.source_privacy_path, self.expected
+        )
+
+        self.assertEqual([], errors)
+
+    def test_compiled_icon_rejects_malformed_xcode26_metadata_chunks(self) -> None:
+        valid = self.xcode26_icon_png(width=120, height=120)
+        chunks = self.decoded_png_chunks(valid)
+        payload_by_type = dict(chunks)
+
+        invalid_chromaticities = struct.pack(
+            ">8I", 0x80000000, *verify.SRGB_CHROMATICITIES[1:]
+        )
+        unapproved_chromaticities = struct.pack(">8I", *([0] * 8))
+        bad_exif_pointer = bytearray(payload_by_type[b"eXIf"])
+        struct.pack_into(">I", bad_exif_pointer, 18, 0xFFFFFFFF)
+        bad_exif_dimensions = bytearray(payload_by_type[b"eXIf"])
+        struct.pack_into(">I", bad_exif_dimensions, 48, 121)
+        idot_values = list(struct.unpack(">7I", payload_by_type[b"iDOT"]))
+        invalid_idot_payloads = []
+        for index, value in ((0, 1), (4, 61), (6, idot_values[6] + 1)):
+            changed_values = list(idot_values)
+            changed_values[index] = value
+            invalid_idot_payloads.append(struct.pack(">7I", *changed_values))
+
+        mutations = (
+            (b"CgBI", b"BAD!", "CgBI"),
+            (b"cHRM", payload_by_type[b"cHRM"][:-1], "cHRM"),
+            (b"cHRM", invalid_chromaticities, "cHRM"),
+            (b"cHRM", unapproved_chromaticities, "cHRM"),
+            (b"eXIf", payload_by_type[b"eXIf"][:-1], "eXIf"),
+            (b"eXIf", b"NOPE" + payload_by_type[b"eXIf"][4:], "eXIf"),
+            (b"eXIf", bytes(bad_exif_pointer), "eXIf"),
+            (b"eXIf", bytes(bad_exif_dimensions), "eXIf"),
+            *((b"iDOT", payload, "iDOT") for payload in invalid_idot_payloads),
+        )
+        for chunk_type, replacement, expected_error in mutations:
+            with self.subTest(chunk_type=chunk_type, replacement=replacement):
+                changed = [
+                    (kind, replacement if kind == chunk_type else payload)
+                    for kind, payload in chunks
+                ]
+
+                errors = self.compiled_png_errors(self.assembled_png(changed))
+
+                self.assert_error_contains(errors, expected_error)
+
+    def test_compiled_icon_enforces_xcode26_chunk_order_and_default_deny(
+        self,
+    ) -> None:
+        valid_chunks = self.decoded_png_chunks(
+            self.xcode26_icon_png(width=120, height=120)
+        )
+        first_idat = next(
+            index for index, (kind, _) in enumerate(valid_chunks) if kind == b"IDAT"
+        )
+
+        for chunk_type in (b"cHRM", b"eXIf", b"iDOT"):
+            with self.subTest(chunk_type=chunk_type, placement="after-IDAT"):
+                moved_chunk = next(item for item in valid_chunks if item[0] == chunk_type)
+                changed = [item for item in valid_chunks if item[0] != chunk_type]
+                changed.insert(len(changed) - 1, moved_chunk)
+
+                errors = self.compiled_png_errors(self.assembled_png(changed))
+
+                self.assert_error_contains(errors, "metadata chunks must precede IDAT")
+
+            with self.subTest(chunk_type=chunk_type, placement="duplicate"):
+                duplicate = list(valid_chunks)
+                source_index = next(
+                    index
+                    for index, (kind, _) in enumerate(duplicate)
+                    if kind == chunk_type
+                )
+                duplicate.insert(source_index + 1, duplicate[source_index])
+
+                errors = self.compiled_png_errors(self.assembled_png(duplicate))
+
+                self.assert_error_contains(errors, "duplicate singleton chunks")
+
+        chrm = next(item for item in valid_chunks if item[0] == b"cHRM")
+        without_chrm = [item for item in valid_chunks if item[0] != b"cHRM"]
+        exif_index = next(
+            index for index, (kind, _) in enumerate(without_chrm) if kind == b"eXIf"
+        )
+        without_chrm[exif_index:exif_index] = [(b"PLTE", b"\0\0\0"), chrm]
+        errors = self.compiled_png_errors(self.assembled_png(without_chrm))
+        self.assert_error_contains(errors, "color chunks must precede PLTE")
+
+        wrong_gamma = [
+            (kind, struct.pack(">I", 50000) if kind == b"gAMA" else payload)
+            for kind, payload in valid_chunks
+        ]
+        errors = self.compiled_png_errors(self.assembled_png(wrong_gamma))
+        self.assert_error_contains(errors, "does not match its sRGB color space")
+
+        for chunk_type in (b"tRNS", b"acTL", b"fcTL", b"fdAT", b"vpAg"):
+            with self.subTest(chunk_type=chunk_type, placement="before-IDAT"):
+                changed = list(valid_chunks)
+                changed.insert(first_idat, (chunk_type, b""))
+
+                errors = self.compiled_png_errors(self.assembled_png(changed))
+
+                self.assertTrue(
+                    any(
+                        marker in error
+                        for error in errors
+                        for marker in (
+                            "unapproved ancillary chunk",
+                            "unknown critical chunk",
+                        )
+                    )
+                )
+
+    def test_compiled_icon_rejects_nonrestartable_idot_segments(self) -> None:
+        valid_chunks = self.decoded_png_chunks(
+            self.xcode26_icon_png(width=120, height=120)
+        )
+        idat_indices = [
+            index for index, (kind, _) in enumerate(valid_chunks) if kind == b"IDAT"
+        ]
+        first_payload = valid_chunks[idat_indices[0]][1]
+        second_payload = valid_chunks[idat_indices[1]][1]
+        combined = first_payload + second_payload
+        split_at = len(first_payload) + 1
+        changed = list(valid_chunks)
+        changed[idat_indices[0]] = (b"IDAT", combined[:split_at])
+        changed[idat_indices[1]] = (b"IDAT", combined[split_at:])
+        idot_index = next(
+            index for index, (kind, _) in enumerate(changed) if kind == b"iDOT"
+        )
+        idot_values = list(struct.unpack(">7I", changed[idot_index][1]))
+        idot_values[6] = 40 + 12 + split_at
+        changed[idot_index] = (b"iDOT", struct.pack(">7I", *idot_values))
+
+        errors = self.compiled_png_errors(self.assembled_png(changed))
+
+        self.assert_error_contains(errors, "not independently decodable")
+
+        errors = self.compiled_png_errors(
+            self.xcode26_icon_png(width=120, height=120, second_filter=2)
+        )
+        self.assert_error_contains(errors, "not independently decodable")
+
+    def test_idot_segment_decoder_never_uses_an_unbounded_zero_limit(self) -> None:
+        class BoundaryInflater:
+            eof = False
+            unused_data = b""
+            unconsumed_tail = b""
+
+            def decompress(self, _payload: bytes, maximum: int) -> bytes:
+                if maximum <= 0:
+                    raise AssertionError("zero means unlimited to zlib")
+                return bytes(maximum)
+
+            def flush(self, maximum: int) -> bytes:
+                if maximum <= 0:
+                    raise AssertionError("zero means unlimited to zlib")
+                return b""
+
+        with mock.patch.object(
+            verify.zlib,
+            "decompressobj",
+            side_effect=(BoundaryInflater(), BoundaryInflater()),
+        ):
+            valid = verify._xcode_built_idot_segments_are_valid(
+                (b"first", b"prefix-overflow", b"second"),
+                second_index=2,
+                width=2,
+                height=2,
+                channels=3,
+                first_row_count=1,
+                second_row_count=1,
+            )
+
+        self.assertFalse(valid)
+
+    def test_idot_segment_decoder_rejects_unbounded_dimensions_before_inflate(
+        self,
+    ) -> None:
+        with mock.patch.object(verify.zlib, "decompressobj") as decompressobj:
+            valid = verify._xcode_built_idot_segments_are_valid(
+                (b"first", b"second"),
+                second_index=1,
+                width=1,
+                height=0xFFFFFFFF,
+                channels=4,
+                first_row_count=0xFFFFFFFE,
+                second_row_count=1,
+            )
+
+        self.assertFalse(valid)
+        decompressobj.assert_not_called()
+
+        chunks = self.decoded_png_chunks(
+            self.xcode26_icon_png(width=120, height=120)
+        )
+        changed: list[tuple[bytes, bytes]] = []
+        for kind, payload in chunks:
+            if kind == b"IHDR":
+                payload = struct.pack(
+                    ">IIBBBBB", 120, 0xFFFFFFFF, 8, 6, 0, 0, 0
+                )
+            elif kind == b"iDOT":
+                values = list(struct.unpack(">7I", payload))
+                values[2] = 0xFFFFFFFE
+                values[4] = 0xFFFFFFFE
+                values[5] = 1
+                payload = struct.pack(">7I", *values)
+            changed.append((kind, payload))
+
+        with mock.patch.object(verify.zlib, "decompressobj") as decompressobj:
+            errors = self.compiled_png_errors(self.assembled_png(changed))
+
+        self.assert_error_contains(errors, "dimensions")
+        self.assert_error_contains(errors, "not independently decodable")
+        decompressobj.assert_not_called()
 
     def test_bundle_allows_declared_nonrepresentative_icon_only_in_assets_car(
         self,

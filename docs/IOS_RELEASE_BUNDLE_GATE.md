@@ -31,7 +31,11 @@ The same commands can run in hosted CI or on Forge's Mac without an Apple accoun
   the same `AppIcon`. The exact standalone-icon behavior is pinned to Xcode's `default`. The required iPhone 120x120
   `AppIcon60x60@2x.png` and, when iPad compatibility metadata is emitted, 152x152
   `AppIcon76x76@2x~ipad.png` are structurally decoded. Every additional present declared loose rendition is also decoded;
-  other declared renditions may remain solely in the bounded `Assets.car` under Xcode's `default` behavior.
+  other declared renditions may remain solely in the bounded `Assets.car` under Xcode's `default` behavior. Xcode 26's
+  `cHRM`, `eXIf`, and Apple `iDOT` output is accepted only with its observed bounded shape: canonical sRGB
+  chromaticities, an exact dimension-bound Exif profile, and a two-segment row map whose targets are parsed IDAT
+  boundaries. Both iDOT segments must independently decode to the same bytes as the serial CgBI raw-DEFLATE stream,
+  preventing an Apple-parallel-versus-serial-decoder differential.
 - The unsigned bundle contains no symlink and no path whose case-insensitive basename or suffix matches the gate's
   enumerated fixture, model, provisioning, signing, environment, or credential filename patterns (including
   `canonical_checkpoint.json`, `ggml-*.bin`, `*whisper*.bin`, `.gguf`, `.tflite`, `.litertlm`, `.task`,
@@ -57,6 +61,11 @@ It does not independently decode or inventory every rendition in that private-fo
 boundary is the exact pinned source catalog, generated-project resource graph, compiler settings, absence of alternate
 icon inputs/scripts/build rules, the exact required loose representatives above, and structural decoding of every
 additional declared loose rendered PNG that Xcode emits.
+
+Apple has not published a normative iDOT format specification; its structural meaning is based on the publicly
+catalogued, reverse-engineered chunk layout and independently observed Xcode 26 outputs. The gate validates the row and
+IDAT mapping conservatively and still decodes the authoritative pixel stream itself; it does not treat iDOT as trusted
+metadata or follow offsets to unparsed bytes.
 
 Security-sensitive JSON, plist, PBX, scheme, PNG, CoreUI, and Mach-O reads use final-component no-follow file descriptors,
 are bounded by `fstat`, and reject observable path or inode changes during verification. Checked final directories and

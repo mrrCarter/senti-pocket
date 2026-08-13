@@ -110,10 +110,24 @@ SCHEME_RELATIVE = Path(
 )
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 COMPILED_ASSET_MAGIC = b"BOMStore"
+XCODE_CGBI_PAYLOAD = b"\x50\x00\x20\x06"
 APPROVED_PNG_CHUNKS = frozenset(
     {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"sRGB", b"gAMA", b"pHYs"}
 )
+APPROVED_BUILT_PNG_CHUNKS = APPROVED_PNG_CHUNKS | frozenset(
+    {b"cHRM", b"eXIf", b"iDOT"}
+)
 UNIQUE_PNG_CHUNKS = APPROVED_PNG_CHUNKS - {b"IDAT"}
+SRGB_CHROMATICITIES = (
+    31270,
+    32900,
+    64000,
+    33000,
+    30000,
+    60000,
+    15000,
+    6000,
+)
 FORBIDDEN_BASENAMES = frozenset(
     {
         FIXTURE_NAME.lower(),
@@ -2992,6 +3006,107 @@ def _validated_icon_names(
     return [(name, is_ipad) for name in validated]
 
 
+def _xcode_built_exif_is_valid(payload: bytes, *, width: int, height: int) -> bool:
+    expected = b"".join(
+        (
+            b"MM\x00\x2a",
+            struct.pack(">I", 8),
+            struct.pack(">H", 1),
+            struct.pack(">HHII", 0x8769, 4, 1, 26),
+            struct.pack(">I", 0),
+            struct.pack(">H", 3),
+            struct.pack(">HHI", 0xA001, 3, 1),
+            struct.pack(">H", 1) + b"\0\0",
+            struct.pack(">HHII", 0xA002, 4, 1, width),
+            struct.pack(">HHII", 0xA003, 4, 1, height),
+            struct.pack(">I", 0),
+        )
+    )
+    return hmac.compare_digest(payload, expected)
+
+
+def _xcode_built_idot_segments_are_valid(
+    idat_payloads: Sequence[bytes],
+    *,
+    second_index: int,
+    width: int,
+    height: int,
+    channels: int,
+    first_row_count: int,
+    second_row_count: int,
+) -> bool:
+    if (
+        not 0 < second_index < len(idat_payloads)
+        or not 1 <= width <= APP_ICON_WIDTH
+        or height != width
+        or not 1 <= height <= APP_ICON_HEIGHT
+        or channels not in {3, 4}
+        or first_row_count <= 0
+        or second_row_count <= 0
+        or first_row_count + second_row_count != height
+    ):
+        return False
+    scanline_bytes = 1 + width * channels
+    first_bytes = scanline_bytes * first_row_count
+    second_bytes = scanline_bytes * second_row_count
+    serial_inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+    independent_inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+    serial_prefix = bytearray()
+    serial_suffix = bytearray()
+    independent_suffix = bytearray()
+    try:
+        for payload in idat_payloads[:second_index]:
+            prefix_remaining = first_bytes + 1 - len(serial_prefix)
+            if prefix_remaining <= 0:
+                return False
+            serial_prefix.extend(
+                serial_inflater.decompress(payload, prefix_remaining)
+            )
+            if serial_inflater.unconsumed_tail:
+                return False
+        if (
+            len(serial_prefix) != first_bytes
+            or serial_inflater.eof
+            or serial_inflater.unused_data
+        ):
+            return False
+        for payload in idat_payloads[second_index:]:
+            serial_remaining = second_bytes + 1 - len(serial_suffix)
+            independent_remaining = second_bytes + 1 - len(independent_suffix)
+            if serial_remaining <= 0 or independent_remaining <= 0:
+                return False
+            serial_suffix.extend(
+                serial_inflater.decompress(payload, serial_remaining)
+            )
+            independent_suffix.extend(
+                independent_inflater.decompress(payload, independent_remaining)
+            )
+            if serial_inflater.unconsumed_tail or independent_inflater.unconsumed_tail:
+                return False
+        serial_suffix.extend(
+            serial_inflater.flush(max(1, second_bytes + 1 - len(serial_suffix)))
+        )
+        independent_suffix.extend(
+            independent_inflater.flush(
+                max(1, second_bytes + 1 - len(independent_suffix))
+            )
+        )
+    except (zlib.error, ValueError):
+        return False
+    return (
+        len(serial_suffix) == second_bytes
+        and len(independent_suffix) == second_bytes
+        and hmac.compare_digest(serial_suffix, independent_suffix)
+        and independent_suffix[0] in {0, 1}
+        and serial_inflater.eof
+        and independent_inflater.eof
+        and not serial_inflater.unused_data
+        and not independent_inflater.unused_data
+        and not serial_inflater.unconsumed_tail
+        and not independent_inflater.unconsumed_tail
+    )
+
+
 def _compiled_icon_png_errors(
     path: Path,
     *,
@@ -3025,17 +3140,26 @@ def _compiled_icon_png_errors(
     saw_idat = False
     saw_iend = False
     saw_cgbi = False
+    saw_plte = False
+    saw_srgb = False
+    gamma: int | None = None
     idat_closed = False
     idat_payloads: list[bytes] = []
+    idat_chunk_offsets: list[int] = []
     seen_unique_chunks: set[bytes] = set()
     width = 0
     height = 0
     channels = 0
+    chromaticities: tuple[int, ...] | None = None
+    idot_chunk_offset: int | None = None
+    idot_targets: tuple[int, int] | None = None
+    idot_rows: tuple[int, int] | None = None
     unsupported_chunk_facts: list[str] = []
     unsupported_chunk_count = 0
     unsupported_chunk_kinds: set[str] = set()
     duplicate_chunk_counts: dict[bytes, int] = {}
     while offset < len(encoded):
+        chunk_offset = offset
         chunk_count += 1
         if chunk_count > MAX_PNG_CHUNKS:
             return ["built AppIcon candidate exceeds the chunk verification limit"]
@@ -3060,7 +3184,7 @@ def _compiled_icon_png_errors(
         ):
             record_error("built AppIcon candidate contains an invalid chunk type")
             break
-        approved_chunks = APPROVED_PNG_CHUNKS | {b"CgBI"}
+        approved_chunks = APPROVED_BUILT_PNG_CHUNKS | {b"CgBI"}
         if chunk_type not in approved_chunks:
             chunk_kind = (
                 "unknown critical chunk"
@@ -3091,10 +3215,20 @@ def _compiled_icon_png_errors(
             record_error("built AppIcon candidate must begin with IHDR or CgBI")
         if saw_idat and chunk_type not in {b"IDAT", b"IEND"}:
             idat_closed = True
-        if saw_idat and chunk_type in {b"PLTE", b"sRGB", b"gAMA", b"pHYs"}:
+        if saw_idat and chunk_type in {
+            b"PLTE",
+            b"sRGB",
+            b"gAMA",
+            b"pHYs",
+            b"cHRM",
+            b"eXIf",
+            b"iDOT",
+        }:
             record_error("built AppIcon candidate metadata chunks must precede IDAT")
+        if saw_plte and chunk_type in {b"sRGB", b"gAMA", b"cHRM"}:
+            record_error("built AppIcon candidate color chunks must precede PLTE")
         if chunk_type == b"CgBI":
-            if chunk_count != 1 or chunk_size not in {0, 4}:
+            if chunk_count != 1 or payload not in {b"", XCODE_CGBI_PAYLOAD}:
                 record_error("built AppIcon candidate has an invalid CgBI chunk")
             saw_cgbi = True
         if chunk_type == b"IHDR":
@@ -3133,19 +3267,80 @@ def _compiled_icon_png_errors(
             if not saw_ihdr or not payload or idat_closed:
                 record_error("built AppIcon candidate has invalid image data")
             saw_idat = True
+            idat_chunk_offsets.append(chunk_offset)
             idat_payloads.append(payload)
         elif chunk_type == b"PLTE":
             if not 3 <= chunk_size <= 768 or chunk_size % 3 != 0:
                 record_error("built AppIcon candidate contains an invalid PLTE chunk")
+            saw_plte = True
         elif chunk_type == b"sRGB":
             if chunk_size != 1 or payload[0] > 3:
                 record_error("built AppIcon candidate contains an invalid sRGB chunk")
+            else:
+                saw_srgb = True
         elif chunk_type == b"gAMA":
             if chunk_size != 4 or struct.unpack(">I", payload)[0] == 0:
                 record_error("built AppIcon candidate contains an invalid gAMA chunk")
+            else:
+                gamma = struct.unpack(">I", payload)[0]
         elif chunk_type == b"pHYs":
             if chunk_size != 9 or payload[-1] not in (0, 1):
                 record_error("built AppIcon candidate contains an invalid pHYs chunk")
+        elif chunk_type == b"cHRM":
+            if chunk_size != 32:
+                record_error("built AppIcon candidate contains an invalid cHRM chunk")
+            else:
+                candidate_chromaticities = struct.unpack(">8I", payload)
+                if any(value > 0x7FFFFFFF for value in candidate_chromaticities):
+                    record_error(
+                        "built AppIcon candidate contains an invalid cHRM chunk"
+                    )
+                elif candidate_chromaticities != SRGB_CHROMATICITIES:
+                    record_error(
+                        "built AppIcon candidate contains unapproved cHRM values"
+                    )
+                elif chromaticities is None:
+                    chromaticities = candidate_chromaticities
+        elif chunk_type == b"eXIf":
+            if not _xcode_built_exif_is_valid(
+                payload, width=width, height=height
+            ):
+                record_error("built AppIcon candidate contains an invalid eXIf chunk")
+        elif chunk_type == b"iDOT":
+            if chunk_size != 28:
+                record_error("built AppIcon candidate contains an invalid iDOT chunk")
+            else:
+                (
+                    segment_count,
+                    first_start_row,
+                    first_row_count,
+                    first_relative_offset,
+                    second_start_row,
+                    second_row_count,
+                    second_relative_offset,
+                ) = struct.unpack(">7I", payload)
+                rows_end = second_start_row + second_row_count
+                if (
+                    segment_count != 2
+                    or chunk_size != 4 + segment_count * 12
+                    or first_start_row != 0
+                    or first_row_count == 0
+                    or first_relative_offset != chunk_size + 12
+                    or second_start_row != first_row_count
+                    or second_row_count == 0
+                    or rows_end != height
+                    or second_relative_offset <= first_relative_offset
+                ):
+                    record_error(
+                        "built AppIcon candidate contains an invalid iDOT chunk"
+                    )
+                elif idot_targets is None:
+                    idot_chunk_offset = chunk_offset
+                    idot_targets = (
+                        chunk_offset + first_relative_offset,
+                        chunk_offset + second_relative_offset,
+                    )
+                    idot_rows = (first_row_count, second_row_count)
         elif chunk_type == b"IEND":
             if chunk_size != 0 or chunk_end != len(encoded):
                 record_error("built AppIcon candidate has an invalid IEND")
@@ -3160,6 +3355,44 @@ def _compiled_icon_png_errors(
         record_error("built AppIcon candidate is missing image data")
     if not saw_iend:
         record_error("built AppIcon candidate is missing IEND")
+    if saw_srgb and gamma not in {None, 45455}:
+        record_error(
+            "built AppIcon candidate gAMA value does not match its sRGB color space"
+        )
+    if saw_srgb and chromaticities not in {None, SRGB_CHROMATICITIES}:
+        record_error(
+            "built AppIcon candidate cHRM values do not match its sRGB color space"
+        )
+    if (
+        idot_targets is not None
+        and idot_chunk_offset is not None
+        and idot_rows is not None
+    ):
+        first_target, second_target = idot_targets
+        if (
+            not saw_cgbi
+            or len(idat_chunk_offsets) < 2
+            or first_target != idat_chunk_offsets[0]
+            or second_target not in idat_chunk_offsets[1:]
+        ):
+            record_error(
+                "built AppIcon candidate iDOT offsets do not identify its IDAT segment boundaries"
+            )
+        else:
+            second_index = idat_chunk_offsets.index(second_target)
+            first_row_count, second_row_count = idot_rows
+            if not _xcode_built_idot_segments_are_valid(
+                idat_payloads,
+                second_index=second_index,
+                width=width,
+                height=height,
+                channels=channels,
+                first_row_count=first_row_count,
+                second_row_count=second_row_count,
+            ):
+                record_error(
+                    "built AppIcon candidate iDOT segments are not independently decodable"
+                )
     if unsupported_chunk_count:
         omitted = unsupported_chunk_count - len(unsupported_chunk_facts)
         omitted_suffix = f", <{omitted} additional omitted>" if omitted else ""
