@@ -6,11 +6,27 @@
 import SwiftUI
 import PocketContracts
 import PocketReasoning
+import PocketUI
 
 struct PocketPhoneView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var reasoning: RealReasoningCoordinator
     @ObservedObject var write: PhoneWriteViewModel
+    private let reasoningLifecycle: PocketPhoneReasoningLifecycle
     @State private var draft: String = ""
+
+    init(
+        reasoning: RealReasoningCoordinator,
+        write: PhoneWriteViewModel,
+        connectivityUpdates: ReasoningConnectivityUpdates = ReasoningConnectivityUpdates()
+    ) {
+        _reasoning = ObservedObject(wrappedValue: reasoning)
+        _write = ObservedObject(wrappedValue: write)
+        reasoningLifecycle = PocketPhoneReasoningLifecycle(
+            reasoning: reasoning,
+            makeUpdates: { connectivityUpdates.stream() }
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -19,7 +35,10 @@ struct PocketPhoneView: View {
                 writeSection
             }
             .navigationTitle("Senti Pocket")
-            .task { reasoning.loadBriefing(connectivity: .online) }
+            .task(id: scenePhase) {
+                await reasoningLifecycle.run(isActive: scenePhase == .active)
+            }
+            .onDisappear { reasoningLifecycle.stop() }
         }
     }
 
@@ -129,5 +148,39 @@ struct PocketPhoneView: View {
 
 private extension BriefingSegment {
     var sentiOpaqueIdentity: OpaqueUTF8Identity { OpaqueUTF8Identity(id) }
+}
+
+/// Owns the reasoning observation at the SwiftUI lifecycle boundary while keeping active/inactive/disappearance
+/// behavior directly testable without fabricating `ScenePhase` environment updates. Parent task cancellation is
+/// forwarded to the exact observation task; inactive and disappearing views synchronously fence all late work.
+@MainActor
+struct PocketPhoneReasoningLifecycle {
+    private let reasoning: RealReasoningCoordinator
+    private let makeUpdates: @Sendable () -> AsyncStream<PocketConnectivity>
+
+    init(
+        reasoning: RealReasoningCoordinator,
+        makeUpdates: @escaping @Sendable () -> AsyncStream<PocketConnectivity>
+    ) {
+        self.reasoning = reasoning
+        self.makeUpdates = makeUpdates
+    }
+
+    func run(isActive: Bool) async {
+        guard isActive else {
+            reasoning.reset()
+            return
+        }
+        let observation = reasoning.observeConnectivity(makeUpdates())
+        await withTaskCancellationHandler {
+            await observation.value
+        } onCancel: {
+            observation.cancel()
+        }
+    }
+
+    func stop() {
+        reasoning.reset()
+    }
 }
 #endif
