@@ -381,7 +381,11 @@ jobs:
 
           for job_id in ${job_ids}; do
             log_file="${tmp_dir}/${job_id}.log"
-            gh api --method GET "repos/${REPOSITORY}/actions/jobs/${job_id}/logs" > "${log_file}"
+            # Current gh releases reject ANSI-bearing job logs unless this
+            # explicit opt-in is present. The parser below treats the log as
+            # untrusted text and extracts only bounded JSON telemetry records.
+            gh api --allow-escape-sequences --method GET \
+              "repos/${REPOSITORY}/actions/jobs/${job_id}/logs" > "${log_file}"
             if ! python3 - "${log_file}" "${job_id}" <<'PY'
           import json
           import sys

@@ -36,6 +36,7 @@ ALLOWED_MANAGED_LLM_LINE = "sentinelayer_managed_llm: ${{ secrets.SENTINELAYER_T
 ALLOWED_MODEL_LINE = "model: gpt-5.3-codex"
 ALLOWED_MODEL_FALLBACK_LINE = "model_fallback: gpt-5.3-codex"
 ALLOWED_USE_CODEX_LINE = 'use_codex: "true"'
+TELEMETRY_LOG_DOWNLOAD_FRAGMENT = "gh api --allow-escape-sequences --method GET"
 
 
 def _repo_llm_configured(workflow_text: str) -> bool:
@@ -288,6 +289,7 @@ def validate_omar_workflow_text(workflow_text: str) -> None:
         "Emit Omar run summary",
         "merge_threshold",
         "Omar Gate Finalize",
+        TELEMETRY_LOG_DOWNLOAD_FRAGMENT,
     )
     for fragment in required_direct_fragments:
         if fragment not in workflow_text:
@@ -364,6 +366,10 @@ jobs:
         run: echo "Omar Gate merge threshold passed"
       - name: Emit Omar run summary
         run: echo "merge_threshold"
+      - name: Assert Omar telemetry uploads
+        run: |
+          gh api --allow-escape-sequences --method GET \
+            "repos/${REPOSITORY}/actions/jobs/${job_id}/logs" > "${log_file}"
   omar-fork-static:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -387,6 +393,17 @@ jobs:
           echo "::error::Omar Gate review result is bad"
 """
     validate_omar_workflow_text(valid)
+
+    # Job logs can contain ANSI bytes. Current gh versions fail closed unless
+    # the workflow explicitly opts in to emitting them for the untrusted-text
+    # telemetry parser, so losing this flag must fail the workflow contract.
+    _assert_fails(
+        valid.replace(
+            TELEMETRY_LOG_DOWNLOAD_FRAGMENT,
+            "gh api --method GET",
+            1,
+        )
+    )
 
     # Bridge/broken action pin plus bridge-only pr_number must be rejected.
     _assert_fails(
