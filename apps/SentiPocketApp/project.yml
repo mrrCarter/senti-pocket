@@ -105,9 +105,10 @@ targets:
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1"
         INCLUDED_SOURCE_FILE_NAMES: ""
-        # Release evidence rejects every unreviewed compiler/linker flag surface;
-        # compiler plugins and dynamic libraries can otherwise execute during build.
-        OTHER_SWIFT_FLAGS: ""
+        # OTHER_SWIFT_FLAGS must remain absent: the generated-project gate rejects
+        # that entire target-level surface, and both configurations resolve it empty.
+        # Release evidence rejects every remaining unreviewed compiler/linker flag
+        # surface; compiler plugins and dynamic libraries can otherwise execute.
         OTHER_CFLAGS: ""
         OTHER_CPLUSPLUSFLAGS: ""
         OTHER_LDFLAGS: ""

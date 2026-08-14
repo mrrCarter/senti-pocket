@@ -64,7 +64,7 @@ APP_ICON_NAME = "AppIcon"
 APP_ICON_FILENAME = "SentiPocketAppIcon.png"
 APP_ICON_SHA256 = "495904bf6d5a1fc41cfebfaa1fe1e67cb20a3c6882194408406210c2097a1b8f"
 PROJECT_SPEC_RELATIVE = Path("apps/SentiPocketApp/project.yml")
-PROJECT_SPEC_SHA256 = "239535279a2ed664c75ed1ad0de99b0178e389a7ea936dc943b2f481e8636344"
+PROJECT_SPEC_SHA256 = "957966359162332844f836876f08df15ac82b7147a2dc90e8a42c6106eb72be0"
 APP_ICON_WIDTH = 1024
 APP_ICON_HEIGHT = 1024
 APP_ICON_CHANNELS = 3
@@ -167,7 +167,8 @@ MARKETING_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,2}$")
 BUILD_NUMBER_RE = re.compile(r"^[1-9][0-9]*$")
 DNS_LABEL_RE = re.compile(r"^(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9])$")
 SWIFT_CONDITION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-SWIFT_DEBUG_FLAG_RE = re.compile(r"(?:^|=)-D=?DEBUG(?:$|=)")
+MAX_SWIFT_SETTING_CHARACTERS = 64 * 1024
+MAX_SWIFT_SETTING_TOKENS = 4096
 BUILD_SETTING_KEY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*"
     r"(?:\[[A-Za-z_][A-Za-z0-9_]*=[^\[\]\x00-\x1f]+\])*$"
@@ -291,6 +292,14 @@ PROJECT_EXECUTION_OVERRIDE_KEYS = frozenset(
         "SWIFT_USE_INTEGRATED_DRIVER",
         *OPTIONAL_EMPTY_RESOLVED_SETTINGS,
         "EXCLUDED_SOURCE_FILE_NAMES",
+    }
+)
+SPECIALIZABLE_EXECUTION_OVERRIDE_KEYS = frozenset(
+    {
+        *EMPTY_RELEASE_FLAG_KEYS,
+        *EMPTY_EXECUTION_OVERRIDE_KEYS,
+        *EMPTY_INFO_PLIST_PREPROCESSOR_KEYS,
+        "SWIFT_TOOLCHAIN_FLAGS",
     }
 )
 
@@ -1180,9 +1189,17 @@ def _build_setting_base(key: str) -> str | None:
     return key.partition("[")[0]
 
 
+def _is_unapproved_specialized_execution_override_base(base: str) -> bool:
+    return base not in PROJECT_EXECUTION_OVERRIDE_KEYS and any(
+        base.startswith(f"{setting_base}_")
+        for setting_base in SPECIALIZABLE_EXECUTION_OVERRIDE_KEYS
+    )
+
+
 def _is_execution_override_base(base: str) -> bool:
     return (
         base in PROJECT_EXECUTION_OVERRIDE_KEYS
+        or _is_unapproved_specialized_execution_override_base(base)
         or any(
             base.startswith(f"{flag_key}_")
             for flag_key in EMPTY_RELEASE_FLAG_KEYS
@@ -1528,6 +1545,11 @@ def _generated_app_icon_membership_error(project: Mapping[str, Any]) -> str | No
                 return (
                     "generated Xcode project contains an executable tool override: "
                     f"{key_label}"
+                )
+            if _is_unapproved_specialized_execution_override_base(base):
+                return (
+                    "generated Xcode project contains a specialized executable tool "
+                    f"override: {key_label}"
                 )
             if _is_execution_override_base(base) and key != base:
                 return (
@@ -1950,10 +1972,12 @@ def _generated_project_errors(path: Path) -> list[str]:
     errors: list[str] = []
     if not project.startswith("// !$*UTF8*$!") or "\x00" in project:
         errors.append("generated Xcode project has an invalid text envelope")
-    # XcodeGen's per-source `compilerFlags` are serialized as PBXBuildFile
-    # COMPILER_FLAGS and do not appear in `xcodebuild -showBuildSettings`.
-    # This app currently needs none, so rejecting the entire surface is both
-    # simpler and stronger than attempting to interpret OpenStep quoting.
+    # XcodeGen's target-level `OTHER_SWIFT_FLAGS` and per-source
+    # `compilerFlags` are serialized in the generated project. This app needs
+    # neither surface, so reject them rather than attempting to interpret
+    # OpenStep quoting or model Swift-driver option semantics.
+    if "OTHER_SWIFT_FLAGS" in project:
+        errors.append("generated Xcode project contains target-level Swift flags")
     if "COMPILER_FLAGS" in project:
         errors.append("generated Xcode project contains per-file compiler flags")
     structured_project, conversion_errors = _structured_project_from_plutil(
@@ -2439,44 +2463,24 @@ def _resolved_setting_tokens(
     if not isinstance(raw, str):
         errors.append(f"{key} must resolve to a string")
         return None
+    if len(raw) > MAX_SWIFT_SETTING_CHARACTERS:
+        errors.append(f"{key} exceeds the resolved setting character limit")
+        return None
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw):
+        errors.append(f"{key} contains an unsupported control character")
+        return None
     try:
         tokens = tuple(shlex.split(raw))
     except ValueError:
         errors.append(f"{key} contains invalid shell-style quoting")
         return None
+    if len(tokens) > MAX_SWIFT_SETTING_TOKENS:
+        errors.append(f"{key} contains too many resolved tokens")
+        return None
     if any(token.startswith("@") for token in tokens):
         errors.append(f"{key} must not contain an opaque response-file argument")
         return None
     return tokens
-
-
-def _forwarded_frontend_tokens(
-    tokens: tuple[str, ...], key: str, errors: list[str]
-) -> tuple[str, ...] | None:
-    forwarded: list[str] = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "-Xfrontend":
-            index += 1
-            if index >= len(tokens):
-                errors.append(f"{key} contains an incomplete -Xfrontend argument")
-                return None
-            forwarded.append(tokens[index])
-        elif token.startswith("-Xfrontend="):
-            value = token.partition("=")[2]
-            if not value:
-                errors.append(f"{key} contains an empty -Xfrontend argument")
-                return None
-            forwarded.append(value)
-        else:
-            forwarded.append(token)
-        index += 1
-
-    if any(token.startswith("@") for token in forwarded):
-        errors.append(f"{key} must not forward an opaque response-file argument")
-        return None
-    return tuple(forwarded)
 
 
 def _verify_swift_compilation_conditions(
@@ -2497,19 +2501,8 @@ def _verify_swift_compilation_conditions(
             errors.append("Release configuration must not define DEBUG")
 
     other_flags = _resolved_setting_tokens(settings, "OTHER_SWIFT_FLAGS", errors)
-    if configuration == "Release" and other_flags is not None:
-        other_flags = _forwarded_frontend_tokens(
-            other_flags, "OTHER_SWIFT_FLAGS", errors
-        )
-    if configuration == "Release" and other_flags is not None:
-        defines_debug = any(
-            token == "DEBUG"
-            or token.startswith("DEBUG=")
-            or SWIFT_DEBUG_FLAG_RE.search(token)
-            for token in other_flags
-        )
-        if defines_debug:
-            errors.append("Release OTHER_SWIFT_FLAGS must not define DEBUG")
+    if other_flags:
+        errors.append("OTHER_SWIFT_FLAGS must resolve to no arguments")
 
 
 def verify_settings_file(
@@ -2606,6 +2599,10 @@ def verify_settings_file(
         ):
             errors.append(
                 f"{key_label}: specialized append-only linker setting is not permitted"
+            )
+        if _is_unapproved_specialized_execution_override_base(base):
+            errors.append(
+                f"{key_label}: specialized execution override is not permitted"
             )
         if _is_execution_override_base(base) and key != base:
             errors.append(
