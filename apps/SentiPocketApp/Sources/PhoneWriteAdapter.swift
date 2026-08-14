@@ -38,8 +38,8 @@ final class PhoneWriteAdapter: DialWriter {
     }
 
     /// Fire the SAME explicit-confirm authorizer as the tap, then await the write's TERMINAL state. `.sending` /
-    /// `.confirming` are transient (skipped); the render-gate inside the ViewModel guarantees `.sent` only on a
-    /// signature-verified `.posted` receipt, so `.posted` here is never optimistic.
+    /// `.confirming` are transient (skipped); the render-gate inside the ViewModel guarantees `.sent` only for a
+    /// `VerifiedActionReceipt` bound to the exact proposal, confirmation, result, key id, and signature.
     func confirmAndPost() async -> DialWriteResult {
         guard ownsUnconfirmedDraft, case .confirming = viewModel.state else {
             return .refused("no confirmable draft is armed")   // fail-safe: nothing to confirm → never posts

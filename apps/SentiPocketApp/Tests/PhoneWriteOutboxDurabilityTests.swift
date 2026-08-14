@@ -10,7 +10,7 @@ import PocketContracts
 /// a restart-retry dedups server-side (idempotent replay / 409 reconcile) — never a double-post.
 ///
 /// These do NOT re-assert the consent/honesty invariants (unchanged by this fix): never-auto-confirm, render-gate
-/// (.sent only on a pin-verified signature), offline→pending. Only the persist TIMING moved.
+/// (`.sent` only for a fully bound `VerifiedActionReceipt`), offline→pending. Only the persist TIMING moved.
 @MainActor
 final class PhoneWriteOutboxDurabilityTests: XCTestCase {
 

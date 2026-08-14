@@ -106,7 +106,7 @@ struct PocketPhoneView: View {
                 HStack(spacing: 8) { ProgressView(); Text("Posting as you…").foregroundStyle(.secondary) }
             case .sent(let receipt):
                 Label("Sent — appeared in the room as you", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
-                Text("verified receipt · signed by \(receipt.signingKeyId ?? "gateway")")
+                Text("verified receipt · signed by \(receipt.signingKeyId)")
                     .font(.caption2).foregroundStyle(.secondary)
                 Button("Write another") { write.cancel(); draft = "" }
             case .pending(let message):

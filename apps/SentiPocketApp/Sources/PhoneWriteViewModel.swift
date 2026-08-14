@@ -1,14 +1,14 @@
 // PhoneWriteViewModel — B2, the phone-write integration state machine (warden #261831 gate checklist items 2-4).
 // This is the milestone: Carter dictates → EXPLICIT human confirm → the write posts as human-mrrcarter → the app
-// renders "sent — appeared as you" ONLY behind a verified signature. Every honesty gate is enforced HERE (warden
+// renders "sent — appeared as you" ONLY behind a verified receipt. Every honesty gate is enforced HERE (warden
 // source-verifies these), the SwiftUI just renders `state`.
 //
 // HONESTY INVARIANTS (never violate):
 //  - NEVER auto-confirm: a proposal only posts from `confirm()`, reachable solely by an explicit human tap (item 2).
-//  - RENDER-GATE (item 3): show `.sent` ONLY if the receipt's gateway signature verifies under the PINNED key.
-//    .invalid/.unsigned → `.refused`, never sent (tamper-safe).
+//  - RENDER-GATE (item 3): show `.sent` ONLY when `VerifiedActionReceipt` binds the receipt to the exact proposal,
+//    confirmation, result semantics, signing-key id, and gateway signature in the immutable registry.
 //  - OFFLINE HONESTY (item 4): a network failure → `.pending` (retryable, intent retained), NEVER "sent"/"failed".
-//    A non-.posted receipt (pending/failed) → `.refused`. No optimistic "sent" before the verified .posted.
+//    An unauthenticated/ambiguous receipt remains `.pending` with its durable intent. No optimistic "sent".
 
 import Foundation
 import PocketContracts
@@ -17,10 +17,10 @@ enum PhoneWriteState: Equatable {
     case composing                 // drafting a message to dictate
     case confirming(ActionProposal) // CONFIRM UI: rendered preview + target session, awaiting the explicit human tap
     case sending
-    case sent(ActionReceipt)       // render-gate PASSED: structurally-valid .posted AND signature .verified under the pin
+    case sent(VerifiedActionReceipt) // complete proposal/confirmation/result/key/signature admission passed
     case pending(String)           // offline: PENDING_CONNECTIVITY — retryable, intent retained; never "sent"
     case blockedByPendingSession(String) // another session owns the one durable outbox slot; never retry/clear it here
-    case refused(String)           // rejected / non-posted / signature-not-verified — NEVER "sent"
+    case refused(String)           // definitive pre-send/auth/terminal rejection — NEVER "sent"
 }
 
 @MainActor
@@ -31,10 +31,6 @@ final class PhoneWriteViewModel: ObservableObject {
     private let client: PocketWriteClient
     private let onReauthenticationRequired: @MainActor (String?) -> Void
     private let isWriteAuthorized: @MainActor () -> Bool
-
-    /// Item 3: the gateway receipt-signing PUBLIC key, HARD-CODED (forge #261850: bound to the fixed signing key,
-    /// stable across restarts). We verify the receipt under THIS pin — we do NOT fetch /demo-pubkey and trust it.
-    private let gatewayPublicKeyPin = "dTyRfSKF07JPaC_0CgCxhL0t6a3laUV0vY2VxUgeKXo"
 
     /// The confirmed intent, retained across an offline failure so `retryPending()` can resend the SAME bytes (the
     /// hash/confirmation are already bound — a retry re-posts identically; the gateway is idempotent by proposal id).
@@ -136,8 +132,8 @@ final class PhoneWriteViewModel: ObservableObject {
         // window, not only the offline catches (the exact "in-memory only → lost on kill" gap OutboxStore exists to
         // close). The SAME proposal id is persisted + restored + resent verbatim, so the gateway's (principal,
         // proposal.id) crash-recovery dedups a restart-retry — never a double-post (prior-posted → same receipt;
-        // in-flight/unknown → 409 reconcile, never a blind re-post). Every terminal path below (applyRenderGate /
-        // refused / cancel) clears the outbox, so a success/refusal leaves nothing queued.
+        // in-flight/unknown → 409 reconcile, never a blind re-post). Only verified success, definitive refusal, or
+        // explicit cancel clears; an unauthenticated/ambiguous receipt retains the outbox for reconciliation.
         switch OutboxStore.claim(intent) {
         case .claimed:
             break
@@ -164,16 +160,25 @@ final class PhoneWriteViewModel: ObservableObject {
                 return
             }
             do {
-                // execute() already fails-closed to a structurally-valid .posted (else it throws) — no optimistic sent.
-                let receipt = try await self.client.execute(proposal: proposal, confirmation: confirmation)
+                let verifiedReceipt = try await self.client.execute(
+                    proposal: proposal,
+                    confirmation: confirmation
+                )
                 guard self.writeRevision == operationRevision else { return }
-                self.applyRenderGate(receipt, resolving: intent)
+                guard self.isWriteAuthorized() else {
+                    self.state = .pending(
+                        "Session \(self.sessionId): selection changed during send. Retained for reconciliation."
+                    )
+                    return
+                }
+                self.applyVerifiedReceipt(verifiedReceipt, resolving: intent)
             } catch {
                 guard self.writeRevision == operationRevision else { return }
                 guard let writeError = error as? PocketWriteError else {
-                    self.pendingIntent = nil
-                    OutboxStore.clear(matching: intent)
-                    self.state = .refused("Not sent — \(error.localizedDescription)")
+                    self.state = .pending(
+                        "Session \(self.sessionId): the write outcome is unknown — retained for reconciliation. "
+                        + "(\(error.localizedDescription))"
+                    )
                     return
                 }
                 switch writeError {
@@ -205,11 +210,6 @@ final class PhoneWriteViewModel: ObservableObject {
                 self.pendingIntent = nil
                 OutboxStore.clear(matching: intent)
                 self.state = .refused("Not sent — this response belonged to an earlier sign-in. Review the message again.")
-                case .notPosted(let why):
-                // The gateway returned a receipt that is NOT a verified posted (pending/failed) → never sent.
-                self.pendingIntent = nil
-                OutboxStore.clear(matching: intent)
-                self.state = .refused("Not sent — \(why)")
                 case .rejected(let why):
                 self.pendingIntent = nil
                 OutboxStore.clear(matching: intent)
@@ -219,34 +219,25 @@ final class PhoneWriteViewModel: ObservableObject {
                 OutboxStore.clear(matching: intent)
                 self.state = .refused("Not sent — Senti's secure gateway is not configured for this build.")
                 case .malformedResponse:
-                    self.pendingIntent = nil
-                    OutboxStore.clear(matching: intent)
-                    self.state = .refused("Not sent — the gateway returned an unexpected response.")
+                    self.state = .pending(
+                        "Session \(self.sessionId): the gateway response could not be authenticated — retained for reconciliation."
+                    )
+                case .unverifiableReceipt:
+                    self.state = .pending(
+                        "Session \(self.sessionId): the receipt could not be authenticated — retained for reconciliation."
+                    )
                 }
             }
         }
     }
 
-    /// The 🔴 RENDER-GATE (item 3): a real .posted receipt is only "sent" if its gateway signature VERIFIES under the
-    /// pinned key. Anything else (unsigned / tampered / no CryptoKit) is REFUSED, never rendered as sent.
-    private func applyRenderGate(_ receipt: ActionReceipt, resolving intent: PersistedWriteIntent) {
-        // Every path here is TERMINAL (sent or refused) — the confirmed intent is resolved, so drop the durable outbox.
+    private func applyVerifiedReceipt(
+        _ verified: VerifiedActionReceipt,
+        resolving intent: PersistedWriteIntent
+    ) {
+        // Verification completed first. The compare-and-swap clear cannot erase a newer principal/session intent.
         OutboxStore.clear(matching: intent)
-        #if canImport(CryptoKit)
-        switch receipt.signatureState(gatewayPublicKeyBase64url: gatewayPublicKeyPin) {
-        case .verified:
-            pendingIntent = nil
-            state = .sent(receipt)
-        case .invalid:
-            pendingIntent = nil
-            state = .refused("Not sent — the receipt signature did not verify (possible tampering).")
-        case .unsigned:
-            pendingIntent = nil
-            state = .refused("Not sent — the receipt was not signed by the gateway.")
-        }
-        #else
         pendingIntent = nil
-        state = .refused("Not sent — the receipt signature cannot be verified on this platform.")
-        #endif
+        state = .sent(verified)
     }
 }
