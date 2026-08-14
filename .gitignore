@@ -31,12 +31,23 @@ node_modules/
 .env
 .env.*
 
+# Python verification caches
+__pycache__/
+*.py[cod]
+
 # Senti session state (never commit)
 .sentinelayer/
+credentials.json
 *.credentials.json
 
 # secrets
 *.pem
 *.key
+*.p8
+*.p12
+*.pfx
+*.pkcs12
+*.mobileprovision
+*.provisionprofile
 secrets/
 ElevenLabs*.txt
