@@ -1,4 +1,9 @@
 // PocketContracts v0.1.8 by Atlas (claude-pocket-atlas).
+// v0.1.8++ (receipt-trust hardening): additive API-only trust boundary; the receipt wire, canonical v4 bytes, and
+//   PocketContracts.version remain unchanged. GovernedWriteConfirmation moves here so VerifiedActionReceipt can bind
+//   the exact local confirmation. Receipt success is mintable only through the immutable purpose-scoped registry;
+//   bundle demo anchors remain bundle-only and production receipt anchors intentionally remain empty pending Carter's
+//   reviewed PUBLIC key/id/canary activation.
 // v0.1.8++ (Atlas #252425, reasoning-seam, round 6): BriefingSegment gains an OPTIONAL taggedText (audio-tagged
 //   variant for ElevenLabs — the splitTagged pair, relay ec71ac7/#252160). ADDITIVE, nil-default, source-compatible.
 //   DELIBERATELY *NOT* a version bump and NO re-sign: BriefingSegment is reasoned OUTPUT — it is ABSENT from
@@ -18,8 +23,8 @@
 //   were REMOVED — a source-break for any external caller (here the only caller was internal PocketCall). That reduction
 //   is intentional (it closes the caller-key-injection bypass).
 //   FIX1 TRUST ANCHOR (non-injectable, non-forgeable): `PocketBundle.verifiesSignature()` takes NO key/anchor; it
-//     resolves the trusted ed25519 key INTERNALLY from `signingKeyId` against the FIXED, file-private
-//     `pocketTrustedGatewayKeys` store, REJECTS an unknown id, and verifies under the pinned key. No public trust-store
+//     resolves the trusted ed25519 key INTERNALLY from `signingKeyId` against the FIXED, immutable
+//     `PocketGatewaySigningKeyRegistry`, REJECTS an unknown id, and verifies under the pinned key. No public trust-store
 //     initializer -> a caller cannot pin its own key. The demo key is now a REAL random keypair: only the PUBLIC key is
 //     committed; the private key was used once to sign the KAV and DISCARDED (the earlier public-seed-phrase design was
 //     publicly forgeable and is removed).
@@ -268,24 +273,26 @@ public extension PocketBundle {
     /// with required fields present + a sane createdAt. This is NOT a trust decision on its own — `pk` must already
     /// be a PINNED trusted key. Private so no lane can accidentally verify under an arbitrary key; the trust gates
     /// below are the only public paths.
-    private func verifiesSignatureRaw(underKeyBase64url pk: String) -> Bool {
+    private func verifiesSignatureRaw(underRawKey pkData: Data) -> Bool {
         guard !checkpointId.isEmpty, !sessionId.isEmpty, !signingKeyId.isEmpty, !signature.isEmpty,
               ActionReceipt.safeEpochMillis(createdAt) != nil else { return false }
-        guard let pkData = Data(base64URLEncoded: pk),
-              let sigData = Data(base64URLEncoded: signature),
+        guard let sigData = Data(base64URLEncoded: signature),
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: pkData) else { return false }
         return key.isValidSignature(sigData, for: Data(canonicalBundlePayload().utf8))
     }
 
     /// FIX1 (P1 re-audit) — the ONLY public bundle verify. Resolves the trusted key INTERNALLY from this bundle's
-    /// `signingKeyId` against the FIXED, file-private `pocketTrustedGatewayKeys` store, REJECTS an unknown id BEFORE any
-    /// crypto, then ed25519-verifies under the pinned key. There is NO caller-supplied key or anchor parameter, so an
+    /// `signingKeyId` against the immutable, purpose-scoped `PocketGatewaySigningKeyRegistry`, REJECTS an unknown id
+    /// BEFORE any crypto, then ed25519-verifies under the pinned key. There is NO caller-supplied key or anchor, so an
     /// attacker cannot pin its own key: the trusted key is chosen by code the attacker does not control — never by the
     /// caller or by the (attacker-authored) bundle. A self-signed bundle either claims a trusted `signingKeyId` (and
     /// then must verify under the REAL pinned key, which the attacker lacks) or an untrusted one (rejected pre-crypto).
     func verifiesSignature() -> Bool {
-        guard let pinned = pocketTrustedGatewayKeys[signingKeyId] else { return false }
-        return verifiesSignatureRaw(underKeyBase64url: pinned)
+        guard let pinned = PocketGatewaySigningKeyRegistry.production.rawPublicKey(
+            signingKeyId: signingKeyId,
+            purpose: .bundle
+        ) else { return false }
+        return verifiesSignatureRaw(underRawKey: pinned)
     }
     #endif
 }
@@ -296,8 +303,8 @@ public extension PocketBundle {
 /// PUBLIC key is committed here; the PRIVATE key was generated ONCE, used to sign the KAV fixture, and DISCARDED — it
 /// is NOT committed and NOT derivable from any committed value, so a forged bundle CANNOT be signed under this key.
 /// (The earlier design derived the private key from a PUBLIC seed phrase, which made it publicly forgeable — removed.)
-/// The real gateway uses a real, rotated key with its own `signingKeyId`, added to the FIXED trust store below the same
-/// way. Verify the committed signature under this public key: Tests/PocketContractsTests/Fixtures/bundle_kav.json.
+/// The real gateway uses a real, rotated key with its own `signingKeyId`, added to the immutable registry in
+/// GatewaySigningTrust.swift. Verify this committed signature: Tests/PocketContractsTests/Fixtures/bundle_kav.json.
 public enum PocketDemoGatewayKey {
     /// The `signingKeyId` the DEMO gateway stamps on bundles.
     public static let signingKeyId = "pocket-demo-phase-a"
@@ -305,16 +312,6 @@ public enum PocketDemoGatewayKey {
     /// (Re-generated once to also sign the negative KAV in the SAME ephemeral session, then discarded.)
     public static let publicKeyBase64url = "tbiyPLuRcBXqYRHazuik4y5mVG_5B__8vO6ov48GhmE"
 }
-
-/// The FIXED, NON-INJECTABLE trust store: `signingKeyId -> trusted base64url ed25519 public key`. A file-private
-/// constant — there is NO public initializer, NO caller-supplied anchor, and no way for any lane (or an attacker) to
-/// add a key at runtime. `PocketBundle.verifiesSignature()` resolves the pinned key from `signingKeyId` HERE and
-/// nowhere else, so bundle verification can only ever trust keys THIS code pins. Phase A pins only reviewed demo keys;
-/// production adds real gateway keys to this literal (in code, reviewed), never via a caller-provided value.
-private let pocketTrustedGatewayKeys: [String: String] = [
-    PocketDemoGatewayKey.signingKeyId: PocketDemoGatewayKey.publicKeyBase64url,
-    "pocket-demo-app-fixture": "SehNmI_dP9XFonEUXzmoDA7B0wCAss_JbVbbM4L0Y94"
-]
 
 // MARK: - Semantic validity (FIX3: crypto-valid != content-valid)
 
@@ -354,7 +351,12 @@ public extension PocketBundle {
 
     /// P1.4 — cheap, no-crypto: is this bundle's `signingKeyId` one the phone pins? The ingress rejects an unknown id
     /// with THIS before running the (bounded) semantic scan or any crypto.
-    func hasTrustedSigningKeyId() -> Bool { pocketTrustedGatewayKeys[signingKeyId] != nil }
+    func hasTrustedSigningKeyId() -> Bool {
+        PocketGatewaySigningKeyRegistry.production.rawPublicKey(
+            signingKeyId: signingKeyId,
+            purpose: .bundle
+        ) != nil
+    }
 
     /// All content-validity issues (deterministic order; empty == valid), independent of the signature. Numeric caps
     /// and per-agent dedup scoping MIRROR the gateway's validateBundleIngress/validateBundleSemantics EXACTLY, so a

@@ -14,15 +14,6 @@
 import Foundation
 import PocketContracts
 
-/// The explicit human confirmation the gateway binds against (actions.mjs L430-433): proposalId + the EXACT hash the
-/// human confirmed + when. `confirmedProposalHash` MUST equal the proposal's live hash or the gateway fails-closed.
-/// Codable so a confirmed-but-offline intent can be persisted in the durable outbox for retry-after-reconnect.
-struct GovernedWriteConfirmation: Codable, Sendable, Equatable {
-    let proposalId: String
-    let confirmedProposalHash: String
-    let confirmedAt: Date
-}
-
 private struct ExecuteRequest: Encodable {
     let proposal: ActionProposal
     let confirmation: GovernedWriteConfirmation
@@ -37,7 +28,7 @@ enum PocketWriteError: LocalizedError, Equatable {
     case retryable(String)       // TRANSIENT gateway response (409 in-progress / 5xx / 503 checkpoint-not-available) — queue + retry
     case rejected(String)        // TERMINAL 4xx (proposal_rejected / hash mismatch / not a known session / auth) — won't succeed on retry
     case malformedResponse
-    case notPosted(String)       // a receipt came back but not a verified .posted (pending/failed) — NEVER render as sent
+    case unverifiableReceipt
     var errorDescription: String? {
         switch self {
         case .notConfigured:      return "Senti's secure gateway is not configured for this build."
@@ -50,7 +41,8 @@ enum PocketWriteError: LocalizedError, Equatable {
         case .retryable(let m):  return "The gateway is busy — will retry: \(m)"
         case .rejected(let m):   return "The gateway rejected the write: \(m)"
         case .malformedResponse: return "The gateway returned an unexpected response."
-        case .notPosted(let m):  return "Not sent: \(m)"
+        case .unverifiableReceipt:
+            return "The gateway response could not be authenticated against the confirmed write."
         }
     }
 }
@@ -83,10 +75,12 @@ final class PocketWriteClient {
         )
     }
 
-    /// POST the CONFIRMED write. Returns the signed ActionReceipt ONLY when it is a verified `.posted`; otherwise
-    /// throws (never lets a pending/failed receipt read as sent). The caller still verifies the signature against the
-    /// gateway public key before rendering "sent — appeared in the room as you".
-    func execute(proposal: ActionProposal, confirmation: GovernedWriteConfirmation) async throws -> ActionReceipt {
+    /// POST the CONFIRMED write. Success is representable only as a `VerifiedActionReceipt`; raw, non-posted,
+    /// misbound, unknown-key, or signature-invalid responses are an ambiguous outcome for reconciliation.
+    func execute(
+        proposal: ActionProposal,
+        confirmation: GovernedWriteConfirmation
+    ) async throws -> VerifiedActionReceipt {
         guard let apiBaseURL else { throw PocketWriteError.notConfigured }
         guard let token = tokenProvider(), !token.isEmpty else { throw PocketWriteError.notLoggedIn }
         guard let url = URL(string: "/actions/execute", relativeTo: apiBaseURL) else {
@@ -127,13 +121,14 @@ final class PocketWriteClient {
         do { receipt = try Self.decoder.decode(ActionReceipt.self, from: data) }
         catch { throw PocketWriteError.malformedResponse }
 
-        // Honesty gate (mirrors the bundle discipline): only a structurally-valid .posted may be treated as sent.
-        // A .pendingConnectivity or .failed receipt is NEVER "sent". Signature verification (SignatureState) is the
-        // caller's final step with the gateway public key — this client refuses to hand back a non-posted as success.
-        guard receipt.status == .posted, receipt.isStructurallyValid() else {
-            throw PocketWriteError.notPosted(receipt.failureReason ?? "receipt is not a verified posted state")
+        guard let verified = VerifiedActionReceipt.verify(
+            receipt,
+            for: proposal,
+            confirmation: confirmation
+        ) else {
+            throw PocketWriteError.unverifiableReceipt
         }
-        return receipt
+        return verified
     }
 
     // MARK: - epoch-millis JSON (byte-exact with the gateway's `new Date(ms)` + the Swift hash's safeEpochMillis)
