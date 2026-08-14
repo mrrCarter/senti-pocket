@@ -9,9 +9,11 @@ The same commands can run in hosted CI or on Forge's Mac without an Apple accoun
 ## What the gate proves
 
 - Debug resolves the development APNs build setting and Release resolves production.
-- Debug defines the Swift `DEBUG` compilation condition; Release proves `DEBUG` absent from both resolved
-  `SWIFT_ACTIVE_COMPILATION_CONDITIONS` and `OTHER_SWIFT_FLAGS`. The generated app project must contain no per-file
-  `COMPILER_FLAGS`, closing the source-level Swift condition surface that build settings do not expose.
+- Debug defines the Swift `DEBUG` compilation condition and Release does not. Both configurations require
+  `OTHER_SWIFT_FLAGS` to resolve to no arguments, so the governed app target cannot add driver, response-file,
+  frontend, tool-selection, or conditional-compilation arguments through that setting. The generated app project
+  must contain neither target-level `OTHER_SWIFT_FLAGS` definitions nor per-file `COMPILER_FLAGS`, closing Swift flag
+  surfaces outside the exact resolved settings record.
 - Signing is explicitly disabled, the Team ID is empty, and the intended bundle/version/build/origins resolve exactly.
 - The resolved compiler, linker, Swift driver, toolchain, SDK, and command-search path are bound to the independently
   selected Xcode. Conditional selectors, compiler launchers, response files, and nonempty Release pass-through flag
@@ -81,6 +83,9 @@ that the provisional collected-data inventory or App Store privacy answers have 
 The verifier does not authenticate how its JSON was produced. CI command provenance, the independently supplied
 products root, and use of the same explicit `-derivedDataPath` for settings capture and build link the evidence to the
 Xcode invocation.
+The empty `OTHER_SWIFT_FLAGS` policy does not independently authenticate the final frontend argv or process
+environment. The selected Xcode and Swift tool selectors are instead bound by the separate resolved-settings and
+workflow checks described above.
 The script does not prove that a hosted workflow invoked it; the workflow step and its terminal result are separate CI
 evidence.
 
