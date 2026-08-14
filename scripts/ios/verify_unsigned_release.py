@@ -72,6 +72,11 @@ MARKETING_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,2}$")
 BUILD_NUMBER_RE = re.compile(r"^[1-9][0-9]*$")
 DNS_LABEL_RE = re.compile(r"^(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9])$")
 SWIFT_CONDITION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Base Swift-flag settings and their build-variant/architecture specializations. Deliberately a
+# PATTERN and not a list of known suffixes: a new variant or architecture Apple ships later is
+# covered without editing this file, which is the whole reason the empty-surface invariant beats
+# the flag parser it replaced.
+SWIFT_FLAG_SETTING_RE = re.compile(r"^(?:OTHER_SWIFT_FLAGS|SWIFT_TOOLCHAIN_FLAGS)(?:_.*)?$")
 MAX_SWIFT_SETTING_CHARACTERS = 64 * 1024
 MAX_SWIFT_SETTING_TOKENS = 4096
 SENSITIVE_SETTING_KEYS = frozenset({"SENTI_API_URL", "SENTI_GATEWAY_URL"})
@@ -337,6 +342,21 @@ def _resolved_setting_tokens(
     return tokens
 
 
+def _swift_flag_setting_keys(settings: Mapping[str, Any]) -> set[str]:
+    """Every resolved setting key that can carry Swift flags into the compile.
+
+    Matches the base names and their build-variant/architecture specializations, which Xcode
+    spells with an underscore suffix (``OTHER_SWIFT_FLAGS_normal_arm64``). Returning the base
+    names unconditionally means an ABSENT key is still checked and still resolves to no
+    arguments, so removing a setting cannot quietly remove its check.
+    """
+    keys = {"OTHER_SWIFT_FLAGS", "SWIFT_TOOLCHAIN_FLAGS"}
+    for key in settings:
+        if isinstance(key, str) and SWIFT_FLAG_SETTING_RE.fullmatch(key):
+            keys.add(key)
+    return keys
+
+
 def _verify_swift_compilation_conditions(
     settings: Mapping[str, Any], configuration: str, errors: list[str]
 ) -> None:
@@ -354,9 +374,21 @@ def _verify_swift_compilation_conditions(
         if configuration == "Release" and debug_is_active:
             errors.append("Release configuration must not define DEBUG")
 
-    other_flags = _resolved_setting_tokens(settings, "OTHER_SWIFT_FLAGS", errors)
-    if other_flags:
-        errors.append("OTHER_SWIFT_FLAGS must resolve to no arguments")
+    # Xcode resolves build-variant/architecture SPECIALIZED settings - OTHER_SWIFT_FLAGS_normal,
+    # _arm64, _normal_arm64, _debug_x86_64 - and those OVERRIDE the base setting for that
+    # variant/arch. An exact-key lookup on the base name therefore does not enforce the
+    # empty-flag-surface invariant: a specialized key reaching the build through a source that
+    # never lands in the generated project (an xcconfig, or an xcodebuild command-line override)
+    # would pass this half untouched. The generated-project half catches specialized names only
+    # because its containment test happens to match them as substrings.
+    #
+    # Scan every RESOLVED key instead of naming the ones we thought of. An enumeration of known
+    # variants is a denylist, and denylists are precisely what this invariant replaced - it beats
+    # the parser it superseded by refusing a whole surface rather than racing its spellings.
+    for key in sorted(_swift_flag_setting_keys(settings)):
+        tokens = _resolved_setting_tokens(settings, key, errors)
+        if tokens:
+            errors.append(f"{key} must resolve to no arguments")
 
 
 def verify_settings_file(

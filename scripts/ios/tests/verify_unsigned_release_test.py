@@ -206,6 +206,44 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 self.assertEqual([], errors)
                 self.assertEqual(settings, resolved)
 
+    def test_swift_flag_key_selection_is_a_pattern_not_an_enumeration(self) -> None:
+        # Pins the SELECTION, not just the rejection. If someone later narrows this back to an
+        # exact-key lookup or swaps the pattern for a list of known suffixes, the specialized
+        # keys stop being checked and every rejection test above would still pass because it
+        # supplies its own key. This is the test that notices.
+        selected = verify._swift_flag_setting_keys(
+            {
+                "OTHER_SWIFT_FLAGS_normal_arm64": "",
+                "SWIFT_TOOLCHAIN_FLAGS_future": "",
+                "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "",
+                "OTHER_CFLAGS": "",
+                "MY_OTHER_SWIFT_FLAGS": "",
+                "OTHER_SWIFT_FLAGSX": "",
+            }
+        )
+        # Base names are returned even when absent, so deleting a setting cannot delete its check.
+        self.assertIn("OTHER_SWIFT_FLAGS", selected)
+        self.assertIn("SWIFT_TOOLCHAIN_FLAGS", selected)
+        self.assertIn("OTHER_SWIFT_FLAGS_normal_arm64", selected)
+        self.assertIn("SWIFT_TOOLCHAIN_FLAGS_future", selected)
+        # Near-misses must NOT be swept in: a prefix match would make the gate reject settings it
+        # has no business owning, and a suffix match would let MY_OTHER_SWIFT_FLAGS masquerade.
+        self.assertNotIn("SWIFT_ACTIVE_COMPILATION_CONDITIONS", selected)
+        self.assertNotIn("OTHER_CFLAGS", selected)
+        self.assertNotIn("MY_OTHER_SWIFT_FLAGS", selected)
+        self.assertNotIn("OTHER_SWIFT_FLAGSX", selected)
+
+    def test_settings_accept_absent_and_empty_swift_flag_surface(self) -> None:
+        # The passing direction, asserted explicitly: an empty flag surface must still verify.
+        # Without this, a mutation that rejected EVERYTHING would satisfy every rejection test.
+        settings = dict(self.settings)
+        settings["OTHER_SWIFT_FLAGS"] = ""
+        settings.pop("SWIFT_TOOLCHAIN_FLAGS", None)
+        settings["OTHER_SWIFT_FLAGS_normal_arm64"] = ""
+        self.write_settings(settings)
+        _, errors = verify.verify_settings_file(self.settings_path, self.expected)
+        self.assertEqual(errors, [])
+
     def test_settings_reject_duplicate_or_missing_target_records(self) -> None:
         self.write_settings(self.settings, duplicate=True)
         _, errors = verify.verify_settings_file(self.settings_path, self.expected)
@@ -281,6 +319,25 @@ class UnsignedReleaseVerifierTests(unittest.TestCase):
                 "no arguments",
             ),
             ("OTHER_SWIFT_FLAGS", "-D'DEBUG'", "no arguments"),
+            # Build-variant / architecture SPECIALIZED keys override the base setting for that
+            # variant, so checking only the base name does not enforce the invariant. These
+            # arrive from sources that need never touch the generated project (an xcconfig, or
+            # an xcodebuild command-line override), which is the half the project-source
+            # substring check cannot see.
+            ("OTHER_SWIFT_FLAGS_normal", "-DDEBUG", "no arguments"),
+            ("OTHER_SWIFT_FLAGS_arm64", "-DDEBUG", "no arguments"),
+            ("OTHER_SWIFT_FLAGS_normal_arm64", "-DDEBUG", "no arguments"),
+            ("OTHER_SWIFT_FLAGS_debug_x86_64", "-Xfrontend -DDEBUG", "no arguments"),
+            # A variant/arch pair nobody has shipped yet: the check is a pattern, not a list of
+            # known suffixes, so a future Apple spelling is covered without editing the verifier.
+            (
+                "OTHER_SWIFT_FLAGS_future_variant_future_arch",
+                "-DDEBUG",
+                "no arguments",
+            ),
+            # The toolchain-flags surface and its specializations reach the compile the same way.
+            ("SWIFT_TOOLCHAIN_FLAGS", "-DDEBUG", "no arguments"),
+            ("SWIFT_TOOLCHAIN_FLAGS_normal_arm64", "-DDEBUG", "no arguments"),
         )
         for key, value, expected_error in injections:
             with self.subTest(key=key, value=value):
