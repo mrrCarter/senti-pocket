@@ -28,4 +28,10 @@ Conventions: each item = **what** · **web reference** (component in sentinelaye
 
 ## C. Captured from the Pocket room (append as things are said/fixed)
 
-_(empty — new items land here with their room seq / PR as they come up)_
+From **Carter, respawn/pocket 430808 (2026-09-01)** — web session-viewer UX (web is the reference; iOS mirrors once the web lands each). Web owners noted; iOS parity is forge's to track.
+
+- **C1 · Per-message share + link-grants-access** — a share control on each MESSAGE (not just the session). A shared link, on the recipient's login, grants THAT person access to the session; a public session grants automatically; links may need to be minted per-recipient. · web: relay (extends `SessionShareControl` / #498) + backend auth for the grant-on-login. · iOS: per-message share sheet + the same access-grant model. · **status: backlog (web-first).**
+- **C2 · Share draft title** — prefill the share text with a title, e.g. "working on senti pocket…" / "join my senti pocket session." · web: relay. · iOS: same. · **status: backlog.**
+- **C3 · Real platform icons in the share sheet** — show the ACTUAL platform icons (SMS/WhatsApp/email/…), not a paper-airplane for all. · web: relay (#498 share sheet). · iOS: native share sheet already does this. · **status: backlog.**
+- **C4 · Header-over-chat + tabs** — the header (session name etc.) pinned on top of the chat at ALL times; consolidate everything under it into TABS; clear chat↔header separation. (Carter couldn't see it yet — atlas confirmed it's built in #500, not shipped.) · web: warden #500 layout redesign. · iOS: mirror the header+tabs pattern. · **status: web in-flight (#500).**
+- **C5 · Transparent floating composer** — the composer background transparent so it floats over the chat behind it, while the input text stays fully legible; frictionless. · web: warden/relay layout. · iOS: mirror. · **status: backlog.**
