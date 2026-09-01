@@ -95,7 +95,17 @@ test("decision carries policyVersion + a stable policyHash (AMEND-3)", () => {
   assert.equal(d.policyHash, policyHash(p1));
 });
 
-test("validates its arguments", () => {
-  assert.throws(() => evaluateRouting(null, {}), /input required/);
-  assert.throws(() => evaluateRouting({}, null), /policy required/);
+test("validates its input", () => {
+  assert.throws(() => evaluateRouting(null, { members: [{ id: "a", hearMode: "all" }] }), /input required/);
+});
+
+test("refuses an absent or empty policy rather than pinning nothing (bundle #156)", () => {
+  // evaluateRouting refuses missing / non-object / empty-members policies:
+  assert.throws(() => evaluateRouting(input(), null), /valid policy with at least one member/);
+  assert.throws(() => evaluateRouting(input(), {}), /valid policy with at least one member/);
+  assert.throws(() => evaluateRouting(input(), { members: [] }), /valid policy with at least one member/);
+  // policyHash never silently hashes {} for a missing/empty policy:
+  assert.throws(() => policyHash(undefined), /valid policy/);
+  assert.throws(() => policyHash({}), /valid policy/);
+  assert.throws(() => policyHash({ members: [] }), /valid policy/);
 });

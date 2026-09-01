@@ -21,7 +21,13 @@
 
 import { createHash } from "node:crypto";
 
-/** Deterministic canonical JSON (sorted keys) so policyHash is stable across key order. */
+/**
+ * Deterministic canonical JSON (sorted keys) so policyHash is stable across key order.
+ * NOTE (bundle #156 advisory): this is HASH-grade (stable + collision-safe for policyHash),
+ * not SS19.1 IDENTITY-grade — it has no integer-only refusal and no never-normalize rule.
+ * When B3 receipts content-address RoutingDecisions, switch to the SS19.1 encoder (cs #804)
+ * as the reference (adopt its refusal posture, or pin bytes it produces).
+ */
 function canonical(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -29,9 +35,22 @@ function canonical(value) {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(",")}}`;
 }
 
+/**
+ * A policy is valid only if it is an object with at least one member. Refuse anything else
+ * rather than defaulting (no-third-behavior, bundle #156): a hash of a missing/empty policy
+ * would look pinned but pin nothing, so a B3 receipt over it would be honest-looking and empty.
+ */
+function assertValidPolicy(policy) {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)
+      || !Array.isArray(policy.members) || policy.members.length === 0) {
+    throw new Error("routing: a valid policy with at least one member is required (refuse, never pin an empty policy)");
+  }
+}
+
 /** sha256 of the canonical policy — pins WHICH policy produced a decision (AMEND-3). */
 export function policyHash(policy) {
-  return createHash("sha256").update(canonical(policy ?? {}), "utf8").digest("hex");
+  assertValidPolicy(policy); // never silently hash {} for a missing/empty policy (bundle #156)
+  return createHash("sha256").update(canonical(policy), "utf8").digest("hex");
 }
 
 function asArray(v) {
@@ -82,7 +101,7 @@ function ruleFires(rule, input) {
  */
 export function evaluateRouting(input, policy, deps = {}) {
   if (!input || typeof input !== "object") throw new Error("routing: input required");
-  if (!policy || typeof policy !== "object") throw new Error("routing: policy required");
+  assertValidPolicy(policy); // refuse an absent/empty policy rather than pin nothing (bundle #156)
   const members = asArray(policy.members);
   const speakerId = input.speaker?.id;
   const transcript = typeof input.transcript === "string" ? input.transcript : "";
