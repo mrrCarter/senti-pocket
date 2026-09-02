@@ -68,7 +68,8 @@ jobs:
 
   hosted-app-tests:
     name: Hosted app build and tests
-    runs-on: macos-15
+    # App Store Connect requires Xcode 26+ with the iOS 26+ SDK for uploads.
+    runs-on: macos-26
     timeout-minutes: 60
     env:
       IOS_BUNDLE_ID: "com.plexaura.sentipocket.app"
@@ -78,6 +79,48 @@ jobs:
       IOS_GATEWAY_URL: "https://gateway.ci.invalid"
     steps:
       - uses: actions/checkout@v4
+      - name: Validate App Store submission toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcode_output="$(xcodebuild -version)"
+          developer_dir_input="$(xcode-select -p)"
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          sdk_path_input="$(xcrun --sdk iphoneos --show-sdk-path)"
+          developer_dir="$(cd "$developer_dir_input" && pwd -P)"
+          sdk_path="$(cd "$sdk_path_input" && pwd -P)"
+
+          printf '%s\n' "$xcode_output"
+          printf 'Selected developer directory: %s\n' "$developer_dir"
+          printf 'iPhoneOS SDK version: %s\n' "$sdk_version"
+          printf 'iPhoneOS SDK path: %s\n' "$sdk_path"
+
+          xcode_version="$(awk '$1 == "Xcode" { print $2; exit }' <<<"$xcode_output")"
+          if [[ ! "$xcode_version" =~ ^([0-9]+)(\.[0-9]+)*$ ]]; then
+            echo "Could not parse the selected Xcode version: $xcode_version" >&2
+            exit 1
+          fi
+          xcode_major="${BASH_REMATCH[1]}"
+
+          if [[ ! "$sdk_version" =~ ^([0-9]+)(\.[0-9]+)*$ ]]; then
+            echo "Could not parse the selected iPhoneOS SDK version: $sdk_version" >&2
+            exit 1
+          fi
+          sdk_major="${BASH_REMATCH[1]}"
+
+          if (( 10#$xcode_major < 26 || 10#$sdk_major < 26 )); then
+            echo "App Store submission proof requires Xcode 26+ and iPhoneOS SDK 26+" >&2
+            exit 1
+          fi
+
+          case "$sdk_path" in
+            "$developer_dir"/*) ;;
+            *)
+              echo "iPhoneOS SDK is not owned by the selected Xcode developer directory" >&2
+              exit 1
+              ;;
+          esac
       - name: Validate iOS release tooling
         shell: bash
         run: |
