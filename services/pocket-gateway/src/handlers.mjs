@@ -667,7 +667,8 @@ export function createGateway(deps) {
       const r = await doDispatch();
       return json(r.status, r.body);
     }
-    const rateMax = Number.isInteger(deps.ringRateMax) && deps.ringRateMax > 0 ? deps.ringRateMax : 20;             // rings per window per human
+    const rateMax = Number.isInteger(deps.ringRateMax) && deps.ringRateMax > 0 ? deps.ringRateMax : 20;             // per-TOKEN (principal): rings per window from one credential
+    const sessionRateMax = Number.isInteger(deps.ringSessionRateMax) && deps.ringSessionRateMax > 0 ? deps.ringSessionRateMax : 10; // per-SESSION: rings per window ABOUT one session (AMEND-1)
     const rateWindowSec = Number.isInteger(deps.ringRateWindowSec) && deps.ringRateWindowSec > 0 ? deps.ringRateWindowSec : 60;
     const idemTtlSec = Number.isInteger(deps.ringIdemTtlSec) && deps.ringIdemTtlSec > 0 ? deps.ringIdemTtlSec : 120; // dedupe window for an identical/keyed retry
     const nowSec = Math.floor(nowMs / 1000);
@@ -680,14 +681,26 @@ export function createGateway(deps) {
       if (prior && typeof prior.dialId === 'string' && Number.isFinite(prior.expiresAtSec) && nowSec < prior.expiresAtSec) {
         return { status: 200, body: { dialId: prior.dialId, dispatched: true, idempotent: true } };
       }
-      // 2. Soft per-human ring rate-limit (fixed window; get->check->put, fail-open on store error). Only a genuine
-      //    (non-replay) ring consumes a token — a deduped retry above never counts against the limit.
+      // 2. Soft ring rate-limit — per-TOKEN (principal) AND per-SESSION (AMEND-1, Call-Me contract v0.2). Fixed window;
+      //    a genuine (non-replay) ring consumes one token in EACH bucket. Either bucket over budget -> 429 with a
+      //    standard Retry-After HEADER (not just a body field) + a `scope` telling which limit bit. The per-token bucket
+      //    bounds one credential storming; the per-session bucket (keyed within the principal + sessionId) bounds rings
+      //    ABOUT one session, so a single noisy session can't monopolize the per-token budget OR spam the owner. Only a
+      //    genuine ring counts — a deduped retry above never consumes a token. Fail-open on any store error (a missed
+      //    ring is worse than a rare over-limit ring). A rejected ring consumes NOTHING (both puts run only when both
+      //    buckets pass), so a 429'd caller isn't charged toward the next window.
       const bucket = Math.floor(nowSec / rateWindowSec);
-      const rateKey = storeKey(ctx.principal || ctx.humanId, 'ringrate:' + bucket);
-      let cnt = 0;
-      try { const rr = await store.get(rateKey); cnt = rr && Number.isFinite(rr.count) ? rr.count : 0; } catch { cnt = 0; }
-      if (cnt >= rateMax) return { status: 429, body: { error: 'ring rate limit exceeded', reason: 'rate-limited', retryAfterSec: (bucket + 1) * rateWindowSec - nowSec } };
-      try { await store.put(rateKey, { count: cnt + 1 }, { ttlEpochSec: (bucket + 2) * rateWindowSec }); } catch { /* best-effort */ }
+      const retryAfterSec = (bucket + 1) * rateWindowSec - nowSec;
+      const rateHeaders = { 'retry-after': String(Math.max(0, Math.min(3600, retryAfterSec))) };
+      const humanRateKey = storeKey(ctx.principal || ctx.humanId, 'ringrate:' + bucket);
+      const sessionRateKey = storeKey(ctx.principal || ctx.humanId, 'ringrate:sess:' + sessionId + ':' + bucket);
+      let humanCnt = 0, sessionCnt = 0;
+      try { const rr = await store.get(humanRateKey); humanCnt = rr && Number.isFinite(rr.count) ? rr.count : 0; } catch { humanCnt = 0; }
+      try { const sr = await store.get(sessionRateKey); sessionCnt = sr && Number.isFinite(sr.count) ? sr.count : 0; } catch { sessionCnt = 0; }
+      if (humanCnt >= rateMax) return { status: 429, headers: rateHeaders, body: { error: 'ring rate limit exceeded', reason: 'rate-limited', scope: 'principal', retryAfterSec } };
+      if (sessionCnt >= sessionRateMax) return { status: 429, headers: rateHeaders, body: { error: 'ring rate limit exceeded', reason: 'rate-limited', scope: 'session', retryAfterSec } };
+      try { await store.put(humanRateKey, { count: humanCnt + 1 }, { ttlEpochSec: (bucket + 2) * rateWindowSec }); } catch { /* best-effort */ }
+      try { await store.put(sessionRateKey, { count: sessionCnt + 1 }, { ttlEpochSec: (bucket + 2) * rateWindowSec }); } catch { /* best-effort */ }
       // 3. Dispatch the ring, then 4. record the idempotency result ONLY on a successful dispatch (a failed ring is
       //    immediately retryable — we never cache a failure).
       const r = await doDispatch();
@@ -713,7 +726,7 @@ export function createGateway(deps) {
     let guarded;
     try { guarded = await runGuarded(); }
     finally { try { await store.releaseLock(idemStoreKey, token); } catch { /* best-effort: the lock self-heals via TTL */ } }
-    return json(guarded.status, guarded.body);
+    return json(guarded.status, guarded.body, guarded.headers);
   }
 
   // POST /dial/register — bind THIS device's VoIP token to a session the human belongs to (the onVoipToken(hex) seam,
