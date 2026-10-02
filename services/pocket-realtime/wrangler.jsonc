@@ -1,0 +1,47 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "senti-pocket-realtime",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "SENTI_API_BASE_URL": "https://api.sentinelayer.com",
+    "REALTIMEKIT_API_BASE_URL": "https://api.cloudflare.com/client/v4",
+    "REALTIMEKIT_WEBHOOK_PUBLIC_KEY_URL": "https://api.realtime.cloudflare.com/.well-known/webhooks.json",
+    "REALTIMEKIT_ACCOUNT_ID": "configure-at-deploy",
+    "REALTIMEKIT_APP_ID": "configure-at-deploy",
+    "REALTIMEKIT_PRESET_MODERATOR": "senti-moderator",
+    "REALTIMEKIT_PRESET_SPEAKER": "senti-speaker",
+    "REALTIMEKIT_PRESET_LISTENER": "senti-listener",
+    "TRANSCRIPTION_MODE": "disabled",
+    "TRANSCRIPTION_NEURONS_PER_AUDIO_MINUTE": "836.36",
+    "OUTBOUND_TIMEOUT_MS": "5000",
+    "MAX_CONTROL_REQUESTS_PER_ROOM_PER_DAY": "10000"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOMS",
+        "class_name": "RoomGovernor"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RoomGovernor"]
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "TRANSCRIPT_INGEST_QUEUE",
+        "queue": "senti-pocket-transcript-ingest"
+      }
+    ]
+  }
+}

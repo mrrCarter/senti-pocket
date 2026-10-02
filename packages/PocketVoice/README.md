@@ -53,6 +53,36 @@ Gateway speech failures include any last-owner audio-session deactivation failur
 - Whisper reports audio duration, transcription wall time, real-time factor, resident memory, and thermal state.
 - `SpeechBenchmarkHarness` reports per-command word error rate and emits a device-labeled JSON-ready report.
 
+## Session Voice Transport
+
+`ProviderNeutralVoiceMediaTransport` implements the client port in
+`docs/contracts/session-voice-room-v1.md`. RealtimeKit 3.1 is isolated behind
+`RealtimeKitVoiceMediaDriver`; SDK classes never cross into view or repository
+state.
+
+- The join response decodes its provider token directly into a memory-only,
+  single-use `VoiceJoinCredentialHandle`. It is not `Encodable`, has a redacted
+  description, and is discarded after five minutes or its first use.
+- Every join starts muted. A listener grant cannot enable the microphone, even
+  if a provider callback reports broader state.
+- Room generations fence asynchronous callbacks, so an old epoch cannot update
+  a newly joined room.
+- Microphone, route, hand-raise, and independently combined media/socket
+  reconnect observations are projected into bounded provider-neutral snapshots.
+- RealtimeKit's `customParticipantId` is an opaque server correlation key, not
+  a canonical Senti principal. The adapter therefore leaves remote
+  roster/stage/active-speaker identity empty until the authenticated control
+  stream supplies the server-owned mapping; it never invents that mapping.
+- Moderation never calls a provider SDK directly. It requires the
+  server-authoritative `VoiceRoomControlClient`, including command,
+  idempotency, and expected-revision fences.
+- The action vocabulary contains promote, demote, mute, remove, deny-publish,
+  and allow-publish. It deliberately has no remote-unmute action.
+
+The iOS package pins Cloudflare's official
+`cloudflare/realtimekit-ios-core` 3.1.0 Swift package on iOS only. macOS remains
+available for provider-neutral tests without linking the iOS binary.
+
 ## Physical Gate
 
 On the exact demo phone, run five consecutive cycles:

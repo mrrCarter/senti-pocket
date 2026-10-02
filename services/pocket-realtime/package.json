@@ -1,0 +1,26 @@
+{
+  "name": "@senti-pocket/pocket-realtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Provider-neutral Senti voice-room control plane backed by Cloudflare RealtimeKit and Durable Objects.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "npm run types && npm run typecheck && npm test && npm run dry-run",
+    "dry-run": "wrangler deploy --dry-run",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types --strict-vars=false",
+    "types:check": "wrangler types --strict-vars=false --check"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.19.0",
+    "@types/node": "^26.1.2",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.115.0"
+  }
+}
