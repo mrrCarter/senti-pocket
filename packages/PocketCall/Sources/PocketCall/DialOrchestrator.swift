@@ -97,6 +97,11 @@ public final class DialOrchestrator {
             if Task.isCancelled { await writer.cancel(); return .declined("hung up during confirm") }
             await voice.speak("I'll post as you: \(reply). Say confirm to send, or cancel.")
             let heard = await voice.listen()
+            // Spec C (write-window linearization): the confirm-listen await can span a hangup. Re-check cancellation
+            // AFTER listen returns and BEFORE the verdict can reach confirmAndPost — before `submit` the proposal is
+            // still call-owned, so `end` WINS: cancel the armed draft and decline. This guarantees ZERO POST/queue even
+            // if a blocked/late listen ultimately returned "confirm" (a hangup must never be linearized as an authorize).
+            if Task.isCancelled { await writer.cancel(); return .declined("hung up during confirm") }
             switch SpokenConfirm.verdict(for: heard) {
             case .confirmed:
                 switch await writer.confirmAndPost() {

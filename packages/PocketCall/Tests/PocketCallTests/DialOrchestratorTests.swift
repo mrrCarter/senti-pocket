@@ -158,4 +158,50 @@ final class DialOrchestratorTests: XCTestCase {
         XCTAssertEqual(w.drafted, "ship it to prod tonight")
         XCTAssertEqual(v.answered, []) // a bare marker does NOT route the next utterance to the reasoner
     }
+
+    // MARK: - Write-window linearization (spec C)
+
+    /// A voice that yields the dictated reply on the FIRST listen (converse), then BLOCKS on the confirm-listen until
+    /// released — releasing it with "confirm" AFTER the run is cancelled. It reproduces a hangup DURING the confirm
+    /// listen where the blocked listen ultimately returns "confirm" LATE.
+    @MainActor
+    final class GatedVoice: DialVoice, @unchecked Sendable {
+        private(set) var listenCount = 0
+        private var gate: CheckedContinuation<Void, Never>?
+        let reply: String
+        init(reply: String) { self.reply = reply }
+        func speak(_ text: String) async {}
+        func listen() async -> String {
+            listenCount += 1
+            if listenCount == 1 { return reply }              // converse: the dictated reply-marker
+            await withCheckedContinuation { gate = $0 }       // confirm: block until released
+            return "confirm"                                   // returns LATE (after the run is cancelled)
+        }
+        func release() { gate?.resume(); gate = nil }
+        func answerFollowUp(_ q: String) async -> DialSpokenAnswer {
+            DialSpokenAnswer(spokenText: "", grounded: true, evidenceIds: [])
+        }
+    }
+
+    // CRITICAL (spec C): cancel AFTER the confirm transcript but BEFORE the verdict → confirmAndPost is NEVER called,
+    // even though the blocked listen returned "confirm" LATE. Before submit the proposal is call-owned and `end` WINS:
+    // the armed draft is cancelled and the run declines → ZERO POST.
+    @MainActor
+    func testCancelDuringConfirmListen_beforeVerdict_neverPosts() async {
+        let voice = GatedVoice(reply: "my reply is rotate the token and hold the deploy")
+        let writer = MockWriter(result: .posted)
+        let orch = DialOrchestrator(voice: voice, writer: writer)
+        let task = Task { await orch.run(req()) }
+
+        while voice.listenCount < 2 { await Task.yield() }     // reached the confirm-listen (blocked)
+        for _ in 0..<4 { await Task.yield() }                  // ensure the continuation is set before releasing
+        task.cancel()                                          // HANG UP during the confirm listen
+        voice.release()                                        // the blocked listen returns "confirm" LATE
+        let out = await task.value
+
+        XCTAssertEqual(writer.confirmCalls, 0, "cancel before verdict must NEVER authorize the write")
+        XCTAssertEqual(writer.cancelCalls, 1, "the armed draft is cancelled on the hangup")
+        XCTAssertEqual(writer.drafted, "rotate the token and hold the deploy") // it DID draft before the hangup
+        if case .declined = out {} else { XCTFail("hangup during confirm must decline") }
+    }
 }
