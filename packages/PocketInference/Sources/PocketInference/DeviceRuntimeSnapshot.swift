@@ -9,8 +9,10 @@ enum DeviceRuntimeSnapshot {
         #if canImport(Darwin)
         var systemInfo = utsname()
         guard uname(&systemInfo) == 0 else { return "unknown" }
-        return withUnsafePointer(to: &systemInfo.machine) {
-            $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: systemInfo.machine)) {
+        var machine = systemInfo.machine
+        let machineCapacity = MemoryLayout.size(ofValue: machine)
+        return withUnsafePointer(to: &machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: machineCapacity) {
                 String(cString: $0)
             }
         }

@@ -1,15 +1,12 @@
-// DeviceRingRegistrar — decides WHEN to register this device's APNs VoIP token with the gateway (Atlas; PR 2, onto the
-// now-live login #103). A ring can only be ADDRESSED to this device once the gateway knows its VoIP token
-// (POST /dial/register), and that POST needs the session Bearer — so registration must happen when BOTH are present.
-// This caches the latest token and (re)registers on EITHER trigger:
-//   • tokenUpdated  — SentiCallManager.onVoipToken fired (the APNs token arrived at launch or ROTATED)
-//   • loginCompleted — SignInCoordinator.onAuthenticated fired (login just persisted a Bearer)
-// So it's correct whether the token arrives BEFORE login (cached → registered on loginCompleted) or AFTER
-// (registered immediately since we're already logged in). The gateway upsert is idempotent, so a double-fire is safe.
+// DeviceRingRegistrar — main-actor lifecycle driver for installation-owned Registry V2.
 //
-// It attaches the app-PRIMARY sessionId (a member session of the human — the gateway membership-gates it, warden gate
-// #3) and drives the DeviceRingRegistrationClient, which enforces the rest of warden's 5-gate (authed Bearer, no
-// spoofable humanId, apns platform). Registration is best-effort: a transient failure is retried by the next trigger.
+// Registration starts only with all three authorities present: a PushKit token, a session bearer, and an exact selected
+// member session. The installation controller persists a pending monotonic generation before the request. A successful
+// server proof is committed only if this registrar revision, token, selection, and bearer are still current.
+//
+// Revocation is synchronous locally: the Keychain record advances generation and clears the accepted proof before a
+// best-effort compare-delete is launched with the still-captured bearer. TTL and the higher next generation preserve
+// safety even if cleanup never reaches the server.
 
 import Foundation
 
@@ -18,46 +15,173 @@ final class DeviceRingRegistrar {
     private let client: DeviceRingRegistrationClient
     private let sessionId: String
     private let isLoggedIn: () -> Bool
-    private var latestToken: String?
-    private var inFlight: Task<Void, Never>?
+    private let installation: DeviceRingInstallationController
+    private let onBindingChanged: (DeviceRingBinding?) -> Void
 
-    init(client: DeviceRingRegistrationClient,
-         sessionId: String,
-         isLoggedIn: @escaping () -> Bool = { SessionTokenStore.load() != nil }) {
+    private var latestToken: String?
+    private var currentBinding: DeviceRingBinding?
+    private var inFlight: Task<Void, Never>?
+    private var operationRevision: UInt64 = 0
+
+    init(
+        client: DeviceRingRegistrationClient,
+        sessionId: String,
+        isLoggedIn: @escaping () -> Bool = { SessionTokenStore.load() != nil },
+        installation: DeviceRingInstallationController = .live,
+        onBindingChanged: @escaping (DeviceRingBinding?) -> Void = { _ in }
+    ) {
         self.client = client
         self.sessionId = sessionId
         self.isLoggedIn = isLoggedIn
+        self.installation = installation
+        self.onBindingChanged = onBindingChanged
+        if let stored = installation.loadCurrentBinding(), stored.sessionId == sessionId {
+            currentBinding = stored
+        }
     }
 
-    /// The APNs VoIP token arrived or ROTATED (SentiCallManager.onVoipToken). Cache it, then register if we have a Bearer.
-    /// Returns the in-flight register Task (for tests); call sites discard it.
     @discardableResult
     func tokenUpdated(_ token: String) -> Task<Void, Never>? {
+        guard !token.isEmpty else { return tokenInvalidated() }
+        if let previous = latestToken, previous != token {
+            revokeCurrentAuthority(clearToken: false)
+        }
         latestToken = token
         return registerIfReady()
     }
 
-    /// Login just persisted a Bearer (SignInCoordinator.onAuthenticated). Register the cached token (if one arrived).
     @discardableResult
-    func loginCompleted() -> Task<Void, Never>? {
-        return registerIfReady()
+    func tokenInvalidated() -> Task<Void, Never>? {
+        revokeCurrentAuthority(clearToken: true)
+        return nil
     }
 
-    /// Register ONLY when a non-empty token is cached AND we're logged in (a Bearer exists). Returns the in-flight Task
-    /// (for tests); `@discardableResult` for the call sites. Supersedes any prior in-flight register (idempotent upsert).
+    @discardableResult
+    func loginCompleted() -> Task<Void, Never>? {
+        registerIfReady()
+    }
+
     @discardableResult
     func registerIfReady() -> Task<Void, Never>? {
         guard let token = latestToken, !token.isEmpty, isLoggedIn() else { return nil }
+        let initialAttempt: DeviceRingRegistrationAttempt
+        do {
+            initialAttempt = try installation.beginRegistration(sessionId, token, false)
+        } catch {
+            revokeCurrentAuthority(clearToken: false)
+            return nil
+        }
+
         inFlight?.cancel()
-        let client = self.client              // capture value types into the Task (no self retained inside)
+        operationRevision &+= 1
+        let expectedRevision = operationRevision
+        // beginRegistration has already cleared the Keychain proof. Mirror that transition into the live PushKit gate
+        // before any network suspension so an old lease cannot authorize a call while renewal/recovery is uncertain.
+        currentBinding = nil
+        onBindingChanged(nil)
+        let client = self.client
+        let installation = self.installation
         let sessionId = self.sessionId
-        let task = Task {
-            // Best-effort: the client carries the Bearer + enforces no-humanId/apns; a transient failure is retried by
-            // the next tokenUpdated/loginCompleted trigger. The upsert is idempotent, so re-registering is harmless.
-            // `_ =` discards the Void? from `try?` so the closure is Task<Void, Never>, not Task<Void?, Never>.
-            _ = try? await client.register(voipToken: token, sessionId: sessionId)
+        let task = Task { @MainActor [weak self] in
+            var attempt = initialAttempt
+            var canRecoverStaleGeneration = true
+            while true {
+                do {
+                    let binding = try await client.register(
+                        voipToken: token,
+                        sessionId: sessionId,
+                        attempt: attempt
+                    )
+                    guard let self,
+                          !Task.isCancelled,
+                          self.operationRevision == expectedRevision,
+                          self.latestToken == token,
+                          self.isLoggedIn() else { return }
+                    do {
+                        try installation.commitRegistration(attempt, binding)
+                    } catch {
+                        // The server may now have a lease, but a proof that could not be persisted must never be accepted.
+                        self.revokeReturnedBinding(binding)
+                        return
+                    }
+                    self.currentBinding = binding
+                    self.onBindingChanged(binding)
+                    if self.operationRevision == expectedRevision {
+                        self.inFlight = nil
+                    }
+                    return
+                } catch DeviceRingRegistrationError.bindingConflict where canRecoverStaleGeneration {
+                    guard let self,
+                          !Task.isCancelled,
+                          self.operationRevision == expectedRevision,
+                          self.latestToken == token,
+                          self.isLoggedIn() else { return }
+                    // One forced generation bump repairs an interrupted transition without allowing an unbounded 409
+                    // loop. Capacity conflicts are a separate error and never enter this recovery path.
+                    do {
+                        attempt = try installation.beginRegistration(sessionId, token, true)
+                    } catch {
+                        self.revokeCurrentAuthority(clearToken: false)
+                        return
+                    }
+                    self.currentBinding = nil
+                    self.onBindingChanged(nil)
+                    canRecoverStaleGeneration = false
+                } catch {
+                    guard let self, self.operationRevision == expectedRevision else { return }
+                    self.inFlight = nil
+                    // Pending identity state deliberately remains for an exact retry. 401 handling is owned by the
+                    // client; auth/selection callbacks synchronously call invalidate(), advance generation, and clear
+                    // authority.
+                    return
+                }
+            }
         }
         inFlight = task
         return task
+    }
+
+    /// Authentication or selected-session authority disappeared. This executes before SessionTokenStore.delete().
+    func invalidate() {
+        revokeCurrentAuthority(clearToken: true)
+    }
+
+    private func revokeReturnedBinding(_ binding: DeviceRingBinding) {
+        let cleanup: DeviceRingUnregistrationAttempt?
+        do { cleanup = try installation.beginRevocation(binding) }
+        catch { cleanup = nil }
+        currentBinding = nil
+        onBindingChanged(nil)
+        if let cleanup { startCleanup(cleanup) }
+    }
+
+    private func revokeCurrentAuthority(clearToken: Bool) {
+        inFlight?.cancel()
+        inFlight = nil
+        operationRevision &+= 1
+        let stored = installation.loadCurrentBinding()
+        let binding = currentBinding ?? (stored?.sessionId == sessionId ? stored : nil)
+        let cleanup: DeviceRingUnregistrationAttempt?
+        do { cleanup = try installation.beginRevocation(binding) }
+        catch { cleanup = nil }
+        currentBinding = nil
+        onBindingChanged(nil)
+        if clearToken { latestToken = nil }
+        if let cleanup { startCleanup(cleanup) }
+    }
+
+    private func startCleanup(_ attempt: DeviceRingUnregistrationAttempt) {
+        guard let network = client.beginUnregister(attempt) else { return }
+        let installation = self.installation
+        Task {
+            if await network.value {
+                try? installation.completeUnregistration(attempt)
+            }
+        }
+    }
+
+    deinit {
+        inFlight?.cancel()
+        // Cleanup tasks are intentionally not retained/cancelled: compare-delete remains safe after this registrar dies.
     }
 }

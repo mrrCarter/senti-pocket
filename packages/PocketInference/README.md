@@ -4,7 +4,8 @@ On-device, evidence-bounded checkpoint Q&A using LiteRT-LM. The package never ex
 
 ## Dependency
 
-- LiteRT-LM: exact Swift package version `0.13.0`
+- LiteRT-LM: upstream `v0.15.0`, pinned to revision
+  `2117fc4314670e00047bc8469783f02a68c33f0c` so a mutable upstream tag cannot change the resolved source
 - Swift product: `LiteRTLM`
 - Model input: a local, integrity-verified `.litertlm` file
 
@@ -56,11 +57,17 @@ Task cancellation, Stop, and barge-in call `cancel()`, which invalidates the cur
 
 ## Verification
 
-Run on a Mac with the current Xcode toolchain:
+Run from the repository root on a Mac with the current Xcode toolchain and a clean package-resolution state:
 
 ```bash
-cd packages/PocketInference
-swift test
+rm -rf packages/PocketInference/.build packages/PocketInference/Package.resolved
+GIT_LFS_SKIP_SMUDGE=1 swift test --package-path packages/PocketInference
 ```
 
-Then run `benchmark(prefillTokens:decodeTokens:)` on the physical demo phone. This package was authored on a Windows host without Swift/Xcode, so a source-parser pass is not a substitute for that build and device gate.
+The command must compile the real `LiteRTLMInferenceEngine`; do not replace it with a stub or exclude it from the
+target. Then run `benchmark(prefillTokens:decodeTokens:)` on the physical demo phone. This package was authored on
+a Windows host without Swift/Xcode, so a source-parser pass is not a substitute for that build and device gate.
+
+`GIT_LFS_SKIP_SMUDGE=1` skips checkout of LiteRT-LM's unrelated `prebuilt/` repository files. The Apple SwiftPM
+targets instead download the release `CLiteRTLM`/`CLiteRTLM_mac` XCFramework declared by the pinned manifest and
+verify its SHA-256 checksum; skipping repository LFS smudging does not bypass that binary-target verification.

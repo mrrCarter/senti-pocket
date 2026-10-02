@@ -1,7 +1,8 @@
 # DialHydration merge — tests (Atlas)
 
-Staged for the app test target (forge wires it on Mac). Covers the LEAN→hydrate merge + the security invariant
-(refuse a fetched signal that doesn't match the ring the push announced).
+Implemented in the app test target. Covers the LEAN→hydrate merge and its security invariants: refuse a fetched signal
+whose routing identity does not match the announced ring, preserve the admitted binding proof, and derive kind,
+priority, caller label, message, options, evidence, confidence, and checkpoint semantics from the authenticated signal.
 
 ```swift
 import XCTest

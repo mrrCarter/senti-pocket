@@ -77,6 +77,44 @@ final class DuplexAudioSessionLeaseTests: XCTestCase {
         XCTAssertEqual(system.activationCount, 2)
         XCTAssertEqual(manager.release(nextLease), .deactivated)
     }
+
+    func testCallKitOwnedLeaseNeverActivatesOrDeactivatesTheSystemSession() throws {
+        let system = RecordingDuplexAudioSessionSystem()
+        let manager = DuplexAudioSessionLeaseManager(system: system)
+        try manager.prepareForCallKit()
+        manager.callKitDidActivate()
+
+        let microphone = try manager.acquire()
+        let narration = try manager.acquire()
+        XCTAssertEqual(system.activationCount, 0)
+        XCTAssertEqual(system.prepareForCallKitCount, 1)
+        XCTAssertEqual(manager.release(microphone), .retained(activeLeaseCount: 1))
+        XCTAssertEqual(manager.release(narration), .releasedUnderCallKitOwnership)
+        XCTAssertEqual(system.deactivationCount, 0)
+
+        manager.callKitDidDeactivate()
+        let standalone = try manager.acquire()
+        XCTAssertEqual(system.activationCount, 1)
+        XCTAssertEqual(manager.release(standalone), .deactivated)
+        XCTAssertEqual(system.deactivationCount, 1)
+    }
+
+    func testCallKitDeactivationMakesNewWorkFailClosedWhileOldLeaseUnwinds() throws {
+        let system = RecordingDuplexAudioSessionSystem()
+        let manager = DuplexAudioSessionLeaseManager(system: system)
+        manager.callKitDidActivate()
+        let old = try manager.acquire()
+
+        manager.callKitDidDeactivate()
+        XCTAssertThrowsError(try manager.acquire())
+        XCTAssertEqual(manager.release(old), .releasedUnderCallKitOwnership)
+        XCTAssertEqual(system.activationCount, 0)
+        XCTAssertEqual(system.deactivationCount, 0)
+
+        let fresh = try manager.acquire()
+        XCTAssertEqual(system.activationCount, 1)
+        XCTAssertEqual(manager.release(fresh), .deactivated)
+    }
 }
 
 private final class RecordingDuplexAudioSessionSystem: DuplexAudioSessionSystem, @unchecked Sendable {
@@ -94,8 +132,13 @@ private final class RecordingDuplexAudioSessionSystem: DuplexAudioSessionSystem,
 
     var activationCount = 0
     var deactivationCount = 0
+    var prepareForCallKitCount = 0
     var failNextActivation = false
     var failNextDeactivation = false
+
+    func prepareForCallKit() throws {
+        prepareForCallKitCount += 1
+    }
 
     func activate() throws {
         activationCount += 1

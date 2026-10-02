@@ -13,6 +13,7 @@ final class SignInCoordinatorTests: XCTestCase {
         var storedToken: Bool
         var loginCalls = 0
         var authFired = 0
+        var protectedStateClears = 0
         init(storedToken: Bool = false) { self.storedToken = storedToken }
     }
 
@@ -24,7 +25,8 @@ final class SignInCoordinatorTests: XCTestCase {
         let coord = SignInCoordinator(
             login: login ?? defaultLogin,
             isLoggedIn: { probe.storedToken },
-            signOut: { probe.storedToken = false })
+            signOut: { probe.storedToken = false },
+            clearProtectedLocalState: { probe.protectedStateClears += 1 })
         coord.onAuthenticated = { probe.authFired += 1 }
         return coord
     }
@@ -38,9 +40,12 @@ final class SignInCoordinatorTests: XCTestCase {
     }
 
     func test_init_is_signedOut_when_no_token() {
-        let coord = makeCoordinator(probe: LoginProbe(storedToken: false))
+        let probe = LoginProbe(storedToken: false)
+        let coord = makeCoordinator(probe: probe)
         XCTAssertEqual(coord.phase, .signedOut)
         XCTAssertFalse(coord.isAuthenticated)
+        XCTAssertEqual(probe.protectedStateClears, 1,
+                       "a stale confirmed intent must not survive launch without its credential")
     }
 
     // MARK: - the happy path: real login stores a token → signedIn + onAuthenticated
@@ -107,7 +112,47 @@ final class SignInCoordinatorTests: XCTestCase {
         coord.handle(.signOut)
         XCTAssertEqual(coord.phase, .signedOut)
         XCTAssertFalse(probe.storedToken, "sign-out cleared the stored token")
+        XCTAssertEqual(probe.protectedStateClears, 1)
         XCTAssertFalse(coord.isAuthenticated)
+    }
+
+    func test_protected_api_401_clears_token_and_requires_reauthentication() {
+        let probe = LoginProbe(storedToken: true)
+        let coord = makeCoordinator(probe: probe)
+
+        coord.invalidateAuthentication()
+
+        XCTAssertEqual(coord.phase, .reauthenticationRequired)
+        XCTAssertFalse(coord.isAuthenticated)
+        XCTAssertFalse(probe.storedToken, "a rejected bearer must not remain in the credential store")
+        XCTAssertEqual(probe.protectedStateClears, 1,
+                       "a confirmed write must never survive into a potentially different account")
+    }
+
+    func test_authentication_invalidation_is_ignored_when_not_signed_in() {
+        let probe = LoginProbe()
+        let coord = makeCoordinator(probe: probe)
+
+        coord.invalidateAuthentication()
+
+        XCTAssertEqual(coord.phase, .signedOut)
+        XCTAssertFalse(probe.storedToken)
+    }
+
+    func test_stale_authentication_epoch_cannot_sign_out_a_later_login() async {
+        let probe = LoginProbe(storedToken: true)
+        let coord = makeCoordinator(probe: probe)
+        let principalAEpoch = coord.authenticationEpoch
+
+        coord.handle(.signOut)
+        await coord.handle(.beginSignIn)?.value
+        XCTAssertTrue(coord.isAuthenticated)
+        XCTAssertNotEqual(coord.authenticationEpoch, principalAEpoch)
+
+        coord.invalidateAuthentication(expectedEpoch: principalAEpoch)
+
+        XCTAssertTrue(coord.isAuthenticated, "a delayed callback retained by principal A must not sign principal B out")
+        XCTAssertTrue(probe.storedToken)
     }
 
     func test_beginSignIn_while_authorizing_is_ignored() async {

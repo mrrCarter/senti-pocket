@@ -1,3 +1,4 @@
+#if DEBUG
 import Foundation
 import PocketContracts
 
@@ -12,3 +13,4 @@ enum FixtureLoader {
         return try? dec.decode(PocketBundle.self, from: data)
     }
 }
+#endif

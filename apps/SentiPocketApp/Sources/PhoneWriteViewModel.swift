@@ -19,6 +19,7 @@ enum PhoneWriteState: Equatable {
     case sending
     case sent(ActionReceipt)       // render-gate PASSED: structurally-valid .posted AND signature .verified under the pin
     case pending(String)           // offline: PENDING_CONNECTIVITY — retryable, intent retained; never "sent"
+    case blockedByPendingSession(String) // another session owns the one durable outbox slot; never retry/clear it here
     case refused(String)           // rejected / non-posted / signature-not-verified — NEVER "sent"
 }
 
@@ -28,6 +29,8 @@ final class PhoneWriteViewModel: ObservableObject {
 
     private let sessionId: String
     private let client: PocketWriteClient
+    private let onReauthenticationRequired: @MainActor (String?) -> Void
+    private let isWriteAuthorized: @MainActor () -> Bool
 
     /// Item 3: the gateway receipt-signing PUBLIC key, HARD-CODED (forge #261850: bound to the fixed signing key,
     /// stable across restarts). We verify the receipt under THIS pin — we do NOT fetch /demo-pubkey and trust it.
@@ -36,21 +39,42 @@ final class PhoneWriteViewModel: ObservableObject {
     /// The confirmed intent, retained across an offline failure so `retryPending()` can resend the SAME bytes (the
     /// hash/confirmation are already bound — a retry re-posts identically; the gateway is idempotent by proposal id).
     private var pendingIntent: (proposal: ActionProposal, confirmation: GovernedWriteConfirmation)?
+    private var writeRevision: UInt64 = 0
 
-    init(sessionId: String, client: PocketWriteClient) {
+    init(
+        sessionId: String,
+        client: PocketWriteClient,
+        onReauthenticationRequired: @escaping @MainActor (String?) -> Void = { _ in },
+        isWriteAuthorized: @escaping @MainActor () -> Bool = { true }
+    ) {
         self.sessionId = sessionId
         self.client = client
+        self.onReauthenticationRequired = onReauthenticationRequired
+        self.isWriteAuthorized = isWriteAuthorized
         // Restore a confirmed-but-unsent write from a previous session (durable outbox) so an offline write survives
         // an app kill. It's already human-confirmed — surfaced as PENDING + retryable; NEVER auto-fired here (retry
         // is an explicit user tap or an app-driven reconnect), NEVER shown as sent.
         if let persisted = OutboxStore.load() {
-            pendingIntent = (persisted.proposal, persisted.confirmation)
-            state = .pending("A message you confirmed earlier is queued — it will send when you reconnect.")
+            switch persisted.binding(to: sessionId) {
+            case .matching:
+                pendingIntent = (persisted.proposal, persisted.confirmation)
+                state = .pending(
+                    "A confirmed message for session \(sessionId) is queued — retry when you are connected."
+                )
+            case .foreignSession(let targetSessionId):
+                // The outbox is intentionally global/single-intent. A different selected session must neither retry
+                // nor overwrite nor clear that intent; the user must return to its explicitly named target.
+                state = .blockedByPendingSession(targetSessionId)
+            case .invalid:
+                OutboxStore.clear(matching: persisted)
+                state = .refused("Not sent — the saved write did not pass its confirmation integrity checks.")
+            }
         }
     }
 
     /// Compose → show the CONFIRM UI. Builds the humanMessage proposal (seq:0) but does NOT post — the human must tap.
     func draft(_ message: String) {
+        guard case .composing = state, isWriteAuthorized() else { return }
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         state = .confirming(PocketWriteClient.makeHumanMessageProposal(sessionId: sessionId, message: trimmed))
@@ -60,6 +84,10 @@ final class PhoneWriteViewModel: ObservableObject {
     /// never from a timer, a default, or an auto-advance. Binds the EXACT hash the human saw.
     func confirm() {
         guard case .confirming(let proposal) = state else { return }
+        guard isWriteAuthorized() else {
+            state = .refused("Not sent — this session is no longer selected or authorized.")
+            return
+        }
         let confirmation = GovernedWriteConfirmation(
             proposalId: proposal.id,
             confirmedProposalHash: proposal.proposalHash,   // == the hash of the content shown in the confirm UI
@@ -71,8 +99,16 @@ final class PhoneWriteViewModel: ObservableObject {
 
     /// Abandon the draft/confirmation — a cancelled decision must leave NOTHING posted or queued.
     func cancel() {
+        // A view composed for session B has no authority to discard session A's persisted confirmed intent.
+        if case .blockedByPendingSession = state { return }
+        writeRevision &+= 1
+        if let pendingIntent {
+            OutboxStore.clear(matching: PersistedWriteIntent(
+                proposal: pendingIntent.proposal,
+                confirmation: pendingIntent.confirmation
+            ))
+        }
         pendingIntent = nil
-        OutboxStore.clear()
         state = .composing
     }
 
@@ -83,6 +119,18 @@ final class PhoneWriteViewModel: ObservableObject {
     }
 
     private func post(_ proposal: ActionProposal, _ confirmation: GovernedWriteConfirmation) {
+        let intent = PersistedWriteIntent(proposal: proposal, confirmation: confirmation)
+        guard intent.binding(to: sessionId) == .matching else {
+            pendingIntent = nil
+            state = .refused("Not sent — the confirmed write is not bound to this selected session.")
+            return
+        }
+        guard isWriteAuthorized() else {
+            state = .pending(
+                "Session \(sessionId): selection changed before send. Return to this session to retry."
+            )
+            return
+        }
         // Persist the confirmed intent BEFORE the send so a crash / app-kill during the `.sending` window can't
         // silently drop a Carter-confirmed governed write — the durable-outbox guarantee must cover the in-flight
         // window, not only the offline catches (the exact "in-memory only → lost on kill" gap OutboxStore exists to
@@ -90,44 +138,100 @@ final class PhoneWriteViewModel: ObservableObject {
         // proposal.id) crash-recovery dedups a restart-retry — never a double-post (prior-posted → same receipt;
         // in-flight/unknown → 409 reconcile, never a blind re-post). Every terminal path below (applyRenderGate /
         // refused / cancel) clears the outbox, so a success/refusal leaves nothing queued.
-        OutboxStore.save(PersistedWriteIntent(proposal: proposal, confirmation: confirmation))
+        switch OutboxStore.claim(intent) {
+        case .claimed:
+            break
+        case .occupied(let targetSessionId):
+            pendingIntent = nil
+            state = .blockedByPendingSession(targetSessionId)
+            return
+        case .storageUnavailable:
+            pendingIntent = nil
+            state = .refused("Not sent — the confirmed message could not be secured in the device outbox.")
+            return
+        }
+        writeRevision &+= 1
+        let operationRevision = writeRevision
         state = .sending
         Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.writeRevision == operationRevision else { return }
+            // `confirm()` and this unstructured Task are separated by an executor turn. Recheck the injected
+            // selected-session/auth gate here so a revocation in that gap cannot start the HTTP write.
+            guard self.isWriteAuthorized() else {
+                self.state = .pending(
+                    "Session \(self.sessionId): selection changed before send. Return to this session to retry."
+                )
+                return
+            }
             do {
                 // execute() already fails-closed to a structurally-valid .posted (else it throws) — no optimistic sent.
                 let receipt = try await self.client.execute(proposal: proposal, confirmation: confirmation)
-                self.applyRenderGate(receipt)
-            } catch PocketWriteError.network(let detail) {
+                guard self.writeRevision == operationRevision else { return }
+                self.applyRenderGate(receipt, resolving: intent)
+            } catch {
+                guard self.writeRevision == operationRevision else { return }
+                guard let writeError = error as? PocketWriteError else {
+                    self.pendingIntent = nil
+                    OutboxStore.clear(matching: intent)
+                    self.state = .refused("Not sent — \(error.localizedDescription)")
+                    return
+                }
+                switch writeError {
+                case .network(let detail):
                 // OFFLINE: the POST couldn't reach the gateway → PENDING, retryable. The confirmed intent was already
                 // persisted at the top of post() (durable outbox), so it survives an app kill; NEVER "sent".
-                self.state = .pending("Offline — your message is queued and will send when you reconnect. (\(detail))")
-            } catch PocketWriteError.retryable(let detail) {
+                self.state = .pending(
+                    "Session \(self.sessionId): offline — your message is queued. (\(detail))"
+                )
+                case .retryable(let detail):
                 // TRANSIENT gateway response (busy / in-progress / temporarily unavailable) — NOT terminal. Queue +
                 // retry like offline; the write may still land, so never refuse it (intent already persisted, top of post()).
-                self.state = .pending("The gateway is busy — queued, tap Retry. (\(detail))")
-            } catch PocketWriteError.notPosted(let why) {
+                self.state = .pending(
+                    "Session \(self.sessionId): the gateway is busy — queued, tap Retry. (\(detail))"
+                )
+                case .notLoggedIn:
+                // Confirmation authority is tied to the authenticated principal. Once that principal is gone, never
+                // carry a retryable intent across a possible account switch; require a fresh review after sign-in.
+                self.pendingIntent = nil
+                OutboxStore.clear(matching: intent)
+                self.state = .refused("Not sent — sign in again, then review this message again.")
+                self.onReauthenticationRequired(nil)
+                case .reauthenticationRequired(let requestToken):
+                self.pendingIntent = nil
+                OutboxStore.clear(matching: intent)
+                self.state = .refused("Not sent — authorization expired. Sign in and review this message again.")
+                self.onReauthenticationRequired(requestToken)
+                case .supersededAuthentication:
+                self.pendingIntent = nil
+                OutboxStore.clear(matching: intent)
+                self.state = .refused("Not sent — this response belonged to an earlier sign-in. Review the message again.")
+                case .notPosted(let why):
                 // The gateway returned a receipt that is NOT a verified posted (pending/failed) → never sent.
                 self.pendingIntent = nil
-                OutboxStore.clear()
+                OutboxStore.clear(matching: intent)
                 self.state = .refused("Not sent — \(why)")
-            } catch PocketWriteError.rejected(let why) {
+                case .rejected(let why):
                 self.pendingIntent = nil
-                OutboxStore.clear()
+                OutboxStore.clear(matching: intent)
                 self.state = .refused("The gateway refused this write — \(why)")
-            } catch {
+                case .notConfigured:
                 self.pendingIntent = nil
-                OutboxStore.clear()
-                self.state = .refused("Not sent — \(error.localizedDescription)")
+                OutboxStore.clear(matching: intent)
+                self.state = .refused("Not sent — Senti's secure gateway is not configured for this build.")
+                case .malformedResponse:
+                    self.pendingIntent = nil
+                    OutboxStore.clear(matching: intent)
+                    self.state = .refused("Not sent — the gateway returned an unexpected response.")
+                }
             }
         }
     }
 
     /// The 🔴 RENDER-GATE (item 3): a real .posted receipt is only "sent" if its gateway signature VERIFIES under the
     /// pinned key. Anything else (unsigned / tampered / no CryptoKit) is REFUSED, never rendered as sent.
-    private func applyRenderGate(_ receipt: ActionReceipt) {
+    private func applyRenderGate(_ receipt: ActionReceipt, resolving intent: PersistedWriteIntent) {
         // Every path here is TERMINAL (sent or refused) — the confirmed intent is resolved, so drop the durable outbox.
-        OutboxStore.clear()
+        OutboxStore.clear(matching: intent)
         #if canImport(CryptoKit)
         switch receipt.signatureState(gatewayPublicKeyBase64url: gatewayPublicKeyPin) {
         case .verified:

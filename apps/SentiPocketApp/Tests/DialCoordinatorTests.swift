@@ -26,7 +26,7 @@ final class DialCoordinatorTests: XCTestCase {
                       hydrate: @escaping (DialReceiveState) async throws -> RenderableRing) -> DialCoordinator {
         DialCoordinator(
             hydrate: hydrate,
-            runDial: { r in rec.ranRings.append(r); return outcome },
+            runDial: { r, _ in rec.ranRings.append(r); return outcome },
             endCall: { rec.endedCalls.append($0) }
         )
     }
@@ -49,7 +49,7 @@ final class DialCoordinatorTests: XCTestCase {
         struct Boom: Error {}
         let rec = Recorder(); let uuid = UUID()
         let c = make(rec, hydrate: { _ in throw Boom() })
-        c.received(state("need_1"), dialId: "need_1")
+        c.received(state("need_1"), dialId: "need_1", callUUID: uuid)
         let out = await c.answered(dialId: "need_1", callUUID: uuid)
         if case .declined = out {} else { return XCTFail("hydration failure must decline") }
         XCTAssertTrue(rec.ranRings.isEmpty)     // NEVER posted on a refused/failed hydrate
@@ -62,7 +62,7 @@ final class DialCoordinatorTests: XCTestCase {
         let rec = Recorder(); let uuid = UUID()
         let r = ring("need_1", message: "Rotate the token?")
         let c = make(rec, outcome: .posted, hydrate: { _ in r })
-        c.received(state("need_1"), dialId: "need_1")
+        c.received(state("need_1"), dialId: "need_1", callUUID: uuid)
         let out = await c.answered(dialId: "need_1", callUUID: uuid)
         XCTAssertEqual(out, .posted)
         XCTAssertEqual(rec.ranRings.count, 1)
@@ -75,8 +75,9 @@ final class DialCoordinatorTests: XCTestCase {
     func test_answered_passes_through_the_run_outcome() async {
         let rec = Recorder()
         let c = make(rec, outcome: .pending("offline"), hydrate: { _ in self.ring() })
-        c.received(state("need_1"), dialId: "need_1")
-        let out = await c.answered(dialId: "need_1", callUUID: UUID())
+        let uuid = UUID()
+        c.received(state("need_1"), dialId: "need_1", callUUID: uuid)
+        let out = await c.answered(dialId: "need_1", callUUID: uuid)
         XCTAssertEqual(out, .pending("offline"))
     }
 
@@ -85,10 +86,45 @@ final class DialCoordinatorTests: XCTestCase {
     func test_answered_consumes_stored_state_once() async {
         let rec = Recorder()
         let c = make(rec, hydrate: { _ in self.ring() })
-        c.received(state("need_1"), dialId: "need_1")
-        _ = await c.answered(dialId: "need_1", callUUID: UUID())
-        let out2 = await c.answered(dialId: "need_1", callUUID: UUID())
+        let uuid = UUID()
+        c.received(state("need_1"), dialId: "need_1", callUUID: uuid)
+        _ = await c.answered(dialId: "need_1", callUUID: uuid)
+        let out2 = await c.answered(dialId: "need_1", callUUID: uuid)
         if case .declined = out2 {} else { return XCTFail("2nd answer must find no state") }
         XCTAssertEqual(rec.ranRings.count, 1)  // ran exactly once — no double-post
+    }
+
+    @MainActor
+    func test_same_dial_id_cannot_cross_callkit_episode() async {
+        let rec = Recorder()
+        let storedUUID = UUID()
+        let foreignUUID = UUID()
+        let c = make(rec, hydrate: { _ in self.ring() })
+        c.received(state("need_1"), dialId: "need_1", callUUID: storedUUID)
+
+        let foreign = await c.answered(dialId: "need_1", callUUID: foreignUUID)
+        if case .declined = foreign {} else { return XCTFail("foreign UUID must not consume a repeated dial id") }
+        XCTAssertTrue(rec.ranRings.isEmpty)
+
+        let owner = await c.answered(dialId: "need_1", callUUID: storedUUID)
+        XCTAssertEqual(owner, .posted)
+        XCTAssertEqual(rec.ranRings.count, 1)
+    }
+
+    @MainActor
+    func test_discarded_episode_cannot_hydrate_or_run() async {
+        let rec = Recorder()
+        let uuid = UUID()
+        let c = make(rec, hydrate: { _ in
+            XCTFail("discarded episode must not hydrate")
+            return self.ring()
+        })
+        c.received(state("need_1"), dialId: "need_1", callUUID: uuid)
+        c.discard(callUUID: uuid)
+
+        let outcome = await c.answered(dialId: "need_1", callUUID: uuid)
+        if case .declined = outcome {} else { return XCTFail("discarded episode must decline") }
+        XCTAssertTrue(rec.ranRings.isEmpty)
+        XCTAssertEqual(rec.endedCalls, [uuid])
     }
 }

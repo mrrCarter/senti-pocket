@@ -22,15 +22,21 @@ final class DialCoordinator: ObservableObject {
     private let hydrate: (DialReceiveState) async throws -> RenderableRing
     /// Drive the governed dial flow for a hydrated ring → outcome (constructs LiveDialVoice+PhoneWriteAdapter+
     /// DialOrchestrator and runs it). Injected so the coordinator's orchestration is testable in isolation.
-    private let runDial: (RenderableRing) async -> DialOutcome
+    private let runDial: (RenderableRing, UUID) async -> DialOutcome
     /// End the CallKit call (SentiCallManager.end) once the flow reaches a terminal outcome.
     private let endCall: (UUID) -> Void
 
-    /// DialReceiveState captured at push-receive, keyed by relay's dialId, consumed once on answer.
-    private var pending: [String: DialReceiveState] = [:]
+    private struct PendingDial {
+        let dialId: String
+        let state: DialReceiveState
+    }
+
+    /// One received episode per CallKit UUID. `dialId` remains correlation data, never the ownership key: two pushes
+    /// that repeat a dial id cannot consume or substitute each other's state across CallKit episodes.
+    private var pending: [UUID: PendingDial] = [:]
 
     init(hydrate: @escaping (DialReceiveState) async throws -> RenderableRing,
-         runDial: @escaping (RenderableRing) async -> DialOutcome,
+         runDial: @escaping (RenderableRing, UUID) async -> DialOutcome,
          endCall: @escaping (UUID) -> Void) {
         self.hydrate = hydrate
         self.runDial = runDial
@@ -39,8 +45,16 @@ final class DialCoordinator: ObservableObject {
 
     /// PUSH-RECEIVE: store the decoded state so the ANSWER can branch/hydrate it. (Wired from SentiCallKit's
     /// receive-hook; the LEAN push carries only id+core, the governed content is fetched at answer.)
-    func received(_ state: DialReceiveState, dialId: String) {
-        pending[dialId] = state
+    func received(_ state: DialReceiveState, dialId: String, callUUID: UUID) {
+        pending[callUUID] = PendingDial(dialId: dialId, state: state)
+    }
+
+    func discard(callUUID: UUID) {
+        pending.removeValue(forKey: callUUID)
+    }
+
+    func discardAll() {
+        pending.removeAll()
     }
 
     /// ANSWER (SentiCallManager.onAnswered → this, via `dialId` + the CallKit UUID): hydrate the stored state
@@ -51,16 +65,24 @@ final class DialCoordinator: ObservableObject {
     @discardableResult
     func answered(dialId: String, callUUID: UUID) async -> DialOutcome {
         defer { endCall(callUUID) }
-        guard let state = pending.removeValue(forKey: dialId) else {
+        guard !Task.isCancelled else {
+            discard(callUUID: callUUID)
+            return .declined("call ended before hydration")
+        }
+        guard let episode = pending.removeValue(forKey: callUUID),
+              episode.dialId == dialId else {
             return .declined("no ring state for dial \(dialId)")
         }
         let ring: RenderableRing
         do {
-            ring = try await hydrate(state)
+            ring = try await hydrate(episode.state)
         } catch {
             // Substitution refused / absent / unauthorized / unavailable — honest decline, nothing posted.
             return .declined("hydration failed: \(error.localizedDescription)")
         }
-        return await runDial(ring)
+        guard !Task.isCancelled else {
+            return .declined("call ended during hydration")
+        }
+        return await runDial(ring, callUUID)
     }
 }

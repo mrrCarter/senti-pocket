@@ -10,7 +10,11 @@ let package = Package(
     dependencies: [
         .package(path: "../PocketContracts"),
         .package(path: "../PocketCall"),
-        .package(url: "https://github.com/google-ai-edge/LiteRT-LM", exact: "0.13.0")
+        // LiteRT-LM v0.15.0. The upstream release is mutable, so bind the reviewed source commit.
+        .package(
+            url: "https://github.com/google-ai-edge/LiteRT-LM",
+            revision: "2117fc4314670e00047bc8469783f02a68c33f0c"
+        )
     ],
     targets: [
         .target(

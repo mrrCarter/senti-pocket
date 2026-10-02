@@ -6,7 +6,9 @@ import PocketContracts
 //   answer → hear the decision → CONVERSE (grounded Q&A) → DICTATE a reply → read-back → DETERMINISTIC confirm →
 //   the governed write posts as Carter.
 // Load-bearing invariant (warden's bar): a governed write NEVER happens without his explicit DICTATED reply AND an
-// explicit confirm. Decline / hangup (cancellation) / unclear-confirm-exhausted → NOTHING is posted or queued.
+// explicit confirm. Decline / hangup before confirmation / unclear-confirm-exhausted → NOTHING is posted or queued.
+// Once Carter explicitly confirms, that confirmation is the irreversible commit point: hangup stops audio/new authority,
+// while the already-confirmed durable write completes or remains queued for idempotent reconciliation.
 // Dependencies are injected protocols, so this consent state machine is unit-testable WITHOUT CallKit / ASR / network,
 // and the confirm authorizer is the SAME governed write() the tap uses (voice-confirm just triggers it, per bar 2b/2c).
 
@@ -72,7 +74,8 @@ public final class DialOrchestrator {
     }
 
     /// Drive one answered decision call to a terminal outcome. Honors Task cancellation (a hangup cancels the run
-    /// Task) as a decline that leaves nothing posted/queued. NEVER posts without an explicit dictated reply + confirm.
+    /// Task) as a decline that leaves nothing posted/queued until explicit confirmation. After confirmation begins the
+    /// durable operation is allowed to resolve/queue honestly; a hangup cannot pretend an in-flight write was revoked.
     public func run(_ request: DialRequest) async -> DialOutcome {
         // 1. BRIEF: open by telling him WHO's asking (beat 4), then the decision. `callerName` is the AUTHED,
         //    hydrated caller identity (NeedCarterSignal.callerName → "Senti · <requestedBy> needs your decision" /
@@ -81,6 +84,7 @@ public final class DialOrchestrator {
         //    <agent>." would thread the authed `requestedBy` onto DialRequest; this uses what the ring already carries.)
         if Task.isCancelled { return .declined("hung up before briefing") }
         await voice.speak("\(request.callerName). \(request.message)")
+        if Task.isCancelled { return .declined("hung up during briefing") }
 
         // 2. CONVERSE: grounded Q&A until an EXPLICIT reply-marker. A marker-less utterance is ALWAYS answered,
         //    NEVER posted — the marker is the ONLY path from speech to a governed write. No reply → nothing posted.
@@ -91,14 +95,21 @@ public final class DialOrchestrator {
         // 3. DRAFT the governed write (arms the read-back; posts nothing yet).
         if Task.isCancelled { return .declined("hung up before draft") }
         await writer.draft(reply)
+        if Task.isCancelled {
+            await writer.cancel()
+            return .declined("hung up during draft")
+        }
 
         // 4. CONFIRM: read back the EXACT reply and require a DETERMINISTIC spoken confirm (bar 2b), bounded retries.
         for attempt in 0...maxConfirmRetries {
             if Task.isCancelled { await writer.cancel(); return .declined("hung up during confirm") }
             await voice.speak("I'll post as you: \(reply). Say confirm to send, or cancel.")
+            if Task.isCancelled { await writer.cancel(); return .declined("hung up during confirm") }
             let heard = await voice.listen()
+            if Task.isCancelled { await writer.cancel(); return .declined("hung up during confirm") }
             switch SpokenConfirm.verdict(for: heard) {
             case .confirmed:
+                if Task.isCancelled { await writer.cancel(); return .declined("hung up before send") }
                 switch await writer.confirmAndPost() {
                 case .posted:            return .posted
                 case .pending(let why):  return .pending(why)
@@ -133,10 +144,13 @@ public final class DialOrchestrator {
     /// utterance verbatim. Even so, the returned reply still flows through DRAFT → the SAME governed confirmAndPost
     /// the tap uses — a false marker can never auto-post.
     private func converse() async -> String? {
+        if Task.isCancelled { return nil }
         await voice.speak("Ask me anything about this, or say 'my reply is' when you're ready to post.")
+        if Task.isCancelled { return nil }
         for _ in 0..<maxConversingTurns {
             if Task.isCancelled { return nil }
             let heard = (await voice.listen()).trimmingCharacters(in: .whitespacesAndNewlines)
+            if Task.isCancelled { return nil }
             switch DialReplyMarker.classify(heard) {
             case .question:
                 guard !heard.isEmpty else {
@@ -146,11 +160,14 @@ public final class DialOrchestrator {
                 }
                 // Grounded-or-honest answer, spoken aloud by the voice. This NEVER posts.
                 _ = await voice.answerFollowUp(heard)
+                if Task.isCancelled { return nil }
             case .reply(let text):
                 return text
             case .awaitingReply:
                 await voice.speak("Go ahead with your reply.")
+                if Task.isCancelled { return nil }
                 let next = (await voice.listen()).trimmingCharacters(in: .whitespacesAndNewlines)
+                if Task.isCancelled { return nil }
                 return next.isEmpty ? nil : next
             }
         }

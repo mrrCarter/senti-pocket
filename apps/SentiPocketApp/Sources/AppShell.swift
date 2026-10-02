@@ -2,21 +2,28 @@ import SwiftUI
 
 // MARK: - App shell (Atlas, V4 §85) — the BARE TabView structure + a screen-INJECTION seam. This layer defines NO
 // presentation: no copy, no view-models, no fallbacks, no badges. Pulse owns every visible screen + the row/content
-// view-models + the factory off Relay's repository snapshot, and INJECTS her designed screens into the Sessions and
-// Activity tabs via `@ViewBuilder` (not blank slots). The Pocket tab hosts the working fail-closed verified-briefing
-// scaffold (RootView) until Pulse's redesigned briefing lands. Tab set + IA (3 tabs; account/settings as a sheet,
-// NOT a 4th tab) per north-star #239314(B).
+// view-models + the factory off Relay's repository snapshot, and INJECTS the designed Sessions, Pocket, and Activity
+// screens via `@ViewBuilder` (not blank slots). Tab set + IA (3 tabs; account/settings as a sheet, NOT a 4th tab)
+// per north-star #239314(B).
 
 enum PocketTab: Hashable { case sessions, pocket, activity }
 
-struct AppShell<Sessions: View, Activity: View>: View {
-    @State private var tab: PocketTab = .pocket
+struct AppShell<Sessions: View, Pocket: View, Activity: View>: View {
+    @Binding private var tab: PocketTab
     private let sessions: Sessions
+    private let pocket: Pocket
     private let activity: Activity
 
-    /// Pulse injects her designed screens here; the shell only composes them into the tab structure.
-    init(@ViewBuilder sessions: () -> Sessions, @ViewBuilder activity: () -> Activity) {
+    /// Feature owners inject designed screens here; the shell only composes them into the tab structure.
+    init(
+        selection: Binding<PocketTab>,
+        @ViewBuilder sessions: () -> Sessions,
+        @ViewBuilder pocket: () -> Pocket,
+        @ViewBuilder activity: () -> Activity
+    ) {
+        _tab = selection
         self.sessions = sessions()
+        self.pocket = pocket()
         self.activity = activity()
     }
 
@@ -26,7 +33,7 @@ struct AppShell<Sessions: View, Activity: View>: View {
                 .tabItem { Label("Sessions", systemImage: "rectangle.stack") }
                 .tag(PocketTab.sessions)
 
-            RootView()   // fail-closed verified-briefing scaffold; Pulse's redesigned briefing replaces this
+            pocket
                 .tabItem { Label("Pocket", systemImage: "phone.fill") }
                 .tag(PocketTab.pocket)
 
@@ -37,13 +44,23 @@ struct AppShell<Sessions: View, Activity: View>: View {
     }
 }
 
-// AppShell is INJECTION-ONLY: there is deliberately no zero-argument initializer. @main ships RootView() until Pulse
-// supplies real Sessions/Activity screens, at which point it composes `AppShell(sessions:{…}, activity:{…})`. This
-// keeps blank tabs from ever shipping (finder item 2) while the shell's composition is still exercised by the preview.
+// AppShell is INJECTION-ONLY: there is deliberately no zero-argument initializer.
+
+#if DEBUG
+private struct AppShellPreview: View {
+    @State private var selection: PocketTab = .pocket
+
+    var body: some View {
+        AppShell(
+            selection: $selection,
+            sessions: { List { Text("Session · room A"); Text("Session · room B") } },
+            pocket: { RootView() },
+            activity: { List { Text("Activity · event 1"); Text("Activity · event 2") } }
+        )
+    }
+}
 
 #Preview("App shell (injection)") {
-    AppShell(
-        sessions: { List { Text("Session · room A"); Text("Session · room B") } },
-        activity: { List { Text("Activity · event 1"); Text("Activity · event 2") } }
-    )
+    AppShellPreview()
 }
+#endif
