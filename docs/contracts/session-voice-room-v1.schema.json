@@ -1,0 +1,1214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sentinelayer.com/schemas/session-voice-room-v1.schema.json",
+  "title": "Senti session voice-room v1 wire records",
+  "description": "Provider-neutral durable voice utterance, entitlement, moderation, usage, and error records.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/sessionVoiceUtterance"
+    },
+    {
+      "$ref": "#/$defs/agentVoiceProfile"
+    },
+    {
+      "$ref": "#/$defs/voiceEntitlement"
+    },
+    {
+      "$ref": "#/$defs/voiceModerationCommand"
+    },
+    {
+      "$ref": "#/$defs/voiceUsageEvent"
+    },
+    {
+      "$ref": "#/$defs/voiceControlStreamEvent"
+    },
+    {
+      "$ref": "#/$defs/voiceErrorEnvelope"
+    }
+  ],
+  "$defs": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[a-z][a-z0-9_.-]*\\.v[1-9][0-9]*$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "traceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "requestCorrelation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "traceId",
+        "traceparent"
+      ],
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "traceId": {
+          "$ref": "#/$defs/traceId"
+        },
+        "traceparent": {
+          "$ref": "#/$defs/traceparent"
+        },
+        "turnId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "causationId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "commandId": {
+          "$ref": "#/$defs/opaqueId"
+        }
+      }
+    },
+    "roomIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tenantId",
+        "sentiSessionId",
+        "voiceRoomEpochId"
+      ],
+      "properties": {
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "sentiSessionId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "voiceRoomEpochId": {
+          "$ref": "#/$defs/opaqueId"
+        }
+      }
+    },
+    "participantRole": {
+      "type": "string",
+      "enum": [
+        "owner",
+        "moderator",
+        "speaker",
+        "listener",
+        "agent"
+      ]
+    },
+    "principalKind": {
+      "type": "string",
+      "enum": [
+        "human",
+        "agent",
+        "service"
+      ]
+    },
+    "speaker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "principalId",
+        "providerParticipantId",
+        "kind",
+        "role",
+        "bindingAuthority"
+      ],
+      "properties": {
+        "principalId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "providerParticipantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "providerTrackId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "kind": {
+          "$ref": "#/$defs/principalKind"
+        },
+        "role": {
+          "$ref": "#/$defs/participantRole"
+        },
+        "bindingAuthority": {
+          "const": "server"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    },
+    "participantSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "principalId",
+        "providerParticipantId",
+        "kind",
+        "role",
+        "mediaState",
+        "microphoneEnabled",
+        "canPublish",
+        "handRaised"
+      ],
+      "properties": {
+        "principalId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "providerParticipantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "kind": {
+          "$ref": "#/$defs/principalKind"
+        },
+        "role": {
+          "$ref": "#/$defs/participantRole"
+        },
+        "mediaState": {
+          "type": "string",
+          "enum": [
+            "invited",
+            "joining",
+            "joined",
+            "reconnecting",
+            "left",
+            "removed"
+          ]
+        },
+        "microphoneEnabled": {
+          "type": "boolean"
+        },
+        "canPublish": {
+          "type": "boolean"
+        },
+        "handRaised": {
+          "type": "boolean"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    },
+    "utteranceTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "roomOffsetStartMs",
+        "roomOffsetEndMs",
+        "startedAt",
+        "endedAt"
+      ],
+      "properties": {
+        "roomOffsetStartMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "roomOffsetEndMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "startedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "endedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transcriptAllowed",
+        "audioRetentionAllowed",
+        "policyId"
+      ],
+      "properties": {
+        "transcriptAllowed": {
+          "const": true
+        },
+        "audioRetentionAllowed": {
+          "type": "boolean"
+        },
+        "policyId": {
+          "$ref": "#/$defs/opaqueId"
+        }
+      }
+    },
+    "transcript": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "language",
+        "confidence",
+        "model",
+        "isFinal",
+        "redactionVersion",
+        "consent"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        },
+        "language": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 35,
+          "pattern": "^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "isFinal": {
+          "const": true
+        },
+        "redactionVersion": {
+          "$ref": "#/$defs/schemaVersion"
+        },
+        "consent": {
+          "$ref": "#/$defs/consent"
+        }
+      }
+    },
+    "audioReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "objectRef",
+        "mediaType",
+        "byteCount",
+        "contentHash",
+        "encrypted",
+        "retainUntil"
+      ],
+      "properties": {
+        "objectRef": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "mediaType": {
+          "type": "string",
+          "enum": [
+            "audio/ogg",
+            "audio/opus",
+            "audio/mp4",
+            "audio/wav"
+          ]
+        },
+        "byteCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "contentHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "encrypted": {
+          "const": true
+        },
+        "retainUntil": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "toneTag": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40,
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "synthesisProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "voiceProfileId",
+        "voiceProfileRevision",
+        "provider",
+        "model",
+        "outputMode",
+        "toneTags"
+      ],
+      "properties": {
+        "voiceProfileId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "voiceProfileRevision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "outputMode": {
+          "type": "string",
+          "enum": [
+            "shared_room_track",
+            "degraded_client_tts"
+          ]
+        },
+        "toneTags": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/toneTag"
+          }
+        }
+      }
+    },
+    "agentVoiceProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "voiceProfileId",
+        "tenantId",
+        "agentPrincipalId",
+        "revision",
+        "displayName",
+        "synthesisProvider",
+        "providerVoiceRef",
+        "stylePolicyId",
+        "toneTags",
+        "fallbackVoiceProfileId",
+        "effectiveAt",
+        "disabledAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "agent_voice_profile.v1"
+        },
+        "voiceProfileId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "agentPrincipalId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "synthesisProvider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "providerVoiceRef": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "stylePolicyId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "toneTags": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/toneTag"
+          }
+        },
+        "fallbackVoiceProfileId": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/opaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effectiveAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "disabledAt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "sessionVoiceUtterance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "event",
+        "tenantId",
+        "sentiSessionId",
+        "voiceRoomEpochId",
+        "utteranceId",
+        "provider",
+        "providerEventId",
+        "providerSegmentId",
+        "projectorPrincipalId",
+        "speaker",
+        "timing",
+        "transcript",
+        "correlation",
+        "contentHash",
+        "recordedAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "session_voice_utterance.v1"
+        },
+        "event": {
+          "const": "session_voice_utterance"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "sentiSessionId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "voiceRoomEpochId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "utteranceId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "providerEventId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "providerSegmentId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "projectorPrincipalId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "speaker": {
+          "$ref": "#/$defs/speaker"
+        },
+        "timing": {
+          "$ref": "#/$defs/utteranceTiming"
+        },
+        "transcript": {
+          "$ref": "#/$defs/transcript"
+        },
+        "correlation": {
+          "$ref": "#/$defs/requestCorrelation"
+        },
+        "audio": {
+          "$ref": "#/$defs/audioReference"
+        },
+        "revisionOfUtteranceId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "synthesis": {
+          "$ref": "#/$defs/synthesisProvenance"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "recordedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "speaker"
+            ],
+            "properties": {
+              "speaker": {
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "agent"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "synthesis"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "synthesis"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "voiceCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transcriptionAllowed",
+        "agentAllowed",
+        "recordingAllowed",
+        "videoAllowed",
+        "archiveExportAllowed"
+      ],
+      "properties": {
+        "transcriptionAllowed": {
+          "type": "boolean"
+        },
+        "agentAllowed": {
+          "type": "boolean"
+        },
+        "recordingAllowed": {
+          "type": "boolean"
+        },
+        "videoAllowed": {
+          "type": "boolean"
+        },
+        "archiveExportAllowed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "voiceLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxConcurrentRooms",
+        "maxJoinedPerRoom",
+        "maxPublishersPerRoom",
+        "participantMinutesMonthly",
+        "transcriptionMinutesMonthly",
+        "agentMinutesMonthly",
+        "recordingMinutesMonthly"
+      ],
+      "properties": {
+        "maxConcurrentRooms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxJoinedPerRoom": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxPublishersPerRoom": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "participantMinutesMonthly": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "transcriptionMinutesMonthly": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "agentMinutesMonthly": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recordingMinutesMonthly": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "voiceEntitlement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "entitlementId",
+        "tenantId",
+        "subjectId",
+        "policyId",
+        "policyClass",
+        "capabilities",
+        "limits",
+        "effectiveAt",
+        "expiresAt",
+        "issuedAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "voice_entitlement.v1"
+        },
+        "entitlementId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "subjectId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "policyId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "policyClass": {
+          "type": "string",
+          "enum": [
+            "trial",
+            "default",
+            "paid",
+            "enterprise",
+            "admin"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/voiceCapabilities"
+        },
+        "limits": {
+          "$ref": "#/$defs/voiceLimits"
+        },
+        "effectiveAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "expiresAt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trialEndsAt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issuedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "voiceModerationCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "tenantId",
+        "sentiSessionId",
+        "voiceRoomEpochId",
+        "commandId",
+        "idempotencyKey",
+        "expectedRevision",
+        "actorPrincipalId",
+        "actorRole",
+        "targetPrincipalId",
+        "action",
+        "correlation",
+        "issuedAt"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "voice_moderation_command.v1"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "sentiSessionId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "voiceRoomEpochId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "commandId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "idempotencyKey": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actorPrincipalId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "actorRole": {
+          "type": "string",
+          "enum": [
+            "owner",
+            "moderator"
+          ]
+        },
+        "targetPrincipalId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "promote",
+            "demote",
+            "mute",
+            "remove",
+            "deny_publish",
+            "allow_publish"
+          ]
+        },
+        "reasonCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        },
+        "correlation": {
+          "$ref": "#/$defs/requestCorrelation"
+        },
+        "issuedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "voiceUsageEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "usageEventId",
+        "tenantId",
+        "sentiSessionId",
+        "voiceRoomEpochId",
+        "provider",
+        "providerEventId",
+        "metric",
+        "quantity",
+        "unit",
+        "observedAt",
+        "contentHash"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "voice_usage_event.v1"
+        },
+        "usageEventId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "sentiSessionId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "voiceRoomEpochId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "providerEventId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "metric": {
+          "type": "string",
+          "enum": [
+            "participant_minute",
+            "transcription_minute",
+            "agent_minute",
+            "recording_minute",
+            "room_peak_joined",
+            "room_peak_publishers",
+            "provider_error"
+          ]
+        },
+        "quantity": {
+          "type": "number",
+          "minimum": 0
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "minute",
+            "participant",
+            "error"
+          ]
+        },
+        "observedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "voiceRoomSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "tenantId",
+        "sentiSessionId",
+        "voiceRoomEpochId",
+        "controlRevision",
+        "providerPresenceRevision",
+        "roomState",
+        "self",
+        "stage",
+        "activeSpeakerPrincipalIds",
+        "connectionState",
+        "joinedCount",
+        "rosterNextCursor"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "voice_room_snapshot.v1"
+        },
+        "tenantId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "sentiSessionId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "voiceRoomEpochId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "controlRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "providerPresenceRevision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "roomState": {
+          "type": "string",
+          "enum": [
+            "provisioning",
+            "open",
+            "draining",
+            "ended",
+            "failed"
+          ]
+        },
+        "self": {
+          "$ref": "#/$defs/participantSummary"
+        },
+        "stage": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/participantSummary"
+          }
+        },
+        "activeSpeakerPrincipalIds": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/opaqueId"
+          }
+        },
+        "connectionState": {
+          "type": "string",
+          "enum": [
+            "joining",
+            "joined",
+            "reconnecting",
+            "disconnected",
+            "failed"
+          ]
+        },
+        "joinedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rosterNextCursor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/opaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "voiceError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "requestId",
+        "recoverable",
+        "retryAfterMs"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "VOICE_BAD_REQUEST",
+            "VOICE_NOT_AUTHENTICATED",
+            "VOICE_JOIN_NOT_AUTHORIZED",
+            "VOICE_ENTITLEMENT_EXCEEDED",
+            "VOICE_PROVIDER_QUOTA_EXCEEDED",
+            "VOICE_ROOM_NOT_FOUND",
+            "VOICE_ROOM_ENDED",
+            "VOICE_CONTROL_CONFLICT",
+            "VOICE_PROVIDER_UNAVAILABLE",
+            "VOICE_AGENT_MEDIA_UNSUPPORTED",
+            "VOICE_TRANSCRIPT_DEGRADED",
+            "VOICE_EXPORT_PARTIAL",
+            "VOICE_STREAM_RESYNC_REQUIRED",
+            "VOICE_INTERNAL"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "requestId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "recoverable": {
+          "type": "boolean"
+        },
+        "retryAfterMs": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 86400000
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "voiceControlStreamEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "kind",
+            "eventId",
+            "sequence",
+            "tenantId",
+            "sentiSessionId",
+            "voiceRoomEpochId",
+            "requestId",
+            "emittedAt",
+            "snapshot"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "voice_control_stream_event.v1"
+            },
+            "kind": {
+              "const": "snapshot"
+            },
+            "eventId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tenantId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "sentiSessionId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "voiceRoomEpochId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "requestId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "emittedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "snapshot": {
+              "$ref": "#/$defs/voiceRoomSnapshot"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "kind",
+            "eventId",
+            "sequence",
+            "tenantId",
+            "sentiSessionId",
+            "voiceRoomEpochId",
+            "requestId",
+            "emittedAt",
+            "error"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "voice_control_stream_event.v1"
+            },
+            "kind": {
+              "const": "error"
+            },
+            "eventId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tenantId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "sentiSessionId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "voiceRoomEpochId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "requestId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "emittedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "error": {
+              "$ref": "#/$defs/voiceError"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schemaVersion",
+            "kind",
+            "eventId",
+            "sequence",
+            "tenantId",
+            "sentiSessionId",
+            "voiceRoomEpochId",
+            "requestId",
+            "emittedAt",
+            "controlRevision"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "voice_control_stream_event.v1"
+            },
+            "kind": {
+              "const": "heartbeat"
+            },
+            "eventId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tenantId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "sentiSessionId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "voiceRoomEpochId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "requestId": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "emittedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "controlRevision": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "voiceErrorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/voiceError"
+        }
+      }
+    }
+  }
+}

@@ -8,7 +8,11 @@ let package = Package(
         .library(name: "PocketVoice", targets: ["PocketVoice"])
     ],
     dependencies: [
-        .package(path: "../PocketContracts")
+        .package(path: "../PocketContracts"),
+        .package(
+            url: "https://github.com/cloudflare/realtimekit-ios-core.git",
+            exact: "3.1.0"
+        )
     ],
     targets: [
         .binaryTarget(
@@ -18,7 +22,15 @@ let package = Package(
         ),
         .target(
             name: "PocketVoice",
-            dependencies: ["whisper", "PocketContracts"]
+            dependencies: [
+                "whisper",
+                "PocketContracts",
+                .product(
+                    name: "RealtimeKit",
+                    package: "realtimekit-ios-core",
+                    condition: .when(platforms: [.iOS])
+                )
+            ]
         ),
         .testTarget(
             name: "PocketVoiceTests",
