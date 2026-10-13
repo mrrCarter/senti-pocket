@@ -213,6 +213,33 @@ const dialFetch = (id = 'u1', role = 'owner') => async (url) => {
   return new Response('{}', { status: 200 });
 };
 
+test('production composition opts into assessment before the existing answer grounding gate', async () => {
+  const sid = '6cf7e861-546a-4b9f-b937-39182a5bd395';
+  const checkpoint = { checkpointId: 'cp-assess', sessionId: sid, startSequence: 100, endSequence: 180,
+    summarySections: { window: { eventCount: 1 } } };
+  const event = (sequenceId, text) => ({ sequenceId, event: 'session_message', agent: { id: 'agent-1' },
+    payload: { text }, ts: '2026-10-12T12:00:00Z' });
+  const run = (args) => JSON.stringify(args.includes('list') ? [checkpoint] : {
+    session: { id: sid, title: 'Assessment fixture' }, agents: ['agent-1'],
+    events: [event(50, 'before'), event(120, 'Deployment is blocked.'), event(200, 'after')],
+  });
+  let calls = 0;
+  const gw = createProdGateway(FULL_ENV, { ...FULL_DEPS, fetch: dialFetch(), run,
+    reason: async ({ groundedEvidenceIds }) => ({ text: 'Deployment completed.', evidenceIds: groundedEvidenceIds }),
+    assessReasoning: async ({ contextHash, candidateHash }) => {
+      calls++;
+      return { contextHash, candidateHash, verdicts: [{ index: 0, support: 'unsupported', supportScore: 1 }] };
+    },
+  });
+  const r = await gw.handle({ method: 'POST', path: '/answer', headers: { authorization: 'Bearer t' },
+    body: { sessionId: sid, question: 'Is production live?' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.answer, undefined);
+  assert.equal(r.body.assessment.status, 'inconclusive');
+  assert.equal(calls, 2);
+  assert.throws(() => createProdGateway(FULL_ENV, { ...FULL_DEPS, assessReasoning: null }), /adapters/);
+});
+
 test('createProdGateway wires DIAL-ME: /dial/register binds under the VERIFIED humanId; /dial rings via apnsSend', async () => {
   const registered = [];
   const deviceRegistry = {

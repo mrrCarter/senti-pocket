@@ -12,16 +12,16 @@
 // fabricated answer. handlers.mjs (routeAnswer / handleBrief) re-apply the SAME grounding intersection downstream, so
 // this backend is defense-in-depth, not the sole gate. Zero-dep, injected fetch (deploy owns transport), never logs.
 import { keepGrounded, groundingIdsFromBundle, isGrounded } from './grounding-gate.mjs';
+import { projectReasoningEvidence } from './reasoning-evidence.mjs';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_EVIDENCE = 24;   // bound the grounding context sent to the model
-const SNIPPET_CAP = 280;   // per-evidence excerpt bytes (already bounded upstream by summarize.mjs)
 
 /** Grounding context lines: `[id] (author @seq N) snippet` — the ids the model is allowed to cite. */
-function evidenceLines(bundle) {
-  const ev = Array.isArray(bundle?.evidence) ? bundle.evidence.slice(0, MAX_EVIDENCE) : [];
+function evidenceLines(bundle, grounded) {
+  // Prompt and post-generation citation policy must use the SAME selection, including explicit empty retrieval.
+  const ev = projectReasoningEvidence(bundle?.evidence, [...grounded]);
   return ev
-    .map((e) => `[${e.id}] (${e.agentId || '?'} @seq ${e.sequence ?? '?'}) ${String(e.snippet || '').slice(0, SNIPPET_CAP)}`)
+    .map((e) => `[${e.id}] (${e.agentId} @seq ${e.sequence ?? '?'} at ${e.ts || 'unknown time'}) ${e.snippet}`)
     .join('\n');
 }
 const groundedSet = (bundle, groundedEvidenceIds) => new Set(
@@ -47,6 +47,17 @@ const normTopics = (topics, grounded) =>
     .filter((t) => t && typeof t.label === 'string' && typeof t.evidenceId === 'string' && grounded.has(t.evidenceId))
     .slice(0, 8)
     .map((t) => ({ label: t.label, evidenceId: t.evidenceId }));
+
+// Only locally generated policy codes and real grounding ids enter a regeneration prompt, never arbitrary critique.
+function feedbackLine(feedback, grounded) {
+  if (!feedback || typeof feedback !== 'object') return '';
+  const allowedReasons = new Set(['invalid-candidate', 'spoken-text-mismatch', 'candidate-too-large',
+    'required-evidence-not-covered', 'invalid-assessment', 'support-not-established']);
+  if (!allowedReasons.has(feedback.reason)) return '';
+  return `\n\nREVISION POLICY:\n${JSON.stringify({ reason: feedback.reason,
+    requiredEvidenceIds: keepGrounded(feedback.requiredEvidenceIds, grounded),
+    missingEvidenceIds: keepGrounded(feedback.missingEvidenceIds, grounded) })}`;
+}
 
 const REASON_SYS =
   'You are a STRICTLY GROUNDED assistant. Answer ONLY from the EVIDENCE provided. Cite the evidence ids you actually '
@@ -75,8 +86,10 @@ export function createGemmaBackend({ baseUrl, model = 'gemma3', apiKey, fetch = 
   const base = String(baseUrl || '').replace(/\/+$/, '');
   if (!base) throw new Error('createGemmaBackend: baseUrl is required (e.g. http://localhost:11434/v1 for Ollama, or the AI Studio OpenAI-compat URL)');
 
-  async function chat(messages) {
-    const signal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') ? AbortSignal.timeout(timeoutMs) : undefined;
+  async function chat(messages, requestSignal) {
+    const timeout = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') ? AbortSignal.timeout(timeoutMs) : undefined;
+    const signal = requestSignal && timeout && typeof AbortSignal.any === 'function'
+      ? AbortSignal.any([requestSignal, timeout]) : (requestSignal || timeout);
     const res = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -101,11 +114,11 @@ export function createGemmaBackend({ baseUrl, model = 'gemma3', apiKey, fetch = 
     baseUrl: base,
 
     // deps.reason({ question, bundle, groundedEvidenceIds }) -> { text, taggedText, evidenceIds, llmConfidence, nearestTopics }
-    async reason({ question, bundle, groundedEvidenceIds } = {}) {
+    async reason({ question, bundle, groundedEvidenceIds, assessmentFeedback, signal } = {}) {
       const grounded = groundedSet(bundle, groundedEvidenceIds);
-      const user = `QUESTION:\n${String(question || '').slice(0, 4096)}\n\nEVIDENCE (id, author, snippet):\n${evidenceLines(bundle) || '(none)'}`;
+      const user = `QUESTION:\n${String(question || '').slice(0, 4096)}\n\nEVIDENCE (id, author, snippet):\n${evidenceLines(bundle, grounded) || '(none)'}${feedbackLine(assessmentFeedback, grounded)}`;
       let raw;
-      try { raw = await chat([{ role: 'system', content: REASON_SYS }, { role: 'user', content: user }]); }
+      try { raw = await chat([{ role: 'system', content: REASON_SYS }, { role: 'user', content: user }], signal); }
       catch { return { text: '', evidenceIds: [], llmConfidence: 0, nearestTopics: [] }; } // fail-closed -> unavailable
       const p = safeJson(raw);
       if (!p) return { text: '', evidenceIds: [], llmConfidence: 0, nearestTopics: [] };
@@ -125,11 +138,11 @@ export function createGemmaBackend({ baseUrl, model = 'gemma3', apiKey, fetch = 
     },
 
     // deps.brief({ bundle, groundedEvidenceIds }) -> { segments: [{ text, taggedText, evidenceIds }] }
-    async brief({ bundle, groundedEvidenceIds } = {}) {
+    async brief({ bundle, groundedEvidenceIds, assessmentFeedback, signal } = {}) {
       const grounded = groundedSet(bundle, groundedEvidenceIds);
-      const user = `EVIDENCE (id, author, snippet):\n${evidenceLines(bundle) || '(none)'}`;
+      const user = `EVIDENCE (id, author, snippet):\n${evidenceLines(bundle, grounded) || '(none)'}${feedbackLine(assessmentFeedback, grounded)}`;
       let raw;
-      try { raw = await chat([{ role: 'system', content: BRIEF_SYS }, { role: 'user', content: user }]); }
+      try { raw = await chat([{ role: 'system', content: BRIEF_SYS }, { role: 'user', content: user }], signal); }
       catch { return { segments: [] }; } // fail-closed -> handleBrief returns grounded:false
       const p = safeJson(raw);
       if (!p || !Array.isArray(p.segments)) return { segments: [] };

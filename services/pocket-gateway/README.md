@@ -89,6 +89,11 @@ sl session export <SID>           ─┴─►  buildRawCheckpoint()  ─►  Ra
 - Writes: snapshot-frozen proposal, single-use confirmation bound to the exact proposal hash, server-time freshness, reserve-before-post exactly-once, read-back verification, real `ActionResultRef` or explicit failure — never a false "sent".
 
 ## Test
+
+Optional Jev/other-model assessment of `/answer` and `/brief` drafts is available through the explicit
+`deps.assessReasoning` adapter. See [ASSESSMENT.md](ASSESSMENT.md) for the local contract, evidence coverage,
+bounded retries, outage behavior, and the remaining Swift/offline/notification work. It has no call or write authority.
+
 ```
 cd services/pocket-gateway && node --test
 

@@ -50,8 +50,8 @@ export function routeAnswer(input, opts = {}) {
 
   // Grounded. Secondary tiebreaker: a grounded-but-low-confidence answer with real alternatives -> clarify,
   // rather than a confident-sounding pick among ambiguous options.
-  const conf = typeof llm.llmConfidence === 'number' ? llm.llmConfidence : 1;
-  if (conf < minConfidence && normalizeTopics(input?.nearestTopics).length > 1) {
+  const conf = Number.isFinite(llm.llmConfidence) && llm.llmConfidence >= 0 && llm.llmConfidence <= 1 ? llm.llmConfidence : null;
+  if (conf !== null && conf < minConfidence && normalizeTopics(input?.nearestTopics).length > 1) {
     return { status: 'clarify', clarify: buildClarify(input?.nearestTopics) };
   }
 
@@ -62,6 +62,7 @@ export function routeAnswer(input, opts = {}) {
       taggedText: typeof llm.taggedText === 'string' ? llm.taggedText : (typeof llm.text === 'string' ? llm.text : ''),
       evidenceIds: citedGrounded, // ONLY grounded citations cross the boundary
       llmConfidence: conf,
+      confidenceProvenance: conf === null ? 'unavailable' : 'model-self-reported-uncalibrated',
     },
   };
 }

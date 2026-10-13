@@ -6,6 +6,7 @@ import { createGateway, storeKey } from '../src/handlers.mjs';
 import { createInMemoryStore } from '../src/store.mjs';
 import { computeProposalHash } from '../src/actions.mjs';
 import { generateSigningKeypair, verifyBundle } from '../src/bundle.mjs';
+import { createAssessedReasoningBackend } from '../src/assessed-reasoning.mjs';
 
 const KNOWN = '6cf7e861-546a-4b9f-b937-39182a5bd395';
 const { privateKey: KEY } = generateSigningKeypair();
@@ -53,6 +54,53 @@ const CP_EXPORT = {
 };
 const CP_CKPT = { checkpointId: 'cp_test_1', sessionId: KNOWN, startSequence: 230100, endSequence: 230180, summarySections: { window: { eventCount: 2 } } };
 const cpRun = (args) => (args.includes('list') ? JSON.stringify([CP_CKPT]) : args.includes('export') ? JSON.stringify(CP_EXPORT) : '{}');
+
+test('opt-in assessment rejects unsupported prose despite valid citations through the real /answer handler', async () => {
+  let assessorCalls = 0;
+  const backend = createAssessedReasoningBackend({
+    reason: async ({ groundedEvidenceIds }) => ({ text: 'Production deployment completed.', evidenceIds: groundedEvidenceIds.slice(0, 1) }),
+    assess: async ({ contextHash, candidateHash }) => {
+      assessorCalls++;
+      return { contextHash, candidateHash, verdicts: [{ index: 0, support: 'unsupported', supportScore: 0.99 }] };
+    },
+  });
+  const gw = createGateway(baseDeps({ run: cpRun, ...backend }));
+  const r = await gw.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'Was it deployed?' }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.status, 'clarify');
+  assert.equal(r.body.answer, undefined);
+  assert.equal(r.body.assessment.status, 'inconclusive');
+  assert.equal(assessorCalls, 2);
+});
+
+test('opt-in assessment outage remains visible through /brief and produces no generated words', async () => {
+  const backend = createAssessedReasoningBackend({
+    brief: async ({ groundedEvidenceIds }) => ({ segments: [{ text: 'Agent reports a parser fix.', evidenceIds: groundedEvidenceIds.slice(0, 1) }] }),
+    assess: async () => { throw new Error('offline'); },
+  });
+  const gw = createGateway(baseDeps({ run: cpRun, ...backend }));
+  const r = await gw.handle({ method: 'POST', path: '/brief', body: { sessionId: KNOWN }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.grounded, false);
+  assert.deepEqual(r.body.segments, []);
+  assert.equal(r.body.assessment.status, 'unavailable');
+});
+
+test('successful assessed /answer never invents missing model confidence at the routing boundary', async () => {
+  const backend = createAssessedReasoningBackend({
+    reason: async ({ groundedEvidenceIds }) => ({ text: 'The agent reports a parser fix.', evidenceIds: groundedEvidenceIds.slice(0, 1) }),
+    assess: async ({ contextHash, candidateHash }) => ({ contextHash, candidateHash,
+      verdicts: [{ index: 0, support: 'supported', supportScore: 0.9 }] }),
+  });
+  const gw = createGateway(baseDeps({ run: cpRun, ...backend }));
+  const r = await gw.handle({ method: 'POST', path: '/answer', body: { sessionId: KNOWN, question: 'What was reported?' }, headers: { authorization: 'Bearer good' } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.status, 'answered');
+  assert.equal(r.body.answer.llmConfidence, null);
+  assert.equal(r.body.answer.confidenceProvenance, 'unavailable');
+  assert.equal(r.body.assessment.semanticSupport, 'model-assessed');
+  assert.match(r.body.assessment.bundleCanonicalHash, /^[a-f0-9]{64}$/);
+});
 
 test('GET /health needs no auth', async () => {
   const gw = createGateway(baseDeps());

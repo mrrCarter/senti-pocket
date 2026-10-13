@@ -13,6 +13,7 @@ import {
 } from './operation-admission-assertion.mjs';
 import { createElevenLabsBackend } from './tts.mjs';
 import { createGemmaBackend } from './gemma-backend.mjs';
+import { createAssessedReasoningBackend } from './assessed-reasoning.mjs';
 import {
   assertDeviceRegistryV2Capabilities,
   createDialPushBackend,
@@ -99,6 +100,14 @@ export function createProdGateway(env = {}, deps = {}) {
   const gemma = env.GEMMA_BASE_URL
     ? createGemmaBackend({ baseUrl: env.GEMMA_BASE_URL, model: env.GEMMA_MODEL, apiKey: env.GEMMA_API_KEY, fetch: deps.fetch })
     : undefined;
+  let reasoning = { reason: deps.reason || gemma?.reason, brief: deps.brief || gemma?.brief };
+  // Explicit injection only: there is no assumed Jev HTTP protocol or automatic external data transfer.
+  // This layer judges prose before the existing citation gate; it grants no actions, calls, or approvals.
+  if (deps.assessReasoning !== undefined) reasoning = createAssessedReasoningBackend({
+    ...(deps.reasoningAssessmentPolicy || {}),
+    ...reasoning, assess: deps.assessReasoning,
+    requiredEvidenceFor: deps.requiredReasoningEvidenceFor,
+  });
 
   // The HUMAN write door (executeAction humanMessage mode) posts to the api under the caller's OWN bearer — no gateway
   // credential in the path. Constructed HERE (not lazily) so "deps.postHumanMessage is defined" is a BOOT INVARIANT: a
@@ -205,8 +214,8 @@ export function createProdGateway(env = {}, deps = {}) {
     // undefined and handleDeck honestly 501s (no-video-capability), never a fabricated/empty video.
     rasterize: deps.rasterize || (deckVideo ? deckVideo.rasterize : undefined),
     encodeVideo: deps.encodeVideo || (deckVideo ? deckVideo.encodeVideo : undefined),
-    reason: deps.reason || (gemma ? gemma.reason : undefined),   // /answer  (grounding-first; 501 if neither configured)
-    brief: deps.brief || (gemma ? gemma.brief : undefined),     // /brief   (grounding-first; 501 if neither configured)
+    reason: reasoning.reason,   // /answer  (grounding-first; 501 if neither configured)
+    brief: reasoning.brief,     // /brief   (grounding-first; 501 if neither configured)
     minConfidence: deps.minConfidence,
     run: deps.run,
     postHumanMessage,

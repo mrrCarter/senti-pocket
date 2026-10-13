@@ -62,6 +62,16 @@ test('grounded + low confidence but NO alternatives -> still answered (grounding
   assert.equal(r.status, 'answered');
 });
 
+test('absent, non-finite and out-of-range confidence remains unavailable, not certainty', () => {
+  for (const llmConfidence of [undefined, null, NaN, Infinity, -1, 1.1]) {
+    const r = routeAnswer({ groundedEvidenceIds: ['ev_1'], llmAnswer: { text: 'Source report.', evidenceIds: ['ev_1'], llmConfidence } });
+    assert.equal(r.answer.llmConfidence, null);
+    assert.equal(r.answer.confidenceProvenance, 'unavailable');
+  }
+  assert.equal(routeAnswer({ groundedEvidenceIds: ['ev_1'], llmAnswer: { text: 'Source report.', evidenceIds: ['ev_1'], llmConfidence: 0.7 } }).answer.confidenceProvenance,
+    'model-self-reported-uncalibrated');
+});
+
 test('grounded citation but EMPTY/whitespace answer text -> NOT answered (parity with brief empty-segment drop)', () => {
   // empty text + a grounded cite is not an answer (was previously routed .answered with no words)
   assert.notEqual(routeAnswer({ groundedEvidenceIds: ['ev_1'], llmAnswer: { text: '', evidenceIds: ['ev_1'] }, nearestTopics: topics }).status, 'answered');

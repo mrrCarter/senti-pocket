@@ -301,7 +301,8 @@ export function createGateway(deps) {
       { minConfidence: deps.minConfidence },
     );
     // Provenance: which verified checkpoint the answer was grounded in (auditable, phone-verifiable).
-    return json(200, { ...routed, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion });
+    return json(200, { ...routed, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion,
+      ...(r.assessment ? { assessment: r.assessment } : {}) });
   }
 
   // POST /brief — a REASONED, segmented briefing (fixes "too brief / no reasoning", Carter). Same
@@ -348,7 +349,8 @@ export function createGateway(deps) {
       .filter(isGrounded); // grounding-first (shared gate): visible text (trim) + >=1 grounded cite — was seg.text-truthy, which kept whitespace-only segments (parity with gemma-backend/brief-pipeline #69/#70)
     // `grounded:false` (no segment survived) is an HONEST "no reasoned briefing grounded in this checkpoint"
     // signal — the caller labels it (never a fabricated brief), same discipline as /answer's unavailable.
-    return json(200, { segments, grounded: segments.length > 0, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion });
+    return json(200, { segments, grounded: segments.length > 0, checkpointId: bundle.checkpointId, contractsVersion: bundle.contractsVersion,
+      ...(briefed?.assessment ? { assessment: briefed.assessment } : {}) });
   }
 
   async function handleExecute(req, ctx) {
