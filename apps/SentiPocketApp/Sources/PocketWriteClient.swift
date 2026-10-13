@@ -62,7 +62,7 @@ final class PocketWriteClient {
     private let tokenProvider: () -> String?
 
     init(apiBaseURL: URL?,
-         urlSession: URLSession = .shared,
+         urlSession: URLSession = SentiHTTPTransportPolicy.liveSession,
          tokenProvider: @escaping () -> String? = { SessionTokenStore.load() }) {
         self.apiBaseURL = apiBaseURL
         self.urlSession = urlSession

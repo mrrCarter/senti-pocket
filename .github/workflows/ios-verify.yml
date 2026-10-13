@@ -52,6 +52,8 @@ jobs:
           - name: PocketInference
             path: packages/PocketInference
             git_lfs_skip_smudge: "1"
+          - name: PocketSyncClient
+            path: packages/PocketSyncClient
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain

@@ -55,7 +55,7 @@ final class DialHydrationClient {
     /// `tokenProvider` defaults to the real Keychain session token (SessionTokenStore) but is injectable so the
     /// fetch is hermetically testable (adopted from forge's DialSignalClient #97 — the one improvement to fold in).
     init(apiBaseURL: URL,
-         urlSession: URLSession = .shared,
+         urlSession: URLSession = SentiHTTPTransportPolicy.liveSession,
          tokenProvider: @escaping () -> String? = { SessionTokenStore.load() },
          onReauthenticationRequired: @escaping @Sendable (String?) -> Void = { _ in }) {
         self.apiBaseURL = apiBaseURL

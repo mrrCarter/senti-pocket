@@ -92,7 +92,7 @@ public final class HTTPSessionTransport: SessionTransport, @unchecked Sendable {
 
     public init(
         apiBaseURL: URL?,
-        urlSession: URLSession = .shared,
+        urlSession: URLSession,
         tokenProvider: @escaping @Sendable () -> String?
     ) {
         self.apiBaseURL = Self.validOrigin(apiBaseURL)
