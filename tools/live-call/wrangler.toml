@@ -1,0 +1,26 @@
+name = "senti-live-call"
+main = "worker.mjs"
+compatibility_date = "2025-01-01"
+
+# One Durable Object instance per AUTHORIZED (session, room) pair (idFromName(`${sessionId}::${roomId}`) in
+# worker.mjs) — a member of one session can never reach another session's room by guessing a roomId.
+[[durable_objects.bindings]]
+name = "CALL_ROOM"
+class_name = "CallRoomDO"
+
+# SQLite-backed DO (the default for new classes); supports storage KV + alarms used by call-do.mjs.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CallRoomDO"]
+
+[vars]
+# CF_REALTIME_APP_ID is public. GATEWAY_AUTHORIZE_URL is the gateway endpoint the Worker POSTs the CLIENT's own
+# bearer to for a bearer->(role, participantId) decision bound to the (session, room) pair (co-designed with warden;
+# unset or wrong host => fail closed, admits no one). GATEWAY_HOST pins that endpoint's host (reject a redirect
+# elsewhere). There is NO shared admin token — authorization is the connecting client's own Senti bearer, forwarded.
+# Secrets are NEVER committed — set them once per environment:
+#   wrangler secret put CF_REALTIME_APP_SECRET   # the CF Realtime App Secret (stays server-side)
+#   wrangler secret put INTERNAL_BIND_KEY        # shared key for the Worker->DO minted-session bind (defense-in-depth)
+CF_REALTIME_APP_ID = ""
+GATEWAY_AUTHORIZE_URL = ""
+GATEWAY_HOST = ""
