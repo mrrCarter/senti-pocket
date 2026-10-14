@@ -496,6 +496,43 @@ test('POST /dial/ring-owner: soft per-human ring rate-limit -> 429 over the wind
   assert.ok(Number.isFinite(third.body.retryAfterSec), 'carries a retryAfterSec');
 });
 
+test('POST /dial/ring-owner: AMEND-1 — the ring 429 carries a standard Retry-After HEADER + scope=principal', async () => {
+  const pushBackend = async (input) => ({ dispatched: true, dialId: input.id });
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, ringRateMax: 1 }));
+  const ring = (q) => gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: q, kind: 'go', context: { sessionId: KNOWN } } });
+  assert.equal((await ring('one?')).status, 200);
+  const blocked = await ring('two?');
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.body.scope, 'principal', 'the per-token (principal) budget is what bit');
+  assert.equal(blocked.headers['retry-after'], String(blocked.body.retryAfterSec), 'Retry-After header mirrors retryAfterSec (header, not just a body field)');
+  assert.ok(Number(blocked.headers['retry-after']) > 0 && Number(blocked.headers['retry-after']) <= 60, 'header value is within the window');
+});
+
+test('POST /dial/ring-owner: AMEND-1 — per-SESSION limit bites, and a DIFFERENT session still rings (isolation, not a per-human block)', async () => {
+  const KNOWN2 = '11111111-2222-4333-8444-555555555555';
+  const pushBackend = async (input) => ({ dispatched: true, dialId: input.id });
+  // per-session budget 1, per-token budget high (10) so ONLY the session limit can bite here.
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, ringSessionRateMax: 1, ringRateMax: 10, knownSessionIdsFor: async () => [KNOWN, KNOWN2] }));
+  const ring = (sid, q) => gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: q, kind: 'go', context: { sessionId: sid } } });
+  assert.equal((await ring(KNOWN, 'first about A?')).status, 200);
+  const secondA = await ring(KNOWN, 'second about A?');
+  assert.equal(secondA.status, 429, 'a 2nd ring ABOUT the same session is session-rate-limited');
+  assert.equal(secondA.body.scope, 'session', 'the SESSION budget is what bit (not the principal budget, which is far from full)');
+  assert.equal(secondA.headers['retry-after'], String(secondA.body.retryAfterSec), 'Retry-After header present on the session 429 too');
+  assert.equal((await ring(KNOWN2, 'first about B?')).status, 200, 'a different session has its own bucket and still rings');
+});
+
+test('POST /dial/ring-owner: AMEND-1 — a rejected (429) ring consumes NO budget and never dispatches', async () => {
+  let rings = 0;
+  const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
+  const gw = createGateway(baseDeps({ verifyToken: dialVerify, pushBackend, ringRateMax: 1 }));
+  const ring = (q) => gw.handle({ method: 'POST', path: '/dial/ring-owner', headers: { authorization: 'Bearer dial' }, body: { question: q, kind: 'go', context: { sessionId: KNOWN } } });
+  assert.equal((await ring('one?')).status, 200);
+  assert.equal((await ring('two?')).status, 429);
+  assert.equal((await ring('three?')).status, 429);
+  assert.equal(rings, 1, 'only the one allowed ring dispatched; a 429 never dispatches and never charges the bucket');
+});
+
 test('POST /dial/ring-owner: fail-open — no store wired still rings (never drop a genuine ring)', async () => {
   let rings = 0;
   const pushBackend = async (input) => { rings += 1; return { dispatched: true, dialId: input.id }; };
